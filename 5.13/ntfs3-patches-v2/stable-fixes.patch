@@ -1,0 +1,232 @@
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index eccbe2aed7c3f703ec51e6b62ffa08bbee039d12..4df33cc08eee0f1f3577f5683b8b20941b8c8e7f 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -2333,6 +2333,9 @@ static int bfq_request_merge(struct request_queue *q, struct request **req,
+ 	__rq = bfq_find_rq_fmerge(bfqd, bio, q);
+ 	if (__rq && elv_bio_merge_ok(__rq, bio)) {
+ 		*req = __rq;
++
++		if (blk_discard_mergable(__rq))
++			return ELEVATOR_DISCARD_MERGE;
+ 		return ELEVATOR_FRONT_MERGE;
+ 	}
+ 
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 65210e9a8eface5bc3e95e373eaf97a2d8aa7ff6..7abbea25ae0c9281dc797ddad01e3f1edcd618e4 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -705,29 +705,13 @@ static void blk_account_io_merge_request(struct request *req)
+ 	}
+ }
+ 
+-/*
+- * Two cases of handling DISCARD merge:
+- * If max_discard_segments > 1, the driver takes every bio
+- * as a range and send them to controller together. The ranges
+- * needn't to be contiguous.
+- * Otherwise, the bios/requests will be handled as same as
+- * others which should be contiguous.
+- */
+-static inline bool blk_discard_mergable(struct request *req)
+-{
+-	if (req_op(req) == REQ_OP_DISCARD &&
+-	    queue_max_discard_segments(req->q) > 1)
+-		return true;
+-	return false;
+-}
+-
+ static enum elv_merge blk_try_req_merge(struct request *req,
+ 					struct request *next)
+ {
+-	if (blk_rq_pos(req) + blk_rq_sectors(req) == blk_rq_pos(next))
+-		return ELEVATOR_BACK_MERGE;
+-	else if (blk_discard_mergable(req))
++	if (blk_discard_mergable(req))
+ 		return ELEVATOR_DISCARD_MERGE;
++	else if (blk_rq_pos(req) + blk_rq_sectors(req) == blk_rq_pos(next))
++		return ELEVATOR_BACK_MERGE;
+ 
+ 	return ELEVATOR_NO_MERGE;
+ }
+@@ -908,12 +892,12 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
+ 
+ enum elv_merge blk_try_merge(struct request *rq, struct bio *bio)
+ {
+-	if (blk_rq_pos(rq) + blk_rq_sectors(rq) == bio->bi_iter.bi_sector)
++	if (blk_discard_mergable(rq))
++		return ELEVATOR_DISCARD_MERGE;
++	else if (blk_rq_pos(rq) + blk_rq_sectors(rq) == bio->bi_iter.bi_sector)
+ 		return ELEVATOR_BACK_MERGE;
+ 	else if (blk_rq_pos(rq) - bio_sectors(bio) == bio->bi_iter.bi_sector)
+ 		return ELEVATOR_FRONT_MERGE;
+-	else if (blk_discard_mergable(rq))
+-		return ELEVATOR_DISCARD_MERGE;
+ 	return ELEVATOR_NO_MERGE;
+ }
+ 
+diff --git a/block/elevator.c b/block/elevator.c
+index 440699c28119337be8c88f40dc826784612a531d..73e0591acfd4b1d51bd1bf73f7ed01a3ec1bef13 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -336,6 +336,9 @@ enum elv_merge elv_merge(struct request_queue *q, struct request **req,
+ 	__rq = elv_rqhash_find(q, bio->bi_iter.bi_sector);
+ 	if (__rq && elv_bio_merge_ok(__rq, bio)) {
+ 		*req = __rq;
++
++		if (blk_discard_mergable(__rq))
++			return ELEVATOR_DISCARD_MERGE;
+ 		return ELEVATOR_BACK_MERGE;
+ 	}
+ 
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index 8eea2cbf2bf4ad1f509dffac7df6b5efb75f7c6d..8dca7255d04cfbdbdd91e6b87b9bb3781a3e99d2 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -454,6 +454,8 @@ static int dd_request_merge(struct request_queue *q, struct request **rq,
+ 
+ 		if (elv_bio_merge_ok(__rq, bio)) {
+ 			*rq = __rq;
++			if (blk_discard_mergable(__rq))
++				return ELEVATOR_DISCARD_MERGE;
+ 			return ELEVATOR_FRONT_MERGE;
+ 		}
+ 	}
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 21db7ee24da5593f10f43c347f0d0fde99e120e1..425bae618131976ccae8f1258a83fe25ca27bbcc 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -116,6 +116,7 @@ static int virtblk_setup_discard_write_zeroes(struct request *req, bool unmap)
+ 	unsigned short segments = blk_rq_nr_discard_segments(req);
+ 	unsigned short n = 0;
+ 	struct virtio_blk_discard_write_zeroes *range;
++	struct bio *bio;
+ 	u32 flags = 0;
+ 
+ 	if (unmap)
+@@ -137,11 +138,9 @@ static int virtblk_setup_discard_write_zeroes(struct request *req, bool unmap)
+ 		range[0].sector = cpu_to_le64(blk_rq_pos(req));
+ 		n = 1;
+ 	} else {
+-		struct req_discard_range r;
+-
+-		rq_for_each_discard_range(r, req) {
+-			u64 sector = r.sector;
+-			u32 num_sectors = r.size >> SECTOR_SHIFT;
++		__rq_for_each_bio(bio, req) {
++			u64 sector = bio->bi_iter.bi_sector;
++			u32 num_sectors = bio->bi_iter.bi_size >> SECTOR_SHIFT;
+ 
+ 			range[n].flags = cpu_to_le32(flags);
+ 			range[n].num_sectors = cpu_to_le32(num_sectors);
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 67f1288c681165db4f362964afa442786a435769..148e756857a89d3ea0c0ca459f8b291f7d94f057 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -813,7 +813,7 @@ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ {
+ 	unsigned short segments = blk_rq_nr_discard_segments(req), n = 0;
+ 	struct nvme_dsm_range *range;
+-	struct req_discard_range r;
++	struct bio *bio;
+ 
+ 	/*
+ 	 * Some devices do not consider the DSM 'Number of Ranges' field when
+@@ -835,9 +835,9 @@ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ 		range = page_address(ns->ctrl->discard_page);
+ 	}
+ 
+-	rq_for_each_discard_range(r, req) {
+-		u64 slba = nvme_sect_to_lba(ns, r.sector);
+-		u32 nlb = r.size >> ns->lba_shift;
++	__rq_for_each_bio(bio, req) {
++		u64 slba = nvme_sect_to_lba(ns, bio->bi_iter.bi_sector);
++		u32 nlb = bio->bi_iter.bi_size >> ns->lba_shift;
+ 
+ 		if (n < segments) {
+ 			range[n].cattr = cpu_to_le32(0);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 50f2ed0f293675db47741158d32a11b5a26610e4..9bfb2f65534b046f1582c02b19ba543d5f554f47 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1003,57 +1003,6 @@ static inline unsigned int blk_rq_stats_sectors(const struct request *rq)
+ 	return rq->stats_sectors;
+ }
+ 
+-struct req_discard_range {
+-	sector_t	sector;
+-	unsigned int	size;
+-
+-	/*
+-	 * internal field: driver don't use it, and it always points to
+-	 * next bio to be processed
+-	 */
+-	struct bio *__bio;
+-};
+-
+-static inline void req_init_discard_range_iter(const struct request *rq,
+-		struct req_discard_range *range)
+-{
+-	range->__bio = rq->bio;
+-}
+-
+-/* return true if @range stores one valid discard range */
+-static inline bool req_get_discard_range(struct req_discard_range *range)
+-{
+-	struct bio *bio;
+-
+-	if (!range->__bio)
+-		return false;
+-
+-	bio = range->__bio;
+-	range->sector = bio->bi_iter.bi_sector;
+-	range->size = bio->bi_iter.bi_size;
+-	range->__bio = bio->bi_next;
+-
+-	while (range->__bio) {
+-		struct bio *bio = range->__bio;
+-
+-		if (range->sector + (range->size >> SECTOR_SHIFT) !=
+-				bio->bi_iter.bi_sector)
+-			break;
+-
+-		/*
+-		 * ->size won't overflow because req->__data_len is defined
+-		 *  as 'unsigned int'
+-		 */
+-		range->size += bio->bi_iter.bi_size;
+-		range->__bio = bio->bi_next;
+-	}
+-	return true;
+-}
+-
+-#define rq_for_each_discard_range(range, rq) \
+-	for (req_init_discard_range_iter((rq), &range); \
+-			req_get_discard_range(&range);)
+-
+ #ifdef CONFIG_BLK_DEV_ZONED
+ 
+ /* Helper to convert BLK_ZONE_ZONE_XXX to its string format XXX */
+@@ -1582,6 +1531,22 @@ static inline int queue_limit_discard_alignment(struct queue_limits *lim, sector
+ 	return offset << SECTOR_SHIFT;
+ }
+ 
++/*
++ * Two cases of handling DISCARD merge:
++ * If max_discard_segments > 1, the driver takes every bio
++ * as a range and send them to controller together. The ranges
++ * needn't to be contiguous.
++ * Otherwise, the bios/requests will be handled as same as
++ * others which should be contiguous.
++ */
++static inline bool blk_discard_mergable(struct request *req)
++{
++	if (req_op(req) == REQ_OP_DISCARD &&
++	    queue_max_discard_segments(req->q) > 1)
++		return true;
++	return false;
++}
++
+ static inline int bdev_discard_alignment(struct block_device *bdev)
+ {
+ 	struct request_queue *q = bdev_get_queue(bdev);

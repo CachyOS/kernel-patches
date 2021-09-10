@@ -1,0 +1,143 @@
+From 58a5b9af4fdb99f70b4487b9a97fa294d367fb8a Mon Sep 17 00:00:00 2001
+From: Alfred Chen <cchalpha@gmail.com>
+Date: Fri, 26 Mar 2021 14:20:06 +0800
+Subject: [PATCH 121/148] sched/alt: Implement cpu load history and util for
+ schedutil.
+
+---
+ kernel/sched/alt_core.c          | 16 ++++-----
+ kernel/sched/cpufreq_schedutil.c | 56 ++++++++++++++++++++++++++++++--
+ 2 files changed, 61 insertions(+), 11 deletions(-)
+
+diff --git a/kernel/sched/alt_core.c b/kernel/sched/alt_core.c
+index be7c185a741d..29b7d30fd45f 100644
+--- a/kernel/sched/alt_core.c
++++ b/kernel/sched/alt_core.c
+@@ -558,14 +558,6 @@ static inline void enqueue_task(struct task_struct *p, struct rq *rq, int flags)
+ #endif
+ 
+ 	sched_update_tick_dependency(rq);
+-
+-	/*
+-	 * If in_iowait is set, the code below may not trigger any cpufreq
+-	 * utilization updates, so do it here explicitly with the IOWAIT flag
+-	 * passed.
+-	 */
+-	if (p->in_iowait)
+-		cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
+ }
+ 
+ static inline void requeue_task(struct task_struct *p, struct rq *rq)
+@@ -1057,7 +1049,13 @@ static void activate_task(struct task_struct *p, struct rq *rq)
+ {
+ 	enqueue_task(p, rq, ENQUEUE_WAKEUP);
+ 	p->on_rq = TASK_ON_RQ_QUEUED;
+-	cpufreq_update_util(rq, 0);
++
++	/*
++	 * If in_iowait is set, the code below may not trigger any cpufreq
++	 * utilization updates, so do it here explicitly with the IOWAIT flag
++	 * passed.
++	 */
++	cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT * p->in_iowait);
+ }
+ 
+ /*
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index e70820389e56..c61cd5858ba0 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -57,6 +57,13 @@ struct sugov_cpu {
+ 	unsigned long		bw_dl;
+ 	unsigned long		max;
+ 
++#ifdef CONFIG_SCHED_ALT
++	/* For genenal cpu load util */
++	s32			load_history;
++	u64			load_block;
++	u64			load_stamp;
++#endif
++
+ 	/* The field below is for single-CPU policies only: */
+ #ifdef CONFIG_NO_HZ_COMMON
+ 	unsigned long		saved_idle_calls;
+@@ -174,15 +181,52 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu)
+ 
+ #else /* CONFIG_SCHED_ALT */
+ 
++#define SG_CPU_LOAD_HISTORY_BITS	(sizeof(s32) * 8ULL)
++#define SG_CPU_UTIL_SHIFT		(8)
++#define SG_CPU_LOAD_HISTORY_SHIFT	(SG_CPU_LOAD_HISTORY_BITS - 1 - SG_CPU_UTIL_SHIFT)
++#define SG_CPU_LOAD_HISTORY_TO_UTIL(l)	(((l) >> SG_CPU_LOAD_HISTORY_SHIFT) & 0xff)
++
++#define LOAD_BLOCK(t)		((t) >> 17)
++#define LOAD_HALF_BLOCK(t)	((t) >> 16)
++#define BLOCK_MASK(t)		((t) & ((0x01 << 18) - 1))
++#define LOAD_BLOCK_BIT(b)	(1UL << (SG_CPU_LOAD_HISTORY_BITS - 1 - (b)))
++#define CURRENT_LOAD_BIT	LOAD_BLOCK_BIT(0)
++
+ static void sugov_get_util(struct sugov_cpu *sg_cpu)
+ {
+ 	unsigned long max = arch_scale_cpu_capacity(sg_cpu->cpu);
+ 
+ 	sg_cpu->max = max;
+ 	sg_cpu->bw_dl = 0;
+-	sg_cpu->util = cpu_rq(sg_cpu->cpu)->nr_running ? max:0UL;
++	sg_cpu->util = SG_CPU_LOAD_HISTORY_TO_UTIL(sg_cpu->load_history) *
++		(max >> SG_CPU_UTIL_SHIFT);
+ }
+-#endif
++
++static inline void sugov_cpu_load_update(struct sugov_cpu *sg_cpu, u64 time)
++{
++	u64 delta = min(LOAD_BLOCK(time) - LOAD_BLOCK(sg_cpu->load_stamp),
++			SG_CPU_LOAD_HISTORY_BITS - 1);
++	u64 prev = !!(sg_cpu->load_history & CURRENT_LOAD_BIT);
++	u64 curr = !!cpu_rq(sg_cpu->cpu)->nr_running;
++
++	if (delta) {
++		sg_cpu->load_history = sg_cpu->load_history >> delta;
++
++		if (delta <= SG_CPU_UTIL_SHIFT) {
++			sg_cpu->load_block += (~BLOCK_MASK(sg_cpu->load_stamp)) * prev;
++			if (!!LOAD_HALF_BLOCK(sg_cpu->load_block) ^ curr)
++				sg_cpu->load_history ^= LOAD_BLOCK_BIT(delta);
++		}
++
++		sg_cpu->load_block = BLOCK_MASK(time) * prev;
++	} else {
++		sg_cpu->load_block += (time - sg_cpu->load_stamp) * prev;
++	}
++	if (prev ^ curr)
++		sg_cpu->load_history ^= CURRENT_LOAD_BIT;
++	sg_cpu->load_stamp = time;
++}
++#endif /* CONFIG_SCHED_ALT */
+ 
+ /**
+  * sugov_iowait_reset() - Reset the IO boost status of a CPU.
+@@ -333,6 +377,10 @@ static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
+ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
+ 					      u64 time, unsigned int flags)
+ {
++#ifdef CONFIG_SCHED_ALT
++	sugov_cpu_load_update(sg_cpu, time);
++#endif /* CONFIG_SCHED_ALT */
++
+ 	sugov_iowait_boost(sg_cpu, time, flags);
+ 	sg_cpu->last_update = time;
+ 
+@@ -453,6 +501,10 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
+ 
+ 	raw_spin_lock(&sg_policy->update_lock);
+ 
++#ifdef CONFIG_SCHED_ALT
++	sugov_cpu_load_update(sg_cpu, time);
++#endif /* CONFIG_SCHED_ALT */
++
+ 	sugov_iowait_boost(sg_cpu, time, flags);
+ 	sg_cpu->last_update = time;
+ 
+-- 
+2.32.0.93.g670b81a890
+

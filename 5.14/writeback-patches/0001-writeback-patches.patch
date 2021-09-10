@@ -1,0 +1,627 @@
+From bf1d2597e2ae419c00b8a170ba01dce2a26cf750 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Mon, 5 Jul 2021 18:23:15 +0200
+Subject: [PATCH 1/5] writeback: Track number of inodes under writeback
+
+Track number of inodes under writeback for each bdi_writeback structure.
+We will use this to decide whether wb does any IO and so we can estimate
+its writeback throughput. In principle we could use number of pages
+under writeback (WB_WRITEBACK counter) for this however normal percpu
+counter reads are too inaccurate for our purposes and summing the
+counter is too expensive.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+---
+ fs/fs-writeback.c                |  5 +++++
+ include/linux/backing-dev-defs.h |  1 +
+ mm/backing-dev.c                 |  1 +
+ mm/page-writeback.c              | 22 ++++++++++++++++++++--
+ 4 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 4c3370548..7439ecd44 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -406,6 +406,11 @@ static bool inode_do_switch_wbs(struct inode *inode,
+ 		inc_wb_stat(new_wb, WB_WRITEBACK);
+ 	}
+ 
++	if (mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK)) {
++		atomic_dec(&old_wb->writeback_inodes);
++		atomic_inc(&new_wb->writeback_inodes);
++	}
++
+ 	wb_get(new_wb);
+ 
+ 	/*
+diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
+index 1d7edad99..06fb8e13f 100644
+--- a/include/linux/backing-dev-defs.h
++++ b/include/linux/backing-dev-defs.h
+@@ -116,6 +116,7 @@ struct bdi_writeback {
+ 	struct list_head b_dirty_time;	/* time stamps are dirty */
+ 	spinlock_t list_lock;		/* protects the b_* lists */
+ 
++	atomic_t writeback_inodes;	/* number of inodes under writeback */
+ 	struct percpu_counter stat[NR_WB_STAT_ITEMS];
+ 
+ 	unsigned long congested;	/* WB_[a]sync_congested flags */
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index f5561ea7d..b4c707dde 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -293,6 +293,7 @@ static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
+ 	INIT_LIST_HEAD(&wb->b_dirty_time);
+ 	spin_lock_init(&wb->list_lock);
+ 
++	atomic_set(&wb->writeback_inodes, 0);
+ 	wb->bw_time_stamp = jiffies;
+ 	wb->balanced_dirty_ratelimit = INIT_BW;
+ 	wb->dirty_ratelimit = INIT_BW;
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index 9f63548f2..e1aa1c9d8 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -2731,6 +2731,16 @@ int clear_page_dirty_for_io(struct page *page)
+ }
+ EXPORT_SYMBOL(clear_page_dirty_for_io);
+ 
++static void wb_inode_writeback_start(struct bdi_writeback *wb)
++{
++	atomic_inc(&wb->writeback_inodes);
++}
++
++static void wb_inode_writeback_end(struct bdi_writeback *wb)
++{
++	atomic_dec(&wb->writeback_inodes);
++}
++
+ int test_clear_page_writeback(struct page *page)
+ {
+ 	struct address_space *mapping = page_mapping(page);
+@@ -2752,6 +2762,9 @@ int test_clear_page_writeback(struct page *page)
+ 
+ 				dec_wb_stat(wb, WB_WRITEBACK);
+ 				__wb_writeout_inc(wb);
++				if (!mapping_tagged(mapping,
++						    PAGECACHE_TAG_WRITEBACK))
++					wb_inode_writeback_end(wb);
+ 			}
+ 		}
+ 
+@@ -2794,8 +2807,13 @@ int __test_set_page_writeback(struct page *page, bool keep_write)
+ 						   PAGECACHE_TAG_WRITEBACK);
+ 
+ 			xas_set_mark(&xas, PAGECACHE_TAG_WRITEBACK);
+-			if (bdi->capabilities & BDI_CAP_WRITEBACK_ACCT)
+-				inc_wb_stat(inode_to_wb(inode), WB_WRITEBACK);
++			if (bdi->capabilities & BDI_CAP_WRITEBACK_ACCT) {
++				struct bdi_writeback *wb = inode_to_wb(inode);
++
++				inc_wb_stat(wb, WB_WRITEBACK);
++				if (!on_wblist)
++					wb_inode_writeback_start(wb);
++			}
+ 
+ 			/*
+ 			 * We can come through here when swapping anonymous
+-- 
+2.33.0
+
+
+From 1990da00d956b77f1f1e82538f2f9bdf69e88fba Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Mon, 5 Jul 2021 18:23:16 +0200
+Subject: [PATCH 2/5] writeback: Reliably update bandwidth estimation
+
+Currently we trigger writeback bandwidth estimation from
+balance_dirty_pages() and from wb_writeback(). However neither of these
+need to trigger when the system is relatively idle and writeback is
+triggered e.g. from fsync(2). Make sure writeback estimates happen
+reliably by triggering them from do_writepages().
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+---
+ fs/fs-writeback.c           |  3 ---
+ include/linux/backing-dev.h | 19 ++++++++++++++++++
+ include/linux/writeback.h   |  1 -
+ mm/page-writeback.c         | 39 +++++++++++++++++++++++++------------
+ 4 files changed, 46 insertions(+), 16 deletions(-)
+
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 7439ecd44..867984e77 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -2004,7 +2004,6 @@ static long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages,
+ static long wb_writeback(struct bdi_writeback *wb,
+ 			 struct wb_writeback_work *work)
+ {
+-	unsigned long wb_start = jiffies;
+ 	long nr_pages = work->nr_pages;
+ 	unsigned long dirtied_before = jiffies;
+ 	struct inode *inode;
+@@ -2058,8 +2057,6 @@ static long wb_writeback(struct bdi_writeback *wb,
+ 			progress = __writeback_inodes_wb(wb, work);
+ 		trace_writeback_written(wb, work);
+ 
+-		wb_update_bandwidth(wb, wb_start);
+-
+ 		/*
+ 		 * Did we write something? Try for more
+ 		 *
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index 44df4fcef..a5d7d625d 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -288,6 +288,17 @@ static inline struct bdi_writeback *inode_to_wb(const struct inode *inode)
+ 	return inode->i_wb;
+ }
+ 
++static inline struct bdi_writeback *inode_to_wb_wbc(
++				struct inode *inode,
++				struct writeback_control *wbc)
++{
++	/*
++	 * If wbc does not have inode attached, it means cgroup writeback was
++ 	 * disabled when wbc started. Just use the default wb in that case.
++	 */
++	return wbc->wb ? wbc->wb : &inode_to_bdi(inode)->wb;
++}
++
+ /**
+  * unlocked_inode_to_wb_begin - begin unlocked inode wb access transaction
+  * @inode: target inode
+@@ -366,6 +377,14 @@ static inline struct bdi_writeback *inode_to_wb(struct inode *inode)
+ 	return &inode_to_bdi(inode)->wb;
+ }
+ 
++static inline struct bdi_writeback *inode_to_wb_wbc(
++				struct inode *inode,
++				struct writeback_control *wbc)
++{
++	return inode_to_wb(inode);
++}
++
++
+ static inline struct bdi_writeback *
+ unlocked_inode_to_wb_begin(struct inode *inode, struct wb_lock_cookie *cookie)
+ {
+diff --git a/include/linux/writeback.h b/include/linux/writeback.h
+index 667e86cfb..2480322c0 100644
+--- a/include/linux/writeback.h
++++ b/include/linux/writeback.h
+@@ -379,7 +379,6 @@ int dirty_writeback_centisecs_handler(struct ctl_table *table, int write,
+ void global_dirty_limits(unsigned long *pbackground, unsigned long *pdirty);
+ unsigned long wb_calc_thresh(struct bdi_writeback *wb, unsigned long thresh);
+ 
+-void wb_update_bandwidth(struct bdi_writeback *wb, unsigned long start_time);
+ void balance_dirty_pages_ratelimited(struct address_space *mapping);
+ bool wb_over_bg_thresh(struct bdi_writeback *wb);
+ 
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index e1aa1c9d8..e4a381b89 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -1332,7 +1332,6 @@ static void wb_update_dirty_ratelimit(struct dirty_throttle_control *dtc,
+ 
+ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+ 				  struct dirty_throttle_control *mdtc,
+-				  unsigned long start_time,
+ 				  bool update_ratelimit)
+ {
+ 	struct bdi_writeback *wb = gdtc->wb;
+@@ -1352,13 +1351,6 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+ 	dirtied = percpu_counter_read(&wb->stat[WB_DIRTIED]);
+ 	written = percpu_counter_read(&wb->stat[WB_WRITTEN]);
+ 
+-	/*
+-	 * Skip quiet periods when disk bandwidth is under-utilized.
+-	 * (at least 1s idle time between two flusher runs)
+-	 */
+-	if (elapsed > HZ && time_before(wb->bw_time_stamp, start_time))
+-		goto snapshot;
+-
+ 	if (update_ratelimit) {
+ 		domain_update_bandwidth(gdtc, now);
+ 		wb_update_dirty_ratelimit(gdtc, dirtied, elapsed);
+@@ -1374,17 +1366,36 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+ 	}
+ 	wb_update_write_bandwidth(wb, elapsed, written);
+ 
+-snapshot:
+ 	wb->dirtied_stamp = dirtied;
+ 	wb->written_stamp = written;
+ 	wb->bw_time_stamp = now;
+ }
+ 
+-void wb_update_bandwidth(struct bdi_writeback *wb, unsigned long start_time)
++static void wb_update_bandwidth(struct bdi_writeback *wb)
+ {
+ 	struct dirty_throttle_control gdtc = { GDTC_INIT(wb) };
+ 
+-	__wb_update_bandwidth(&gdtc, NULL, start_time, false);
++	spin_lock(&wb->list_lock);
++	__wb_update_bandwidth(&gdtc, NULL, false);
++	spin_unlock(&wb->list_lock);
++}
++
++/* Interval after which we consider wb idle and don't estimate bandwidth */
++#define WB_BANDWIDTH_IDLE_JIF (HZ)
++
++static void wb_bandwidth_estimate_start(struct bdi_writeback *wb)
++{
++	unsigned long now = jiffies;
++	unsigned long elapsed = now - READ_ONCE(wb->bw_time_stamp);
++
++	if (elapsed > WB_BANDWIDTH_IDLE_JIF &&
++	    !atomic_read(&wb->writeback_inodes)) {
++		spin_lock(&wb->list_lock);
++		wb->dirtied_stamp = wb_stat(wb, WB_DIRTIED);
++		wb->written_stamp = wb_stat(wb, WB_WRITTEN);
++		wb->bw_time_stamp = now;
++		spin_unlock(&wb->list_lock);
++	}
+ }
+ 
+ /*
+@@ -1713,7 +1724,7 @@ static void balance_dirty_pages(struct bdi_writeback *wb,
+ 		if (time_is_before_jiffies(wb->bw_time_stamp +
+ 					   BANDWIDTH_INTERVAL)) {
+ 			spin_lock(&wb->list_lock);
+-			__wb_update_bandwidth(gdtc, mdtc, start_time, true);
++			__wb_update_bandwidth(gdtc, mdtc, true);
+ 			spin_unlock(&wb->list_lock);
+ 		}
+ 
+@@ -2347,9 +2358,12 @@ EXPORT_SYMBOL(generic_writepages);
+ int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ {
+ 	int ret;
++	struct bdi_writeback *wb;
+ 
+ 	if (wbc->nr_to_write <= 0)
+ 		return 0;
++	wb = inode_to_wb_wbc(mapping->host, wbc);
++	wb_bandwidth_estimate_start(wb);
+ 	while (1) {
+ 		if (mapping->a_ops->writepages)
+ 			ret = mapping->a_ops->writepages(mapping, wbc);
+@@ -2360,6 +2374,7 @@ int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ 		cond_resched();
+ 		congestion_wait(BLK_RW_ASYNC, HZ/50);
+ 	}
++	wb_update_bandwidth(wb);
+ 	return ret;
+ }
+ 
+-- 
+2.33.0
+
+
+From 34b939a28e647d1bcea8be7f53ec8455ecf7c6aa Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Mon, 5 Jul 2021 18:23:17 +0200
+Subject: [PATCH 3/5] writeback: Fix bandwidth estimate for spiky workload
+
+Michael Stapelberg has reported that for workload with short big spikes
+of writes (GCC linker seem to trigger this frequently) the write
+throughput is heavily underestimated and tends to steadily sink until it
+reaches zero. This has rather bad impact on writeback throttling
+(causing stalls). The problem is that writeback throughput estimate gets
+updated at most once per 200 ms. One update happens early after we
+submit pages for writeback (at that point writeout of only small
+fraction of pages is completed and thus observed throughput is tiny).
+Next update happens only during the next write spike (updates happen
+only from inode writeback and dirty throttling code) and if that is
+more than 1s after previous spike, we decide system was idle and just
+ignore whatever was written until this moment.
+
+Fix the problem by making sure writeback throughput estimate is also
+updated shortly after writeback completes to get reasonable estimate of
+throughput for spiky workloads.
+
+Link: https://lore.kernel.org/lkml/20210617095309.3542373-1-stapelberg+linux@google.com
+Reported-by: Michael Stapelberg <stapelberg+linux@google.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+---
+ include/linux/backing-dev-defs.h |  1 +
+ include/linux/writeback.h        |  1 +
+ mm/backing-dev.c                 | 10 ++++++++++
+ mm/page-writeback.c              | 32 ++++++++++++++++----------------
+ 4 files changed, 28 insertions(+), 16 deletions(-)
+
+diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
+index 06fb8e13f..33207004c 100644
+--- a/include/linux/backing-dev-defs.h
++++ b/include/linux/backing-dev-defs.h
+@@ -143,6 +143,7 @@ struct bdi_writeback {
+ 	spinlock_t work_lock;		/* protects work_list & dwork scheduling */
+ 	struct list_head work_list;
+ 	struct delayed_work dwork;	/* work item used for writeback */
++	struct delayed_work bw_dwork;	/* work item used for bandwidth estimate */
+ 
+ 	unsigned long dirty_sleep;	/* last wait */
+ 
+diff --git a/include/linux/writeback.h b/include/linux/writeback.h
+index 2480322c0..cbaef0996 100644
+--- a/include/linux/writeback.h
++++ b/include/linux/writeback.h
+@@ -379,6 +379,7 @@ int dirty_writeback_centisecs_handler(struct ctl_table *table, int write,
+ void global_dirty_limits(unsigned long *pbackground, unsigned long *pdirty);
+ unsigned long wb_calc_thresh(struct bdi_writeback *wb, unsigned long thresh);
+ 
++void wb_update_bandwidth(struct bdi_writeback *wb);
+ void balance_dirty_pages_ratelimited(struct address_space *mapping);
+ bool wb_over_bg_thresh(struct bdi_writeback *wb);
+ 
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index b4c707dde..6122c78ce 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -271,6 +271,14 @@ void wb_wakeup_delayed(struct bdi_writeback *wb)
+ 	spin_unlock_bh(&wb->work_lock);
+ }
+ 
++static void wb_update_bandwidth_workfn(struct work_struct *work)
++{
++	struct bdi_writeback *wb = container_of(to_delayed_work(work),
++						struct bdi_writeback, bw_dwork);
++
++	wb_update_bandwidth(wb);
++}
++
+ /*
+  * Initial write bandwidth: 100 MB/s
+  */
+@@ -303,6 +311,7 @@ static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
+ 	spin_lock_init(&wb->work_lock);
+ 	INIT_LIST_HEAD(&wb->work_list);
+ 	INIT_DELAYED_WORK(&wb->dwork, wb_workfn);
++	INIT_DELAYED_WORK(&wb->bw_dwork, wb_update_bandwidth_workfn);
+ 	wb->dirty_sleep = jiffies;
+ 
+ 	err = fprop_local_init_percpu(&wb->completions, gfp);
+@@ -351,6 +360,7 @@ static void wb_shutdown(struct bdi_writeback *wb)
+ 	mod_delayed_work(bdi_wq, &wb->dwork, 0);
+ 	flush_delayed_work(&wb->dwork);
+ 	WARN_ON(!list_empty(&wb->work_list));
++	flush_delayed_work(&wb->bw_dwork);
+ }
+ 
+ static void wb_exit(struct bdi_writeback *wb)
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index e4a381b89..da93c2195 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -1340,14 +1340,7 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+ 	unsigned long dirtied;
+ 	unsigned long written;
+ 
+-	lockdep_assert_held(&wb->list_lock);
+-
+-	/*
+-	 * rate-limit, only update once every 200ms.
+-	 */
+-	if (elapsed < BANDWIDTH_INTERVAL)
+-		return;
+-
++	spin_lock(&wb->list_lock);
+ 	dirtied = percpu_counter_read(&wb->stat[WB_DIRTIED]);
+ 	written = percpu_counter_read(&wb->stat[WB_WRITTEN]);
+ 
+@@ -1369,15 +1362,14 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+ 	wb->dirtied_stamp = dirtied;
+ 	wb->written_stamp = written;
+ 	wb->bw_time_stamp = now;
++	spin_unlock(&wb->list_lock);
+ }
+ 
+-static void wb_update_bandwidth(struct bdi_writeback *wb)
++void wb_update_bandwidth(struct bdi_writeback *wb)
+ {
+ 	struct dirty_throttle_control gdtc = { GDTC_INIT(wb) };
+ 
+-	spin_lock(&wb->list_lock);
+ 	__wb_update_bandwidth(&gdtc, NULL, false);
+-	spin_unlock(&wb->list_lock);
+ }
+ 
+ /* Interval after which we consider wb idle and don't estimate bandwidth */
+@@ -1722,11 +1714,8 @@ static void balance_dirty_pages(struct bdi_writeback *wb,
+ 			wb->dirty_exceeded = 1;
+ 
+ 		if (time_is_before_jiffies(wb->bw_time_stamp +
+-					   BANDWIDTH_INTERVAL)) {
+-			spin_lock(&wb->list_lock);
++					   BANDWIDTH_INTERVAL))
+ 			__wb_update_bandwidth(gdtc, mdtc, true);
+-			spin_unlock(&wb->list_lock);
+-		}
+ 
+ 		/* throttle according to the chosen dtc */
+ 		dirty_ratelimit = wb->dirty_ratelimit;
+@@ -2374,7 +2363,13 @@ int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ 		cond_resched();
+ 		congestion_wait(BLK_RW_ASYNC, HZ/50);
+ 	}
+-	wb_update_bandwidth(wb);
++	/*
++	 * Usually few pages are written by now from those we've just submitted
++	 * but if there's constant writeback being submitted, this makes sure
++	 * writeback bandwidth is updated once in a while.
++	 */
++	if (time_is_before_jiffies(wb->bw_time_stamp + BANDWIDTH_INTERVAL))
++		wb_update_bandwidth(wb);
+ 	return ret;
+ }
+ 
+@@ -2754,6 +2749,11 @@ static void wb_inode_writeback_start(struct bdi_writeback *wb)
+ static void wb_inode_writeback_end(struct bdi_writeback *wb)
+ {
+ 	atomic_dec(&wb->writeback_inodes);
++	/*
++	 * Make sure estimate of writeback throughput gets
++	 * updated after writeback completed.
++	 */
++	queue_delayed_work(bdi_wq, &wb->bw_dwork, BANDWIDTH_INTERVAL);
+ }
+ 
+ int test_clear_page_writeback(struct page *page)
+-- 
+2.33.0
+
+
+From fb73835277a72dd3af4c72db0113c5b0d8b78216 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Mon, 5 Jul 2021 18:23:18 +0200
+Subject: [PATCH 4/5] writeback: Rename domain_update_bandwidth()
+
+Rename domain_update_bandwidth() to domain_update_dirty_limit(). The
+original name is a misnomer. The function has nothing to do with a
+bandwidth, it updates dirty limits.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+---
+ mm/page-writeback.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index da93c2195..a88dc91d5 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -1147,8 +1147,8 @@ static void update_dirty_limit(struct dirty_throttle_control *dtc)
+ 	dom->dirty_limit = limit;
+ }
+ 
+-static void domain_update_bandwidth(struct dirty_throttle_control *dtc,
+-				    unsigned long now)
++static void domain_update_dirty_limit(struct dirty_throttle_control *dtc,
++				      unsigned long now)
+ {
+ 	struct wb_domain *dom = dtc_dom(dtc);
+ 
+@@ -1345,7 +1345,7 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+ 	written = percpu_counter_read(&wb->stat[WB_WRITTEN]);
+ 
+ 	if (update_ratelimit) {
+-		domain_update_bandwidth(gdtc, now);
++		domain_update_dirty_limit(gdtc, now);
+ 		wb_update_dirty_ratelimit(gdtc, dirtied, elapsed);
+ 
+ 		/*
+@@ -1353,7 +1353,7 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+ 		 * compiler has no way to figure that out.  Help it.
+ 		 */
+ 		if (IS_ENABLED(CONFIG_CGROUP_WRITEBACK) && mdtc) {
+-			domain_update_bandwidth(mdtc, now);
++			domain_update_dirty_limit(mdtc, now);
+ 			wb_update_dirty_ratelimit(mdtc, dirtied, elapsed);
+ 		}
+ 	}
+-- 
+2.33.0
+
+
+From 4301a6f0f17a9d8dc07cffca05784bbb4e3e38f6 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Mon, 5 Jul 2021 18:23:19 +0200
+Subject: [PATCH 5/5] writeback: Use READ_ONCE for unlocked reads of writeback
+ stats
+
+We do some unlocked reads of writeback statistics like
+avg_write_bandwidth, dirty_ratelimit, or bw_time_stamp. Generally we are
+fine with getting somewhat out-of-date values but actually getting
+different values in various parts of the functions because the compiler
+decided to reload value from original memory location could confuse
+calculations. Use READ_ONCE for these unlocked accesses to be on the
+safe side.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+---
+ mm/page-writeback.c | 20 +++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index a88dc91d5..505802c79 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -183,7 +183,7 @@ static struct fprop_local_percpu *wb_memcg_completions(struct bdi_writeback *wb)
+ static void wb_min_max_ratio(struct bdi_writeback *wb,
+ 			     unsigned long *minp, unsigned long *maxp)
+ {
+-	unsigned long this_bw = wb->avg_write_bandwidth;
++	unsigned long this_bw = READ_ONCE(wb->avg_write_bandwidth);
+ 	unsigned long tot_bw = atomic_long_read(&wb->bdi->tot_write_bandwidth);
+ 	unsigned long long min = wb->bdi->min_ratio;
+ 	unsigned long long max = wb->bdi->max_ratio;
+@@ -892,7 +892,7 @@ static long long pos_ratio_polynom(unsigned long setpoint,
+ static void wb_position_ratio(struct dirty_throttle_control *dtc)
+ {
+ 	struct bdi_writeback *wb = dtc->wb;
+-	unsigned long write_bw = wb->avg_write_bandwidth;
++	unsigned long write_bw = READ_ONCE(wb->avg_write_bandwidth);
+ 	unsigned long freerun = dirty_freerun_ceiling(dtc->thresh, dtc->bg_thresh);
+ 	unsigned long limit = hard_dirty_limit(dtc_dom(dtc), dtc->thresh);
+ 	unsigned long wb_thresh = dtc->wb_thresh;
+@@ -1336,11 +1336,12 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+ {
+ 	struct bdi_writeback *wb = gdtc->wb;
+ 	unsigned long now = jiffies;
+-	unsigned long elapsed = now - wb->bw_time_stamp;
++	unsigned long elapsed;
+ 	unsigned long dirtied;
+ 	unsigned long written;
+ 
+ 	spin_lock(&wb->list_lock);
++	elapsed = now - wb->bw_time_stamp;
+ 	dirtied = percpu_counter_read(&wb->stat[WB_DIRTIED]);
+ 	written = percpu_counter_read(&wb->stat[WB_WRITTEN]);
+ 
+@@ -1410,7 +1411,7 @@ static unsigned long dirty_poll_interval(unsigned long dirty,
+ static unsigned long wb_max_pause(struct bdi_writeback *wb,
+ 				  unsigned long wb_dirty)
+ {
+-	unsigned long bw = wb->avg_write_bandwidth;
++	unsigned long bw = READ_ONCE(wb->avg_write_bandwidth);
+ 	unsigned long t;
+ 
+ 	/*
+@@ -1432,8 +1433,8 @@ static long wb_min_pause(struct bdi_writeback *wb,
+ 			 unsigned long dirty_ratelimit,
+ 			 int *nr_dirtied_pause)
+ {
+-	long hi = ilog2(wb->avg_write_bandwidth);
+-	long lo = ilog2(wb->dirty_ratelimit);
++	long hi = ilog2(READ_ONCE(wb->avg_write_bandwidth));
++	long lo = ilog2(READ_ONCE(wb->dirty_ratelimit));
+ 	long t;		/* target pause */
+ 	long pause;	/* estimated next pause */
+ 	int pages;	/* target nr_dirtied_pause */
+@@ -1713,12 +1714,12 @@ static void balance_dirty_pages(struct bdi_writeback *wb,
+ 		if (dirty_exceeded && !wb->dirty_exceeded)
+ 			wb->dirty_exceeded = 1;
+ 
+-		if (time_is_before_jiffies(wb->bw_time_stamp +
++		if (time_is_before_jiffies(READ_ONCE(wb->bw_time_stamp) +
+ 					   BANDWIDTH_INTERVAL))
+ 			__wb_update_bandwidth(gdtc, mdtc, true);
+ 
+ 		/* throttle according to the chosen dtc */
+-		dirty_ratelimit = wb->dirty_ratelimit;
++		dirty_ratelimit = READ_ONCE(wb->dirty_ratelimit);
+ 		task_ratelimit = ((u64)dirty_ratelimit * sdtc->pos_ratio) >>
+ 							RATELIMIT_CALC_SHIFT;
+ 		max_pause = wb_max_pause(wb, sdtc->wb_dirty);
+@@ -2368,7 +2369,8 @@ int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ 	 * but if there's constant writeback being submitted, this makes sure
+ 	 * writeback bandwidth is updated once in a while.
+ 	 */
+-	if (time_is_before_jiffies(wb->bw_time_stamp + BANDWIDTH_INTERVAL))
++	if (time_is_before_jiffies(READ_ONCE(wb->bw_time_stamp) +
++				   BANDWIDTH_INTERVAL))
+ 		wb_update_bandwidth(wb);
+ 	return ret;
+ }
+-- 
+2.33.0
+

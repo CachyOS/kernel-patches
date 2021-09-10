@@ -1,0 +1,463 @@
+From ee064ed69d6a804012c8f1183f08dd65a8dacb01 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Sat, 5 Dec 2020 17:19:18 +0100
+Subject: [PATCH 1/6] genirq, i2c: Provide and use generic_dispatch_irq()
+
+Carlos reported that on his system booting with 'threadirqs' on the command
+line result in the following warning:
+
+irq 31 handler irq_default_primary_handler+0x0/0x10 enabled interrupts
+WARNING: CPU: 2 PID: 989 at kernel/irq/handle.c:153 __handle_irq_event_percpu+0x19f/0x1b0
+
+The reason is in the i2c stack:
+
+    i801_isr()
+      i801_host_notify_isr()
+        i2c_handle_smbus_host_notify()
+          generic_handle_irq()
+
+and that explodes with forced interrupt threading because it's called with
+interrupts enabled.
+
+It would be possible to set IRQF_NO_THREAD on the i801 interrupt to exclude
+it from force threading, but that would break on RT and require a larger
+update.
+
+It's also unclear whether there are other drivers which can reach that code
+path via i2c_slave_host_notify_cb(). As there are enough i2c drivers which
+use threaded interrupt handlers by default it seems not completely
+impossible that this can happen even without force threaded interrupts.
+
+For a quick fix provide a wrapper around generic_handle_irq() which has a
+local_irq_save/restore() around the invocation and use it in the i2c code.
+
+Reported-by: Carlos Jimenez <javashin1986@gmail.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1873673
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=202453
+Link: https://lore.kernel.org/lkml/20201204201930.vtvitsq6xcftjj3o@spock.localdomain/
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ drivers/i2c/i2c-core-base.c |  2 +-
+ include/linux/irqdesc.h     |  1 +
+ kernel/irq/irqdesc.c        | 21 +++++++++++++++++++++
+ 3 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/i2c/i2c-core-base.c b/drivers/i2c/i2c-core-base.c
+index e314cca..577a641 100644
+--- a/drivers/i2c/i2c-core-base.c
++++ b/drivers/i2c/i2c-core-base.c
+@@ -1421,7 +1421,7 @@ int i2c_handle_smbus_host_notify(struct i2c_adapter *adap, unsigned short addr)
+ 	if (irq <= 0)
+ 		return -ENXIO;
+ 
+-	generic_handle_irq(irq);
++	generic_dispatch_irq(irq);
+ 
+ 	return 0;
+ }
+diff --git a/include/linux/irqdesc.h b/include/linux/irqdesc.h
+index df46512..fd7b765 100644
+--- a/include/linux/irqdesc.h
++++ b/include/linux/irqdesc.h
+@@ -159,6 +159,7 @@ static inline void generic_handle_irq_desc(struct irq_desc *desc)
+ }
+ 
+ int generic_handle_irq(unsigned int irq);
++int generic_dispatch_irq(unsigned int irq);
+ 
+ #ifdef CONFIG_HANDLE_DOMAIN_IRQ
+ /*
+diff --git a/kernel/irq/irqdesc.c b/kernel/irq/irqdesc.c
+index 4a617d7..5aafaf4 100644
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@ -654,6 +654,27 @@ int generic_handle_irq(unsigned int irq)
+ }
+ EXPORT_SYMBOL_GPL(generic_handle_irq);
+ 
++/**
++ * generic_dispatch_irq - Dispatch an interrupt from an interrupt handler
++ * @irq:	The irq number to handle
++ *
++ * A wrapper around generic_handle_irq() which ensures that interrupts are
++ * disabled when the primary handler of the dispatched irq is invoked.
++ * This is useful for interrupt handlers with dispatching to be safe for
++ * the forced threaded case.
++ */
++int generic_dispatch_irq(unsigned int irq)
++{
++	unsigned long flags;
++	int ret;
++
++	local_irq_save(flags);
++	ret = generic_handle_irq(irq);
++	local_irq_restore(flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(generic_dispatch_irq);
++
+ #ifdef CONFIG_HANDLE_DOMAIN_IRQ
+ /**
+  * __handle_domain_irq - Invoke the handler for a HW irq belonging to a domain
+-- 
+2.32.0.349.gdaab8a564f
+
+
+From 407a55437845e3c9588b842811c766ef819e0ad6 Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Mon, 7 Jun 2021 16:45:45 +0200
+Subject: [PATCH 2/6] mac80211: minstrel_ht: force ampdu_len to be > 0
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is a hack.
+
+Work around the following crash:
+
+```
+divide error: 0000 [#1] PREEMPT SMP PTI
+CPU: 2 PID: 683 Comm: mt76-tx phy0 Tainted: G         C        5.12.0-pf4 #1
+Hardware name: To Be Filled By O.E.M. To Be Filled By O.E.M./J3710-ITX, BIOS P1.50 04/16/2018
+RIP: 0010:minstrel_ht_get_tp_avg+0xb1/0x100 [mac80211]
+…
+Call Trace:
+ minstrel_ht_update_stats+0x1fe/0x1320 [mac80211]
+ minstrel_ht_tx_status+0x67f/0x710 [mac80211]
+ rate_control_tx_status+0x6e/0xb0 [mac80211]
+ ieee80211_tx_status_ext+0x22e/0xb00 [mac80211]
+ ieee80211_tx_status+0x7d/0xa0 [mac80211]
+ mt76_tx_status_unlock+0x83/0xa0 [mt76]
+ mt76x02_send_tx_status+0x1b7/0x400 [mt76x02_lib]
+ mt76x02_tx_worker+0x8f/0xd0 [mt76x02_lib]
+ __mt76_worker_fn+0x78/0xb0 [mt76]
+ kthread+0x183/0x1b0
+ ret_from_fork+0x22/0x30
+```
+
+Link: https://lore.kernel.org/lkml/20210529165728.bskaozwtmwxnvucx@spock.localdomain/
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ net/mac80211/rc80211_minstrel_ht.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/net/mac80211/rc80211_minstrel_ht.c b/net/mac80211/rc80211_minstrel_ht.c
+index a6f3fb4..f1d3fa7 100644
+--- a/net/mac80211/rc80211_minstrel_ht.c
++++ b/net/mac80211/rc80211_minstrel_ht.c
+@@ -440,8 +440,13 @@ minstrel_ht_get_tp_avg(struct minstrel_ht_sta *mi, int group, int rate,
+ 
+ 	if (minstrel_ht_is_legacy_group(group))
+ 		overhead = mi->overhead_legacy;
+-	else
++	else {
+ 		ampdu_len = minstrel_ht_avg_ampdu_len(mi);
++		if (unlikely(!ampdu_len)) {
++			pr_err_once("minstrel_ht_get_tp_avg: ampdu_len == 0!");
++			ampdu_len = 1;
++		}
++	}
+ 
+ 	nsecs = 1000 * overhead / ampdu_len;
+ 	nsecs += minstrel_mcs_groups[group].duration[rate] <<
+-- 
+2.32.0.349.gdaab8a564f
+
+
+From 5bfbab000902dfdc3eb080ae34d6a490ff8a981f Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Tue, 13 Jul 2021 10:27:20 +0200
+Subject: [PATCH 3/6] net: replace WARN_ONCE with pr_warn_once
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is a hack.
+
+Work around the following warning:
+
+```
+igb_poll+0x0/0x13f0 [igb] exceeded budget in poll
+WARNING: CPU: 1 PID: 43231 at net/core/netpoll.c:154 netpoll_poll_dev+0x18a/0x1a0
+…
+Call Trace:
+ netpoll_send_skb+0x1a0/0x260
+ write_msg+0xd8/0xf0 [netconsole]
+ console_unlock+0x3f2/0x710
+ suspend_devices_and_enter+0x2a9/0x7f0
+ pm_suspend.cold+0x321/0x36c
+ state_store+0x96/0x130
+ kernfs_fop_write_iter+0x11c/0x1b0
+ new_sync_write+0x15b/0x1f0
+ vfs_write+0x1b5/0x2b0
+ __x64_sys_write+0x6c/0xf0
+```
+
+and turn it into a simple message.
+
+This happens on resume from suspend with netconsole enabled.
+
+Link: https://lists.osuosl.org/pipermail/intel-wired-lan/Week-of-Mon-20210503/024220.html
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=212573
+Signed-off-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+---
+ net/core/netpoll.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/net/core/netpoll.c b/net/core/netpoll.c
+index c310c7c..44db200 100644
+--- a/net/core/netpoll.c
++++ b/net/core/netpoll.c
+@@ -151,7 +151,8 @@ static void poll_one_napi(struct napi_struct *napi)
+ 	 * indicate that we are clearing the Tx path only.
+ 	 */
+ 	work = napi->poll(napi, 0);
+-	WARN_ONCE(work, "%pS exceeded budget in poll\n", napi->poll);
++	if (unlikely(work))
++		pr_warn_once("%pS exceeded budget in poll\n", napi->poll);
+ 	trace_napi_poll(napi, work, 0);
+ 
+ 	clear_bit(NAPI_STATE_NPSVC, &napi->state);
+-- 
+2.32.0.349.gdaab8a564f
+
+
+From 53a6a5eaf729e104e87e50440d19907f50fdd95d Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Sun, 25 Jul 2021 16:15:24 +0200
+Subject: [PATCH 4/6] Revert "Revert "mm/shmem: fix shmem_swapin() race with
+ swapoff""
+
+This reverts commit b33e80b18a0a553dee39ec19e2397b5c474b25fb.
+---
+ mm/shmem.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 680d83c..5fa21d6 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1696,7 +1696,8 @@ static int shmem_swapin_page(struct inode *inode, pgoff_t index,
+ 	struct address_space *mapping = inode->i_mapping;
+ 	struct shmem_inode_info *info = SHMEM_I(inode);
+ 	struct mm_struct *charge_mm = vma ? vma->vm_mm : current->mm;
+-	struct page *page;
++	struct swap_info_struct *si;
++	struct page *page = NULL;
+ 	swp_entry_t swap;
+ 	int error;
+ 
+@@ -1704,6 +1705,12 @@ static int shmem_swapin_page(struct inode *inode, pgoff_t index,
+ 	swap = radix_to_swp_entry(*pagep);
+ 	*pagep = NULL;
+ 
++	/* Prevent swapoff from happening to us. */
++	si = get_swap_device(swap);
++	if (!si) {
++		error = EINVAL;
++		goto failed;
++	}
+ 	/* Look it up and read it in.. */
+ 	page = lookup_swap_cache(swap, NULL, 0);
+ 	if (!page) {
+@@ -1765,6 +1772,8 @@ static int shmem_swapin_page(struct inode *inode, pgoff_t index,
+ 	swap_free(swap);
+ 
+ 	*pagep = page;
++	if (si)
++		put_swap_device(si);
+ 	return 0;
+ failed:
+ 	if (!shmem_confirm_swap(mapping, index, swap))
+@@ -1775,6 +1784,9 @@ static int shmem_swapin_page(struct inode *inode, pgoff_t index,
+ 		put_page(page);
+ 	}
+ 
++	if (si)
++		put_swap_device(si);
++
+ 	return error;
+ }
+ 
+-- 
+2.32.0.349.gdaab8a564f
+
+
+From cce3c366fe49c44b396c749f7d6a433cf8db2815 Mon Sep 17 00:00:00 2001
+From: Oleksandr Natalenko <oleksandr@natalenko.name>
+Date: Sun, 25 Jul 2021 16:15:30 +0200
+Subject: [PATCH 5/6] Revert "Revert "swap: fix do_swap_page() race with
+ swapoff""
+
+This reverts commit 58d7ce3934ae6da952052d8d0f2ea458b16deef9.
+---
+ include/linux/swap.h |  9 +++++++++
+ mm/memory.c          | 11 +++++++++--
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 1447270..a84f76d 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -526,6 +526,15 @@ static inline struct swap_info_struct *swp_swap_info(swp_entry_t entry)
+ 	return NULL;
+ }
+ 
++static inline struct swap_info_struct *get_swap_device(swp_entry_t entry)
++{
++	return NULL;
++}
++
++static inline void put_swap_device(struct swap_info_struct *si)
++{
++}
++
+ #define swap_address_space(entry)		(NULL)
+ #define get_nr_swap_pages()			0L
+ #define total_swap_pages			0L
+diff --git a/mm/memory.c b/mm/memory.c
+index 3fdba3e..f8e8c99 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3354,6 +3354,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct page *page = NULL, *swapcache;
++	struct swap_info_struct *si = NULL;
+ 	swp_entry_t entry;
+ 	pte_t pte;
+ 	int locked;
+@@ -3381,14 +3382,16 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		goto out;
+ 	}
+ 
++	/* Prevent swapoff from happening to us. */
++	si = get_swap_device(entry);
++	if (unlikely(!si))
++		goto out;
+ 
+ 	delayacct_set_flag(current, DELAYACCT_PF_SWAPIN);
+ 	page = lookup_swap_cache(entry, vma, vmf->address);
+ 	swapcache = page;
+ 
+ 	if (!page) {
+-		struct swap_info_struct *si = swp_swap_info(entry);
+-
+ 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
+ 		    __swap_count(entry) == 1) {
+ 			/* skip swapcache */
+@@ -3557,6 +3560,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ unlock:
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+ out:
++	if (si)
++		put_swap_device(si);
+ 	return ret;
+ out_nomap:
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+@@ -3568,6 +3573,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		unlock_page(swapcache);
+ 		put_page(swapcache);
+ 	}
++	if (si)
++		put_swap_device(si);
+ 	return ret;
+ }
+ 
+-- 
+2.32.0.349.gdaab8a564f
+
+
+From d95af5a929a1f779fa9cf9052cd7ae4fc74869e6 Mon Sep 17 00:00:00 2001
+From: Charan Teja Reddy <charante@codeaurora.org>
+Date: Wed, 21 Jul 2021 17:43:19 +0530
+Subject: [PATCH 6/6] mm: compaction: optimize proactive compaction deferrals
+
+Vlastimil Babka figured out that when fragmentation score didn't go down
+across the proactive compaction i.e. when no progress is made, next wake
+up for proactive compaction is deferred for 1 <<
+COMPACT_MAX_DEFER_SHIFT, i.e. 64 times, with each wakeup interval of
+HPAGE_FRAG_CHECK_INTERVAL_MSEC(=500). In each of this wakeup, it just
+decrement 'proactive_defer' counter and goes sleep i.e. it is getting
+woken to just decrement a counter. The same deferral time can also
+achieved by simply doing the HPAGE_FRAG_CHECK_INTERVAL_MSEC <<
+COMPACT_MAX_DEFER_SHIFT thus unnecessary wakeup of kcompact thread is
+avoided thus also removes the need of 'proactive_defer' thread counter.
+
+Link: https://lore.kernel.org/linux-fsdevel/88abfdb6-2c13-b5a6-5b46-742d12d1c910@suse.cz/
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: David Rientjes <rientjes@google.com>
+Reviewed-by: Khalid Aziz <khalid.aziz@oracle.com>
+Signed-off-by: Charan Teja Reddy <charante@codeaurora.org>
+---
+ mm/compaction.c | 29 +++++++++++++++++++----------
+ 1 file changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 84fde27..93f3793 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -2887,7 +2887,8 @@ static int kcompactd(void *p)
+ {
+ 	pg_data_t *pgdat = (pg_data_t *)p;
+ 	struct task_struct *tsk = current;
+-	unsigned int proactive_defer = 0;
++	long default_timeout = msecs_to_jiffies(HPAGE_FRAG_CHECK_INTERVAL_MSEC);
++	long timeout = default_timeout;
+ 
+ 	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
+ 
+@@ -2904,23 +2905,30 @@ static int kcompactd(void *p)
+ 
+ 		trace_mm_compaction_kcompactd_sleep(pgdat->node_id);
+ 		if (wait_event_freezable_timeout(pgdat->kcompactd_wait,
+-			kcompactd_work_requested(pgdat),
+-			msecs_to_jiffies(HPAGE_FRAG_CHECK_INTERVAL_MSEC))) {
++			kcompactd_work_requested(pgdat), timeout)) {
+ 
+ 			psi_memstall_enter(&pflags);
+ 			kcompactd_do_work(pgdat);
+ 			psi_memstall_leave(&pflags);
++			/*
++			 * Reset the timeout value. The defer timeout from
++			 * proactive compaction is lost here but that is fine
++			 * as the condition of the zone changing substantionally
++			 * then carrying on with the previous defer interval is
++			 * not useful.
++			 */
++			timeout = default_timeout;
+ 			continue;
+ 		}
+ 
+-		/* kcompactd wait timeout */
++		/*
++		 * Start the proactive work with default timeout. Based
++		 * on the fragmentation score, this timeout is updated.
++		 */
++		timeout = default_timeout;
+ 		if (should_proactive_compact_node(pgdat)) {
+ 			unsigned int prev_score, score;
+ 
+-			if (proactive_defer) {
+-				proactive_defer--;
+-				continue;
+-			}
+ 			prev_score = fragmentation_score_node(pgdat);
+ 			proactive_compact_node(pgdat);
+ 			score = fragmentation_score_node(pgdat);
+@@ -2928,8 +2936,9 @@ static int kcompactd(void *p)
+ 			 * Defer proactive compaction if the fragmentation
+ 			 * score did not go down i.e. no progress made.
+ 			 */
+-			proactive_defer = score < prev_score ?
+-					0 : 1 << COMPACT_MAX_DEFER_SHIFT;
++			if (unlikely(score >= prev_score))
++				timeout =
++				   default_timeout << COMPACT_MAX_DEFER_SHIFT;
+ 		}
+ 	}
+ 
+-- 
+2.32.0.349.gdaab8a564f
+

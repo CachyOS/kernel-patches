@@ -1,0 +1,133 @@
+From 654429510d26269467a3583941f0a613a57c0267 Mon Sep 17 00:00:00 2001
+From: "Martin K. Petersen" <martin.petersen@oracle.com>
+Date: Sun, 22 Mar 2020 16:57:06 -0400
+Subject: [PATCH 12/18] scsi: sd: Optimal I/O size should be a multiple of
+ reported granularity
+
+Commit a83da8a4509d ("scsi: sd: Optimal I/O size should be a multiple of
+physical block size") validated the reported optimal I/O size against the
+physical block size to overcome problems with devices reporting nonsensical
+transfer sizes.
+
+However, some devices claim conformity to older SCSI versions that predate
+the physical block size being reported. Other devices do not report a
+physical block size at all. We need to be able to validate the optimal I/O
+size on those devices as well.
+
+Many devices report an OPTIMAL TRANSFER LENGTH GRANULARITY in the same VPD
+page as the OPTIMAL TRANSFER LENGTH. Use this value to validate the optimal
+I/O size. Also check that the reported granularity is a multiple of the
+physical block size, if supported.
+
+Link: https://lore.kernel.org/r/33fb522e-4f61-1b76-914f-c9e6a3553c9b@gmail.com
+Reported-by: Bernhard Sulzer <micraft.b@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+---
+ drivers/scsi/sd.c | 43 +++++++++++++++++++++++++++++++++++++++----
+ drivers/scsi/sd.h |  1 +
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index a2c3d9ad9..8718f58ad 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -2938,7 +2938,6 @@ static void sd_read_app_tag_own(struct scsi_disk *sdkp, unsigned char *buffer)
+  */
+ static void sd_read_block_limits(struct scsi_disk *sdkp)
+ {
+-	unsigned int sector_sz = sdkp->device->sector_size;
+ 	const int vpd_len = 64;
+ 	unsigned char *buffer = kmalloc(vpd_len, GFP_KERNEL);
+ 
+@@ -2947,9 +2946,7 @@ static void sd_read_block_limits(struct scsi_disk *sdkp)
+ 	    scsi_get_vpd_page(sdkp->device, 0xb0, buffer, vpd_len))
+ 		goto out;
+ 
+-	blk_queue_io_min(sdkp->disk->queue,
+-			 get_unaligned_be16(&buffer[6]) * sector_sz);
+-
++	sdkp->min_xfer_blocks = get_unaligned_be16(&buffer[6]);
+ 	sdkp->max_xfer_blocks = get_unaligned_be32(&buffer[8]);
+ 	sdkp->opt_xfer_blocks = get_unaligned_be32(&buffer[12]);
+ 
+@@ -3125,6 +3122,29 @@ static void sd_read_security(struct scsi_disk *sdkp, unsigned char *buffer)
+ 		sdkp->security = 1;
+ }
+ 
++static bool sd_validate_min_xfer_size(struct scsi_disk *sdkp)
++{
++	struct scsi_device *sdp = sdkp->device;
++	unsigned int min_xfer_bytes =
++		logical_to_bytes(sdp, sdkp->min_xfer_blocks);
++
++	if (sdkp->min_xfer_blocks == 0)
++		return false;
++
++	if (min_xfer_bytes & (sdkp->physical_block_size - 1)) {
++		sd_first_printk(KERN_WARNING, sdkp,
++				"Preferred minimum I/O size %u bytes not a " \
++				"multiple of physical block size (%u bytes)\n",
++				min_xfer_bytes, sdkp->physical_block_size);
++		sdkp->min_xfer_blocks = 0;
++		return false;
++	}
++
++	sd_first_printk(KERN_INFO, sdkp, "Preferred minimum I/O size %u bytes\n",
++			min_xfer_bytes);
++	return true;
++}
++
+ /*
+  * Determine the device's preferred I/O size for reads and writes
+  * unless the reported value is unreasonably small, large, not a
+@@ -3136,6 +3156,8 @@ static bool sd_validate_opt_xfer_size(struct scsi_disk *sdkp,
+ 	struct scsi_device *sdp = sdkp->device;
+ 	unsigned int opt_xfer_bytes =
+ 		logical_to_bytes(sdp, sdkp->opt_xfer_blocks);
++	unsigned int min_xfer_bytes =
++		logical_to_bytes(sdp, sdkp->min_xfer_blocks);
+ 
+ 	if (sdkp->opt_xfer_blocks == 0)
+ 		return false;
+@@ -3172,6 +3194,15 @@ static bool sd_validate_opt_xfer_size(struct scsi_disk *sdkp,
+ 		return false;
+ 	}
+ 
++	if (min_xfer_bytes && opt_xfer_bytes & (min_xfer_bytes - 1)) {
++		sd_first_printk(KERN_WARNING, sdkp,
++				"Optimal transfer size %u bytes not a " \
++				"multiple of preferred minimum block " \
++				"size (%u bytes)\n",
++				opt_xfer_bytes, min_xfer_bytes);
++		return false;
++	}
++
+ 	sd_first_printk(KERN_INFO, sdkp, "Optimal transfer size %u bytes\n",
+ 			opt_xfer_bytes);
+ 	return true;
+@@ -3255,6 +3286,10 @@ static int sd_revalidate_disk(struct gendisk *disk)
+ 	dev_max = min_not_zero(dev_max, sdkp->max_xfer_blocks);
+ 	q->limits.max_dev_sectors = logical_to_sectors(sdp, dev_max);
+ 
++	if (sd_validate_min_xfer_size(sdkp))
++		blk_queue_io_min(sdkp->disk->queue,
++				 logical_to_bytes(sdp, sdkp->min_xfer_blocks));
++
+ 	if (sd_validate_opt_xfer_size(sdkp, dev_max)) {
+ 		q->limits.io_opt = logical_to_bytes(sdp, sdkp->opt_xfer_blocks);
+ 		rw_max = logical_to_sectors(sdp, sdkp->opt_xfer_blocks);
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index b59136c41..4154030c8 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -91,6 +91,7 @@ struct scsi_disk {
+ 	atomic_t	openers;
+ 	sector_t	capacity;	/* size in logical blocks */
+ 	int		max_retries;
++	u32		min_xfer_blocks;
+ 	u32		max_xfer_blocks;
+ 	u32		opt_xfer_blocks;
+ 	u32		max_ws_blocks;
+-- 
+2.32.0.93.g670b81a890
+

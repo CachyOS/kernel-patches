@@ -1,0 +1,182 @@
+From 12810dc8edb2939b3afb72e1843acdaa2a775f7a Mon Sep 17 00:00:00 2001
+From: Ming Lei <ming.lei@redhat.com>
+Date: Mon, 7 Jun 2021 16:03:51 +0800
+Subject: [PATCH] block: support bio merge for multi-range discard
+
+So far multi-range discard treats each bio as one segment(range) of single
+discard request. This way becomes not efficient if lots of small sized
+discard bios are submitted, and one example is raid456.
+
+Support bio merge for multi-range discard for improving lots of small
+sized discard bios.
+
+Turns out it is easy to support it:
+
+1) always try to merge bio first
+
+2) run into multi-range discard only if bio merge can't be done
+
+3) add rq_for_each_discard_range() for retrieving each range(segment)
+of discard request
+
+Reported-by: Wang Shanker <shankerwangmiao@gmail.com>
+Signed-off-by: Ming Lei <ming.lei@redhat.com>
+---
+ block/blk-merge.c          | 12 ++++-----
+ drivers/block/virtio_blk.c |  9 ++++---
+ drivers/nvme/host/core.c   |  8 +++---
+ include/linux/blkdev.h     | 51 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 66 insertions(+), 14 deletions(-)
+
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index bcdff1879c34..65210e9a8efa 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -724,10 +724,10 @@ static inline bool blk_discard_mergable(struct request *req)
+ static enum elv_merge blk_try_req_merge(struct request *req,
+ 					struct request *next)
+ {
+-	if (blk_discard_mergable(req))
+-		return ELEVATOR_DISCARD_MERGE;
+-	else if (blk_rq_pos(req) + blk_rq_sectors(req) == blk_rq_pos(next))
++	if (blk_rq_pos(req) + blk_rq_sectors(req) == blk_rq_pos(next))
+ 		return ELEVATOR_BACK_MERGE;
++	else if (blk_discard_mergable(req))
++		return ELEVATOR_DISCARD_MERGE;
+ 
+ 	return ELEVATOR_NO_MERGE;
+ }
+@@ -908,12 +908,12 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
+ 
+ enum elv_merge blk_try_merge(struct request *rq, struct bio *bio)
+ {
+-	if (blk_discard_mergable(rq))
+-		return ELEVATOR_DISCARD_MERGE;
+-	else if (blk_rq_pos(rq) + blk_rq_sectors(rq) == bio->bi_iter.bi_sector)
++	if (blk_rq_pos(rq) + blk_rq_sectors(rq) == bio->bi_iter.bi_sector)
+ 		return ELEVATOR_BACK_MERGE;
+ 	else if (blk_rq_pos(rq) - bio_sectors(bio) == bio->bi_iter.bi_sector)
+ 		return ELEVATOR_FRONT_MERGE;
++	else if (blk_discard_mergable(rq))
++		return ELEVATOR_DISCARD_MERGE;
+ 	return ELEVATOR_NO_MERGE;
+ }
+ 
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 425bae618131..21db7ee24da5 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -116,7 +116,6 @@ static int virtblk_setup_discard_write_zeroes(struct request *req, bool unmap)
+ 	unsigned short segments = blk_rq_nr_discard_segments(req);
+ 	unsigned short n = 0;
+ 	struct virtio_blk_discard_write_zeroes *range;
+-	struct bio *bio;
+ 	u32 flags = 0;
+ 
+ 	if (unmap)
+@@ -138,9 +137,11 @@ static int virtblk_setup_discard_write_zeroes(struct request *req, bool unmap)
+ 		range[0].sector = cpu_to_le64(blk_rq_pos(req));
+ 		n = 1;
+ 	} else {
+-		__rq_for_each_bio(bio, req) {
+-			u64 sector = bio->bi_iter.bi_sector;
+-			u32 num_sectors = bio->bi_iter.bi_size >> SECTOR_SHIFT;
++		struct req_discard_range r;
++
++		rq_for_each_discard_range(r, req) {
++			u64 sector = r.sector;
++			u32 num_sectors = r.size >> SECTOR_SHIFT;
+ 
+ 			range[n].flags = cpu_to_le32(flags);
+ 			range[n].num_sectors = cpu_to_le32(num_sectors);
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 66973bb56305..ece479b5179a 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -813,7 +813,7 @@ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ {
+ 	unsigned short segments = blk_rq_nr_discard_segments(req), n = 0;
+ 	struct nvme_dsm_range *range;
+-	struct bio *bio;
++	struct req_discard_range r;
+ 
+ 	/*
+ 	 * Some devices do not consider the DSM 'Number of Ranges' field when
+@@ -835,9 +835,9 @@ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ 		range = page_address(ns->ctrl->discard_page);
+ 	}
+ 
+-	__rq_for_each_bio(bio, req) {
+-		u64 slba = nvme_sect_to_lba(ns, bio->bi_iter.bi_sector);
+-		u32 nlb = bio->bi_iter.bi_size >> ns->lba_shift;
++	rq_for_each_discard_range(r, req) {
++		u64 slba = nvme_sect_to_lba(ns, r.sector);
++		u32 nlb = r.size >> ns->lba_shift;
+ 
+ 		if (n < segments) {
+ 			range[n].cattr = cpu_to_le32(0);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index f69c75bd6d27..50f2ed0f2936 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1003,6 +1003,57 @@ static inline unsigned int blk_rq_stats_sectors(const struct request *rq)
+ 	return rq->stats_sectors;
+ }
+ 
++struct req_discard_range {
++	sector_t	sector;
++	unsigned int	size;
++
++	/*
++	 * internal field: driver don't use it, and it always points to
++	 * next bio to be processed
++	 */
++	struct bio *__bio;
++};
++
++static inline void req_init_discard_range_iter(const struct request *rq,
++		struct req_discard_range *range)
++{
++	range->__bio = rq->bio;
++}
++
++/* return true if @range stores one valid discard range */
++static inline bool req_get_discard_range(struct req_discard_range *range)
++{
++	struct bio *bio;
++
++	if (!range->__bio)
++		return false;
++
++	bio = range->__bio;
++	range->sector = bio->bi_iter.bi_sector;
++	range->size = bio->bi_iter.bi_size;
++	range->__bio = bio->bi_next;
++
++	while (range->__bio) {
++		struct bio *bio = range->__bio;
++
++		if (range->sector + (range->size >> SECTOR_SHIFT) !=
++				bio->bi_iter.bi_sector)
++			break;
++
++		/*
++		 * ->size won't overflow because req->__data_len is defined
++		 *  as 'unsigned int'
++		 */
++		range->size += bio->bi_iter.bi_size;
++		range->__bio = bio->bi_next;
++	}
++	return true;
++}
++
++#define rq_for_each_discard_range(range, rq) \
++	for (req_init_discard_range_iter((rq), &range); \
++			req_get_discard_range(&range);)
++
+ #ifdef CONFIG_BLK_DEV_ZONED
+ 
+ /* Helper to convert BLK_ZONE_ZONE_XXX to its string format XXX */
+-- 
+GitLab
+

@@ -1,0 +1,121 @@
+From 5bf05320a676748a3526a2c15f9300505707c944 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Fri, 28 May 2021 11:37:32 +0100
+Subject: [PATCH 16/19] btrfs: avoid unnecessary logging of xattrs during fast
+ fsyncs
+
+When logging an inode we always log all its xattrs, so that we are able
+to figure out which ones should be deleted during log replay. However this
+is unnecessary when we are doing a fast fsync and no xattrs were added,
+changed or deleted since the last time we logged the inode in the current
+transaction.
+
+So skip the logging of xattrs when the inode was previously logged in the
+current transaction and no xattrs were added, changed or deleted. If any
+changes to xattrs happened, than the inode has BTRFS_INODE_COPY_EVERYTHING
+set in its runtime flags and the xattrs get logged. This saves time on
+scanning for xattrs, allocating memory, COWing log tree extent buffers and
+adding more lock contention on the extent buffers when there are multiple
+tasks logging in parallel.
+
+The use of xattrs is common when using ACLs, some applications, or when
+using security modules like SELinux where every inode gets a security
+xattr added to it.
+
+The following test script, using fio, was used on a box with 12 cores, 64G
+of RAM, a NVMe device and the default non-debug kernel config from Debian.
+It uses 8 concurrent jobs each writing in blocks of 64K to its own 4G file,
+each file with a single xattr of 50 bytes (about the same size for an ACL
+or SELinux xattr), doing random buffered writes with an fsync after each
+write.
+
+   $ cat test.sh
+   #!/bin/bash
+
+   DEV=/dev/nvme0n1
+   MNT=/mnt/test
+   MOUNT_OPTIONS="-o ssd"
+   MKFS_OPTIONS="-d single -m single"
+
+   NUM_JOBS=8
+   FILE_SIZE=4G
+
+   cat <<EOF > /tmp/fio-job.ini
+   [writers]
+   rw=randwrite
+   fsync=1
+   fallocate=none
+   group_reporting=1
+   direct=0
+   bs=64K
+   ioengine=sync
+   size=$FILE_SIZE
+   directory=$MNT
+   numjobs=$NUM_JOBS
+   EOF
+
+   echo "performance" | \
+       tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+   mkfs.btrfs -f $MKFS_OPTIONS $DEV > /dev/null
+   mount $MOUNT_OPTIONS $DEV $MNT
+
+   echo "Creating files before fio runs, each with 1 xattr of 50 bytes"
+   for ((i = 0; i < $NUM_JOBS; i++)); do
+       path="$MNT/writers.$i.0"
+       truncate -s $FILE_SIZE $path
+       setfattr -n user.xa1 -v $(printf '%0.sX' $(seq 50)) $path
+   done
+
+   fio /tmp/fio-job.ini
+   umount $MNT
+
+fio output before this change:
+
+WRITE: bw=120MiB/s (126MB/s), 120MiB/s-120MiB/s (126MB/s-126MB/s), io=32.0GiB (34.4GB), run=272145-272145msec
+
+fio output after this change:
+
+WRITE: bw=142MiB/s (149MB/s), 142MiB/s-142MiB/s (149MB/s-149MB/s), io=32.0GiB (34.4GB), run=230408-230408msec
+
++16.8% throughput, -16.6% runtime
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/tree-log.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index dfb65a0d8..2d0ae503b 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -5466,13 +5466,23 @@ static int btrfs_log_inode(struct btrfs_trans_handle *trans,
+ 	btrfs_release_path(dst_path);
+ 	if (need_log_inode_item) {
+ 		err = log_inode_item(trans, log, dst_path, inode);
+-		if (!err && !xattrs_logged) {
++		if (err)
++			goto out_unlock;
++		/*
++		 * If we are doing a fast fsync and the inode was logged before
++		 * in this transaction, we don't need to log the xattrs because
++		 * they were logged before. If xattrs were added, changed or
++		 * deleted since the last time we logged the inode, then we have
++		 * already logged them because the inode had the runtime flag
++		 * BTRFS_INODE_COPY_EVERYTHING set.
++		 */
++		if (!xattrs_logged && inode->logged_trans < trans->transid) {
+ 			err = btrfs_log_all_xattrs(trans, root, inode, path,
+ 						   dst_path);
++			if (err)
++				goto out_unlock;
+ 			btrfs_release_path(path);
+ 		}
+-		if (err)
+-			goto out_unlock;
+ 	}
+ 	if (fast_search) {
+ 		ret = btrfs_log_changed_extents(trans, root, inode, dst_path,
+-- 
+2.32.0.93.g670b81a890
+

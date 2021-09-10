@@ -1,0 +1,249 @@
+This is a testing version for RDB.
+
+Background
+----------
+RDB wasn't stable and it was experimental. This time we
+need to push RDB forward and make it stable. You can think
+of RDB as a stupid but super lightweight load balancer. RDB
+will never be able to distribute tasks wisely among CPUs as
+same as CFS load balancer does. However, CFS needs many stats
+and task accounting in order to choose wisely – RDB doesn’t.
+So RDB shines when there is simple load balancing to do. It
+tries to take a decision based on interactivity score (IS)
+which is already been used in CacULE, so no overhead stats
+counting.
+
+
+Previous RDB version and its issues
+-----------------------------------
+Previous RDB works good in certain situations, and many
+users don’t like it because it didn’t work well with them.
+However, others had good experience with it. Personally,
+RDB was working great on my OpenSuse Tumbleweed/Leap, but
+when I tried it on Ubuntu it was a disaster. So these new
+changes are made to make RDB stable on most OS and on
+different configs.
+
+
+Changes
+-------
+The first change I made that makes RDB works on Ubuntu as
+good as it was on OpenSuse is changing `try_pull_any` in
+`active_balance` to `try_push_any`. This change could effect
+negatively the RDB performance with users where previous RDB
+was good on their machines. Therefore, this change must be
+tested. I have added 4 syctls for rdb testing. And `try_push_any`
+is included in testing where testers can enable/disable. Below
+is an explanation of each sysctl.
+
+
+kernel.rdb_try_push_any_enable
+------------------------------
+Purpose:
+	To choose between `try_pull_any` and `try_push_any`, or both.
+
+Possible values (default 0):
+	0: try_pull_any
+	1: try_push_any
+	2: both: try_push_any then try_pull_any
+	3: both: try_pull_any then try_push_any
+
+I recommend testing this first.
+
+
+kernel.rdb_balance_guard_ms
+---------------------------
+Purpose:
+	The trigger_load_balance runs in every tick. For
+	High HZ values, the load balance could be overwhelming.
+RDB load balance includes locking which can reduce the
+performance. The balance guard can help to avoid running
+load balance on every tick. For example, rdb_balance_guard_ms=3
+will only run load balance every 3ms. Setting rdb_balance_guard_ms
+depends on HZ. If you want load balancer run every 2ms while HZ=500
+then it is not needed and better to disable rdb_balance_guard_ms
+since 500HZ already (1000ms/500HZ = 2ms). However, if you have
+1000HZ and want to avoid load balancer from running every 1ms,
+you could set rdb_balance_guard_ms=4ms for example to make load
+balancer run every 4ms. Less rdb_balance_guard_ms values (or 0 to
+disable) could make sure tasks are balanced ASAP, but with the
+cost of locking/blocking time. High rdb_balance_guard_ms values
+can relax balancing locking but with the cost of imbalanced
+workload for that period of time (i.e. if rdb_balance_guard_ms=100ms)
+there will be no balancing for 100ms (except for newidle_balance
+which is not effected by rdb_balance_guard_ms).
+
+Possible values (default 3):
+	0: to disable
+	non 0: to enable with the value set
+
+I recommend first set this to 0, then test rdb_try_push_any_enable.
+After you chose which is better (push or pull), then try tune
+rdb_balance_guard_ms.
+
+
+kernel.scale_down_hz_value
+--------------------------
+Note: if CONFIG_NO_HZ_FULL=y, this sysctl has not effects at all.
+Purpose:
+	To reduce the calling of the following functions to the
+	specified HZ if the runqueue (rq) has only 1 runnable task.
+	- rq_lock
+	- arch_scale_thermal_pressure
+	- update_thermal_load_avg
+	- task_tick
+	- calc_global_load_tick
+	- psi_task_tick
+	- perf_event_task_tick
+	- trigger_load_balance
+
+Notice that trigger_load_balance is also controlled by
+rdb_balance_guard_ms. scale_down_hz_value doesn’t scale down the
+whole HZ, nor affects interrupts. It is just an if statement
+to return from calling the above functions (see
+core.c:scheduler_tick()). Since RDB load balancer is simple,
+we can actually mess with scheduler_tick wishing to increase
+performance. There is another reason to consider this feature
+in case of `try_push_any_enable` is enabled.
+
+For example, if we have cpu0 and cpu1. cpu0 has 3 tasks and
+cpu1 has only 1 task. Assuming scale_down_hz_value=1, cpu0
+will not skip any tick since it has more than 1 task (cpu0
+wont be effected by scale_down_hz_value), however, cpu1 is
+effected because it has only 1 task in its rq. Cpu1 will
+call the above functions only 1 time per second since the
+scale_down_hz_value=1 means 1HZ = 1 call/s. Now cpu1 is not
+going to call trigger_load_balance during 1s to pull tasks
+from cpu0. That’s why I believe `try_push_any_enable=1` works
+together with `scale_down_hz_value` because cpu0 can push tasks
+to cpu1 while cpu1’s HZ is scaled down. The benefits are less
+locking time since cpu1 doesn’t bother other cpus asking to
+pull tasks, and cpu1 can save more time not calling the above
+functions since it has only 1 task in rq. The feature runs as
+following: assume HZ=500, if scale_down_hz_value=100, then
+500 / 100 = 5. The above functions will be skipped 5 – 1 = 4
+times. They will be called once every 5 ticks. Setting
+scale_down_hz_value=500 is same as scale_down_hz_value=0
+since 500 / 500 = 1, and then 1 – 1 = 0, so no skip.
+
+Notice that this is an integer division! So the following
+values when HZ=500 are the same:
+scale_down_hz_value=300 → 500/300=1.6  =1
+scale_down_hz_value=400 → 500/400=1.25 =1
+scale_down_hz_value=500 → 500/500=1    =1
+
+However
+scale_down_hz_value=250 → 500/250      =2
+
+So you need to consider the integer division first,
+then divide HZ/(skip) to get the actual HZ
+
+For example, you might assume scale_down_hz_value=84
+would mean 1000ms/84hz = 11.9ms! But that is
+incorrect since 500HZ/84 = 5.952380952 by taking the floor
+it is going to be 5 skips, then 500/5 = 100, therefore
+you are actually scaling it down to 100HZ i.e. 10ms.
+
+Possible values (default 0):
+	0: disabled the feature
+	1: tick per second
+	2-2000: scaled down hz based on original HZ
+              and integer division.
+
+
+kernel.average_vruntime_enable
+------------------------------
+Purpose:
+rdb disables autogroup, which can be a problem because
+sometimes autogroup provides better interactivity since
+it gathers tasks in groups and count their vruntime as
+one entity. I have made something similar to autogroups
+where update_curr updates all parents with delta_fair
+(func. update_parents()). Also normalize_lifetime updates
+the diff of vruntime to all parents. The use is in
+calc_interactivity where instead of taking cn.vruntime
+we take the average vruntime from the task to its highest
+root parent (func. average_vruntime). Since every parent/task
+has the total of vruntime of its children (due to update_curr
+updating parents) the average is taking of the task would
+take on the account that if this task belongs to a very
+busy group (based on fork hierarchy) or not. The task
+will have higher vruntime average if it is a child of
+busy group (going thru the path to root parent).
+
+Example:
+Let’s assume the following task tree:
+
+systemd (10)
+├── calculator (1)
+├── fakeroot (6)
+│   ├── make1 (3)
+│   ├── make2 (1)
+│   ├── make3 (0)
+│   └── make4 (2)
+└── sh (3)
+    └── fish (3)
+        └── cat (3)
+
+
+These tasks could be distributed on multiple cpus. Let’s assume
+the two tasks cat, and make3 on the same rq. The cat has
+IS=3 while make3’s IS=0. With average_vruntime_enable=0,
+make3 will run since its IS is less than cat’s IS. However
+make3 is a task in one group doing compiling.
+4 makes are doing compiling while cat is only one interactive
+task that is competing with other 4 tasks. With average_vruntime_enable=1,
+The average IS is for cat and make3 is calculated as following:
+
+make3 = (0+6+10)/3 = 16/3 = 5.3
+fakeroot=6 since it is the sum of its children, the same thing
+for other parents.
+
+cat = (3+3+3+10)/4 = 19/4 = 4.75
+
+So cat will be picked to run instead of make3
+
+
+Potential of improper decision:
+Assuming that cat and make3 are the only 2 tasks in cpu0.
+make3 could be starved because its group is doing great job
+on cpu1! So, it is better to consider averaging with respect
+of cpus too. I will try to enhance this feature on future, but
+for now let’s test and see if this feature provide any better.
+
+Note while testing average_vruntime_enable:
+Moving from average_vruntime_enable=0 to average_vruntime_enable=1
+is ok since parents have 0 updates, however, after you tested
+with average_vruntime_enable=1 and while testing or after 
+few seconds you turned average_vruntime_enable to 0, there will
+be an issue since most grouped tasks were been restricted to
+their group but suddenly you opened the freedom to all tasks.
+Most likely when compiling with average_vruntime_enable=1 then
+switch to average_vruntime_enable=0 while compiling will cause
+system slowdown. So it is not recommended when testing to switch
+from average_vruntime_enable 1→0. I recommend a reboot to switch
+back from 1 to 0. I don’t want you to have incorrect conclusion 
+due to this switch from 1 to 0. The safest way is test with
+average_vruntime_enable=0, then do:
+sysctl -w kernel.average_vruntime_enable=1 | tee -a /etc/sysctl.conf
+
+and reboot to start a fresh test with average_vruntime_enable=1
+
+
+Lastly
+
+kernel.sched_interactivity_threshold
+------------------------------------
+sched_interactivity_threshold value can also affect the RDB
+behavior. You can tune this after you have tunned the rdbs values.
+
+
+Please test which values give better response and performance.
+And please compare your best RDB tunned with previous RDB, and
+also compare it with CacULE+autogroup.
+
+
+Please take your time. This will be a very important test
+to make RDB stable and make it usable.
+
+Thank you

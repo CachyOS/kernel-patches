@@ -1,0 +1,166 @@
+From 8feb4fa1e366a43f330e5095a0f7b597b01699d9 Mon Sep 17 00:00:00 2001
+From: Alfred Chen <cchalpha@gmail.com>
+Date: Sun, 7 Mar 2021 10:03:57 +0800
+Subject: [PATCH 115/148] sched/alt: Implement fake cpu.shares for CGROUP
+
+---
+ init/Kconfig             |  4 +++-
+ kernel/sched/alt_core.c  | 50 ++++++++++++++++++++++++++++++++++++++++
+ kernel/sched/alt_sched.h | 45 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/init/Kconfig b/init/Kconfig
+index c93140b47e8e..7746c8d4610b 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -988,12 +988,13 @@ menuconfig CGROUP_SCHED
+ 	  bandwidth allocation to such task groups. It uses cgroups to group
+ 	  tasks.
+ 
+-if CGROUP_SCHED && !SCHED_ALT
++if CGROUP_SCHED
+ config FAIR_GROUP_SCHED
+ 	bool "Group scheduling for SCHED_OTHER"
+ 	depends on CGROUP_SCHED
+ 	default CGROUP_SCHED
+ 
++if !SCHED_ALT
+ config CFS_BANDWIDTH
+ 	bool "CPU bandwidth provisioning for FAIR_GROUP_SCHED"
+ 	depends on FAIR_GROUP_SCHED
+@@ -1016,6 +1017,7 @@ config RT_GROUP_SCHED
+ 	  realtime bandwidth for them.
+ 	  See Documentation/scheduler/sched-rt-group.rst for more information.
+ 
++endif #!SCHED_ALT
+ endif #CGROUP_SCHED
+ 
+ config UCLAMP_TASK_GROUP
+diff --git a/kernel/sched/alt_core.c b/kernel/sched/alt_core.c
+index 2ca0e6470022..b470dc451585 100644
+--- a/kernel/sched/alt_core.c
++++ b/kernel/sched/alt_core.c
+@@ -6411,6 +6411,9 @@ struct task_group {
+ 	struct task_group *parent;
+ 	struct list_head siblings;
+ 	struct list_head children;
++#ifdef CONFIG_FAIR_GROUP_SCHED
++	unsigned long		shares;
++#endif
+ };
+ 
+ /*
+@@ -6829,7 +6832,54 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
+ {
+ }
+ 
++#ifdef CONFIG_FAIR_GROUP_SCHED
++static DEFINE_MUTEX(shares_mutex);
++
++int sched_group_set_shares(struct task_group *tg, unsigned long shares)
++{
++	/*
++	 * We can't change the weight of the root cgroup.
++	 */
++	if (&root_task_group == tg)
++		return -EINVAL;
++
++	shares = clamp(shares, scale_load(MIN_SHARES), scale_load(MAX_SHARES));
++
++	mutex_lock(&shares_mutex);
++	if (tg->shares == shares)
++		goto done;
++
++	tg->shares = shares;
++done:
++	mutex_unlock(&shares_mutex);
++	return 0;
++}
++
++static int cpu_shares_write_u64(struct cgroup_subsys_state *css,
++				struct cftype *cftype, u64 shareval)
++{
++	if (shareval > scale_load_down(ULONG_MAX))
++		shareval = MAX_SHARES;
++	return sched_group_set_shares(css_tg(css), scale_load(shareval));
++}
++
++static u64 cpu_shares_read_u64(struct cgroup_subsys_state *css,
++			       struct cftype *cft)
++{
++	struct task_group *tg = css_tg(css);
++
++	return (u64) scale_load_down(tg->shares);
++}
++#endif
++
+ static struct cftype cpu_legacy_files[] = {
++#ifdef CONFIG_FAIR_GROUP_SCHED
++	{
++		.name = "shares",
++		.read_u64 = cpu_shares_read_u64,
++		.write_u64 = cpu_shares_write_u64,
++	},
++#endif
+ 	{ }	/* Terminate */
+ };
+ 
+diff --git a/kernel/sched/alt_sched.h b/kernel/sched/alt_sched.h
+index 192586fee177..51f11bf416f4 100644
+--- a/kernel/sched/alt_sched.h
++++ b/kernel/sched/alt_sched.h
+@@ -61,6 +61,51 @@
+ # define SCHED_WARN_ON(x)	({ (void)(x), 0; })
+ #endif
+ 
++/*
++ * Increase resolution of nice-level calculations for 64-bit architectures.
++ * The extra resolution improves shares distribution and load balancing of
++ * low-weight task groups (eg. nice +19 on an autogroup), deeper taskgroup
++ * hierarchies, especially on larger systems. This is not a user-visible change
++ * and does not change the user-interface for setting shares/weights.
++ *
++ * We increase resolution only if we have enough bits to allow this increased
++ * resolution (i.e. 64-bit). The costs for increasing resolution when 32-bit
++ * are pretty high and the returns do not justify the increased costs.
++ *
++ * Really only required when CONFIG_FAIR_GROUP_SCHED=y is also set, but to
++ * increase coverage and consistency always enable it on 64-bit platforms.
++ */
++#ifdef CONFIG_64BIT
++# define NICE_0_LOAD_SHIFT	(SCHED_FIXEDPOINT_SHIFT + SCHED_FIXEDPOINT_SHIFT)
++# define scale_load(w)		((w) << SCHED_FIXEDPOINT_SHIFT)
++# define scale_load_down(w) \
++({ \
++	unsigned long __w = (w); \
++	if (__w) \
++		__w = max(2UL, __w >> SCHED_FIXEDPOINT_SHIFT); \
++	__w; \
++})
++#else
++# define NICE_0_LOAD_SHIFT	(SCHED_FIXEDPOINT_SHIFT)
++# define scale_load(w)		(w)
++# define scale_load_down(w)	(w)
++#endif
++
++#ifdef CONFIG_FAIR_GROUP_SCHED
++#define ROOT_TASK_GROUP_LOAD	NICE_0_LOAD
++
++/*
++ * A weight of 0 or 1 can cause arithmetics problems.
++ * A weight of a cfs_rq is the sum of weights of which entities
++ * are queued on this cfs_rq, so a weight of a entity should not be
++ * too large, so as the shares value of a task group.
++ * (The default weight is 1024 - so there's no practical
++ *  limitation from this.)
++ */
++#define MIN_SHARES		(1UL <<  1)
++#define MAX_SHARES		(1UL << 18)
++#endif
++
+ /* task_struct::on_rq states: */
+ #define TASK_ON_RQ_QUEUED	1
+ #define TASK_ON_RQ_MIGRATING	2
+-- 
+2.32.0.93.g670b81a890
+
