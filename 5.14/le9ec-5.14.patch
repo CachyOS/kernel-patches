@@ -1,6 +1,6 @@
-From 274137f65ee1d571de62f5fd9e12ead75db13831 Mon Sep 17 00:00:00 2001
+From 9c1c5cd36985884cf0691bdc9966dec60f13f2cd Mon Sep 17 00:00:00 2001
 From: Alexey Avramov <hakavlad@inbox.lv>
-Date: Mon, 30 Aug 2021 20:39:55 +0900
+Date: Mon, 13 Sep 2021 23:23:46 +0900
 Subject: [PATCH] mm/vmscan: add sysctl knobs for protecting the working set
 
 The kernel does not provide a way to protect the working set under memory
@@ -45,12 +45,13 @@ Kconfig).
 
 Signed-off-by: Alexey Avramov <hakavlad@inbox.lv>
 ---
- Documentation/admin-guide/sysctl/vm.rst | 66 ++++++++++++++++++++++++
- include/linux/mm.h                      |  4 ++
- kernel/sysctl.c                         | 21 ++++++++
- mm/Kconfig                              | 63 +++++++++++++++++++++++
- mm/vmscan.c                             | 91 +++++++++++++++++++++++++++++++++
- 5 files changed, 245 insertions(+)
+ Documentation/admin-guide/sysctl/vm.rst |  66 ++++++++++++++++++
+ include/linux/mm.h                      |   4 ++
+ kernel/sysctl.c                         |  21 ++++++
+ mm/Kconfig                              |  63 +++++++++++++++++
+ mm/internal.h                           |   2 +
+ mm/vmscan.c                             | 119 ++++++++++++++++++++++++++++++++
+ 6 files changed, 275 insertions(+)
 
 diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
 index 003d5cc37..608c43254 100644
@@ -264,11 +265,24 @@ index 40a9bfcd5..307555b71 100644
  config HAVE_MEMBLOCK_PHYS_MAP
  	bool
 
+diff --git a/mm/internal.h b/mm/internal.h
+index 31ff935b2..7444f7150 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -104,6 +104,8 @@ extern unsigned long highest_memmap_pfn;
+  */
+ #define MAX_RECLAIM_RETRIES 16
+
++#define MAX_NEAR_OOM_COUNTER 16
++
+ /*
+  * in mm/vmscan.c:
+  */
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index eeae2f6bc..4cfbab526 100644
+index eeae2f6bc..88fa8e435 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
-@@ -121,6 +121,15 @@ struct scan_control {
+@@ -121,6 +121,17 @@ struct scan_control {
  	/* The file pages on the current node are dangerously low */
  	unsigned int file_is_tiny:1;
 
@@ -281,10 +295,12 @@ index eeae2f6bc..4cfbab526 100644
 +	/* The clean file pages on the current node are below vm.clean_min_kbytes */
 +	unsigned int clean_below_min:1;
 +
++	int near_oom_counter;
++
  	/* Allocation order */
  	s8 order;
 
-@@ -167,6 +176,10 @@ struct scan_control {
+@@ -167,6 +178,10 @@ struct scan_control {
  #define prefetchw_prev_lru_page(_page, _base, _field) do { } while (0)
  #endif
 
@@ -295,7 +311,7 @@ index eeae2f6bc..4cfbab526 100644
  /*
   * From 0 .. 200.  Higher means more swappy.
   */
-@@ -2498,6 +2511,15 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+@@ -2498,6 +2513,15 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
  	}
 
  	/*
@@ -311,7 +327,7 @@ index eeae2f6bc..4cfbab526 100644
  	 * If there is enough inactive page cache, we do not reclaim
  	 * anything from the anonymous working right now.
  	 */
-@@ -2641,6 +2663,25 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+@@ -2641,10 +2665,44 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
  			BUG();
  		}
 
@@ -337,7 +353,44 @@ index eeae2f6bc..4cfbab526 100644
  		nr[lru] = scan;
  	}
  }
-@@ -2830,6 +2871,54 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
+
++static void invoke_oom(struct scan_control *sc)
++{
++	struct oom_control oc = {
++		.gfp_mask = sc->gfp_mask,
++		.order = sc->order,
++	};
++	if (mem_cgroup_oom_synchronize(true))
++		return;
++	if (!mutex_trylock(&oom_lock))
++		return;
++	pr_info("Invoke OOM\n");
++	out_of_memory(&oc);
++	mutex_unlock(&oom_lock);
++}
++
+ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ {
+ 	unsigned long nr[NR_LRU_LISTS];
+@@ -2658,6 +2716,17 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+
+ 	get_scan_count(lruvec, sc, nr);
+
++	if (sc->clean_below_min && !sc->priority && !current_is_kswapd() &&
++		!nr[LRU_INACTIVE_ANON] && !nr[LRU_ACTIVE_ANON]) {
++		sc->near_oom_counter++;
++		pr_info("near_oom_counter: %i\n", sc->near_oom_counter);
++		if (sc->near_oom_counter >= MAX_NEAR_OOM_COUNTER) {
++			invoke_oom(sc);
++			sc->near_oom_counter = 0;
++		}
++	} else
++		sc->near_oom_counter = 0;
++
+ 	/* Record the original scan target for proportional adjustments later */
+ 	memcpy(targets, nr, sizeof(nr));
+
+@@ -2830,6 +2899,54 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
  	return inactive_lru_pages > pages_for_compaction;
  }
 
@@ -392,7 +445,7 @@ index eeae2f6bc..4cfbab526 100644
  static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
  {
  	struct mem_cgroup *target_memcg = sc->target_mem_cgroup;
-@@ -2991,6 +3080,8 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -2991,6 +3108,8 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  			anon >> sc->priority;
  	}
 
@@ -405,4 +458,3 @@ index eeae2f6bc..4cfbab526 100644
 base-commit: 7d2a07b769330c34b4deabeed939325c77a7ec2f
 --
 2.11.0
-
