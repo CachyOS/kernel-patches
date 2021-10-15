@@ -1,28 +1,32 @@
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index f6935787e7e8..15f9aec26938 100644
+index f6935787e7e8..caad916e704b 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -462,6 +462,14 @@ struct sched_statistics {
+@@ -462,6 +462,18 @@ struct sched_statistics {
  #endif
  };
  
 +#ifdef CONFIG_BS_SCHED
 +struct bs_node {
-+	struct bs_node*                 next;
-+	struct bs_node*                 prev;
-+	u64				deadline;
++	struct bs_node*	next;
++	struct bs_node*	prev;
++	u64		deadline;
++	u64		prev_bursts;
++	u64		bursts;
++	u64		start_time;
++
 +};
 +#endif
 +
  struct sched_entity {
  	/* For load-balancing: */
  	struct load_weight		load;
-@@ -469,6 +477,10 @@ struct sched_entity {
+@@ -469,6 +481,10 @@ struct sched_entity {
  	struct list_head		group_node;
  	unsigned int			on_rq;
  
 +#ifdef CONFIG_BS_SCHED
-+	struct bs_node                  bs_node;
++	struct bs_node			bs_node;
 +#endif
 +
  	u64				exec_start;
@@ -150,10 +154,10 @@ index 978fcfca5871..464b134de739 100644
  obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o pelt.o
 diff --git a/kernel/sched/bs.c b/kernel/sched/bs.c
 new file mode 100644
-index 000000000000..61ef9b59cf62
+index 000000000000..b78dcf504202
 --- /dev/null
 +++ b/kernel/sched/bs.c
-@@ -0,0 +1,911 @@
+@@ -0,0 +1,961 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Baby Scheduler (BS) Class (SCHED_NORMAL/SCHED_BATCH)
@@ -165,24 +169,40 @@ index 000000000000..61ef9b59cf62
 +#include "fair_numa.h"
 +#include "bs.h"
 +
-+#define MIN_DEADLINE_NS	 590000ULL
++#define TIME_PERIOD 200000000ULL
++#define TO_COMPLETE 5000000ULL
 +
++#define MIN_DEADLINE_NS	 590000ULL
 +/* MIN_DEADLINE_NS * 2 */
 +#define DEADLINE_NS	1180000ULL
 +
 +const s64 prio_factor[40] = {
-+ /* -20 */  -666666L, -633333L, -600000L, -566666L, -533333L,
-+ /* -15 */  -500000L, -466666L, -433333L, -400000L, -366666L,
-+ /* -10 */  -333333L, -300000L, -266666L, -233333L, -200000L,
-+ /*  -5 */  -166666L, -133333L, -100000L, -66666L,  -33333L,
-+ /*   0 */   0L,       33333L,   66666L,   100000L,  133333L,
-+ /*   5 */   166666L,  200000L,  233333L,  266666L,  300000L,
-+ /*  10 */   333333L,  366666L,  400000L,  433333L,  466666L,
-+ /*  15 */   500000L,  533333L,  566666L,  600000L,  633333L
++ /* -20 */  -1080000L, -980000L, -880000L, -780000L, -680000L,
++ /* -15 */   -580000L, -480000L, -380000L, -280000L, -180000L,
++ /* -10 */    -80000L,  -79000L,  -78000L,  -77000L,  -76000L,
++ /*  -5 */    -75000L,  -74000L,  -73000L,  -72000L,  -71000L,
++ /*   0 */         0L, 1080000L, 1090000L, 1100000L, 1110000L,
++ /*   5 */   1120000L, 1130000L, 1140000L, 1150000L, 1160000L,
++ /*  10 */   1170000L, 1180000L, 1190000L, 1200000L, 1210000L,
++ /*  15 */   1220000L, 1230000L, 1240000L, 1250000L, 1260000L
 +};
 +
 +#define YIELD_MARK(bsn)		((bsn)->deadline |= 0x8000000000000000ULL)
 +#define YIELD_UNMARK(bsn)	((bsn)->deadline &= 0x7FFFFFFFFFFFFFFFULL)
++
++static inline void
++calc_bursts(struct sched_entity *se, u64 burst, u64 now)
++{
++	struct bs_node *bsn = &se->bs_node;
++
++	if ((s64) now - bsn->start_time >= TIME_PERIOD) {
++		bsn->start_time = now;
++		bsn->prev_bursts = bsn->bursts;
++		bsn->bursts = 0ULL;
++	}
++
++	bsn->bursts += burst;
++}
 +
 +static inline u64
 +calc_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -225,6 +245,7 @@ index 000000000000..61ef9b59cf62
 +	curr->exec_start = now;
 +	curr->sum_exec_runtime += delta_exec;
 +
++	calc_bursts(curr, delta_exec, now);
 +	if (reached_deadline(cfs_rq, curr))
 +		curr->bs_node.deadline = calc_deadline(cfs_rq, curr);
 +}
@@ -241,6 +262,33 @@ index 000000000000..61ef9b59cf62
 +entity_before(struct bs_node *a, struct bs_node *b)
 +{
 +	return (s64)(a->deadline - b->deadline) < 0;
++}
++
++static inline bool
++can_resched_curr(struct sched_entity *curr)
++{
++	struct bs_node *bsn = &curr->bs_node;
++	u64 bursts = bsn->prev_bursts;
++	u64 curr_bursts = bsn->bursts;
++	u64 delta = 25000000ULL;
++
++	if (!bursts)
++		return true;
++	else if ((s64)(TIME_PERIOD - (bursts + delta)) <= 0)
++		return true;
++	else if ((s64)(curr_bursts - bursts) >= 0)
++		return true;
++	else if ((s64)(bursts - (curr_bursts + TO_COMPLETE)) > 0)
++		return true;
++
++	return false;
++}
++
++static inline void
++try_resched_curr(struct rq *rq, struct sched_entity *curr)
++{
++	if (can_resched_curr(curr))
++		resched_curr(rq);
 +}
 +
 +#ifdef CONFIG_SCHED_HRTICK
@@ -281,6 +329,9 @@ index 000000000000..61ef9b59cf62
 +	if (rq->cfs.h_nr_running < 2)
 +		return;
 +
++	if (!can_resched_curr(curr))
++		return;
++
 +	next = pick_next_entity(&rq->cfs, NULL);
 +
 +	if (!next)
@@ -310,7 +361,7 @@ index 000000000000..61ef9b59cf62
 +		if (entity_before(&next->bs_node, c_bsn)) {
 +			// if n1
 +			if (DIFF_DL(curr, next) - MIN_DEADLINE_NS > 0)
-+				resched_curr(rq);
++				try_resched_curr(rq, curr);
 +			// if n2
 +			else
 +				hrtick_start(rq, cd);
@@ -680,7 +731,7 @@ index 000000000000..61ef9b59cf62
 +check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 +{
 +	if (pick_next_entity(cfs_rq, curr) != curr)
-+		resched_curr(rq_of(cfs_rq));
++		try_resched_curr(rq_of(cfs_rq), curr);
 +}
 +
 +static void
@@ -694,7 +745,7 @@ index 000000000000..61ef9b59cf62
 +	 * validating it and just reschedule.
 +	 */
 +	if (queued) {
-+		resched_curr(rq_of(cfs_rq));
++		try_resched_curr(rq_of(cfs_rq), curr);
 +		return;
 +	}
 +
@@ -747,7 +798,7 @@ index 000000000000..61ef9b59cf62
 +	return;
 +
 +preempt:
-+	resched_curr(rq);
++	try_resched_curr(rq, se);
 +}
 +
 +#ifdef CONFIG_SMP
@@ -1013,6 +1064,9 @@ index 000000000000..61ef9b59cf62
 +
 +	rq_lock(rq, &rf);
 +	update_rq_clock(rq);
++
++	se->bs_node.start_time = rq_clock_task(rq);
++	se->bs_node.prev_bursts = 0;
 +
 +	cfs_rq = task_cfs_rq(current);
 +
