@@ -1,0 +1,313 @@
+diff --git a/arch/x86/kernel/acpi/cstate.c b/arch/x86/kernel/acpi/cstate.c
+index 7de599eba7f045139cbd1396e992ab4f257c8c19..62a5986d625afc15760e18b4626821cf1e991d50 100644
+--- a/arch/x86/kernel/acpi/cstate.c
++++ b/arch/x86/kernel/acpi/cstate.c
+@@ -79,6 +79,21 @@ void acpi_processor_power_init_bm_check(struct acpi_processor_flags *flags,
+ 		 */
+ 		flags->bm_control = 0;
+ 	}
++	if (c->x86_vendor == X86_VENDOR_AMD) {
++		/*
++		 * For all AMD CPUs that support C3, caches should not be
++		 * flushed by software while entering C3 type state. Set
++		 * bm->check to 1 so that kernel doesn't need to execute
++		 * cache flush operation.
++		 */
++		flags->bm_check = 1;
++		/*
++		 * In current AMD C state implementation ARB_DIS is no longer
++		 * used. So set bm_control to zero to indicate ARB_DIS is not
++		 * required while entering C3 type state.
++		 */
++		flags->bm_control = 0;
++	}
+ }
+ EXPORT_SYMBOL(acpi_processor_power_init_bm_check);
+ 
+diff --git a/drivers/i2c/i2c-core-base.c b/drivers/i2c/i2c-core-base.c
+index 54964fbe3f0336630d3b6a410f45fae11d483cff..310d0ec2d9593a72f9a418629161d6f5f70d10e1 100644
+--- a/drivers/i2c/i2c-core-base.c
++++ b/drivers/i2c/i2c-core-base.c
+@@ -1517,7 +1517,7 @@ int i2c_handle_smbus_host_notify(struct i2c_adapter *adap, unsigned short addr)
+ 	if (irq <= 0)
+ 		return -ENXIO;
+ 
+-	generic_handle_irq(irq);
++	generic_dispatch_irq(irq);
+ 
+ 	return 0;
+ }
+diff --git a/include/linux/irqdesc.h b/include/linux/irqdesc.h
+index 59aea39785bfdb76a4fc35ff1bf3523e5452bf2a..f10ab73327c790837cfe995119dd53733028dc4f 100644
+--- a/include/linux/irqdesc.h
++++ b/include/linux/irqdesc.h
+@@ -160,6 +160,7 @@ static inline void generic_handle_irq_desc(struct irq_desc *desc)
+ 
+ int handle_irq_desc(struct irq_desc *desc);
+ int generic_handle_irq(unsigned int irq);
++int generic_dispatch_irq(unsigned int irq);
+ 
+ #ifdef CONFIG_IRQ_DOMAIN
+ /*
+diff --git a/include/linux/user_namespace.h b/include/linux/user_namespace.h
+index eb70cabe6e7f2f6362bde868a21dbf257701afe9..dda54e3bc47cf288b2c81684e3d7eb2afad4acd7 100644
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@ -137,6 +137,8 @@ static inline void set_rlimit_ucount_max(struct user_namespace *ns,
+ 
+ #ifdef CONFIG_USER_NS
+ 
++extern int unprivileged_userns_clone;
++
+ static inline struct user_namespace *get_user_ns(struct user_namespace *ns)
+ {
+ 	if (ns)
+@@ -170,6 +172,8 @@ extern bool current_in_userns(const struct user_namespace *target_ns);
+ struct ns_common *ns_get_owner(struct ns_common *ns);
+ #else
+ 
++#define unprivileged_userns_clone 0
++
+ static inline struct user_namespace *get_user_ns(struct user_namespace *ns)
+ {
+ 	return &init_user_ns;
+diff --git a/init/Kconfig b/init/Kconfig
+index 806c196d51276e14d6e2449439387255e412ed7a..bee8682291bf022ff88de4451afe53ae3619a36c 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1226,6 +1226,22 @@ config USER_NS
+ 
+ 	  If unsure, say N.
+ 
++config USER_NS_UNPRIVILEGED
++	bool "Allow unprivileged users to create namespaces"
++	default y
++	depends on USER_NS
++	help
++	  When disabled, unprivileged users will not be able to create
++	  new namespaces. Allowing users to create their own namespaces
++	  has been part of several recent local privilege escalation
++	  exploits, so if you need user namespaces but are
++	  paranoid^Wsecurity-conscious you want to disable this.
++
++	  This setting can be overridden at runtime via the
++	  kernel.unprivileged_userns_clone sysctl.
++
++	  If unsure, say Y.
++
+ config PID_NS
+ 	bool "PID Namespaces"
+ 	default y
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 38681ad44c76bc71ce3795ff052f7eb218769643..d4b40f72018f8151f6320f830a415c6c3a42640c 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -98,6 +98,10 @@
+ #include <linux/io_uring.h>
+ #include <linux/bpf.h>
+ 
++#ifdef CONFIG_USER_NS
++#include <linux/user_namespace.h>
++#endif
++
+ #include <asm/pgalloc.h>
+ #include <linux/uaccess.h>
+ #include <asm/mmu_context.h>
+@@ -1950,6 +1954,10 @@ static __latent_entropy struct task_struct *copy_process(
+ 	if ((clone_flags & (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))
+ 		return ERR_PTR(-EINVAL);
+ 
++	if ((clone_flags & CLONE_NEWUSER) && !unprivileged_userns_clone)
++		if (!capable(CAP_SYS_ADMIN))
++			return ERR_PTR(-EPERM);
++
+ 	/*
+ 	 * Thread groups must share signals as well, and detached threads
+ 	 * can only be started up within the thread group.
+@@ -3055,6 +3063,12 @@ int ksys_unshare(unsigned long unshare_flags)
+ 	if (unshare_flags & CLONE_NEWNS)
+ 		unshare_flags |= CLONE_FS;
+ 
++	if ((unshare_flags & CLONE_NEWUSER) && !unprivileged_userns_clone) {
++		err = -EPERM;
++		if (!capable(CAP_SYS_ADMIN))
++			goto bad_unshare_out;
++	}
++
+ 	err = check_unshare_flags(unshare_flags);
+ 	if (err)
+ 		goto bad_unshare_out;
+diff --git a/kernel/irq/irqdesc.c b/kernel/irq/irqdesc.c
+index 4e3c29bb603c319cb203f375247ffe308e2055a8..fa146ad933a331dfba660ed75475af39c90a25c3 100644
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@ -676,6 +676,27 @@ int generic_handle_domain_irq(struct irq_domain *domain, unsigned int hwirq)
+ }
+ EXPORT_SYMBOL_GPL(generic_handle_domain_irq);
+ 
++/**
++ * generic_dispatch_irq - Dispatch an interrupt from an interrupt handler
++ * @irq:	The irq number to handle
++ *
++ * A wrapper around generic_handle_irq() which ensures that interrupts are
++ * disabled when the primary handler of the dispatched irq is invoked.
++ * This is useful for interrupt handlers with dispatching to be safe for
++ * the forced threaded case.
++ */
++int generic_dispatch_irq(unsigned int irq)
++{
++	unsigned long flags;
++	int ret;
++
++	local_irq_save(flags);
++	ret = generic_handle_irq(irq);
++	local_irq_restore(flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(generic_dispatch_irq);
++
+ #ifdef CONFIG_HANDLE_DOMAIN_IRQ
+ /**
+  * handle_domain_irq - Invoke the handler for a HW irq belonging to a domain,
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 083be6af29d705f371676a0bbca3b4c2546c62ee..42aa3c7835b96d7a3eff607c356e9b63a966ef8f 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -105,6 +105,9 @@
+ #ifdef CONFIG_LOCKUP_DETECTOR
+ #include <linux/nmi.h>
+ #endif
++#ifdef CONFIG_USER_NS
++#include <linux/user_namespace.h>
++#endif
+ 
+ #if defined(CONFIG_SYSCTL)
+ 
+@@ -1949,6 +1952,15 @@ static struct ctl_table kern_table[] = {
+ 		.proc_handler	= proc_dointvec,
+ 	},
+ #endif
++#ifdef CONFIG_USER_NS
++	{
++		.procname	= "unprivileged_userns_clone",
++		.data		= &unprivileged_userns_clone,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++#endif
+ #ifdef CONFIG_PROC_SYSCTL
+ 	{
+ 		.procname	= "tainted",
+diff --git a/kernel/user_namespace.c b/kernel/user_namespace.c
+index 6b2e3ca7ee993a7b0ff4fa44a6450770661106dc..0253002184f1d91953f7076cbb618c68eb0f50fe 100644
+--- a/kernel/user_namespace.c
++++ b/kernel/user_namespace.c
+@@ -21,6 +21,13 @@
+ #include <linux/bsearch.h>
+ #include <linux/sort.h>
+ 
++/* sysctl */
++#ifdef CONFIG_USER_NS_UNPRIVILEGED
++int unprivileged_userns_clone = 1;
++#else
++int unprivileged_userns_clone;
++#endif
++
+ static struct kmem_cache *user_ns_cachep __read_mostly;
+ static DEFINE_MUTEX(userns_state_mutex);
+ 
+diff --git a/net/core/netpoll.c b/net/core/netpoll.c
+index edfc0f8011f88a7d46d69e94c6343489369fa78c..7aaaeec088e75a387dd7c0849fe9f8396b33df5c 100644
+--- a/net/core/netpoll.c
++++ b/net/core/netpoll.c
+@@ -152,7 +152,8 @@ static void poll_one_napi(struct napi_struct *napi)
+ 	 * indicate that we are clearing the Tx path only.
+ 	 */
+ 	work = napi->poll(napi, 0);
+-	WARN_ONCE(work, "%pS exceeded budget in poll\n", napi->poll);
++	if (unlikely(work))
++		pr_warn_once("%pS exceeded budget in poll\n", napi->poll);
+ 	trace_napi_poll(napi, work, 0);
+ 
+ 	clear_bit(NAPI_STATE_NPSVC, &napi->state);
+diff --git a/net/mac80211/airtime.c b/net/mac80211/airtime.c
+index 26d2f8ba70297dde561b73cbf0a01334bdf21054..03fb8070bdae6861720d389cf086146d893956cd 100644
+--- a/net/mac80211/airtime.c
++++ b/net/mac80211/airtime.c
+@@ -453,9 +453,17 @@ static u32 ieee80211_get_rate_duration(struct ieee80211_hw *hw,
+ 		return 0;
+ 	}
+ 
+-	if (WARN_ON_ONCE((status->encoding != RX_ENC_HE && streams > 4) ||
+-			 (status->encoding == RX_ENC_HE && streams > 8)))
++	if (unlikely(status->encoding != RX_ENC_HE && streams > 4)) {
++		pr_warn_once("%s: status->encoding != RX_ENC_HE (%u != %d) && streams > 4 (%d > 4)\n",
++			     __func__, status->encoding, RX_ENC_HE, streams);
+ 		return 0;
++	}
++
++	if (unlikely(status->encoding == RX_ENC_HE && streams > 8)) {
++		pr_warn_once("%s: status->encoding == RX_ENC_HE (%u == %d) && streams > 8 (%d > 8)\n",
++			     __func__, status->encoding, RX_ENC_HE, streams);
++		return 0;
++	}
+ 
+ 	duration = airtime_mcs_groups[group].duration[idx];
+ 	duration <<= airtime_mcs_groups[group].shift;
+diff --git a/net/mac80211/rate.c b/net/mac80211/rate.c
+index 8c6416129d5bed9669a77419b1e6f230cdc24063..810ea5cd66814be42b2c3190371d0caa847fd495 100644
+--- a/net/mac80211/rate.c
++++ b/net/mac80211/rate.c
+@@ -664,7 +664,9 @@ static void rate_fixup_ratelist(struct ieee80211_vif *vif,
+ 		 * needs to be fixed.
+ 		 */
+ 		if (rates[i].flags & IEEE80211_TX_RC_MCS) {
+-			WARN_ON(rates[i].idx > 76);
++			if (unlikely(rates[i].idx > 76))
++				pr_warn("%s: rates[%d].idx == %d > 76\n",
++					__func__, i, rates[i].idx);
+ 
+ 			if (!(rates[i].flags & IEEE80211_TX_RC_USE_RTS_CTS) &&
+ 			    info->control.use_cts_prot)
+@@ -674,7 +676,9 @@ static void rate_fixup_ratelist(struct ieee80211_vif *vif,
+ 		}
+ 
+ 		if (rates[i].flags & IEEE80211_TX_RC_VHT_MCS) {
+-			WARN_ON(ieee80211_rate_get_vht_mcs(&rates[i]) > 9);
++			if (unlikely(ieee80211_rate_get_vht_mcs(&rates[i]) > 9))
++				pr_warn("%s: ieee80211_rate_get_vht_mcs(&rates[%d]) == %d > 9\n",
++					__func__, i, ieee80211_rate_get_vht_mcs(&rates[i]));
+ 			continue;
+ 		}
+ 
+@@ -685,7 +689,9 @@ static void rate_fixup_ratelist(struct ieee80211_vif *vif,
+ 		}
+ 
+ 		/* RC is busted */
+-		if (WARN_ON_ONCE(rates[i].idx >= sband->n_bitrates)) {
++		if (unlikely(rates[i].idx >= sband->n_bitrates)) {
++			pr_warn_once("%s: rates[%d].idx == %d >= sband->n_bitrates == %d\n",
++				     __func__, i, rates[i].idx, sband->n_bitrates);
+ 			rates[i].idx = -1;
+ 			continue;
+ 		}
+diff --git a/net/mac80211/rc80211_minstrel_ht.c b/net/mac80211/rc80211_minstrel_ht.c
+index 72b44d4c42d0ee0a030c2a8d468cb25a359b6346..f60003530448e43039d0889f6e7f1c169dcd47d7 100644
+--- a/net/mac80211/rc80211_minstrel_ht.c
++++ b/net/mac80211/rc80211_minstrel_ht.c
+@@ -440,8 +440,13 @@ minstrel_ht_get_tp_avg(struct minstrel_ht_sta *mi, int group, int rate,
+ 
+ 	if (minstrel_ht_is_legacy_group(group))
+ 		overhead = mi->overhead_legacy;
+-	else
++	else {
+ 		ampdu_len = minstrel_ht_avg_ampdu_len(mi);
++		if (unlikely(!ampdu_len)) {
++			pr_err_once("%s: ampdu_len == 0!\n", __func__);
++			ampdu_len = 1;
++		}
++	}
+ 
+ 	nsecs = 1000 * overhead / ampdu_len;
+ 	nsecs += minstrel_mcs_groups[group].duration[rate] <<
