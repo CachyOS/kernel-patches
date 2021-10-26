@@ -1,0 +1,5920 @@
+From 0630276931db867e9aca63be28c54a86da53d081 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:32 +0000
+Subject: [PATCH 01/41] x86/MCE/AMD, EDAC/amd64: Move address translation to
+ AMD64 EDAC
+
+The address translation code used for current AMD systems is
+non-architectural. So move it to EDAC.
+
+Cc: <x86@kernel.org>
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ arch/x86/include/asm/mce.h    |   3 -
+ arch/x86/kernel/cpu/mce/amd.c | 200 ----------------------------------
+ drivers/edac/amd64_edac.c     | 199 +++++++++++++++++++++++++++++++++
+ 3 files changed, 199 insertions(+), 203 deletions(-)
+
+diff --git a/arch/x86/include/asm/mce.h b/arch/x86/include/asm/mce.h
+index da9321548..6bcc432b7 100644
+--- a/arch/x86/include/asm/mce.h
++++ b/arch/x86/include/asm/mce.h
+@@ -357,7 +357,6 @@ extern int mce_threshold_create_device(unsigned int cpu);
+ extern int mce_threshold_remove_device(unsigned int cpu);
+ 
+ void mce_amd_feature_init(struct cpuinfo_x86 *c);
+-int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr);
+ 
+ #else
+ 
+@@ -365,8 +364,6 @@ static inline int mce_threshold_create_device(unsigned int cpu)		{ return 0; };
+ static inline int mce_threshold_remove_device(unsigned int cpu)		{ return 0; };
+ static inline bool amd_mce_is_memory_error(struct mce *m)		{ return false; };
+ static inline void mce_amd_feature_init(struct cpuinfo_x86 *c)		{ }
+-static inline int
+-umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)	{ return -EINVAL; };
+ #endif
+ 
+ static inline void mce_hygon_feature_init(struct cpuinfo_x86 *c)	{ return mce_amd_feature_init(c); }
+diff --git a/arch/x86/kernel/cpu/mce/amd.c b/arch/x86/kernel/cpu/mce/amd.c
+index 08831acc1..4e5ba898a 100644
+--- a/arch/x86/kernel/cpu/mce/amd.c
++++ b/arch/x86/kernel/cpu/mce/amd.c
+@@ -688,206 +688,6 @@ void mce_amd_feature_init(struct cpuinfo_x86 *c)
+ 		deferred_error_interrupt_enable(c);
+ }
+ 
+-int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
+-{
+-	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
+-	/* We start from the normalized address */
+-	u64 ret_addr = norm_addr;
+-
+-	u32 tmp;
+-
+-	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+-	u8 intlv_num_dies, intlv_num_chan, intlv_num_sockets;
+-	u8 intlv_addr_sel, intlv_addr_bit;
+-	u8 num_intlv_bits, hashed_bit;
+-	u8 lgcy_mmio_hole_en, base = 0;
+-	u8 cs_mask, cs_id = 0;
+-	bool hash_enabled = false;
+-
+-	/* Read D18F0x1B4 (DramOffset), check if base 1 is used. */
+-	if (amd_df_indirect_read(nid, 0, 0x1B4, umc, &tmp))
+-		goto out_err;
+-
+-	/* Remove HiAddrOffset from normalized address, if enabled: */
+-	if (tmp & BIT(0)) {
+-		u64 hi_addr_offset = (tmp & GENMASK_ULL(31, 20)) << 8;
+-
+-		if (norm_addr >= hi_addr_offset) {
+-			ret_addr -= hi_addr_offset;
+-			base = 1;
+-		}
+-	}
+-
+-	/* Read D18F0x110 (DramBaseAddress). */
+-	if (amd_df_indirect_read(nid, 0, 0x110 + (8 * base), umc, &tmp))
+-		goto out_err;
+-
+-	/* Check if address range is valid. */
+-	if (!(tmp & BIT(0))) {
+-		pr_err("%s: Invalid DramBaseAddress range: 0x%x.\n",
+-			__func__, tmp);
+-		goto out_err;
+-	}
+-
+-	lgcy_mmio_hole_en = tmp & BIT(1);
+-	intlv_num_chan	  = (tmp >> 4) & 0xF;
+-	intlv_addr_sel	  = (tmp >> 8) & 0x7;
+-	dram_base_addr	  = (tmp & GENMASK_ULL(31, 12)) << 16;
+-
+-	/* {0, 1, 2, 3} map to address bits {8, 9, 10, 11} respectively */
+-	if (intlv_addr_sel > 3) {
+-		pr_err("%s: Invalid interleave address select %d.\n",
+-			__func__, intlv_addr_sel);
+-		goto out_err;
+-	}
+-
+-	/* Read D18F0x114 (DramLimitAddress). */
+-	if (amd_df_indirect_read(nid, 0, 0x114 + (8 * base), umc, &tmp))
+-		goto out_err;
+-
+-	intlv_num_sockets = (tmp >> 8) & 0x1;
+-	intlv_num_dies	  = (tmp >> 10) & 0x3;
+-	dram_limit_addr	  = ((tmp & GENMASK_ULL(31, 12)) << 16) | GENMASK_ULL(27, 0);
+-
+-	intlv_addr_bit = intlv_addr_sel + 8;
+-
+-	/* Re-use intlv_num_chan by setting it equal to log2(#channels) */
+-	switch (intlv_num_chan) {
+-	case 0:	intlv_num_chan = 0; break;
+-	case 1: intlv_num_chan = 1; break;
+-	case 3: intlv_num_chan = 2; break;
+-	case 5:	intlv_num_chan = 3; break;
+-	case 7:	intlv_num_chan = 4; break;
+-
+-	case 8: intlv_num_chan = 1;
+-		hash_enabled = true;
+-		break;
+-	default:
+-		pr_err("%s: Invalid number of interleaved channels %d.\n",
+-			__func__, intlv_num_chan);
+-		goto out_err;
+-	}
+-
+-	num_intlv_bits = intlv_num_chan;
+-
+-	if (intlv_num_dies > 2) {
+-		pr_err("%s: Invalid number of interleaved nodes/dies %d.\n",
+-			__func__, intlv_num_dies);
+-		goto out_err;
+-	}
+-
+-	num_intlv_bits += intlv_num_dies;
+-
+-	/* Add a bit if sockets are interleaved. */
+-	num_intlv_bits += intlv_num_sockets;
+-
+-	/* Assert num_intlv_bits <= 4 */
+-	if (num_intlv_bits > 4) {
+-		pr_err("%s: Invalid interleave bits %d.\n",
+-			__func__, num_intlv_bits);
+-		goto out_err;
+-	}
+-
+-	if (num_intlv_bits > 0) {
+-		u64 temp_addr_x, temp_addr_i, temp_addr_y;
+-		u8 die_id_bit, sock_id_bit, cs_fabric_id;
+-
+-		/*
+-		 * Read FabricBlockInstanceInformation3_CS[BlockFabricID].
+-		 * This is the fabric id for this coherent slave. Use
+-		 * umc/channel# as instance id of the coherent slave
+-		 * for FICAA.
+-		 */
+-		if (amd_df_indirect_read(nid, 0, 0x50, umc, &tmp))
+-			goto out_err;
+-
+-		cs_fabric_id = (tmp >> 8) & 0xFF;
+-		die_id_bit   = 0;
+-
+-		/* If interleaved over more than 1 channel: */
+-		if (intlv_num_chan) {
+-			die_id_bit = intlv_num_chan;
+-			cs_mask	   = (1 << die_id_bit) - 1;
+-			cs_id	   = cs_fabric_id & cs_mask;
+-		}
+-
+-		sock_id_bit = die_id_bit;
+-
+-		/* Read D18F1x208 (SystemFabricIdMask). */
+-		if (intlv_num_dies || intlv_num_sockets)
+-			if (amd_df_indirect_read(nid, 1, 0x208, umc, &tmp))
+-				goto out_err;
+-
+-		/* If interleaved over more than 1 die. */
+-		if (intlv_num_dies) {
+-			sock_id_bit  = die_id_bit + intlv_num_dies;
+-			die_id_shift = (tmp >> 24) & 0xF;
+-			die_id_mask  = (tmp >> 8) & 0xFF;
+-
+-			cs_id |= ((cs_fabric_id & die_id_mask) >> die_id_shift) << die_id_bit;
+-		}
+-
+-		/* If interleaved over more than 1 socket. */
+-		if (intlv_num_sockets) {
+-			socket_id_shift	= (tmp >> 28) & 0xF;
+-			socket_id_mask	= (tmp >> 16) & 0xFF;
+-
+-			cs_id |= ((cs_fabric_id & socket_id_mask) >> socket_id_shift) << sock_id_bit;
+-		}
+-
+-		/*
+-		 * The pre-interleaved address consists of XXXXXXIIIYYYYY
+-		 * where III is the ID for this CS, and XXXXXXYYYYY are the
+-		 * address bits from the post-interleaved address.
+-		 * "num_intlv_bits" has been calculated to tell us how many "I"
+-		 * bits there are. "intlv_addr_bit" tells us how many "Y" bits
+-		 * there are (where "I" starts).
+-		 */
+-		temp_addr_y = ret_addr & GENMASK_ULL(intlv_addr_bit-1, 0);
+-		temp_addr_i = (cs_id << intlv_addr_bit);
+-		temp_addr_x = (ret_addr & GENMASK_ULL(63, intlv_addr_bit)) << num_intlv_bits;
+-		ret_addr    = temp_addr_x | temp_addr_i | temp_addr_y;
+-	}
+-
+-	/* Add dram base address */
+-	ret_addr += dram_base_addr;
+-
+-	/* If legacy MMIO hole enabled */
+-	if (lgcy_mmio_hole_en) {
+-		if (amd_df_indirect_read(nid, 0, 0x104, umc, &tmp))
+-			goto out_err;
+-
+-		dram_hole_base = tmp & GENMASK(31, 24);
+-		if (ret_addr >= dram_hole_base)
+-			ret_addr += (BIT_ULL(32) - dram_hole_base);
+-	}
+-
+-	if (hash_enabled) {
+-		/* Save some parentheses and grab ls-bit at the end. */
+-		hashed_bit =	(ret_addr >> 12) ^
+-				(ret_addr >> 18) ^
+-				(ret_addr >> 21) ^
+-				(ret_addr >> 30) ^
+-				cs_id;
+-
+-		hashed_bit &= BIT(0);
+-
+-		if (hashed_bit != ((ret_addr >> intlv_addr_bit) & BIT(0)))
+-			ret_addr ^= BIT(intlv_addr_bit);
+-	}
+-
+-	/* Is calculated system address is above DRAM limit address? */
+-	if (ret_addr > dram_limit_addr)
+-		goto out_err;
+-
+-	*sys_addr = ret_addr;
+-	return 0;
+-
+-out_err:
+-	return -EINVAL;
+-}
+-EXPORT_SYMBOL_GPL(umc_normaddr_to_sysaddr);
+-
+ bool amd_mce_is_memory_error(struct mce *m)
+ {
+ 	/* ErrCodeExt[20:16] */
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index f0d8f60ac..046b98fcc 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -993,6 +993,205 @@ static int sys_addr_to_csrow(struct mem_ctl_info *mci, u64 sys_addr)
+ 	return csrow;
+ }
+ 
++static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
++{
++	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
++	/* We start from the normalized address */
++	u64 ret_addr = norm_addr;
++
++	u32 tmp;
++
++	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
++	u8 intlv_num_dies, intlv_num_chan, intlv_num_sockets;
++	u8 intlv_addr_sel, intlv_addr_bit;
++	u8 num_intlv_bits, hashed_bit;
++	u8 lgcy_mmio_hole_en, base = 0;
++	u8 cs_mask, cs_id = 0;
++	bool hash_enabled = false;
++
++	/* Read D18F0x1B4 (DramOffset), check if base 1 is used. */
++	if (amd_df_indirect_read(nid, 0, 0x1B4, umc, &tmp))
++		goto out_err;
++
++	/* Remove HiAddrOffset from normalized address, if enabled: */
++	if (tmp & BIT(0)) {
++		u64 hi_addr_offset = (tmp & GENMASK_ULL(31, 20)) << 8;
++
++		if (norm_addr >= hi_addr_offset) {
++			ret_addr -= hi_addr_offset;
++			base = 1;
++		}
++	}
++
++	/* Read D18F0x110 (DramBaseAddress). */
++	if (amd_df_indirect_read(nid, 0, 0x110 + (8 * base), umc, &tmp))
++		goto out_err;
++
++	/* Check if address range is valid. */
++	if (!(tmp & BIT(0))) {
++		pr_err("%s: Invalid DramBaseAddress range: 0x%x.\n",
++			__func__, tmp);
++		goto out_err;
++	}
++
++	lgcy_mmio_hole_en = tmp & BIT(1);
++	intlv_num_chan	  = (tmp >> 4) & 0xF;
++	intlv_addr_sel	  = (tmp >> 8) & 0x7;
++	dram_base_addr	  = (tmp & GENMASK_ULL(31, 12)) << 16;
++
++	/* {0, 1, 2, 3} map to address bits {8, 9, 10, 11} respectively */
++	if (intlv_addr_sel > 3) {
++		pr_err("%s: Invalid interleave address select %d.\n",
++			__func__, intlv_addr_sel);
++		goto out_err;
++	}
++
++	/* Read D18F0x114 (DramLimitAddress). */
++	if (amd_df_indirect_read(nid, 0, 0x114 + (8 * base), umc, &tmp))
++		goto out_err;
++
++	intlv_num_sockets = (tmp >> 8) & 0x1;
++	intlv_num_dies	  = (tmp >> 10) & 0x3;
++	dram_limit_addr	  = ((tmp & GENMASK_ULL(31, 12)) << 16) | GENMASK_ULL(27, 0);
++
++	intlv_addr_bit = intlv_addr_sel + 8;
++
++	/* Re-use intlv_num_chan by setting it equal to log2(#channels) */
++	switch (intlv_num_chan) {
++	case 0:	intlv_num_chan = 0; break;
++	case 1: intlv_num_chan = 1; break;
++	case 3: intlv_num_chan = 2; break;
++	case 5:	intlv_num_chan = 3; break;
++	case 7:	intlv_num_chan = 4; break;
++
++	case 8: intlv_num_chan = 1;
++		hash_enabled = true;
++		break;
++	default:
++		pr_err("%s: Invalid number of interleaved channels %d.\n",
++			__func__, intlv_num_chan);
++		goto out_err;
++	}
++
++	num_intlv_bits = intlv_num_chan;
++
++	if (intlv_num_dies > 2) {
++		pr_err("%s: Invalid number of interleaved nodes/dies %d.\n",
++			__func__, intlv_num_dies);
++		goto out_err;
++	}
++
++	num_intlv_bits += intlv_num_dies;
++
++	/* Add a bit if sockets are interleaved. */
++	num_intlv_bits += intlv_num_sockets;
++
++	/* Assert num_intlv_bits <= 4 */
++	if (num_intlv_bits > 4) {
++		pr_err("%s: Invalid interleave bits %d.\n",
++			__func__, num_intlv_bits);
++		goto out_err;
++	}
++
++	if (num_intlv_bits > 0) {
++		u64 temp_addr_x, temp_addr_i, temp_addr_y;
++		u8 die_id_bit, sock_id_bit, cs_fabric_id;
++
++		/*
++		 * Read FabricBlockInstanceInformation3_CS[BlockFabricID].
++		 * This is the fabric id for this coherent slave. Use
++		 * umc/channel# as instance id of the coherent slave
++		 * for FICAA.
++		 */
++		if (amd_df_indirect_read(nid, 0, 0x50, umc, &tmp))
++			goto out_err;
++
++		cs_fabric_id = (tmp >> 8) & 0xFF;
++		die_id_bit   = 0;
++
++		/* If interleaved over more than 1 channel: */
++		if (intlv_num_chan) {
++			die_id_bit = intlv_num_chan;
++			cs_mask	   = (1 << die_id_bit) - 1;
++			cs_id	   = cs_fabric_id & cs_mask;
++		}
++
++		sock_id_bit = die_id_bit;
++
++		/* Read D18F1x208 (SystemFabricIdMask). */
++		if (intlv_num_dies || intlv_num_sockets)
++			if (amd_df_indirect_read(nid, 1, 0x208, umc, &tmp))
++				goto out_err;
++
++		/* If interleaved over more than 1 die. */
++		if (intlv_num_dies) {
++			sock_id_bit  = die_id_bit + intlv_num_dies;
++			die_id_shift = (tmp >> 24) & 0xF;
++			die_id_mask  = (tmp >> 8) & 0xFF;
++
++			cs_id |= ((cs_fabric_id & die_id_mask) >> die_id_shift) << die_id_bit;
++		}
++
++		/* If interleaved over more than 1 socket. */
++		if (intlv_num_sockets) {
++			socket_id_shift	= (tmp >> 28) & 0xF;
++			socket_id_mask	= (tmp >> 16) & 0xFF;
++
++			cs_id |= ((cs_fabric_id & socket_id_mask) >> socket_id_shift) << sock_id_bit;
++		}
++
++		/*
++		 * The pre-interleaved address consists of XXXXXXIIIYYYYY
++		 * where III is the ID for this CS, and XXXXXXYYYYY are the
++		 * address bits from the post-interleaved address.
++		 * "num_intlv_bits" has been calculated to tell us how many "I"
++		 * bits there are. "intlv_addr_bit" tells us how many "Y" bits
++		 * there are (where "I" starts).
++		 */
++		temp_addr_y = ret_addr & GENMASK_ULL(intlv_addr_bit-1, 0);
++		temp_addr_i = (cs_id << intlv_addr_bit);
++		temp_addr_x = (ret_addr & GENMASK_ULL(63, intlv_addr_bit)) << num_intlv_bits;
++		ret_addr    = temp_addr_x | temp_addr_i | temp_addr_y;
++	}
++
++	/* Add dram base address */
++	ret_addr += dram_base_addr;
++
++	/* If legacy MMIO hole enabled */
++	if (lgcy_mmio_hole_en) {
++		if (amd_df_indirect_read(nid, 0, 0x104, umc, &tmp))
++			goto out_err;
++
++		dram_hole_base = tmp & GENMASK(31, 24);
++		if (ret_addr >= dram_hole_base)
++			ret_addr += (BIT_ULL(32) - dram_hole_base);
++	}
++
++	if (hash_enabled) {
++		/* Save some parentheses and grab ls-bit at the end. */
++		hashed_bit =	(ret_addr >> 12) ^
++				(ret_addr >> 18) ^
++				(ret_addr >> 21) ^
++				(ret_addr >> 30) ^
++				cs_id;
++
++		hashed_bit &= BIT(0);
++
++		if (hashed_bit != ((ret_addr >> intlv_addr_bit) & BIT(0)))
++			ret_addr ^= BIT(intlv_addr_bit);
++	}
++
++	/* Is calculated system address is above DRAM limit address? */
++	if (ret_addr > dram_limit_addr)
++		goto out_err;
++
++	*sys_addr = ret_addr;
++	return 0;
++
++out_err:
++	return -EINVAL;
++}
++
+ static int get_channel_from_ecc_syndrome(struct mem_ctl_info *, u16);
+ 
+ /*
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 96d6ae00438ef70bc9ef54834ce6ac777f4974df Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:33 +0000
+Subject: [PATCH 02/41] x86/amd_nb, EDAC/amd64: Move DF Indirect Read to AMD64
+ EDAC
+
+The df_indirect_read() function is only used for address translation.
+Move this to EDAC along with the translation code.
+
+Cc: <x86@kernel.org>
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ arch/x86/include/asm/amd_nb.h |  1 -
+ arch/x86/kernel/amd_nb.c      | 50 +----------------------------------
+ drivers/edac/amd64_edac.c     | 50 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 51 insertions(+), 50 deletions(-)
+
+diff --git a/arch/x86/include/asm/amd_nb.h b/arch/x86/include/asm/amd_nb.h
+index 455066a06..00d1a400b 100644
+--- a/arch/x86/include/asm/amd_nb.h
++++ b/arch/x86/include/asm/amd_nb.h
+@@ -24,7 +24,6 @@ extern int amd_set_subcaches(int, unsigned long);
+ 
+ extern int amd_smn_read(u16 node, u32 address, u32 *value);
+ extern int amd_smn_write(u16 node, u32 address, u32 value);
+-extern int amd_df_indirect_read(u16 node, u8 func, u16 reg, u8 instance_id, u32 *lo);
+ 
+ struct amd_l3_cache {
+ 	unsigned indices;
+diff --git a/arch/x86/kernel/amd_nb.c b/arch/x86/kernel/amd_nb.c
+index 23dda362d..5884dfa61 100644
+--- a/arch/x86/kernel/amd_nb.c
++++ b/arch/x86/kernel/amd_nb.c
+@@ -27,7 +27,7 @@
+ #define PCI_DEVICE_ID_AMD_19H_DF_F4	0x1654
+ #define PCI_DEVICE_ID_AMD_19H_M50H_DF_F4 0x166e
+ 
+-/* Protect the PCI config register pairs used for SMN and DF indirect access. */
++/* Protect the PCI config register pairs used for SMN. */
+ static DEFINE_MUTEX(smn_mutex);
+ 
+ static u32 *flush_words;
+@@ -177,54 +177,6 @@ int amd_smn_write(u16 node, u32 address, u32 value)
+ }
+ EXPORT_SYMBOL_GPL(amd_smn_write);
+ 
+-/*
+- * Data Fabric Indirect Access uses FICAA/FICAD.
+- *
+- * Fabric Indirect Configuration Access Address (FICAA): Constructed based
+- * on the device's Instance Id and the PCI function and register offset of
+- * the desired register.
+- *
+- * Fabric Indirect Configuration Access Data (FICAD): There are FICAD LO
+- * and FICAD HI registers but so far we only need the LO register.
+- */
+-int amd_df_indirect_read(u16 node, u8 func, u16 reg, u8 instance_id, u32 *lo)
+-{
+-	struct pci_dev *F4;
+-	u32 ficaa;
+-	int err = -ENODEV;
+-
+-	if (node >= amd_northbridges.num)
+-		goto out;
+-
+-	F4 = node_to_amd_nb(node)->link;
+-	if (!F4)
+-		goto out;
+-
+-	ficaa  = 1;
+-	ficaa |= reg & 0x3FC;
+-	ficaa |= (func & 0x7) << 11;
+-	ficaa |= instance_id << 16;
+-
+-	mutex_lock(&smn_mutex);
+-
+-	err = pci_write_config_dword(F4, 0x5C, ficaa);
+-	if (err) {
+-		pr_warn("Error writing DF Indirect FICAA, FICAA=0x%x\n", ficaa);
+-		goto out_unlock;
+-	}
+-
+-	err = pci_read_config_dword(F4, 0x98, lo);
+-	if (err)
+-		pr_warn("Error reading DF Indirect FICAD LO, FICAA=0x%x.\n", ficaa);
+-
+-out_unlock:
+-	mutex_unlock(&smn_mutex);
+-
+-out:
+-	return err;
+-}
+-EXPORT_SYMBOL_GPL(amd_df_indirect_read);
+-
+ int amd_cache_northbridges(void)
+ {
+ 	const struct pci_device_id *misc_ids = amd_nb_misc_ids;
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 046b98fcc..e9342d7d6 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -993,6 +993,56 @@ static int sys_addr_to_csrow(struct mem_ctl_info *mci, u64 sys_addr)
+ 	return csrow;
+ }
+ 
++/* Protect the PCI config register pairs used for DF indirect access. */
++static DEFINE_MUTEX(df_indirect_mutex);
++
++/*
++ * Data Fabric Indirect Access uses FICAA/FICAD.
++ *
++ * Fabric Indirect Configuration Access Address (FICAA): Constructed based
++ * on the device's Instance Id and the PCI function and register offset of
++ * the desired register.
++ *
++ * Fabric Indirect Configuration Access Data (FICAD): There are FICAD LO
++ * and FICAD HI registers but so far we only need the LO register.
++ */
++static int amd_df_indirect_read(u16 node, u8 func, u16 reg, u8 instance_id, u32 *lo)
++{
++	struct pci_dev *F4;
++	u32 ficaa;
++	int err = -ENODEV;
++
++	if (node >= amd_nb_num())
++		goto out;
++
++	F4 = node_to_amd_nb(node)->link;
++	if (!F4)
++		goto out;
++
++	ficaa  = 1;
++	ficaa |= reg & 0x3FC;
++	ficaa |= (func & 0x7) << 11;
++	ficaa |= instance_id << 16;
++
++	mutex_lock(&df_indirect_mutex);
++
++	err = pci_write_config_dword(F4, 0x5C, ficaa);
++	if (err) {
++		pr_warn("Error writing DF Indirect FICAA, FICAA=0x%x\n", ficaa);
++		goto out_unlock;
++	}
++
++	err = pci_read_config_dword(F4, 0x98, lo);
++	if (err)
++		pr_warn("Error reading DF Indirect FICAD LO, FICAA=0x%x.\n", ficaa);
++
++out_unlock:
++	mutex_unlock(&df_indirect_mutex);
++
++out:
++	return err;
++}
++
+ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
+ {
+ 	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
+-- 
+2.33.1.711.g9d530dc002
+
+
+From acf5d6f5ae6b2d8b3a4462b30cddfec83f8c8df5 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:34 +0000
+Subject: [PATCH 03/41] EDAC/amd64: Don't use naked values for DF registers
+
+AMD Data Fabric registers are defined using a combination of PCI
+function number and offset. Define a struct to hold these values, and
+update the DF Indirect Access function to accept a struct of this type.
+
+Update the address translation code to include a list of the needed DF
+registers using this new format. Define an enumeration to give the
+registers more human-readable names.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 60 ++++++++++++++++++++++++++++++---------
+ 1 file changed, 47 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index e9342d7d6..b94067e39 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -996,6 +996,11 @@ static int sys_addr_to_csrow(struct mem_ctl_info *mci, u64 sys_addr)
+ /* Protect the PCI config register pairs used for DF indirect access. */
+ static DEFINE_MUTEX(df_indirect_mutex);
+ 
++struct df_reg {
++	u8 func;
++	u16 offset;
++};
++
+ /*
+  * Data Fabric Indirect Access uses FICAA/FICAD.
+  *
+@@ -1006,7 +1011,7 @@ static DEFINE_MUTEX(df_indirect_mutex);
+  * Fabric Indirect Configuration Access Data (FICAD): There are FICAD LO
+  * and FICAD HI registers but so far we only need the LO register.
+  */
+-static int amd_df_indirect_read(u16 node, u8 func, u16 reg, u8 instance_id, u32 *lo)
++static int amd_df_indirect_read(u16 node, struct df_reg reg, u8 instance_id, u32 *lo)
+ {
+ 	struct pci_dev *F4;
+ 	u32 ficaa;
+@@ -1020,8 +1025,8 @@ static int amd_df_indirect_read(u16 node, u8 func, u16 reg, u8 instance_id, u32
+ 		goto out;
+ 
+ 	ficaa  = 1;
+-	ficaa |= reg & 0x3FC;
+-	ficaa |= (func & 0x7) << 11;
++	ficaa |= reg.offset & 0x3FC;
++	ficaa |= (reg.func & 0x7) << 11;
+ 	ficaa |= instance_id << 16;
+ 
+ 	mutex_lock(&df_indirect_mutex);
+@@ -1043,6 +1048,33 @@ static int amd_df_indirect_read(u16 node, u8 func, u16 reg, u8 instance_id, u32
+ 	return err;
+ }
+ 
++enum df_reg_names {
++	/* Function 0 */
++	FAB_BLK_INST_INFO_3,
++	DRAM_HOLE_CTL,
++	DRAM_BASE_ADDR,
++	DRAM_LIMIT_ADDR,
++	DRAM_OFFSET,
++
++	/* Function 1 */
++	SYS_FAB_ID_MASK,
++};
++
++static struct df_reg df_regs[] = {
++	/* D18F0x50 (FabricBlockInstanceInformation3_CS) */
++	[FAB_BLK_INST_INFO_3]	=	{0, 0x50},
++	/* D18F0x104 (DramHoleControl) */
++	[DRAM_HOLE_CTL]		=	{0, 0x104},
++	/* D18F0x110 (DramBaseAddress) */
++	[DRAM_BASE_ADDR]	=	{0, 0x110},
++	/* D18F0x114 (DramLimitAddress) */
++	[DRAM_LIMIT_ADDR]	=	{0, 0x114},
++	/* D18F0x1B4 (DramOffset) */
++	[DRAM_OFFSET]		=	{0, 0x1B4},
++	/* D18F1x208 (SystemFabricIdMask) */
++	[SYS_FAB_ID_MASK]	=	{1, 0x208},
++};
++
+ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
+ {
+ 	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
+@@ -1059,8 +1091,9 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	u8 cs_mask, cs_id = 0;
+ 	bool hash_enabled = false;
+ 
+-	/* Read D18F0x1B4 (DramOffset), check if base 1 is used. */
+-	if (amd_df_indirect_read(nid, 0, 0x1B4, umc, &tmp))
++	struct df_reg reg;
++
++	if (amd_df_indirect_read(nid, df_regs[DRAM_OFFSET], umc, &tmp))
+ 		goto out_err;
+ 
+ 	/* Remove HiAddrOffset from normalized address, if enabled: */
+@@ -1073,8 +1106,9 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		}
+ 	}
+ 
+-	/* Read D18F0x110 (DramBaseAddress). */
+-	if (amd_df_indirect_read(nid, 0, 0x110 + (8 * base), umc, &tmp))
++	reg = df_regs[DRAM_BASE_ADDR];
++	reg.offset += base * 8;
++	if (amd_df_indirect_read(nid, reg, umc, &tmp))
+ 		goto out_err;
+ 
+ 	/* Check if address range is valid. */
+@@ -1096,8 +1130,9 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		goto out_err;
+ 	}
+ 
+-	/* Read D18F0x114 (DramLimitAddress). */
+-	if (amd_df_indirect_read(nid, 0, 0x114 + (8 * base), umc, &tmp))
++	reg = df_regs[DRAM_LIMIT_ADDR];
++	reg.offset += base * 8;
++	if (amd_df_indirect_read(nid, reg, umc, &tmp))
+ 		goto out_err;
+ 
+ 	intlv_num_sockets = (tmp >> 8) & 0x1;
+@@ -1153,7 +1188,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		 * umc/channel# as instance id of the coherent slave
+ 		 * for FICAA.
+ 		 */
+-		if (amd_df_indirect_read(nid, 0, 0x50, umc, &tmp))
++		if (amd_df_indirect_read(nid, df_regs[FAB_BLK_INST_INFO_3], umc, &tmp))
+ 			goto out_err;
+ 
+ 		cs_fabric_id = (tmp >> 8) & 0xFF;
+@@ -1168,9 +1203,8 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 
+ 		sock_id_bit = die_id_bit;
+ 
+-		/* Read D18F1x208 (SystemFabricIdMask). */
+ 		if (intlv_num_dies || intlv_num_sockets)
+-			if (amd_df_indirect_read(nid, 1, 0x208, umc, &tmp))
++			if (amd_df_indirect_read(nid, df_regs[SYS_FAB_ID_MASK], umc, &tmp))
+ 				goto out_err;
+ 
+ 		/* If interleaved over more than 1 die. */
+@@ -1209,7 +1243,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 
+ 	/* If legacy MMIO hole enabled */
+ 	if (lgcy_mmio_hole_en) {
+-		if (amd_df_indirect_read(nid, 0, 0x104, umc, &tmp))
++		if (amd_df_indirect_read(nid, df_regs[DRAM_HOLE_CTL], umc, &tmp))
+ 			goto out_err;
+ 
+ 		dram_hole_base = tmp & GENMASK(31, 24);
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 2ad36353f02743dc6f5f101fccfb2c67b1532e94 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:35 +0000
+Subject: [PATCH 04/41] EDAC/amd64: Allow for DF Indirect Broadcast reads
+
+The DF Indirect Access method allows for "Broadcast" accesses in which
+case no specific instance is targeted. Add support using a reserved
+instance ID of 0xFF to indicate a broadcast access. Set the FICAA
+register appropriately.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index b94067e39..d67cd8f57 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1010,7 +1010,11 @@ struct df_reg {
+  *
+  * Fabric Indirect Configuration Access Data (FICAD): There are FICAD LO
+  * and FICAD HI registers but so far we only need the LO register.
++ *
++ * Use Instance Id 0xFF to indicate a broadcast read.
+  */
++
++#define DF_BROADCAST	0xFF
+ static int amd_df_indirect_read(u16 node, struct df_reg reg, u8 instance_id, u32 *lo)
+ {
+ 	struct pci_dev *F4;
+@@ -1024,7 +1028,7 @@ static int amd_df_indirect_read(u16 node, struct df_reg reg, u8 instance_id, u32
+ 	if (!F4)
+ 		goto out;
+ 
+-	ficaa  = 1;
++	ficaa  = (instance_id == DF_BROADCAST) ? 0 : 1;
+ 	ficaa |= reg.offset & 0x3FC;
+ 	ficaa |= (reg.func & 0x7) << 11;
+ 	ficaa |= instance_id << 16;
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 7a422f261946722aabce0f054f5baee36dae184e Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:36 +0000
+Subject: [PATCH 05/41] EDAC/amd64: Add context struct
+
+Define an address translation context struct. This will hold values that
+will be passed between multiple functions.
+
+Save return address, Node ID, and the Instance ID number to start.
+Currently, we use the UMC number as the Instance ID, but future DF
+versions may use another value.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 49 +++++++++++++++++++++++++--------------
+ 1 file changed, 31 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index d67cd8f57..62eca1884 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1079,12 +1079,15 @@ static struct df_reg df_regs[] = {
+ 	[SYS_FAB_ID_MASK]	=	{1, 0x208},
+ };
+ 
++struct addr_ctx {
++	u64 ret_addr;
++	u16 nid;
++	u8 inst_id;
++};
++
+ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
+ {
+ 	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
+-	/* We start from the normalized address */
+-	u64 ret_addr = norm_addr;
+-
+ 	u32 tmp;
+ 
+ 	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+@@ -1097,6 +1100,16 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 
+ 	struct df_reg reg;
+ 
++	struct addr_ctx ctx;
++
++	memset(&ctx, 0, sizeof(ctx));
++
++	/* We start from the normalized address */
++	ctx.ret_addr = norm_addr;
++
++	ctx.nid = nid;
++	ctx.inst_id = umc;
++
+ 	if (amd_df_indirect_read(nid, df_regs[DRAM_OFFSET], umc, &tmp))
+ 		goto out_err;
+ 
+@@ -1105,7 +1118,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		u64 hi_addr_offset = (tmp & GENMASK_ULL(31, 20)) << 8;
+ 
+ 		if (norm_addr >= hi_addr_offset) {
+-			ret_addr -= hi_addr_offset;
++			ctx.ret_addr -= hi_addr_offset;
+ 			base = 1;
+ 		}
+ 	}
+@@ -1236,14 +1249,14 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		 * bits there are. "intlv_addr_bit" tells us how many "Y" bits
+ 		 * there are (where "I" starts).
+ 		 */
+-		temp_addr_y = ret_addr & GENMASK_ULL(intlv_addr_bit-1, 0);
++		temp_addr_y = ctx.ret_addr & GENMASK_ULL(intlv_addr_bit - 1, 0);
+ 		temp_addr_i = (cs_id << intlv_addr_bit);
+-		temp_addr_x = (ret_addr & GENMASK_ULL(63, intlv_addr_bit)) << num_intlv_bits;
+-		ret_addr    = temp_addr_x | temp_addr_i | temp_addr_y;
++		temp_addr_x = (ctx.ret_addr & GENMASK_ULL(63, intlv_addr_bit)) << num_intlv_bits;
++		ctx.ret_addr    = temp_addr_x | temp_addr_i | temp_addr_y;
+ 	}
+ 
+ 	/* Add dram base address */
+-	ret_addr += dram_base_addr;
++	ctx.ret_addr += dram_base_addr;
+ 
+ 	/* If legacy MMIO hole enabled */
+ 	if (lgcy_mmio_hole_en) {
+@@ -1251,29 +1264,29 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 			goto out_err;
+ 
+ 		dram_hole_base = tmp & GENMASK(31, 24);
+-		if (ret_addr >= dram_hole_base)
+-			ret_addr += (BIT_ULL(32) - dram_hole_base);
++		if (ctx.ret_addr >= dram_hole_base)
++			ctx.ret_addr += (BIT_ULL(32) - dram_hole_base);
+ 	}
+ 
+ 	if (hash_enabled) {
+ 		/* Save some parentheses and grab ls-bit at the end. */
+-		hashed_bit =	(ret_addr >> 12) ^
+-				(ret_addr >> 18) ^
+-				(ret_addr >> 21) ^
+-				(ret_addr >> 30) ^
++		hashed_bit =	(ctx.ret_addr >> 12) ^
++				(ctx.ret_addr >> 18) ^
++				(ctx.ret_addr >> 21) ^
++				(ctx.ret_addr >> 30) ^
+ 				cs_id;
+ 
+ 		hashed_bit &= BIT(0);
+ 
+-		if (hashed_bit != ((ret_addr >> intlv_addr_bit) & BIT(0)))
+-			ret_addr ^= BIT(intlv_addr_bit);
++		if (hashed_bit != ((ctx.ret_addr >> intlv_addr_bit) & BIT(0)))
++			ctx.ret_addr ^= BIT(intlv_addr_bit);
+ 	}
+ 
+ 	/* Is calculated system address is above DRAM limit address? */
+-	if (ret_addr > dram_limit_addr)
++	if (ctx.ret_addr > dram_limit_addr)
+ 		goto out_err;
+ 
+-	*sys_addr = ret_addr;
++	*sys_addr = ctx.ret_addr;
+ 	return 0;
+ 
+ out_err:
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 6736d6e4b6eb3976a95d2fd8daa207c0d9da554a Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:37 +0000
+Subject: [PATCH 06/41] EDAC/amd64: Define Data Fabric operations
+
+Define a stub to hold operations for different Data Fabric versions.
+This will be filled in following patches.
+
+Define a function to set the appropriate operations. Use a return code
+because future updates have checks that may fail.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 62eca1884..f769353ef 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1085,6 +1085,21 @@ struct addr_ctx {
+ 	u8 inst_id;
+ };
+ 
++struct data_fabric_ops {
++};
++
++struct data_fabric_ops df2_ops = {
++};
++
++struct data_fabric_ops *df_ops;
++
++static int set_df_ops(struct addr_ctx *ctx)
++{
++	df_ops = &df2_ops;
++
++	return 0;
++}
++
+ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
+ {
+ 	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
+@@ -1110,6 +1125,9 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	ctx.nid = nid;
+ 	ctx.inst_id = umc;
+ 
++	if (set_df_ops(&ctx))
++		return -EINVAL;
++
+ 	if (amd_df_indirect_read(nid, df_regs[DRAM_OFFSET], umc, &tmp))
+ 		goto out_err;
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 12435888e61f669adab5eb5ef23d155d39bd1425 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:38 +0000
+Subject: [PATCH 07/41] EDAC/amd64: Define functions for DramOffset
+
+Add helper functions to read the DramOffset register and to remove the
+offset from the calculated address.
+
+The helper functions will be expanded in future DF versions.
+
+Rename the "base" variable to "map_num" to indicate that this is the
+address map number. An address map is defined with a base and limit
+value. The map_num variable is used to select the proper base and limit
+registers to use for the address translation.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 57 +++++++++++++++++++++++++++++----------
+ 1 file changed, 43 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index f769353ef..389f0621e 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1079,16 +1079,26 @@ static struct df_reg df_regs[] = {
+ 	[SYS_FAB_ID_MASK]	=	{1, 0x208},
+ };
+ 
++/* Use "reg_" prefix for raw register values. */
+ struct addr_ctx {
+ 	u64 ret_addr;
++	u32 reg_dram_offset;
+ 	u16 nid;
+ 	u8 inst_id;
++	u8 map_num;
+ };
+ 
+ struct data_fabric_ops {
++	u64 (*get_hi_addr_offset)(struct addr_ctx *ctx);
+ };
+ 
++static u64 get_hi_addr_offset_df2(struct addr_ctx *ctx)
++{
++	return (ctx->reg_dram_offset & GENMASK_ULL(31, 20)) << 8;
++}
++
+ struct data_fabric_ops df2_ops = {
++	.get_hi_addr_offset		=	&get_hi_addr_offset_df2,
+ };
+ 
+ struct data_fabric_ops *df_ops;
+@@ -1100,6 +1110,35 @@ static int set_df_ops(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
++static int get_dram_offset_reg(struct addr_ctx *ctx)
++{
++	if (amd_df_indirect_read(ctx->nid, df_regs[DRAM_OFFSET],
++				 ctx->inst_id, &ctx->reg_dram_offset))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int remove_dram_offset(struct addr_ctx *ctx)
++{
++	if (get_dram_offset_reg(ctx))
++		return -EINVAL;
++
++	ctx->map_num = 0;
++
++	/* Remove HiAddrOffset from normalized address, if enabled: */
++	if (ctx->reg_dram_offset & BIT(0)) {
++		u64 hi_addr_offset = df_ops->get_hi_addr_offset(ctx);
++
++		if (ctx->ret_addr >= hi_addr_offset) {
++			ctx->ret_addr -= hi_addr_offset;
++			ctx->map_num = 1;
++		}
++	}
++
++	return 0;
++}
++
+ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
+ {
+ 	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
+@@ -1109,7 +1148,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	u8 intlv_num_dies, intlv_num_chan, intlv_num_sockets;
+ 	u8 intlv_addr_sel, intlv_addr_bit;
+ 	u8 num_intlv_bits, hashed_bit;
+-	u8 lgcy_mmio_hole_en, base = 0;
++	u8 lgcy_mmio_hole_en;
+ 	u8 cs_mask, cs_id = 0;
+ 	bool hash_enabled = false;
+ 
+@@ -1128,21 +1167,11 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (set_df_ops(&ctx))
+ 		return -EINVAL;
+ 
+-	if (amd_df_indirect_read(nid, df_regs[DRAM_OFFSET], umc, &tmp))
++	if (remove_dram_offset(&ctx))
+ 		goto out_err;
+ 
+-	/* Remove HiAddrOffset from normalized address, if enabled: */
+-	if (tmp & BIT(0)) {
+-		u64 hi_addr_offset = (tmp & GENMASK_ULL(31, 20)) << 8;
+-
+-		if (norm_addr >= hi_addr_offset) {
+-			ctx.ret_addr -= hi_addr_offset;
+-			base = 1;
+-		}
+-	}
+-
+ 	reg = df_regs[DRAM_BASE_ADDR];
+-	reg.offset += base * 8;
++	reg.offset += ctx.map_num * 8;
+ 	if (amd_df_indirect_read(nid, reg, umc, &tmp))
+ 		goto out_err;
+ 
+@@ -1166,7 +1195,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	}
+ 
+ 	reg = df_regs[DRAM_LIMIT_ADDR];
+-	reg.offset += base * 8;
++	reg.offset += ctx.map_num * 8;
+ 	if (amd_df_indirect_read(nid, reg, umc, &tmp))
+ 		goto out_err;
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 835e1ec9a05e04f187c2743b7dc17039728a16e9 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:39 +0000
+Subject: [PATCH 08/41] EDAC/amd64: Define function to read DRAM address map
+ registers
+
+Move the reading of the base and limit registers into a helper function.
+Save the raw values in the context struct as they will be parsed later.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 58 +++++++++++++++++++++++----------------
+ 1 file changed, 34 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 389f0621e..867ab32ca 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1083,6 +1083,8 @@ static struct df_reg df_regs[] = {
+ struct addr_ctx {
+ 	u64 ret_addr;
+ 	u32 reg_dram_offset;
++	u32 reg_base_addr;
++	u32 reg_limit_addr;
+ 	u16 nid;
+ 	u8 inst_id;
+ 	u8 map_num;
+@@ -1139,6 +1141,30 @@ static int remove_dram_offset(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
++static int get_dram_addr_map(struct addr_ctx *ctx)
++{
++	struct df_reg reg = df_regs[DRAM_BASE_ADDR];
++
++	reg.offset += ctx->map_num * 8;
++
++	if (amd_df_indirect_read(ctx->nid, reg, ctx->inst_id, &ctx->reg_base_addr))
++		return -EINVAL;
++
++	/* Check if address range is valid. */
++	if (!(ctx->reg_base_addr & BIT(0))) {
++		pr_debug("Invalid DramBaseAddress range: 0x%x.\n", ctx->reg_base_addr);
++		return -EINVAL;
++	}
++
++	reg = df_regs[DRAM_LIMIT_ADDR];
++	reg.offset += ctx->map_num * 8;
++
++	if (amd_df_indirect_read(ctx->nid, reg, ctx->inst_id, &ctx->reg_limit_addr))
++		return -EINVAL;
++
++	return 0;
++}
++
+ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
+ {
+ 	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
+@@ -1152,8 +1178,6 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	u8 cs_mask, cs_id = 0;
+ 	bool hash_enabled = false;
+ 
+-	struct df_reg reg;
+-
+ 	struct addr_ctx ctx;
+ 
+ 	memset(&ctx, 0, sizeof(ctx));
+@@ -1170,22 +1194,13 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (remove_dram_offset(&ctx))
+ 		goto out_err;
+ 
+-	reg = df_regs[DRAM_BASE_ADDR];
+-	reg.offset += ctx.map_num * 8;
+-	if (amd_df_indirect_read(nid, reg, umc, &tmp))
+-		goto out_err;
+-
+-	/* Check if address range is valid. */
+-	if (!(tmp & BIT(0))) {
+-		pr_err("%s: Invalid DramBaseAddress range: 0x%x.\n",
+-			__func__, tmp);
++	if (get_dram_addr_map(&ctx))
+ 		goto out_err;
+-	}
+ 
+-	lgcy_mmio_hole_en = tmp & BIT(1);
+-	intlv_num_chan	  = (tmp >> 4) & 0xF;
+-	intlv_addr_sel	  = (tmp >> 8) & 0x7;
+-	dram_base_addr	  = (tmp & GENMASK_ULL(31, 12)) << 16;
++	lgcy_mmio_hole_en = ctx.reg_base_addr & BIT(1);
++	intlv_num_chan	  = (ctx.reg_base_addr >> 4) & 0xF;
++	intlv_addr_sel	  = (ctx.reg_base_addr >> 8) & 0x7;
++	dram_base_addr	  = (ctx.reg_base_addr & GENMASK_ULL(31, 12)) << 16;
+ 
+ 	/* {0, 1, 2, 3} map to address bits {8, 9, 10, 11} respectively */
+ 	if (intlv_addr_sel > 3) {
+@@ -1194,14 +1209,9 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		goto out_err;
+ 	}
+ 
+-	reg = df_regs[DRAM_LIMIT_ADDR];
+-	reg.offset += ctx.map_num * 8;
+-	if (amd_df_indirect_read(nid, reg, umc, &tmp))
+-		goto out_err;
+-
+-	intlv_num_sockets = (tmp >> 8) & 0x1;
+-	intlv_num_dies	  = (tmp >> 10) & 0x3;
+-	dram_limit_addr	  = ((tmp & GENMASK_ULL(31, 12)) << 16) | GENMASK_ULL(27, 0);
++	intlv_num_sockets = (ctx.reg_limit_addr >> 8) & 0x1;
++	intlv_num_dies	  = (ctx.reg_limit_addr >> 10) & 0x3;
++	dram_limit_addr	  = ((ctx.reg_limit_addr & GENMASK_ULL(31, 12)) << 16) | GENMASK_ULL(27, 0);
+ 
+ 	intlv_addr_bit = intlv_addr_sel + 8;
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From d29e8d8fcab3fc698aae79c6539da49584f24f0b Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:40 +0000
+Subject: [PATCH 09/41] EDAC/amd64: Define function to find interleaving mode
+
+Define a helper function to find the interleaving mode. Define a
+DF2-specific function now. Future DF versions will have their own
+functions.
+
+Use an enumeration for the interleaving modes to give a human-readable
+value. Save the interleaving mode in the context struct, since this will
+be used in multiple functions.
+
+Multiple interleaving modes support hashing, so save a boolean in the
+context struct to check if hashing is enabled.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 35 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 867ab32ca..93a4ce9eb 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1079,8 +1079,16 @@ static struct df_reg df_regs[] = {
+ 	[SYS_FAB_ID_MASK]	=	{1, 0x208},
+ };
+ 
++/* These are mapped 1:1 to the hardware values. Special cases are set at > 0x20. */
++enum intlv_modes {
++	NONE		= 0x00,
++	NOHASH_2CH	= 0x01,
++	DF2_HASH_2CH	= 0x21,
++};
++
+ /* Use "reg_" prefix for raw register values. */
+ struct addr_ctx {
++	enum intlv_modes intlv_mode;
+ 	u64 ret_addr;
+ 	u32 reg_dram_offset;
+ 	u32 reg_base_addr;
+@@ -1088,10 +1096,12 @@ struct addr_ctx {
+ 	u16 nid;
+ 	u8 inst_id;
+ 	u8 map_num;
++	bool hash_enabled;
+ };
+ 
+ struct data_fabric_ops {
+ 	u64 (*get_hi_addr_offset)(struct addr_ctx *ctx);
++	int (*get_intlv_mode)(struct addr_ctx *ctx);
+ };
+ 
+ static u64 get_hi_addr_offset_df2(struct addr_ctx *ctx)
+@@ -1099,8 +1109,26 @@ static u64 get_hi_addr_offset_df2(struct addr_ctx *ctx)
+ 	return (ctx->reg_dram_offset & GENMASK_ULL(31, 20)) << 8;
+ }
+ 
++static int get_intlv_mode_df2(struct addr_ctx *ctx)
++{
++	ctx->intlv_mode = (ctx->reg_base_addr >> 4) & 0xF;
++
++	if (ctx->intlv_mode == 8) {
++		ctx->intlv_mode = DF2_HASH_2CH;
++		ctx->hash_enabled = true;
++	}
++
++	if (ctx->intlv_mode != NONE &&
++	    ctx->intlv_mode != NOHASH_2CH &&
++	    ctx->intlv_mode != DF2_HASH_2CH)
++		return -EINVAL;
++
++	return 0;
++}
++
+ struct data_fabric_ops df2_ops = {
+ 	.get_hi_addr_offset		=	&get_hi_addr_offset_df2,
++	.get_intlv_mode			=	&get_intlv_mode_df2,
+ };
+ 
+ struct data_fabric_ops *df_ops;
+@@ -1176,7 +1204,6 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	u8 num_intlv_bits, hashed_bit;
+ 	u8 lgcy_mmio_hole_en;
+ 	u8 cs_mask, cs_id = 0;
+-	bool hash_enabled = false;
+ 
+ 	struct addr_ctx ctx;
+ 
+@@ -1197,6 +1224,9 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (get_dram_addr_map(&ctx))
+ 		goto out_err;
+ 
++	if (df_ops->get_intlv_mode(&ctx))
++		goto out_err;
++
+ 	lgcy_mmio_hole_en = ctx.reg_base_addr & BIT(1);
+ 	intlv_num_chan	  = (ctx.reg_base_addr >> 4) & 0xF;
+ 	intlv_addr_sel	  = (ctx.reg_base_addr >> 8) & 0x7;
+@@ -1224,7 +1254,6 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	case 7:	intlv_num_chan = 4; break;
+ 
+ 	case 8: intlv_num_chan = 1;
+-		hash_enabled = true;
+ 		break;
+ 	default:
+ 		pr_err("%s: Invalid number of interleaved channels %d.\n",
+@@ -1325,7 +1354,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 			ctx.ret_addr += (BIT_ULL(32) - dram_hole_base);
+ 	}
+ 
+-	if (hash_enabled) {
++	if (ctx.hash_enabled) {
+ 		/* Save some parentheses and grab ls-bit at the end. */
+ 		hashed_bit =	(ctx.ret_addr >> 12) ^
+ 				(ctx.ret_addr >> 18) ^
+-- 
+2.33.1.711.g9d530dc002
+
+
+From a680cf7b4de0e8fc6192a745a1f74f15c036c6f1 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:41 +0000
+Subject: [PATCH 10/41] EDAC/amd64: Define function to denormalize address
+
+Move the address denormalization into a separate helper function. This
+will be further refactored in later patches.
+
+Add the interleave address bit and the CS ID to the context struct.
+These values will be used by multiple functions.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 128 ++++++++++++++++++++++----------------
+ 1 file changed, 73 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 93a4ce9eb..ebb82b5e1 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1096,6 +1096,8 @@ struct addr_ctx {
+ 	u16 nid;
+ 	u8 inst_id;
+ 	u8 map_num;
++	u8 intlv_addr_bit;
++	u8 cs_id;
+ 	bool hash_enabled;
+ };
+ 
+@@ -1193,57 +1195,26 @@ static int get_dram_addr_map(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
+-static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
++static int denormalize_addr(struct addr_ctx *ctx)
+ {
+-	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
+ 	u32 tmp;
+ 
+ 	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+ 	u8 intlv_num_dies, intlv_num_chan, intlv_num_sockets;
+-	u8 intlv_addr_sel, intlv_addr_bit;
+-	u8 num_intlv_bits, hashed_bit;
+-	u8 lgcy_mmio_hole_en;
+-	u8 cs_mask, cs_id = 0;
+-
+-	struct addr_ctx ctx;
+-
+-	memset(&ctx, 0, sizeof(ctx));
+-
+-	/* We start from the normalized address */
+-	ctx.ret_addr = norm_addr;
+-
+-	ctx.nid = nid;
+-	ctx.inst_id = umc;
+-
+-	if (set_df_ops(&ctx))
+-		return -EINVAL;
+-
+-	if (remove_dram_offset(&ctx))
+-		goto out_err;
+-
+-	if (get_dram_addr_map(&ctx))
+-		goto out_err;
+-
+-	if (df_ops->get_intlv_mode(&ctx))
+-		goto out_err;
+-
+-	lgcy_mmio_hole_en = ctx.reg_base_addr & BIT(1);
+-	intlv_num_chan	  = (ctx.reg_base_addr >> 4) & 0xF;
+-	intlv_addr_sel	  = (ctx.reg_base_addr >> 8) & 0x7;
+-	dram_base_addr	  = (ctx.reg_base_addr & GENMASK_ULL(31, 12)) << 16;
++	u8 intlv_addr_sel = (ctx->reg_base_addr >> 8) & 0x7;
++	u8 num_intlv_bits, cs_mask = 0;
+ 
+ 	/* {0, 1, 2, 3} map to address bits {8, 9, 10, 11} respectively */
+ 	if (intlv_addr_sel > 3) {
+ 		pr_err("%s: Invalid interleave address select %d.\n",
+ 			__func__, intlv_addr_sel);
+-		goto out_err;
++		return -EINVAL;
+ 	}
+ 
+-	intlv_num_sockets = (ctx.reg_limit_addr >> 8) & 0x1;
+-	intlv_num_dies	  = (ctx.reg_limit_addr >> 10) & 0x3;
+-	dram_limit_addr	  = ((ctx.reg_limit_addr & GENMASK_ULL(31, 12)) << 16) | GENMASK_ULL(27, 0);
++	intlv_num_sockets = (ctx->reg_limit_addr >> 8) & 0x1;
++	intlv_num_dies	  = (ctx->reg_limit_addr >> 10) & 0x3;
+ 
+-	intlv_addr_bit = intlv_addr_sel + 8;
++	ctx->intlv_addr_bit = intlv_addr_sel + 8;
+ 
+ 	/* Re-use intlv_num_chan by setting it equal to log2(#channels) */
+ 	switch (intlv_num_chan) {
+@@ -1258,7 +1229,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	default:
+ 		pr_err("%s: Invalid number of interleaved channels %d.\n",
+ 			__func__, intlv_num_chan);
+-		goto out_err;
++		return -EINVAL;
+ 	}
+ 
+ 	num_intlv_bits = intlv_num_chan;
+@@ -1266,7 +1237,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (intlv_num_dies > 2) {
+ 		pr_err("%s: Invalid number of interleaved nodes/dies %d.\n",
+ 			__func__, intlv_num_dies);
+-		goto out_err;
++		return -EINVAL;
+ 	}
+ 
+ 	num_intlv_bits += intlv_num_dies;
+@@ -1278,7 +1249,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (num_intlv_bits > 4) {
+ 		pr_err("%s: Invalid interleave bits %d.\n",
+ 			__func__, num_intlv_bits);
+-		goto out_err;
++		return -EINVAL;
+ 	}
+ 
+ 	if (num_intlv_bits > 0) {
+@@ -1291,8 +1262,9 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		 * umc/channel# as instance id of the coherent slave
+ 		 * for FICAA.
+ 		 */
+-		if (amd_df_indirect_read(nid, df_regs[FAB_BLK_INST_INFO_3], umc, &tmp))
+-			goto out_err;
++		if (amd_df_indirect_read(ctx->nid, df_regs[FAB_BLK_INST_INFO_3],
++					 ctx->inst_id, &tmp))
++			return -EINVAL;
+ 
+ 		cs_fabric_id = (tmp >> 8) & 0xFF;
+ 		die_id_bit   = 0;
+@@ -1301,14 +1273,15 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		if (intlv_num_chan) {
+ 			die_id_bit = intlv_num_chan;
+ 			cs_mask	   = (1 << die_id_bit) - 1;
+-			cs_id	   = cs_fabric_id & cs_mask;
++			ctx->cs_id = cs_fabric_id & cs_mask;
+ 		}
+ 
+ 		sock_id_bit = die_id_bit;
+ 
+ 		if (intlv_num_dies || intlv_num_sockets)
+-			if (amd_df_indirect_read(nid, df_regs[SYS_FAB_ID_MASK], umc, &tmp))
+-				goto out_err;
++			if (amd_df_indirect_read(ctx->nid, df_regs[SYS_FAB_ID_MASK],
++						 ctx->inst_id, &tmp))
++				return -EINVAL;
+ 
+ 		/* If interleaved over more than 1 die. */
+ 		if (intlv_num_dies) {
+@@ -1316,7 +1289,8 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 			die_id_shift = (tmp >> 24) & 0xF;
+ 			die_id_mask  = (tmp >> 8) & 0xFF;
+ 
+-			cs_id |= ((cs_fabric_id & die_id_mask) >> die_id_shift) << die_id_bit;
++			ctx->cs_id |= ((cs_fabric_id & die_id_mask)
++					>> die_id_shift) << die_id_bit;
+ 		}
+ 
+ 		/* If interleaved over more than 1 socket. */
+@@ -1324,7 +1298,8 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 			socket_id_shift	= (tmp >> 28) & 0xF;
+ 			socket_id_mask	= (tmp >> 16) & 0xFF;
+ 
+-			cs_id |= ((cs_fabric_id & socket_id_mask) >> socket_id_shift) << sock_id_bit;
++			ctx->cs_id |= ((cs_fabric_id & socket_id_mask)
++					>> socket_id_shift) << sock_id_bit;
+ 		}
+ 
+ 		/*
+@@ -1335,12 +1310,55 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		 * bits there are. "intlv_addr_bit" tells us how many "Y" bits
+ 		 * there are (where "I" starts).
+ 		 */
+-		temp_addr_y = ctx.ret_addr & GENMASK_ULL(intlv_addr_bit - 1, 0);
+-		temp_addr_i = (cs_id << intlv_addr_bit);
+-		temp_addr_x = (ctx.ret_addr & GENMASK_ULL(63, intlv_addr_bit)) << num_intlv_bits;
+-		ctx.ret_addr    = temp_addr_x | temp_addr_i | temp_addr_y;
++		temp_addr_y = ctx->ret_addr & GENMASK_ULL(ctx->intlv_addr_bit - 1, 0);
++		temp_addr_i = (ctx->cs_id << ctx->intlv_addr_bit);
++		temp_addr_x = (ctx->ret_addr & GENMASK_ULL(63, ctx->intlv_addr_bit))
++			       << num_intlv_bits;
++		ctx->ret_addr    = temp_addr_x | temp_addr_i | temp_addr_y;
+ 	}
+ 
++	return 0;
++}
++
++static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
++{
++	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
++
++	u32 tmp;
++
++	u8 hashed_bit;
++	u8 lgcy_mmio_hole_en;
++
++	struct addr_ctx ctx;
++
++	memset(&ctx, 0, sizeof(ctx));
++
++	/* We start from the normalized address */
++	ctx.ret_addr = norm_addr;
++
++	ctx.nid = nid;
++	ctx.inst_id = umc;
++
++	if (set_df_ops(&ctx))
++		return -EINVAL;
++
++	if (remove_dram_offset(&ctx))
++		return -EINVAL;
++
++	if (get_dram_addr_map(&ctx))
++		goto out_err;
++
++	if (df_ops->get_intlv_mode(&ctx))
++		goto out_err;
++
++	if (denormalize_addr(&ctx))
++		goto out_err;
++
++	lgcy_mmio_hole_en = ctx.reg_base_addr & BIT(1);
++	dram_base_addr	  = (ctx.reg_base_addr & GENMASK_ULL(31, 12)) << 16;
++
++	dram_limit_addr	  = ((ctx.reg_limit_addr & GENMASK_ULL(31, 12)) << 16) | GENMASK_ULL(27, 0);
++
+ 	/* Add dram base address */
+ 	ctx.ret_addr += dram_base_addr;
+ 
+@@ -1360,12 +1378,12 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 				(ctx.ret_addr >> 18) ^
+ 				(ctx.ret_addr >> 21) ^
+ 				(ctx.ret_addr >> 30) ^
+-				cs_id;
++				ctx.cs_id;
+ 
+ 		hashed_bit &= BIT(0);
+ 
+-		if (hashed_bit != ((ctx.ret_addr >> intlv_addr_bit) & BIT(0)))
+-			ctx.ret_addr ^= BIT(intlv_addr_bit);
++		if (hashed_bit != ((ctx.ret_addr >> ctx.intlv_addr_bit) & BIT(0)))
++			ctx.ret_addr ^= BIT(ctx.intlv_addr_bit);
+ 	}
+ 
+ 	/* Is calculated system address is above DRAM limit address? */
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 2d1ac00c3f736098c867ed562641ef61b0933c13 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:42 +0000
+Subject: [PATCH 11/41] EDAC/amd64: Define function to add DRAM base and hole
+
+Move adding of DRAM base and hole into a separate helper function.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 45 ++++++++++++++++++++++-----------------
+ 1 file changed, 26 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index ebb82b5e1..68c4aecd5 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1320,14 +1320,34 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
+-static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
++static int add_base_and_hole(struct addr_ctx *ctx)
+ {
+-	u64 dram_base_addr, dram_limit_addr, dram_hole_base;
++	u64 dram_base_addr = (ctx->reg_base_addr & GENMASK_ULL(31, 12)) << 16;
+ 
+-	u32 tmp;
++	/* Add dram base address */
++	ctx->ret_addr += dram_base_addr;
++
++	/* If legacy MMIO hole enabled */
++	if (ctx->reg_base_addr & BIT(1)) {
++		u32 dram_hole_base;
++
++		if (amd_df_indirect_read(0, df_regs[DRAM_HOLE_CTL],
++					 DF_BROADCAST, &dram_hole_base))
++			return -EINVAL;
++
++		dram_hole_base &= GENMASK(31, 24);
++		if (ctx->ret_addr >= dram_hole_base)
++			ctx->ret_addr += (BIT_ULL(32) - dram_hole_base);
++	}
++
++	return 0;
++}
++
++static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
++{
++	u64 dram_limit_addr;
+ 
+ 	u8 hashed_bit;
+-	u8 lgcy_mmio_hole_en;
+ 
+ 	struct addr_ctx ctx;
+ 
+@@ -1354,23 +1374,10 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (denormalize_addr(&ctx))
+ 		goto out_err;
+ 
+-	lgcy_mmio_hole_en = ctx.reg_base_addr & BIT(1);
+-	dram_base_addr	  = (ctx.reg_base_addr & GENMASK_ULL(31, 12)) << 16;
+-
+ 	dram_limit_addr	  = ((ctx.reg_limit_addr & GENMASK_ULL(31, 12)) << 16) | GENMASK_ULL(27, 0);
+ 
+-	/* Add dram base address */
+-	ctx.ret_addr += dram_base_addr;
+-
+-	/* If legacy MMIO hole enabled */
+-	if (lgcy_mmio_hole_en) {
+-		if (amd_df_indirect_read(nid, df_regs[DRAM_HOLE_CTL], umc, &tmp))
+-			goto out_err;
+-
+-		dram_hole_base = tmp & GENMASK(31, 24);
+-		if (ctx.ret_addr >= dram_hole_base)
+-			ctx.ret_addr += (BIT_ULL(32) - dram_hole_base);
+-	}
++	if (add_base_and_hole(&ctx))
++		goto out_err;
+ 
+ 	if (ctx.hash_enabled) {
+ 		/* Save some parentheses and grab ls-bit at the end. */
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 18e9b4b6e5183ee69b768f660db97f24660eed9f Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:43 +0000
+Subject: [PATCH 12/41] EDAC/amd64: Define function to dehash address
+
+Move the dehashing code into a separate helper function. Define a
+DF2-specific function for the current code. Specific helper functions
+will be added for future DF versions.
+
+The dehashing code is tied to interleaving mode rather than Data Fabric
+version, so save the function pointer in the ctx struct. The name
+include "df2" because this mode only exists on DF2.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 37 ++++++++++++++++++++-----------------
+ 1 file changed, 20 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 68c4aecd5..46b0279a2 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1098,7 +1098,7 @@ struct addr_ctx {
+ 	u8 map_num;
+ 	u8 intlv_addr_bit;
+ 	u8 cs_id;
+-	bool hash_enabled;
++	int (*dehash_addr)(struct addr_ctx *ctx);
+ };
+ 
+ struct data_fabric_ops {
+@@ -1111,13 +1111,29 @@ static u64 get_hi_addr_offset_df2(struct addr_ctx *ctx)
+ 	return (ctx->reg_dram_offset & GENMASK_ULL(31, 20)) << 8;
+ }
+ 
++static int dehash_addr_df2(struct addr_ctx *ctx)
++{
++	u8 hashed_bit =	(ctx->ret_addr >> 12) ^
++			(ctx->ret_addr >> 18) ^
++			(ctx->ret_addr >> 21) ^
++			(ctx->ret_addr >> 30) ^
++			ctx->cs_id;
++
++	hashed_bit &= BIT(0);
++
++	if (hashed_bit != ((ctx->ret_addr >> ctx->intlv_addr_bit) & BIT(0)))
++		ctx->ret_addr ^= BIT(ctx->intlv_addr_bit);
++
++	return 0;
++}
++
+ static int get_intlv_mode_df2(struct addr_ctx *ctx)
+ {
+ 	ctx->intlv_mode = (ctx->reg_base_addr >> 4) & 0xF;
+ 
+ 	if (ctx->intlv_mode == 8) {
+ 		ctx->intlv_mode = DF2_HASH_2CH;
+-		ctx->hash_enabled = true;
++		ctx->dehash_addr = &dehash_addr_df2;
+ 	}
+ 
+ 	if (ctx->intlv_mode != NONE &&
+@@ -1347,8 +1363,6 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ {
+ 	u64 dram_limit_addr;
+ 
+-	u8 hashed_bit;
+-
+ 	struct addr_ctx ctx;
+ 
+ 	memset(&ctx, 0, sizeof(ctx));
+@@ -1379,19 +1393,8 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (add_base_and_hole(&ctx))
+ 		goto out_err;
+ 
+-	if (ctx.hash_enabled) {
+-		/* Save some parentheses and grab ls-bit at the end. */
+-		hashed_bit =	(ctx.ret_addr >> 12) ^
+-				(ctx.ret_addr >> 18) ^
+-				(ctx.ret_addr >> 21) ^
+-				(ctx.ret_addr >> 30) ^
+-				ctx.cs_id;
+-
+-		hashed_bit &= BIT(0);
+-
+-		if (hashed_bit != ((ctx.ret_addr >> ctx.intlv_addr_bit) & BIT(0)))
+-			ctx.ret_addr ^= BIT(ctx.intlv_addr_bit);
+-	}
++	if (ctx.dehash_addr && ctx.dehash_addr(&ctx))
++		goto out_err;
+ 
+ 	/* Is calculated system address is above DRAM limit address? */
+ 	if (ctx.ret_addr > dram_limit_addr)
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 4920e2a6720bc3ac721f8dfc6dc60459e86ea45f Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:44 +0000
+Subject: [PATCH 13/41] EDAC/amd64: Define function to check DRAM limit address
+
+Move the DRAM limit check into a separate helper function.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 46b0279a2..de80a224e 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1359,10 +1359,20 @@ static int add_base_and_hole(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
+-static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
++static int addr_over_limit(struct addr_ctx *ctx)
+ {
+-	u64 dram_limit_addr;
++	u64 dram_limit_addr  = ((ctx->reg_limit_addr & GENMASK_ULL(31, 12)) << 16)
++					| GENMASK_ULL(27, 0);
++
++	/* Is calculated system address above DRAM limit address? */
++	if (ctx->ret_addr > dram_limit_addr)
++		return -EINVAL;
+ 
++	return 0;
++}
++
++static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
++{
+ 	struct addr_ctx ctx;
+ 
+ 	memset(&ctx, 0, sizeof(ctx));
+@@ -1388,16 +1398,13 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (denormalize_addr(&ctx))
+ 		goto out_err;
+ 
+-	dram_limit_addr	  = ((ctx.reg_limit_addr & GENMASK_ULL(31, 12)) << 16) | GENMASK_ULL(27, 0);
+-
+ 	if (add_base_and_hole(&ctx))
+ 		goto out_err;
+ 
+ 	if (ctx.dehash_addr && ctx.dehash_addr(&ctx))
+ 		goto out_err;
+ 
+-	/* Is calculated system address is above DRAM limit address? */
+-	if (ctx.ret_addr > dram_limit_addr)
++	if (addr_over_limit(&ctx))
+ 		goto out_err;
+ 
+ 	*sys_addr = ctx.ret_addr;
+-- 
+2.33.1.711.g9d530dc002
+
+
+From a4be302d7896d875b7c599cfa851ad4cd39bf4a7 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:45 +0000
+Subject: [PATCH 14/41] EDAC/amd64: Remove goto statements
+
+...and just return error codes directly.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 15 ++++++---------
+ 1 file changed, 6 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index de80a224e..3f1ff5adc 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1390,28 +1390,25 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 		return -EINVAL;
+ 
+ 	if (get_dram_addr_map(&ctx))
+-		goto out_err;
++		return -EINVAL;
+ 
+ 	if (df_ops->get_intlv_mode(&ctx))
+-		goto out_err;
++		return -EINVAL;
+ 
+ 	if (denormalize_addr(&ctx))
+-		goto out_err;
++		return -EINVAL;
+ 
+ 	if (add_base_and_hole(&ctx))
+-		goto out_err;
++		return -EINVAL;
+ 
+ 	if (ctx.dehash_addr && ctx.dehash_addr(&ctx))
+-		goto out_err;
++		return -EINVAL;
+ 
+ 	if (addr_over_limit(&ctx))
+-		goto out_err;
++		return -EINVAL;
+ 
+ 	*sys_addr = ctx.ret_addr;
+ 	return 0;
+-
+-out_err:
+-	return -EINVAL;
+ }
+ 
+ static int get_channel_from_ecc_syndrome(struct mem_ctl_info *, u16);
+-- 
+2.33.1.711.g9d530dc002
+
+
+From caecde9ed1af599b336e5a3204b65947313ed145 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:46 +0000
+Subject: [PATCH 15/41] EDAC/amd64: Simplify function parameters
+
+Use a single address parameter for input and result to reduce the number
+of parameters.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 3f1ff5adc..496ca863f 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1371,14 +1371,14 @@ static int addr_over_limit(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
+-static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr)
++static int umc_normaddr_to_sysaddr(u64 *addr, u16 nid, u8 umc)
+ {
+ 	struct addr_ctx ctx;
+ 
+ 	memset(&ctx, 0, sizeof(ctx));
+ 
+ 	/* We start from the normalized address */
+-	ctx.ret_addr = norm_addr;
++	ctx.ret_addr = *addr;
+ 
+ 	ctx.nid = nid;
+ 	ctx.inst_id = umc;
+@@ -1407,7 +1407,7 @@ static int umc_normaddr_to_sysaddr(u64 norm_addr, u16 nid, u8 umc, u64 *sys_addr
+ 	if (addr_over_limit(&ctx))
+ 		return -EINVAL;
+ 
+-	*sys_addr = ctx.ret_addr;
++	*addr = ctx.ret_addr;
+ 	return 0;
+ }
+ 
+@@ -3314,7 +3314,7 @@ static void decode_umc_error(int node_id, struct mce *m)
+ 	struct mem_ctl_info *mci;
+ 	struct amd64_pvt *pvt;
+ 	struct err_info err;
+-	u64 sys_addr;
++	u64 sys_addr = m->addr;
+ 
+ 	mci = edac_mc_find(node_id);
+ 	if (!mci)
+@@ -3345,7 +3345,7 @@ static void decode_umc_error(int node_id, struct mce *m)
+ 
+ 	err.csrow = m->synd & 0x7;
+ 
+-	if (umc_normaddr_to_sysaddr(m->addr, pvt->mc_node_id, err.channel, &sys_addr)) {
++	if (umc_normaddr_to_sysaddr(&sys_addr, pvt->mc_node_id, err.channel)) {
+ 		err.err_code = ERR_NORM_ADDR;
+ 		goto log_error;
+ 	}
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 11f063ae836fcda7577e08fbc2c209bd3e73cff0 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:47 +0000
+Subject: [PATCH 16/41] EDAC/amd64: Define function to get Interleave Address
+ Bit
+
+Move code to find the interleave address bit into a separate helper
+function.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 496ca863f..233f8cec4 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1211,27 +1211,35 @@ static int get_dram_addr_map(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
++static int get_intlv_addr_bit(struct addr_ctx *ctx)
++{
++	u8 intlv_addr_sel = (ctx->reg_base_addr >> 8) & 0x7;
++
++	/* {0, 1, 2, 3} map to address bits {8, 9, 10, 11} respectively */
++	if (intlv_addr_sel > 3) {
++		pr_debug("Invalid interleave address select %d.\n", intlv_addr_sel);
++		return -EINVAL;
++	}
++
++	ctx->intlv_addr_bit = intlv_addr_sel + 8;
++
++	return 0;
++}
++
+ static int denormalize_addr(struct addr_ctx *ctx)
+ {
+ 	u32 tmp;
+ 
+ 	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+ 	u8 intlv_num_dies, intlv_num_chan, intlv_num_sockets;
+-	u8 intlv_addr_sel = (ctx->reg_base_addr >> 8) & 0x7;
+ 	u8 num_intlv_bits, cs_mask = 0;
+ 
+-	/* {0, 1, 2, 3} map to address bits {8, 9, 10, 11} respectively */
+-	if (intlv_addr_sel > 3) {
+-		pr_err("%s: Invalid interleave address select %d.\n",
+-			__func__, intlv_addr_sel);
++	if (get_intlv_addr_bit(ctx))
+ 		return -EINVAL;
+-	}
+ 
+ 	intlv_num_sockets = (ctx->reg_limit_addr >> 8) & 0x1;
+ 	intlv_num_dies	  = (ctx->reg_limit_addr >> 10) & 0x3;
+ 
+-	ctx->intlv_addr_bit = intlv_addr_sel + 8;
+-
+ 	/* Re-use intlv_num_chan by setting it equal to log2(#channels) */
+ 	switch (intlv_num_chan) {
+ 	case 0:	intlv_num_chan = 0; break;
+-- 
+2.33.1.711.g9d530dc002
+
+
+From d5f3755c3fbbb264b59c95c52a3c83970ab938d1 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:48 +0000
+Subject: [PATCH 17/41] EDAC/amd64: Skip denormalization if no interleaving
+
+Denormalization doesn't apply to the "no interleaving" mode, so return
+early without error in this case.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 233f8cec4..02dc34c13 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1234,6 +1234,10 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	u8 intlv_num_dies, intlv_num_chan, intlv_num_sockets;
+ 	u8 num_intlv_bits, cs_mask = 0;
+ 
++	/* Return early if no interleaving. */
++	if (ctx->intlv_mode == NONE)
++		return 0;
++
+ 	if (get_intlv_addr_bit(ctx))
+ 		return -EINVAL;
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 3cf23f15481bfc99e95076b2ae95b7ca988487a2 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:49 +0000
+Subject: [PATCH 18/41] EDAC/amd64: Define function to get number of
+ interleaved channels
+
+Move number of interleaved channel calculation to a separate helper
+function. Drop unused cases.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 42 +++++++++++++++++++++------------------
+ 1 file changed, 23 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 02dc34c13..80192a05b 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1097,6 +1097,7 @@ struct addr_ctx {
+ 	u8 inst_id;
+ 	u8 map_num;
+ 	u8 intlv_addr_bit;
++	u8 intlv_num_chan;
+ 	u8 cs_id;
+ 	int (*dehash_addr)(struct addr_ctx *ctx);
+ };
+@@ -1226,12 +1227,29 @@ static int get_intlv_addr_bit(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
++static void get_intlv_num_chan(struct addr_ctx *ctx)
++{
++	/* Save the log2(# of channels). */
++	switch (ctx->intlv_mode) {
++	case NONE:
++		ctx->intlv_num_chan = 0;
++		break;
++	case NOHASH_2CH:
++	case DF2_HASH_2CH:
++		ctx->intlv_num_chan = 1;
++		break;
++	default:
++		/* Valid interleaving modes where checked earlier. */
++		break;
++	}
++}
++
+ static int denormalize_addr(struct addr_ctx *ctx)
+ {
+ 	u32 tmp;
+ 
+ 	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+-	u8 intlv_num_dies, intlv_num_chan, intlv_num_sockets;
++	u8 intlv_num_dies, intlv_num_sockets;
+ 	u8 num_intlv_bits, cs_mask = 0;
+ 
+ 	/* Return early if no interleaving. */
+@@ -1244,23 +1262,9 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	intlv_num_sockets = (ctx->reg_limit_addr >> 8) & 0x1;
+ 	intlv_num_dies	  = (ctx->reg_limit_addr >> 10) & 0x3;
+ 
+-	/* Re-use intlv_num_chan by setting it equal to log2(#channels) */
+-	switch (intlv_num_chan) {
+-	case 0:	intlv_num_chan = 0; break;
+-	case 1: intlv_num_chan = 1; break;
+-	case 3: intlv_num_chan = 2; break;
+-	case 5:	intlv_num_chan = 3; break;
+-	case 7:	intlv_num_chan = 4; break;
+-
+-	case 8: intlv_num_chan = 1;
+-		break;
+-	default:
+-		pr_err("%s: Invalid number of interleaved channels %d.\n",
+-			__func__, intlv_num_chan);
+-		return -EINVAL;
+-	}
++	get_intlv_num_chan(ctx);
+ 
+-	num_intlv_bits = intlv_num_chan;
++	num_intlv_bits = ctx->intlv_num_chan;
+ 
+ 	if (intlv_num_dies > 2) {
+ 		pr_err("%s: Invalid number of interleaved nodes/dies %d.\n",
+@@ -1298,8 +1302,8 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 		die_id_bit   = 0;
+ 
+ 		/* If interleaved over more than 1 channel: */
+-		if (intlv_num_chan) {
+-			die_id_bit = intlv_num_chan;
++		if (ctx->intlv_num_chan) {
++			die_id_bit = ctx->intlv_num_chan;
+ 			cs_mask	   = (1 << die_id_bit) - 1;
+ 			ctx->cs_id = cs_fabric_id & cs_mask;
+ 		}
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 7f7523aa896e485313b7120ec78bd2077115578b Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:50 +0000
+Subject: [PATCH 19/41] EDAC/amd64: Define function to get number of
+ interleaved dies
+
+Move parsing of the number of interleaved dies to a separate helper
+function. This will be expanded for future DF versions. Also, drop an
+unneeded assert to match the reference code.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 27 ++++++++++++++-------------
+ 1 file changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 80192a05b..360fbecf0 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1098,6 +1098,7 @@ struct addr_ctx {
+ 	u8 map_num;
+ 	u8 intlv_addr_bit;
+ 	u8 intlv_num_chan;
++	u8 intlv_num_dies;
+ 	u8 cs_id;
+ 	int (*dehash_addr)(struct addr_ctx *ctx);
+ };
+@@ -1105,6 +1106,7 @@ struct addr_ctx {
+ struct data_fabric_ops {
+ 	u64 (*get_hi_addr_offset)(struct addr_ctx *ctx);
+ 	int (*get_intlv_mode)(struct addr_ctx *ctx);
++	void (*get_intlv_num_dies)(struct addr_ctx *ctx);
+ };
+ 
+ static u64 get_hi_addr_offset_df2(struct addr_ctx *ctx)
+@@ -1145,9 +1147,15 @@ static int get_intlv_mode_df2(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
++static void get_intlv_num_dies_df2(struct addr_ctx *ctx)
++{
++	ctx->intlv_num_dies  = (ctx->reg_limit_addr >> 10) & 0x3;
++}
++
+ struct data_fabric_ops df2_ops = {
+ 	.get_hi_addr_offset		=	&get_hi_addr_offset_df2,
+ 	.get_intlv_mode			=	&get_intlv_mode_df2,
++	.get_intlv_num_dies		=	&get_intlv_num_dies_df2,
+ };
+ 
+ struct data_fabric_ops *df_ops;
+@@ -1249,7 +1257,7 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	u32 tmp;
+ 
+ 	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+-	u8 intlv_num_dies, intlv_num_sockets;
++	u8 intlv_num_sockets;
+ 	u8 num_intlv_bits, cs_mask = 0;
+ 
+ 	/* Return early if no interleaving. */
+@@ -1260,19 +1268,12 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 		return -EINVAL;
+ 
+ 	intlv_num_sockets = (ctx->reg_limit_addr >> 8) & 0x1;
+-	intlv_num_dies	  = (ctx->reg_limit_addr >> 10) & 0x3;
+ 
+ 	get_intlv_num_chan(ctx);
++	df_ops->get_intlv_num_dies(ctx);
+ 
+ 	num_intlv_bits = ctx->intlv_num_chan;
+-
+-	if (intlv_num_dies > 2) {
+-		pr_err("%s: Invalid number of interleaved nodes/dies %d.\n",
+-			__func__, intlv_num_dies);
+-		return -EINVAL;
+-	}
+-
+-	num_intlv_bits += intlv_num_dies;
++	num_intlv_bits += ctx->intlv_num_dies;
+ 
+ 	/* Add a bit if sockets are interleaved. */
+ 	num_intlv_bits += intlv_num_sockets;
+@@ -1310,14 +1311,14 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 
+ 		sock_id_bit = die_id_bit;
+ 
+-		if (intlv_num_dies || intlv_num_sockets)
++		if (ctx->intlv_num_dies || intlv_num_sockets)
+ 			if (amd_df_indirect_read(ctx->nid, df_regs[SYS_FAB_ID_MASK],
+ 						 ctx->inst_id, &tmp))
+ 				return -EINVAL;
+ 
+ 		/* If interleaved over more than 1 die. */
+-		if (intlv_num_dies) {
+-			sock_id_bit  = die_id_bit + intlv_num_dies;
++		if (ctx->intlv_num_dies) {
++			sock_id_bit  = die_id_bit + ctx->intlv_num_dies;
+ 			die_id_shift = (tmp >> 24) & 0xF;
+ 			die_id_mask  = (tmp >> 8) & 0xFF;
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 494bd8fa2cb9564d41043bb2b10107bc6c472755 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:51 +0000
+Subject: [PATCH 20/41] EDAC/amd64: Define function to get number of
+ interleaved sockets
+
+Move parsing of the number of interleaved sockets to a separate helper
+function. This will be expanded for future DF versions.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 360fbecf0..09cdc0466 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1099,6 +1099,7 @@ struct addr_ctx {
+ 	u8 intlv_addr_bit;
+ 	u8 intlv_num_chan;
+ 	u8 intlv_num_dies;
++	u8 intlv_num_sockets;
+ 	u8 cs_id;
+ 	int (*dehash_addr)(struct addr_ctx *ctx);
+ };
+@@ -1107,6 +1108,7 @@ struct data_fabric_ops {
+ 	u64 (*get_hi_addr_offset)(struct addr_ctx *ctx);
+ 	int (*get_intlv_mode)(struct addr_ctx *ctx);
+ 	void (*get_intlv_num_dies)(struct addr_ctx *ctx);
++	void (*get_intlv_num_sockets)(struct addr_ctx *ctx);
+ };
+ 
+ static u64 get_hi_addr_offset_df2(struct addr_ctx *ctx)
+@@ -1152,10 +1154,16 @@ static void get_intlv_num_dies_df2(struct addr_ctx *ctx)
+ 	ctx->intlv_num_dies  = (ctx->reg_limit_addr >> 10) & 0x3;
+ }
+ 
++static void get_intlv_num_sockets_df2(struct addr_ctx *ctx)
++{
++	ctx->intlv_num_sockets = (ctx->reg_limit_addr >> 8) & 0x1;
++}
++
+ struct data_fabric_ops df2_ops = {
+ 	.get_hi_addr_offset		=	&get_hi_addr_offset_df2,
+ 	.get_intlv_mode			=	&get_intlv_mode_df2,
+ 	.get_intlv_num_dies		=	&get_intlv_num_dies_df2,
++	.get_intlv_num_sockets		=	&get_intlv_num_sockets_df2,
+ };
+ 
+ struct data_fabric_ops *df_ops;
+@@ -1257,7 +1265,6 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	u32 tmp;
+ 
+ 	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+-	u8 intlv_num_sockets;
+ 	u8 num_intlv_bits, cs_mask = 0;
+ 
+ 	/* Return early if no interleaving. */
+@@ -1267,16 +1274,13 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	if (get_intlv_addr_bit(ctx))
+ 		return -EINVAL;
+ 
+-	intlv_num_sockets = (ctx->reg_limit_addr >> 8) & 0x1;
+-
+ 	get_intlv_num_chan(ctx);
+ 	df_ops->get_intlv_num_dies(ctx);
++	df_ops->get_intlv_num_sockets(ctx);
+ 
+ 	num_intlv_bits = ctx->intlv_num_chan;
+ 	num_intlv_bits += ctx->intlv_num_dies;
+-
+-	/* Add a bit if sockets are interleaved. */
+-	num_intlv_bits += intlv_num_sockets;
++	num_intlv_bits += ctx->intlv_num_sockets;
+ 
+ 	/* Assert num_intlv_bits <= 4 */
+ 	if (num_intlv_bits > 4) {
+@@ -1311,7 +1315,7 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 
+ 		sock_id_bit = die_id_bit;
+ 
+-		if (ctx->intlv_num_dies || intlv_num_sockets)
++		if (ctx->intlv_num_dies || ctx->intlv_num_sockets)
+ 			if (amd_df_indirect_read(ctx->nid, df_regs[SYS_FAB_ID_MASK],
+ 						 ctx->inst_id, &tmp))
+ 				return -EINVAL;
+@@ -1327,7 +1331,7 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 		}
+ 
+ 		/* If interleaved over more than 1 socket. */
+-		if (intlv_num_sockets) {
++		if (ctx->intlv_num_sockets) {
+ 			socket_id_shift	= (tmp >> 28) & 0xF;
+ 			socket_id_mask	= (tmp >> 16) & 0xFF;
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 7f28996980d252124fa29202109a2ad08ae5b48d Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:52 +0000
+Subject: [PATCH 21/41] EDAC/amd64: Remove unnecessary assert
+
+It was removed in the reference code, so remove it here.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 7 -------
+ 1 file changed, 7 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 09cdc0466..e5c296b00 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1282,13 +1282,6 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	num_intlv_bits += ctx->intlv_num_dies;
+ 	num_intlv_bits += ctx->intlv_num_sockets;
+ 
+-	/* Assert num_intlv_bits <= 4 */
+-	if (num_intlv_bits > 4) {
+-		pr_err("%s: Invalid interleave bits %d.\n",
+-			__func__, num_intlv_bits);
+-		return -EINVAL;
+-	}
+-
+ 	if (num_intlv_bits > 0) {
+ 		u64 temp_addr_x, temp_addr_i, temp_addr_y;
+ 		u8 die_id_bit, sock_id_bit, cs_fabric_id;
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 317c87fc902f9fa9c0aa876439a004e5643c62e1 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:53 +0000
+Subject: [PATCH 22/41] EDAC/amd64: Define function to make space for CS ID
+
+Move code that makes a gap for the CS ID into a separate helper function.
+The exact bits to use vary based on interleaving mode. New interleaving
+modes in future DF versions will be added as new cases.
+
+Also, introduce a helper function that does the bit manipulation to make
+the gap. The current version of this function is "simple", and future
+interleaving modes may reuse this or use a more advanced function.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 37 +++++++++++++++++++++++++++++--------
+ 1 file changed, 29 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index e5c296b00..b497af7c3 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1102,6 +1102,7 @@ struct addr_ctx {
+ 	u8 intlv_num_sockets;
+ 	u8 cs_id;
+ 	int (*dehash_addr)(struct addr_ctx *ctx);
++	void (*make_space_for_cs_id)(struct addr_ctx *ctx);
+ };
+ 
+ struct data_fabric_ops {
+@@ -1111,6 +1112,29 @@ struct data_fabric_ops {
+ 	void (*get_intlv_num_sockets)(struct addr_ctx *ctx);
+ };
+ 
++static void expand_bits(u8 start_bit, u8 num_bits, u64 *value)
++{
++	u64 temp1, temp2;
++
++	if (start_bit == 0) {
++		*value <<= num_bits;
++		return;
++	}
++
++	temp1 = *value & GENMASK_ULL(start_bit - 1, 0);
++	temp2 = (*value & GENMASK_ULL(63, start_bit)) << num_bits;
++	*value = temp1 | temp2;
++}
++
++static void make_space_for_cs_id_simple(struct addr_ctx *ctx)
++{
++	u8 num_intlv_bits = ctx->intlv_num_chan;
++
++	num_intlv_bits += ctx->intlv_num_dies;
++	num_intlv_bits += ctx->intlv_num_sockets;
++	expand_bits(ctx->intlv_addr_bit, num_intlv_bits, &ctx->ret_addr);
++}
++
+ static u64 get_hi_addr_offset_df2(struct addr_ctx *ctx)
+ {
+ 	return (ctx->reg_dram_offset & GENMASK_ULL(31, 20)) << 8;
+@@ -1141,6 +1165,8 @@ static int get_intlv_mode_df2(struct addr_ctx *ctx)
+ 		ctx->dehash_addr = &dehash_addr_df2;
+ 	}
+ 
++	ctx->make_space_for_cs_id = &make_space_for_cs_id_simple;
++
+ 	if (ctx->intlv_mode != NONE &&
+ 	    ctx->intlv_mode != NOHASH_2CH &&
+ 	    ctx->intlv_mode != DF2_HASH_2CH)
+@@ -1278,13 +1304,11 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	df_ops->get_intlv_num_dies(ctx);
+ 	df_ops->get_intlv_num_sockets(ctx);
+ 
+-	num_intlv_bits = ctx->intlv_num_chan;
+-	num_intlv_bits += ctx->intlv_num_dies;
+-	num_intlv_bits += ctx->intlv_num_sockets;
++	ctx->make_space_for_cs_id(ctx);
+ 
+ 	if (num_intlv_bits > 0) {
+-		u64 temp_addr_x, temp_addr_i, temp_addr_y;
+ 		u8 die_id_bit, sock_id_bit, cs_fabric_id;
++		u64 temp_addr_i;
+ 
+ 		/*
+ 		 * Read FabricBlockInstanceInformation3_CS[BlockFabricID].
+@@ -1340,11 +1364,8 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 		 * bits there are. "intlv_addr_bit" tells us how many "Y" bits
+ 		 * there are (where "I" starts).
+ 		 */
+-		temp_addr_y = ctx->ret_addr & GENMASK_ULL(ctx->intlv_addr_bit - 1, 0);
+ 		temp_addr_i = (ctx->cs_id << ctx->intlv_addr_bit);
+-		temp_addr_x = (ctx->ret_addr & GENMASK_ULL(63, ctx->intlv_addr_bit))
+-			       << num_intlv_bits;
+-		ctx->ret_addr    = temp_addr_x | temp_addr_i | temp_addr_y;
++		ctx->ret_addr |= temp_addr_i;
+ 	}
+ 
+ 	return 0;
+-- 
+2.33.1.711.g9d530dc002
+
+
+From e98912410f0253a7578f620ba75ff3479f4649de Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:54 +0000
+Subject: [PATCH 23/41] EDAC/amd64: Define function to calculate CS ID
+
+Move code used to calculate the CS ID into a separate helper function.
+
+Drop redundant code comment about reading DF register.
+
+The "num_intlv_bits" variable is left uninitialized as it will be removed
+in a later patch.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 98 +++++++++++++++++++--------------------
+ 1 file changed, 48 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index b497af7c3..0270bf4f1 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1286,12 +1286,54 @@ static void get_intlv_num_chan(struct addr_ctx *ctx)
+ 	}
+ }
+ 
+-static int denormalize_addr(struct addr_ctx *ctx)
++static int calculate_cs_id(struct addr_ctx *ctx)
+ {
++	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
++	u8 die_id_bit, sock_id_bit, cs_fabric_id, cs_mask = 0;
+ 	u32 tmp;
+ 
+-	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+-	u8 num_intlv_bits, cs_mask = 0;
++	if (amd_df_indirect_read(ctx->nid, df_regs[FAB_BLK_INST_INFO_3], ctx->inst_id, &tmp))
++		return -EINVAL;
++
++	cs_fabric_id = (tmp >> 8) & 0xFF;
++	die_id_bit   = 0;
++
++	/* If interleaved over more than 1 channel: */
++	if (ctx->intlv_num_chan) {
++		die_id_bit = ctx->intlv_num_chan;
++		cs_mask	   = (1 << die_id_bit) - 1;
++		ctx->cs_id = cs_fabric_id & cs_mask;
++	}
++
++	sock_id_bit = die_id_bit;
++
++	if (ctx->intlv_num_dies || ctx->intlv_num_sockets)
++		if (amd_df_indirect_read(ctx->nid, df_regs[SYS_FAB_ID_MASK], ctx->inst_id, &tmp))
++			return -EINVAL;
++
++	/* If interleaved over more than 1 die: */
++	if (ctx->intlv_num_dies) {
++		sock_id_bit  = die_id_bit + ctx->intlv_num_dies;
++		die_id_shift = (tmp >> 24) & 0xF;
++		die_id_mask  = (tmp >> 8) & 0xFF;
++
++		ctx->cs_id |= ((cs_fabric_id & die_id_mask) >> die_id_shift) << die_id_bit;
++	}
++
++	/* If interleaved over more than 1 socket: */
++	if (ctx->intlv_num_sockets) {
++		socket_id_shift	= (tmp >> 28) & 0xF;
++		socket_id_mask	= (tmp >> 16) & 0xFF;
++
++		ctx->cs_id |= ((cs_fabric_id & socket_id_mask) >> socket_id_shift) << sock_id_bit;
++	}
++
++	return 0;
++}
++
++static int denormalize_addr(struct addr_ctx *ctx)
++{
++	u8 num_intlv_bits;
+ 
+ 	/* Return early if no interleaving. */
+ 	if (ctx->intlv_mode == NONE)
+@@ -1306,56 +1348,12 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 
+ 	ctx->make_space_for_cs_id(ctx);
+ 
++	if (calculate_cs_id(ctx))
++		return -EINVAL;
++
+ 	if (num_intlv_bits > 0) {
+-		u8 die_id_bit, sock_id_bit, cs_fabric_id;
+ 		u64 temp_addr_i;
+ 
+-		/*
+-		 * Read FabricBlockInstanceInformation3_CS[BlockFabricID].
+-		 * This is the fabric id for this coherent slave. Use
+-		 * umc/channel# as instance id of the coherent slave
+-		 * for FICAA.
+-		 */
+-		if (amd_df_indirect_read(ctx->nid, df_regs[FAB_BLK_INST_INFO_3],
+-					 ctx->inst_id, &tmp))
+-			return -EINVAL;
+-
+-		cs_fabric_id = (tmp >> 8) & 0xFF;
+-		die_id_bit   = 0;
+-
+-		/* If interleaved over more than 1 channel: */
+-		if (ctx->intlv_num_chan) {
+-			die_id_bit = ctx->intlv_num_chan;
+-			cs_mask	   = (1 << die_id_bit) - 1;
+-			ctx->cs_id = cs_fabric_id & cs_mask;
+-		}
+-
+-		sock_id_bit = die_id_bit;
+-
+-		if (ctx->intlv_num_dies || ctx->intlv_num_sockets)
+-			if (amd_df_indirect_read(ctx->nid, df_regs[SYS_FAB_ID_MASK],
+-						 ctx->inst_id, &tmp))
+-				return -EINVAL;
+-
+-		/* If interleaved over more than 1 die. */
+-		if (ctx->intlv_num_dies) {
+-			sock_id_bit  = die_id_bit + ctx->intlv_num_dies;
+-			die_id_shift = (tmp >> 24) & 0xF;
+-			die_id_mask  = (tmp >> 8) & 0xFF;
+-
+-			ctx->cs_id |= ((cs_fabric_id & die_id_mask)
+-					>> die_id_shift) << die_id_bit;
+-		}
+-
+-		/* If interleaved over more than 1 socket. */
+-		if (ctx->intlv_num_sockets) {
+-			socket_id_shift	= (tmp >> 28) & 0xF;
+-			socket_id_mask	= (tmp >> 16) & 0xFF;
+-
+-			ctx->cs_id |= ((cs_fabric_id & socket_id_mask)
+-					>> socket_id_shift) << sock_id_bit;
+-		}
+-
+ 		/*
+ 		 * The pre-interleaved address consists of XXXXXXIIIYYYYY
+ 		 * where III is the ID for this CS, and XXXXXXYYYYY are the
+-- 
+2.33.1.711.g9d530dc002
+
+
+From e9e000f00cb1f1a809a1814856057d80ee841076 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:55 +0000
+Subject: [PATCH 24/41] EDAC/amd64: Define function to insert CS ID into
+ address
+
+Move the code that inserts the CS ID into the address into a separate
+helper function. This will be expanded for future DF versions.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 24 ++++++++----------------
+ 1 file changed, 8 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 0270bf4f1..d09a17747 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1103,6 +1103,7 @@ struct addr_ctx {
+ 	u8 cs_id;
+ 	int (*dehash_addr)(struct addr_ctx *ctx);
+ 	void (*make_space_for_cs_id)(struct addr_ctx *ctx);
++	void (*insert_cs_id)(struct addr_ctx *ctx);
+ };
+ 
+ struct data_fabric_ops {
+@@ -1135,6 +1136,11 @@ static void make_space_for_cs_id_simple(struct addr_ctx *ctx)
+ 	expand_bits(ctx->intlv_addr_bit, num_intlv_bits, &ctx->ret_addr);
+ }
+ 
++static void insert_cs_id_simple(struct addr_ctx *ctx)
++{
++	ctx->ret_addr |= (ctx->cs_id << ctx->intlv_addr_bit);
++}
++
+ static u64 get_hi_addr_offset_df2(struct addr_ctx *ctx)
+ {
+ 	return (ctx->reg_dram_offset & GENMASK_ULL(31, 20)) << 8;
+@@ -1166,6 +1172,7 @@ static int get_intlv_mode_df2(struct addr_ctx *ctx)
+ 	}
+ 
+ 	ctx->make_space_for_cs_id = &make_space_for_cs_id_simple;
++	ctx->insert_cs_id = &insert_cs_id_simple;
+ 
+ 	if (ctx->intlv_mode != NONE &&
+ 	    ctx->intlv_mode != NOHASH_2CH &&
+@@ -1333,8 +1340,6 @@ static int calculate_cs_id(struct addr_ctx *ctx)
+ 
+ static int denormalize_addr(struct addr_ctx *ctx)
+ {
+-	u8 num_intlv_bits;
+-
+ 	/* Return early if no interleaving. */
+ 	if (ctx->intlv_mode == NONE)
+ 		return 0;
+@@ -1351,20 +1356,7 @@ static int denormalize_addr(struct addr_ctx *ctx)
+ 	if (calculate_cs_id(ctx))
+ 		return -EINVAL;
+ 
+-	if (num_intlv_bits > 0) {
+-		u64 temp_addr_i;
+-
+-		/*
+-		 * The pre-interleaved address consists of XXXXXXIIIYYYYY
+-		 * where III is the ID for this CS, and XXXXXXYYYYY are the
+-		 * address bits from the post-interleaved address.
+-		 * "num_intlv_bits" has been calculated to tell us how many "I"
+-		 * bits there are. "intlv_addr_bit" tells us how many "Y" bits
+-		 * there are (where "I" starts).
+-		 */
+-		temp_addr_i = (ctx->cs_id << ctx->intlv_addr_bit);
+-		ctx->ret_addr |= temp_addr_i;
+-	}
++	ctx->insert_cs_id(ctx);
+ 
+ 	return 0;
+ }
+-- 
+2.33.1.711.g9d530dc002
+
+
+From de22b2dc31dda67cc35d0f5ab88297efc90e0691 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:56 +0000
+Subject: [PATCH 25/41] EDAC/amd64: Define function to get CS Fabric ID
+
+Move code that gets the CS Fabric ID into a separate helper function.
+This will be expanded for future DF versions.
+
+The bitfield used for this value may be larger than the 8 bits currently
+used. So make it a u16 type which is large enough to hold all known
+sizes of this bitfield across DF versions.
+
+Also, call this function early as future DF versions may need the value
+early.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 31 +++++++++++++++++++++++--------
+ 1 file changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index d09a17747..f5ac3b633 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1093,6 +1093,7 @@ struct addr_ctx {
+ 	u32 reg_dram_offset;
+ 	u32 reg_base_addr;
+ 	u32 reg_limit_addr;
++	u16 cs_fabric_id;
+ 	u16 nid;
+ 	u8 inst_id;
+ 	u8 map_num;
+@@ -1109,6 +1110,7 @@ struct addr_ctx {
+ struct data_fabric_ops {
+ 	u64 (*get_hi_addr_offset)(struct addr_ctx *ctx);
+ 	int (*get_intlv_mode)(struct addr_ctx *ctx);
++	int (*get_cs_fabric_id)(struct addr_ctx *ctx);
+ 	void (*get_intlv_num_dies)(struct addr_ctx *ctx);
+ 	void (*get_intlv_num_sockets)(struct addr_ctx *ctx);
+ };
+@@ -1192,11 +1194,24 @@ static void get_intlv_num_sockets_df2(struct addr_ctx *ctx)
+ 	ctx->intlv_num_sockets = (ctx->reg_limit_addr >> 8) & 0x1;
+ }
+ 
++static int get_cs_fabric_id_df2(struct addr_ctx *ctx)
++{
++	u32 tmp;
++
++	if (amd_df_indirect_read(ctx->nid, df_regs[FAB_BLK_INST_INFO_3], ctx->inst_id, &tmp))
++		return -EINVAL;
++
++	ctx->cs_fabric_id = (tmp >> 8) & 0xFF;
++
++	return 0;
++}
++
+ struct data_fabric_ops df2_ops = {
+ 	.get_hi_addr_offset		=	&get_hi_addr_offset_df2,
+ 	.get_intlv_mode			=	&get_intlv_mode_df2,
+ 	.get_intlv_num_dies		=	&get_intlv_num_dies_df2,
+ 	.get_intlv_num_sockets		=	&get_intlv_num_sockets_df2,
++	.get_cs_fabric_id		=	&get_cs_fabric_id_df2,
+ };
+ 
+ struct data_fabric_ops *df_ops;
+@@ -1296,20 +1311,16 @@ static void get_intlv_num_chan(struct addr_ctx *ctx)
+ static int calculate_cs_id(struct addr_ctx *ctx)
+ {
+ 	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+-	u8 die_id_bit, sock_id_bit, cs_fabric_id, cs_mask = 0;
++	u8 die_id_bit, sock_id_bit, cs_mask = 0;
+ 	u32 tmp;
+ 
+-	if (amd_df_indirect_read(ctx->nid, df_regs[FAB_BLK_INST_INFO_3], ctx->inst_id, &tmp))
+-		return -EINVAL;
+-
+-	cs_fabric_id = (tmp >> 8) & 0xFF;
+ 	die_id_bit   = 0;
+ 
+ 	/* If interleaved over more than 1 channel: */
+ 	if (ctx->intlv_num_chan) {
+ 		die_id_bit = ctx->intlv_num_chan;
+ 		cs_mask	   = (1 << die_id_bit) - 1;
+-		ctx->cs_id = cs_fabric_id & cs_mask;
++		ctx->cs_id = ctx->cs_fabric_id & cs_mask;
+ 	}
+ 
+ 	sock_id_bit = die_id_bit;
+@@ -1324,7 +1335,7 @@ static int calculate_cs_id(struct addr_ctx *ctx)
+ 		die_id_shift = (tmp >> 24) & 0xF;
+ 		die_id_mask  = (tmp >> 8) & 0xFF;
+ 
+-		ctx->cs_id |= ((cs_fabric_id & die_id_mask) >> die_id_shift) << die_id_bit;
++		ctx->cs_id |= ((ctx->cs_fabric_id & die_id_mask) >> die_id_shift) << die_id_bit;
+ 	}
+ 
+ 	/* If interleaved over more than 1 socket: */
+@@ -1332,7 +1343,8 @@ static int calculate_cs_id(struct addr_ctx *ctx)
+ 		socket_id_shift	= (tmp >> 28) & 0xF;
+ 		socket_id_mask	= (tmp >> 16) & 0xFF;
+ 
+-		ctx->cs_id |= ((cs_fabric_id & socket_id_mask) >> socket_id_shift) << sock_id_bit;
++		ctx->cs_id |= ((ctx->cs_fabric_id & socket_id_mask)
++				>> socket_id_shift) << sock_id_bit;
+ 	}
+ 
+ 	return 0;
+@@ -1411,6 +1423,9 @@ static int umc_normaddr_to_sysaddr(u64 *addr, u16 nid, u8 umc)
+ 	if (set_df_ops(&ctx))
+ 		return -EINVAL;
+ 
++	if (df_ops->get_cs_fabric_id(&ctx))
++		return -EINVAL;
++
+ 	if (remove_dram_offset(&ctx))
+ 		return -EINVAL;
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From f9986d041c62019c68678470cb9c8c5d012e898a Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:57 +0000
+Subject: [PATCH 26/41] EDAC/amd64: Define function to find shift and mask
+ values
+
+Move code to find the shift and mask values used in die and socket
+interleaving into separate helper functions. These will be expanded for
+future DF versions. Make the die_id_mask and socket_id_mask values u16
+type to accommodate larger bitfields in future DF versions.
+
+Also, move reading of the System Fabric ID Mask register into
+set_df_ops(). This will be expanded for future DF versions and will be
+used to determine DF version levels.
+
+And call this function early since future DF versions may need these
+values early.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 61 +++++++++++++++++++++++++++++----------
+ 1 file changed, 45 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index f5ac3b633..fa8046e2b 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1093,7 +1093,10 @@ struct addr_ctx {
+ 	u32 reg_dram_offset;
+ 	u32 reg_base_addr;
+ 	u32 reg_limit_addr;
++	u32 reg_fab_id_mask0;
+ 	u16 cs_fabric_id;
++	u16 die_id_mask;
++	u16 socket_id_mask;
+ 	u16 nid;
+ 	u8 inst_id;
+ 	u8 map_num;
+@@ -1109,8 +1112,11 @@ struct addr_ctx {
+ 
+ struct data_fabric_ops {
+ 	u64 (*get_hi_addr_offset)(struct addr_ctx *ctx);
++	u8 (*get_die_id_shift)(struct addr_ctx *ctx);
++	u8 (*get_socket_id_shift)(struct addr_ctx *ctx);
+ 	int (*get_intlv_mode)(struct addr_ctx *ctx);
+ 	int (*get_cs_fabric_id)(struct addr_ctx *ctx);
++	int (*get_masks)(struct addr_ctx *ctx);
+ 	void (*get_intlv_num_dies)(struct addr_ctx *ctx);
+ 	void (*get_intlv_num_sockets)(struct addr_ctx *ctx);
+ };
+@@ -1206,18 +1212,43 @@ static int get_cs_fabric_id_df2(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
++static int get_masks_df2(struct addr_ctx *ctx)
++{
++	ctx->die_id_mask    = (ctx->reg_fab_id_mask0 >> 8) & 0xFF;
++	ctx->socket_id_mask = (ctx->reg_fab_id_mask0 >> 16) & 0xFF;
++
++	return 0;
++}
++
++static u8 get_die_id_shift_df2(struct addr_ctx *ctx)
++{
++	return (ctx->reg_fab_id_mask0 >> 24) & 0xF;
++}
++
++static u8 get_socket_id_shift_df2(struct addr_ctx *ctx)
++{
++	return (ctx->reg_fab_id_mask0 >> 28) & 0xF;
++}
++
+ struct data_fabric_ops df2_ops = {
+ 	.get_hi_addr_offset		=	&get_hi_addr_offset_df2,
+ 	.get_intlv_mode			=	&get_intlv_mode_df2,
+ 	.get_intlv_num_dies		=	&get_intlv_num_dies_df2,
+ 	.get_intlv_num_sockets		=	&get_intlv_num_sockets_df2,
+ 	.get_cs_fabric_id		=	&get_cs_fabric_id_df2,
++	.get_masks			=	&get_masks_df2,
++	.get_die_id_shift		=	&get_die_id_shift_df2,
++	.get_socket_id_shift		=	&get_socket_id_shift_df2,
+ };
+ 
+ struct data_fabric_ops *df_ops;
+ 
+ static int set_df_ops(struct addr_ctx *ctx)
+ {
++	if (amd_df_indirect_read(0, df_regs[SYS_FAB_ID_MASK],
++				 DF_BROADCAST, &ctx->reg_fab_id_mask0))
++		return -EINVAL;
++
+ 	df_ops = &df2_ops;
+ 
+ 	return 0;
+@@ -1310,11 +1341,7 @@ static void get_intlv_num_chan(struct addr_ctx *ctx)
+ 
+ static int calculate_cs_id(struct addr_ctx *ctx)
+ {
+-	u8 die_id_shift, die_id_mask, socket_id_shift, socket_id_mask;
+-	u8 die_id_bit, sock_id_bit, cs_mask = 0;
+-	u32 tmp;
+-
+-	die_id_bit   = 0;
++	u8 die_id_bit = 0, sock_id_bit, cs_mask = 0;
+ 
+ 	/* If interleaved over more than 1 channel: */
+ 	if (ctx->intlv_num_chan) {
+@@ -1323,27 +1350,26 @@ static int calculate_cs_id(struct addr_ctx *ctx)
+ 		ctx->cs_id = ctx->cs_fabric_id & cs_mask;
+ 	}
+ 
+-	sock_id_bit = die_id_bit;
++	/* Return early if no die interleaving and no socket interleaving. */
++	if (!(ctx->intlv_num_dies || ctx->intlv_num_sockets))
++		return 0;
+ 
+-	if (ctx->intlv_num_dies || ctx->intlv_num_sockets)
+-		if (amd_df_indirect_read(ctx->nid, df_regs[SYS_FAB_ID_MASK], ctx->inst_id, &tmp))
+-			return -EINVAL;
++	sock_id_bit = die_id_bit;
+ 
+ 	/* If interleaved over more than 1 die: */
+ 	if (ctx->intlv_num_dies) {
+-		sock_id_bit  = die_id_bit + ctx->intlv_num_dies;
+-		die_id_shift = (tmp >> 24) & 0xF;
+-		die_id_mask  = (tmp >> 8) & 0xFF;
++		u8 die_id_shift = df_ops->get_die_id_shift(ctx);
+ 
+-		ctx->cs_id |= ((ctx->cs_fabric_id & die_id_mask) >> die_id_shift) << die_id_bit;
++		sock_id_bit  = die_id_bit + ctx->intlv_num_dies;
++		ctx->cs_id |= ((ctx->cs_fabric_id & ctx->die_id_mask)
++				>> die_id_shift) << die_id_bit;
+ 	}
+ 
+ 	/* If interleaved over more than 1 socket: */
+ 	if (ctx->intlv_num_sockets) {
+-		socket_id_shift	= (tmp >> 28) & 0xF;
+-		socket_id_mask	= (tmp >> 16) & 0xFF;
++		u8 socket_id_shift = df_ops->get_socket_id_shift(ctx);
+ 
+-		ctx->cs_id |= ((ctx->cs_fabric_id & socket_id_mask)
++		ctx->cs_id |= ((ctx->cs_fabric_id & ctx->socket_id_mask)
+ 				>> socket_id_shift) << sock_id_bit;
+ 	}
+ 
+@@ -1423,6 +1449,9 @@ static int umc_normaddr_to_sysaddr(u64 *addr, u16 nid, u8 umc)
+ 	if (set_df_ops(&ctx))
+ 		return -EINVAL;
+ 
++	if (df_ops->get_masks(&ctx))
++		return -EINVAL;
++
+ 	if (df_ops->get_cs_fabric_id(&ctx))
+ 		return -EINVAL;
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From ac9ade97806f232553f71b10930a0cd1101e844c Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:58 +0000
+Subject: [PATCH 27/41] EDAC/amd64: Update CS ID calculation to match reference
+ code
+
+Redo the current CS ID calculations to match the reference code. Helper
+functions are introduced that will be expanded for future DF versions.
+
+Use u16 type for dst_fabric_id and component_id_mask values to
+accommodate larger bitfields in future DF versions.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 52 ++++++++++++++++++++++++++-------------
+ 1 file changed, 35 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index fa8046e2b..fc2cd288d 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1112,6 +1112,8 @@ struct addr_ctx {
+ 
+ struct data_fabric_ops {
+ 	u64 (*get_hi_addr_offset)(struct addr_ctx *ctx);
++	u16 (*get_dst_fabric_id)(struct addr_ctx *ctx);
++	u16 (*get_component_id_mask)(struct addr_ctx *ctx);
+ 	u8 (*get_die_id_shift)(struct addr_ctx *ctx);
+ 	u8 (*get_socket_id_shift)(struct addr_ctx *ctx);
+ 	int (*get_intlv_mode)(struct addr_ctx *ctx);
+@@ -1230,6 +1232,16 @@ static u8 get_socket_id_shift_df2(struct addr_ctx *ctx)
+ 	return (ctx->reg_fab_id_mask0 >> 28) & 0xF;
+ }
+ 
++static u16 get_dst_fabric_id_df2(struct addr_ctx *ctx)
++{
++	return ctx->reg_limit_addr & 0xFF;
++}
++
++static u16 get_component_id_mask_df2(struct addr_ctx *ctx)
++{
++	return (~(ctx->socket_id_mask | ctx->die_id_mask)) & 0xFF;
++}
++
+ struct data_fabric_ops df2_ops = {
+ 	.get_hi_addr_offset		=	&get_hi_addr_offset_df2,
+ 	.get_intlv_mode			=	&get_intlv_mode_df2,
+@@ -1239,6 +1251,8 @@ struct data_fabric_ops df2_ops = {
+ 	.get_masks			=	&get_masks_df2,
+ 	.get_die_id_shift		=	&get_die_id_shift_df2,
+ 	.get_socket_id_shift		=	&get_socket_id_shift_df2,
++	.get_dst_fabric_id		=	&get_dst_fabric_id_df2,
++	.get_component_id_mask		=	&get_component_id_mask_df2,
+ };
+ 
+ struct data_fabric_ops *df_ops;
+@@ -1339,38 +1353,42 @@ static void get_intlv_num_chan(struct addr_ctx *ctx)
+ 	}
+ }
+ 
+-static int calculate_cs_id(struct addr_ctx *ctx)
++static u8 calc_level_bits(u8 id, u8 level_mask, u8 shift, u8 mask, u8 num_bits)
+ {
+-	u8 die_id_bit = 0, sock_id_bit, cs_mask = 0;
++	return (((id & level_mask) >> shift) & mask) << num_bits;
++}
+ 
+-	/* If interleaved over more than 1 channel: */
+-	if (ctx->intlv_num_chan) {
+-		die_id_bit = ctx->intlv_num_chan;
+-		cs_mask	   = (1 << die_id_bit) - 1;
+-		ctx->cs_id = ctx->cs_fabric_id & cs_mask;
+-	}
++static int calculate_cs_id(struct addr_ctx *ctx)
++{
++	u16 dst_fabric_id = df_ops->get_dst_fabric_id(ctx);
++	u16 mask, num_intlv_bits = ctx->intlv_num_chan;
+ 
+-	/* Return early if no die interleaving and no socket interleaving. */
+-	if (!(ctx->intlv_num_dies || ctx->intlv_num_sockets))
+-		return 0;
++	mask = df_ops->get_component_id_mask(ctx);
++	ctx->cs_id = (ctx->cs_fabric_id & mask) - (dst_fabric_id & mask);
+ 
+-	sock_id_bit = die_id_bit;
++	mask = (1 << num_intlv_bits) - 1;
++	ctx->cs_id &= mask;
+ 
+ 	/* If interleaved over more than 1 die: */
+ 	if (ctx->intlv_num_dies) {
+ 		u8 die_id_shift = df_ops->get_die_id_shift(ctx);
+ 
+-		sock_id_bit  = die_id_bit + ctx->intlv_num_dies;
+-		ctx->cs_id |= ((ctx->cs_fabric_id & ctx->die_id_mask)
+-				>> die_id_shift) << die_id_bit;
++		mask = (1 << ctx->intlv_num_dies) - 1;
++
++		ctx->cs_id |= calc_level_bits(ctx->cs_fabric_id, ctx->die_id_mask,
++					      die_id_shift, mask, num_intlv_bits);
++
++		num_intlv_bits += ctx->intlv_num_dies;
+ 	}
+ 
+ 	/* If interleaved over more than 1 socket: */
+ 	if (ctx->intlv_num_sockets) {
+ 		u8 socket_id_shift = df_ops->get_socket_id_shift(ctx);
+ 
+-		ctx->cs_id |= ((ctx->cs_fabric_id & ctx->socket_id_mask)
+-				>> socket_id_shift) << sock_id_bit;
++		mask = (1 << ctx->intlv_num_sockets) - 1;
++
++		ctx->cs_id |= calc_level_bits(ctx->cs_fabric_id, ctx->socket_id_mask,
++					      socket_id_shift, mask, num_intlv_bits);
+ 	}
+ 
+ 	return 0;
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 049da4de68eb5c8e7dc8a72308ec6d00cc2ca045 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:19:59 +0000
+Subject: [PATCH 28/41] EDAC/amd64: Match hash function to reference code
+
+The reference code for DF2 hashing was changed to XOR the interleave
+address bit rather than the CS ID. Match that here.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index fc2cd288d..7ba6aa97e 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1162,7 +1162,7 @@ static int dehash_addr_df2(struct addr_ctx *ctx)
+ 			(ctx->ret_addr >> 18) ^
+ 			(ctx->ret_addr >> 21) ^
+ 			(ctx->ret_addr >> 30) ^
+-			ctx->cs_id;
++			(ctx->ret_addr >> ctx->intlv_addr_bit);
+ 
+ 	hashed_bit &= BIT(0);
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 9c0c87e7fd5a2baf467d903f306f10778b077aa4 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:20:00 +0000
+Subject: [PATCH 29/41] EDAC/amd64: Define helper function to get interleave
+ address select bit
+
+...this will be expanded for future Data Fabric versions.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 7ba6aa97e..aa8b8d0b3 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1116,6 +1116,7 @@ struct data_fabric_ops {
+ 	u16 (*get_component_id_mask)(struct addr_ctx *ctx);
+ 	u8 (*get_die_id_shift)(struct addr_ctx *ctx);
+ 	u8 (*get_socket_id_shift)(struct addr_ctx *ctx);
++	u8 (*get_intlv_addr_sel)(struct addr_ctx *ctx);
+ 	int (*get_intlv_mode)(struct addr_ctx *ctx);
+ 	int (*get_cs_fabric_id)(struct addr_ctx *ctx);
+ 	int (*get_masks)(struct addr_ctx *ctx);
+@@ -1192,6 +1193,11 @@ static int get_intlv_mode_df2(struct addr_ctx *ctx)
+ 	return 0;
+ }
+ 
++static u8 get_intlv_addr_sel_df2(struct addr_ctx *ctx)
++{
++	return (ctx->reg_base_addr >> 8) & 0x7;
++}
++
+ static void get_intlv_num_dies_df2(struct addr_ctx *ctx)
+ {
+ 	ctx->intlv_num_dies  = (ctx->reg_limit_addr >> 10) & 0x3;
+@@ -1245,6 +1251,7 @@ static u16 get_component_id_mask_df2(struct addr_ctx *ctx)
+ struct data_fabric_ops df2_ops = {
+ 	.get_hi_addr_offset		=	&get_hi_addr_offset_df2,
+ 	.get_intlv_mode			=	&get_intlv_mode_df2,
++	.get_intlv_addr_sel		=	&get_intlv_addr_sel_df2,
+ 	.get_intlv_num_dies		=	&get_intlv_num_dies_df2,
+ 	.get_intlv_num_sockets		=	&get_intlv_num_sockets_df2,
+ 	.get_cs_fabric_id		=	&get_cs_fabric_id_df2,
+@@ -1323,7 +1330,7 @@ static int get_dram_addr_map(struct addr_ctx *ctx)
+ 
+ static int get_intlv_addr_bit(struct addr_ctx *ctx)
+ {
+-	u8 intlv_addr_sel = (ctx->reg_base_addr >> 8) & 0x7;
++	u8 intlv_addr_sel = df_ops->get_intlv_addr_sel(ctx);
+ 
+ 	/* {0, 1, 2, 3} map to address bits {8, 9, 10, 11} respectively */
+ 	if (intlv_addr_sel > 3) {
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 2fc766f66c7665b82c76391c7ee9a8a0572f5e9c Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:20:01 +0000
+Subject: [PATCH 30/41] EDAC/amd64: Add support for address translation on DF3
+ systems
+
+DF3-based systems (Rome and later) support new interleaving modes and a
+number of bit fields have changed or moved entirely. Add support for
+these new modes and fields.
+
+Refactoring should be minimal due to earlier changes, and most updates
+will be additions.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 189 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 187 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index aa8b8d0b3..882ac3fbc 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1059,9 +1059,11 @@ enum df_reg_names {
+ 	DRAM_BASE_ADDR,
+ 	DRAM_LIMIT_ADDR,
+ 	DRAM_OFFSET,
++	DF_GLOBAL_CTL,
+ 
+ 	/* Function 1 */
+ 	SYS_FAB_ID_MASK,
++	SYS_FAB_ID_MASK_1,
+ };
+ 
+ static struct df_reg df_regs[] = {
+@@ -1075,14 +1077,23 @@ static struct df_reg df_regs[] = {
+ 	[DRAM_LIMIT_ADDR]	=	{0, 0x114},
+ 	/* D18F0x1B4 (DramOffset) */
+ 	[DRAM_OFFSET]		=	{0, 0x1B4},
++	/* D18F0x3F8 (DfGlobalCtrl) */
++	[DF_GLOBAL_CTL]		=	{0, 0x3F8},
+ 	/* D18F1x208 (SystemFabricIdMask) */
+ 	[SYS_FAB_ID_MASK]	=	{1, 0x208},
++	/* D18F1x20C (SystemFabricIdMask1) */
++	[SYS_FAB_ID_MASK_1]	=	{1, 0x20C},
+ };
+ 
+ /* These are mapped 1:1 to the hardware values. Special cases are set at > 0x20. */
+ enum intlv_modes {
+ 	NONE		= 0x00,
+ 	NOHASH_2CH	= 0x01,
++	NOHASH_4CH	= 0x03,
++	NOHASH_8CH	= 0x05,
++	HASH_COD4_2CH	= 0x0C,
++	HASH_COD2_4CH	= 0x0D,
++	HASH_COD1_8CH	= 0x0E,
+ 	DF2_HASH_2CH	= 0x21,
+ };
+ 
+@@ -1094,6 +1105,7 @@ struct addr_ctx {
+ 	u32 reg_base_addr;
+ 	u32 reg_limit_addr;
+ 	u32 reg_fab_id_mask0;
++	u32 reg_fab_id_mask1;
+ 	u16 cs_fabric_id;
+ 	u16 die_id_mask;
+ 	u16 socket_id_mask;
+@@ -1105,6 +1117,7 @@ struct addr_ctx {
+ 	u8 intlv_num_dies;
+ 	u8 intlv_num_sockets;
+ 	u8 cs_id;
++	u8 node_id_shift;
+ 	int (*dehash_addr)(struct addr_ctx *ctx);
+ 	void (*make_space_for_cs_id)(struct addr_ctx *ctx);
+ 	void (*insert_cs_id)(struct addr_ctx *ctx);
+@@ -1262,6 +1275,164 @@ struct data_fabric_ops df2_ops = {
+ 	.get_component_id_mask		=	&get_component_id_mask_df2,
+ };
+ 
++static u64 get_hi_addr_offset_df3(struct addr_ctx *ctx)
++{
++	return (ctx->reg_dram_offset & GENMASK_ULL(31, 12)) << 16;
++}
++
++static void make_space_for_cs_id_cod_hash(struct addr_ctx *ctx)
++{
++	u8 num_intlv_bits = ctx->intlv_num_chan;
++
++	num_intlv_bits += ctx->intlv_num_sockets;
++	expand_bits(ctx->intlv_addr_bit, 1, &ctx->ret_addr);
++	if (num_intlv_bits > 1)
++		expand_bits(12, num_intlv_bits - 1, &ctx->ret_addr);
++}
++
++static void insert_cs_id_cod_hash(struct addr_ctx *ctx)
++{
++	ctx->ret_addr |= ((ctx->cs_id & 0x1) << ctx->intlv_addr_bit);
++	ctx->ret_addr |= ((ctx->cs_id & 0xE) << 11);
++}
++
++static int dehash_addr_df3(struct addr_ctx *ctx)
++{
++	u8 hashed_bit, intlv_ctl_64k, intlv_ctl_2M, intlv_ctl_1G;
++	u32 tmp;
++
++	if (amd_df_indirect_read(0, df_regs[DF_GLOBAL_CTL], DF_BROADCAST, &tmp))
++		return -EINVAL;
++
++	intlv_ctl_64k = !!((tmp >> 20) & 0x1);
++	intlv_ctl_2M  = !!((tmp >> 21) & 0x1);
++	intlv_ctl_1G  = !!((tmp >> 22) & 0x1);
++
++	hashed_bit =	(ctx->ret_addr >> 14) ^
++			((ctx->ret_addr >> 18) & intlv_ctl_64k) ^
++			((ctx->ret_addr >> 23) & intlv_ctl_2M) ^
++			((ctx->ret_addr >> 32) & intlv_ctl_1G) ^
++			(ctx->ret_addr >> ctx->intlv_addr_bit);
++
++	hashed_bit &= BIT(0);
++
++	if (hashed_bit != ((ctx->ret_addr >> ctx->intlv_addr_bit) & BIT(0)))
++		ctx->ret_addr ^= BIT(ctx->intlv_addr_bit);
++
++	if (ctx->intlv_mode != HASH_COD2_4CH &&
++	    ctx->intlv_mode != HASH_COD1_8CH)
++		return 0;
++
++	hashed_bit =	(ctx->ret_addr >> 12) ^
++			((ctx->ret_addr >> 16) & intlv_ctl_64k) ^
++			((ctx->ret_addr >> 21) & intlv_ctl_2M) ^
++			((ctx->ret_addr >> 30) & intlv_ctl_1G);
++
++	hashed_bit &= BIT(0);
++
++	if (hashed_bit != ((ctx->ret_addr >> 12) & BIT(0)))
++		ctx->ret_addr ^= BIT(12);
++
++	if (ctx->intlv_mode != HASH_COD1_8CH)
++		return 0;
++
++	hashed_bit =	(ctx->ret_addr >> 13) ^
++			((ctx->ret_addr >> 17) & intlv_ctl_64k) ^
++			((ctx->ret_addr >> 22) & intlv_ctl_2M) ^
++			((ctx->ret_addr >> 31) & intlv_ctl_1G);
++
++	hashed_bit &= BIT(0);
++
++	if (hashed_bit != ((ctx->ret_addr >> 13) & BIT(0)))
++		ctx->ret_addr ^= BIT(13);
++
++	return 0;
++}
++
++static int get_intlv_mode_df3(struct addr_ctx *ctx)
++{
++	ctx->intlv_mode = (ctx->reg_base_addr >> 2) & 0xF;
++
++	if (ctx->intlv_mode == HASH_COD4_2CH ||
++	    ctx->intlv_mode == HASH_COD2_4CH ||
++	    ctx->intlv_mode == HASH_COD1_8CH) {
++		ctx->make_space_for_cs_id = &make_space_for_cs_id_cod_hash;
++		ctx->insert_cs_id = &insert_cs_id_cod_hash;
++		ctx->dehash_addr = &dehash_addr_df3;
++	} else {
++		ctx->make_space_for_cs_id = &make_space_for_cs_id_simple;
++		ctx->insert_cs_id = &insert_cs_id_simple;
++	}
++
++	return 0;
++}
++
++static u8 get_intlv_addr_sel_df3(struct addr_ctx *ctx)
++{
++	return (ctx->reg_base_addr >> 9) & 0x7;
++}
++
++static void get_intlv_num_dies_df3(struct addr_ctx *ctx)
++{
++	ctx->intlv_num_dies  = (ctx->reg_base_addr >> 6) & 0x3;
++}
++
++static void get_intlv_num_sockets_df3(struct addr_ctx *ctx)
++{
++	ctx->intlv_num_sockets = (ctx->reg_base_addr >> 8) & 0x1;
++}
++
++static u8 get_die_id_shift_df3(struct addr_ctx *ctx)
++{
++	return ctx->node_id_shift;
++}
++
++static u8 get_socket_id_shift_df3(struct addr_ctx *ctx)
++{
++	return ((ctx->reg_fab_id_mask1 >> 8) & 0x3) + ctx->node_id_shift;
++}
++
++static int get_masks_df3(struct addr_ctx *ctx)
++{
++	if (amd_df_indirect_read(0, df_regs[SYS_FAB_ID_MASK_1],
++				 DF_BROADCAST, &ctx->reg_fab_id_mask1))
++		return -EINVAL;
++
++	ctx->node_id_shift = ctx->reg_fab_id_mask1 & 0xF;
++
++	ctx->die_id_mask = (ctx->reg_fab_id_mask1 >> 16) & 0x7;
++	ctx->die_id_mask <<= ctx->node_id_shift;
++
++	ctx->socket_id_mask = (ctx->reg_fab_id_mask1 >> 24) & 0x7;
++	ctx->socket_id_mask <<= ctx->node_id_shift;
++
++	return 0;
++}
++
++static u16 get_dst_fabric_id_df3(struct addr_ctx *ctx)
++{
++	return ctx->reg_limit_addr & 0x3FF;
++}
++
++static u16 get_component_id_mask_df3(struct addr_ctx *ctx)
++{
++	return ctx->reg_fab_id_mask0 & 0x3FF;
++}
++
++struct data_fabric_ops df3_ops = {
++	.get_hi_addr_offset		=	&get_hi_addr_offset_df3,
++	.get_intlv_mode			=	&get_intlv_mode_df3,
++	.get_intlv_addr_sel		=	&get_intlv_addr_sel_df3,
++	.get_intlv_num_dies		=	&get_intlv_num_dies_df3,
++	.get_intlv_num_sockets		=	&get_intlv_num_sockets_df3,
++	.get_cs_fabric_id		=	&get_cs_fabric_id_df2,
++	.get_masks			=	&get_masks_df3,
++	.get_die_id_shift		=	&get_die_id_shift_df3,
++	.get_socket_id_shift		=	&get_socket_id_shift_df3,
++	.get_dst_fabric_id		=	&get_dst_fabric_id_df3,
++	.get_component_id_mask		=	&get_component_id_mask_df3,
++};
++
+ struct data_fabric_ops *df_ops;
+ 
+ static int set_df_ops(struct addr_ctx *ctx)
+@@ -1270,6 +1441,11 @@ static int set_df_ops(struct addr_ctx *ctx)
+ 				 DF_BROADCAST, &ctx->reg_fab_id_mask0))
+ 		return -EINVAL;
+ 
++	if ((ctx->reg_fab_id_mask0 & 0xFF) != 0) {
++		df_ops = &df3_ops;
++		return 0;
++	}
++
+ 	df_ops = &df2_ops;
+ 
+ 	return 0;
+@@ -1332,8 +1508,8 @@ static int get_intlv_addr_bit(struct addr_ctx *ctx)
+ {
+ 	u8 intlv_addr_sel = df_ops->get_intlv_addr_sel(ctx);
+ 
+-	/* {0, 1, 2, 3} map to address bits {8, 9, 10, 11} respectively */
+-	if (intlv_addr_sel > 3) {
++	/* {0, 1, 2, 3, 4} map to address bits {8, 9, 10, 11, 12} respectively */
++	if (intlv_addr_sel > 4) {
+ 		pr_debug("Invalid interleave address select %d.\n", intlv_addr_sel);
+ 		return -EINVAL;
+ 	}
+@@ -1351,9 +1527,18 @@ static void get_intlv_num_chan(struct addr_ctx *ctx)
+ 		ctx->intlv_num_chan = 0;
+ 		break;
+ 	case NOHASH_2CH:
++	case HASH_COD4_2CH:
+ 	case DF2_HASH_2CH:
+ 		ctx->intlv_num_chan = 1;
+ 		break;
++	case NOHASH_4CH:
++	case HASH_COD2_4CH:
++		ctx->intlv_num_chan = 2;
++		break;
++	case NOHASH_8CH:
++	case HASH_COD1_8CH:
++		ctx->intlv_num_chan = 3;
++		break;
+ 	default:
+ 		/* Valid interleaving modes where checked earlier. */
+ 		break;
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 734c2d7ef273b273c131ce1e7db5279e86ae3f34 Mon Sep 17 00:00:00 2001
+From: Yazen Ghannam <yazen.ghannam@amd.com>
+Date: Wed, 23 Jun 2021 19:20:02 +0000
+Subject: [PATCH 31/41] EDAC/amd64: Add glossary of acronyms for address
+ translation
+
+Add a short glossary of the acronyms used for address translation. Some
+terms may be seen with other AMD code, and some are only used within the
+translation code.
+
+Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/edac/amd64_edac.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index 882ac3fbc..d8557716d 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -993,6 +993,15 @@ static int sys_addr_to_csrow(struct mem_ctl_info *mci, u64 sys_addr)
+ 	return csrow;
+ }
+ 
++/*
++ * Glossary of acronyms used in address translation for Zen-based systems
++ *
++ * COD		=	Cluster-on-Die
++ * CS		=	Coherent Slave
++ * DF		=	Data Fabric
++ * UMC		=	Unified Memory Controller
++ */
++
+ /* Protect the PCI config register pairs used for DF indirect access. */
+ static DEFINE_MUTEX(df_indirect_mutex);
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From fe4cc56c117d4c3fda1ea3bfa7ee7cdcbfadf860 Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Tue, 17 Aug 2021 08:55:57 -0500
+Subject: [PATCH 32/41] dmaengine: ptdma: Initial driver for the AMD PTDMA
+
+Add support for AMD PTDMA controller. It performs high-bandwidth
+memory to memory and IO copy operation. Device commands are managed
+via a circular queue of 'descriptors', each of which specifies source
+and destination addresses for copying a single buffer of data.
+
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ MAINTAINERS                   |   6 +
+ drivers/dma/Kconfig           |   2 +
+ drivers/dma/Makefile          |   1 +
+ drivers/dma/ptdma/Kconfig     |  11 ++
+ drivers/dma/ptdma/Makefile    |  10 ++
+ drivers/dma/ptdma/ptdma-dev.c | 268 +++++++++++++++++++++++++++++++
+ drivers/dma/ptdma/ptdma-pci.c | 243 ++++++++++++++++++++++++++++
+ drivers/dma/ptdma/ptdma.h     | 293 ++++++++++++++++++++++++++++++++++
+ 8 files changed, 834 insertions(+)
+ create mode 100644 drivers/dma/ptdma/Kconfig
+ create mode 100644 drivers/dma/ptdma/Makefile
+ create mode 100644 drivers/dma/ptdma/ptdma-dev.c
+ create mode 100644 drivers/dma/ptdma/ptdma-pci.c
+ create mode 100644 drivers/dma/ptdma/ptdma.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index d7b4f3287..bd856d9d7 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -979,6 +979,12 @@ S:	Supported
+ T:	git https://gitlab.freedesktop.org/agd5f/linux.git
+ F:	drivers/gpu/drm/amd/pm/powerplay/
+ 
+++AMD PTDMA DRIVER
+++M:	Sanjay R Mehta <sanju.mehta@amd.com>
+++L:	dmaengine@vger.kernel.org
+++S:	Maintained
+++F:	drivers/dma/ptdma/
++
+ AMD SEATTLE DEVICE TREE SUPPORT
+ M:	Brijesh Singh <brijeshkumar.singh@amd.com>
+ M:	Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+diff --git a/drivers/dma/Kconfig b/drivers/dma/Kconfig
+index 4f70cf574..4b26abfff 100644
+--- a/drivers/dma/Kconfig
++++ b/drivers/dma/Kconfig
+@@ -716,6 +716,8 @@ source "drivers/dma/bestcomm/Kconfig"
+ 
+ source "drivers/dma/mediatek/Kconfig"
+ 
++source "drivers/dma/ptdma/Kconfig"
++
+ source "drivers/dma/qcom/Kconfig"
+ 
+ source "drivers/dma/dw/Kconfig"
+diff --git a/drivers/dma/Makefile b/drivers/dma/Makefile
+index aa69094e3..bf9ffc207 100644
+--- a/drivers/dma/Makefile
++++ b/drivers/dma/Makefile
+@@ -16,6 +16,7 @@ obj-$(CONFIG_DMATEST) += dmatest.o
+ obj-$(CONFIG_ALTERA_MSGDMA) += altera-msgdma.o
+ obj-$(CONFIG_AMBA_PL08X) += amba-pl08x.o
+ obj-$(CONFIG_AMCC_PPC440SPE_ADMA) += ppc4xx/
++obj-$(CONFIG_AMD_PTDMA) += ptdma/
+ obj-$(CONFIG_AT_HDMAC) += at_hdmac.o
+ obj-$(CONFIG_AT_XDMAC) += at_xdmac.o
+ obj-$(CONFIG_AXI_DMAC) += dma-axi-dmac.o
+diff --git a/drivers/dma/ptdma/Kconfig b/drivers/dma/ptdma/Kconfig
+new file mode 100644
+index 000000000..e6b8ca1d4
+--- /dev/null
++++ b/drivers/dma/ptdma/Kconfig
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config AMD_PTDMA
++	tristate  "AMD PassThru DMA Engine"
++	depends on X86_64 && PCI
++	help
++	  Enable support for the AMD PTDMA controller. This controller
++	  provides DMA capabilities to perform high bandwidth memory to
++	  memory and IO copy operations. It performs DMA transfer through
++	  queue-based descriptor management. This DMA controller is intended
++	  to be used with AMD Non-Transparent Bridge devices and not for
++	  general purpose peripheral DMA.
+diff --git a/drivers/dma/ptdma/Makefile b/drivers/dma/ptdma/Makefile
+new file mode 100644
+index 000000000..320fa8237
+--- /dev/null
++++ b/drivers/dma/ptdma/Makefile
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# AMD Passthru DMA driver
++#
++
++obj-$(CONFIG_AMD_PTDMA) += ptdma.o
++
++ptdma-objs := ptdma-dev.o
++
++ptdma-$(CONFIG_PCI) += ptdma-pci.o
+diff --git a/drivers/dma/ptdma/ptdma-dev.c b/drivers/dma/ptdma/ptdma-dev.c
+new file mode 100644
+index 000000000..953cdd0b8
+--- /dev/null
++++ b/drivers/dma/ptdma/ptdma-dev.c
+@@ -0,0 +1,268 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * AMD Passthru DMA device driver
++ * -- Based on the CCP driver
++ *
++ * Copyright (C) 2016,2021 Advanced Micro Devices, Inc.
++ *
++ * Author: Sanjay R Mehta <sanju.mehta@amd.com>
++ * Author: Gary R Hook <gary.hook@amd.com>
++ */
++
++#include <linux/bitfield.h>
++#include <linux/dma-mapping.h>
++#include <linux/debugfs.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++
++#include "ptdma.h"
++
++/* Human-readable error strings */
++static char *pt_error_codes[] = {
++	"",
++	"ERR 01: ILLEGAL_ENGINE",
++	"ERR 03: ILLEGAL_FUNCTION_TYPE",
++	"ERR 04: ILLEGAL_FUNCTION_MODE",
++	"ERR 06: ILLEGAL_FUNCTION_SIZE",
++	"ERR 08: ILLEGAL_FUNCTION_RSVD",
++	"ERR 09: ILLEGAL_BUFFER_LENGTH",
++	"ERR 10: VLSB_FAULT",
++	"ERR 11: ILLEGAL_MEM_ADDR",
++	"ERR 12: ILLEGAL_MEM_SEL",
++	"ERR 13: ILLEGAL_CONTEXT_ID",
++	"ERR 15: 0xF Reserved",
++	"ERR 18: CMD_TIMEOUT",
++	"ERR 19: IDMA0_AXI_SLVERR",
++	"ERR 20: IDMA0_AXI_DECERR",
++	"ERR 21: 0x15 Reserved",
++	"ERR 22: IDMA1_AXI_SLAVE_FAULT",
++	"ERR 23: IDMA1_AIXI_DECERR",
++	"ERR 24: 0x18 Reserved",
++	"ERR 27: 0x1B Reserved",
++	"ERR 38: ODMA0_AXI_SLVERR",
++	"ERR 39: ODMA0_AXI_DECERR",
++	"ERR 40: 0x28 Reserved",
++	"ERR 41: ODMA1_AXI_SLVERR",
++	"ERR 42: ODMA1_AXI_DECERR",
++	"ERR 43: LSB_PARITY_ERR",
++};
++
++static void pt_log_error(struct pt_device *d, int e)
++{
++	dev_err(d->dev, "PTDMA error: %s (0x%x)\n", pt_error_codes[e], e);
++}
++
++void pt_start_queue(struct pt_cmd_queue *cmd_q)
++{
++	/* Turn on the run bit */
++	iowrite32(cmd_q->qcontrol | CMD_Q_RUN, cmd_q->reg_control);
++}
++
++void pt_stop_queue(struct pt_cmd_queue *cmd_q)
++{
++	/* Turn off the run bit */
++	iowrite32(cmd_q->qcontrol & ~CMD_Q_RUN, cmd_q->reg_control);
++}
++
++static int pt_core_execute_cmd(struct ptdma_desc *desc, struct pt_cmd_queue *cmd_q)
++{
++	bool soc = FIELD_GET(DWORD0_SOC, desc->dw0);
++	u8 *q_desc = (u8 *)&cmd_q->qbase[cmd_q->qidx];
++	u32 tail;
++
++	if (soc) {
++		desc->dw0 |= FIELD_PREP(DWORD0_IOC, desc->dw0);
++		desc->dw0 &= ~DWORD0_SOC;
++	}
++	mutex_lock(&cmd_q->q_mutex);
++
++	/* Copy 32-byte command descriptor to hw queue. */
++	memcpy(q_desc, desc, 32);
++	cmd_q->qidx = (cmd_q->qidx + 1) % CMD_Q_LEN;
++
++	/* The data used by this command must be flushed to memory */
++	wmb();
++
++	/* Write the new tail address back to the queue register */
++	tail = lower_32_bits(cmd_q->qdma_tail + cmd_q->qidx * Q_DESC_SIZE);
++	iowrite32(tail, cmd_q->reg_control + 0x0004);
++
++	/* Turn the queue back on using our cached control register */
++	pt_start_queue(cmd_q);
++	mutex_unlock(&cmd_q->q_mutex);
++
++	return 0;
++}
++
++int pt_core_perform_passthru(struct pt_cmd_queue *cmd_q,
++			     struct pt_passthru_engine *pt_engine)
++{
++	struct ptdma_desc desc;
++
++	cmd_q->cmd_error = 0;
++	memset(&desc, 0, sizeof(desc));
++	desc.dw0 = CMD_DESC_DW0_VAL;
++	desc.length = pt_engine->src_len;
++	desc.src_lo = lower_32_bits(pt_engine->src_dma);
++	desc.dw3.src_hi = upper_32_bits(pt_engine->src_dma);
++	desc.dst_lo = lower_32_bits(pt_engine->dst_dma);
++	desc.dw5.dst_hi = upper_32_bits(pt_engine->dst_dma);
++
++	return pt_core_execute_cmd(&desc, cmd_q);
++}
++
++static inline void pt_core_disable_queue_interrupts(struct pt_device *pt)
++{
++	iowrite32(0, pt->cmd_q.reg_control + 0x000C);
++}
++
++static inline void pt_core_enable_queue_interrupts(struct pt_device *pt)
++{
++	iowrite32(SUPPORTED_INTERRUPTS, pt->cmd_q.reg_control + 0x000C);
++}
++
++static irqreturn_t pt_core_irq_handler(int irq, void *data)
++{
++	struct pt_device *pt = data;
++	struct pt_cmd_queue *cmd_q = &pt->cmd_q;
++	u32 status;
++
++	pt_core_disable_queue_interrupts(pt);
++	status = ioread32(cmd_q->reg_control + 0x0010);
++	if (status) {
++		cmd_q->int_status = status;
++		cmd_q->q_status = ioread32(cmd_q->reg_control + 0x0100);
++		cmd_q->q_int_status = ioread32(cmd_q->reg_control + 0x0104);
++
++		/* On error, only save the first error value */
++		if ((status & INT_ERROR) && !cmd_q->cmd_error)
++			cmd_q->cmd_error = CMD_Q_ERROR(cmd_q->q_status);
++
++		/* Acknowledge the interrupt */
++		iowrite32(status, cmd_q->reg_control + 0x0010);
++		pt_core_enable_queue_interrupts(pt);
++	}
++	return IRQ_HANDLED;
++}
++
++int pt_core_init(struct pt_device *pt)
++{
++	char dma_pool_name[MAX_DMAPOOL_NAME_LEN];
++	struct pt_cmd_queue *cmd_q = &pt->cmd_q;
++	u32 dma_addr_lo, dma_addr_hi;
++	struct device *dev = pt->dev;
++	struct dma_pool *dma_pool;
++	int ret;
++
++	/* Allocate a dma pool for the queue */
++	snprintf(dma_pool_name, sizeof(dma_pool_name), "%s_q", dev_name(pt->dev));
++
++	dma_pool = dma_pool_create(dma_pool_name, dev,
++				   PT_DMAPOOL_MAX_SIZE,
++				   PT_DMAPOOL_ALIGN, 0);
++	if (!dma_pool)
++		return -ENOMEM;
++
++	/* ptdma core initialisation */
++	iowrite32(CMD_CONFIG_VHB_EN, pt->io_regs + CMD_CONFIG_OFFSET);
++	iowrite32(CMD_QUEUE_PRIO, pt->io_regs + CMD_QUEUE_PRIO_OFFSET);
++	iowrite32(CMD_TIMEOUT_DISABLE, pt->io_regs + CMD_TIMEOUT_OFFSET);
++	iowrite32(CMD_CLK_GATE_CONFIG, pt->io_regs + CMD_CLK_GATE_CTL_OFFSET);
++	iowrite32(CMD_CONFIG_REQID, pt->io_regs + CMD_REQID_CONFIG_OFFSET);
++
++	cmd_q->pt = pt;
++	cmd_q->dma_pool = dma_pool;
++	mutex_init(&cmd_q->q_mutex);
++
++	/* Page alignment satisfies our needs for N <= 128 */
++	cmd_q->qsize = Q_SIZE(Q_DESC_SIZE);
++	cmd_q->qbase = dma_alloc_coherent(dev, cmd_q->qsize,
++					  &cmd_q->qbase_dma,
++					  GFP_KERNEL);
++	if (!cmd_q->qbase) {
++		dev_err(dev, "unable to allocate command queue\n");
++		ret = -ENOMEM;
++		goto e_dma_alloc;
++	}
++
++	cmd_q->qidx = 0;
++
++	/* Preset some register values */
++	cmd_q->reg_control = pt->io_regs + CMD_Q_STATUS_INCR;
++
++	/* Turn off the queues and disable interrupts until ready */
++	pt_core_disable_queue_interrupts(pt);
++
++	cmd_q->qcontrol = 0; /* Start with nothing */
++	iowrite32(cmd_q->qcontrol, cmd_q->reg_control);
++
++	ioread32(cmd_q->reg_control + 0x0104);
++	ioread32(cmd_q->reg_control + 0x0100);
++
++	/* Clear the interrupt status */
++	iowrite32(SUPPORTED_INTERRUPTS, cmd_q->reg_control + 0x0010);
++
++	/* Request an irq */
++	ret = request_irq(pt->pt_irq, pt_core_irq_handler, 0, dev_name(pt->dev), pt);
++	if (ret)
++		goto e_pool;
++
++	/* Update the device registers with queue information. */
++	cmd_q->qcontrol &= ~CMD_Q_SIZE;
++	cmd_q->qcontrol |= FIELD_PREP(CMD_Q_SIZE, QUEUE_SIZE_VAL);
++
++	cmd_q->qdma_tail = cmd_q->qbase_dma;
++	dma_addr_lo = lower_32_bits(cmd_q->qdma_tail);
++	iowrite32((u32)dma_addr_lo, cmd_q->reg_control + 0x0004);
++	iowrite32((u32)dma_addr_lo, cmd_q->reg_control + 0x0008);
++
++	dma_addr_hi = upper_32_bits(cmd_q->qdma_tail);
++	cmd_q->qcontrol |= (dma_addr_hi << 16);
++	iowrite32(cmd_q->qcontrol, cmd_q->reg_control);
++
++	pt_core_enable_queue_interrupts(pt);
++
++	return 0;
++
++e_dma_alloc:
++	dma_free_coherent(dev, cmd_q->qsize, cmd_q->qbase, cmd_q->qbase_dma);
++
++e_pool:
++	dev_err(dev, "unable to allocate an IRQ\n");
++	dma_pool_destroy(pt->cmd_q.dma_pool);
++
++	return ret;
++}
++
++void pt_core_destroy(struct pt_device *pt)
++{
++	struct device *dev = pt->dev;
++	struct pt_cmd_queue *cmd_q = &pt->cmd_q;
++	struct pt_cmd *cmd;
++
++	/* Disable and clear interrupts */
++	pt_core_disable_queue_interrupts(pt);
++
++	/* Turn off the run bit */
++	pt_stop_queue(cmd_q);
++
++	/* Clear the interrupt status */
++	iowrite32(SUPPORTED_INTERRUPTS, cmd_q->reg_control + 0x0010);
++	ioread32(cmd_q->reg_control + 0x0104);
++	ioread32(cmd_q->reg_control + 0x0100);
++
++	free_irq(pt->pt_irq, pt);
++
++	dma_free_coherent(dev, cmd_q->qsize, cmd_q->qbase,
++			  cmd_q->qbase_dma);
++
++	/* Flush the cmd queue */
++	while (!list_empty(&pt->cmd)) {
++		/* Invoke the callback directly with an error code */
++		cmd = list_first_entry(&pt->cmd, struct pt_cmd, entry);
++		list_del(&cmd->entry);
++		cmd->pt_cmd_callback(cmd->data, -ENODEV);
++	}
++}
+diff --git a/drivers/dma/ptdma/ptdma-pci.c b/drivers/dma/ptdma/ptdma-pci.c
+new file mode 100644
+index 000000000..22739ff0c
+--- /dev/null
++++ b/drivers/dma/ptdma/ptdma-pci.c
+@@ -0,0 +1,243 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * AMD Passthru DMA device driver
++ * -- Based on the CCP driver
++ *
++ * Copyright (C) 2016,2021 Advanced Micro Devices, Inc.
++ *
++ * Author: Sanjay R Mehta <sanju.mehta@amd.com>
++ * Author: Tom Lendacky <thomas.lendacky@amd.com>
++ * Author: Gary R Hook <gary.hook@amd.com>
++ */
++
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/kthread.h>
++#include <linux/module.h>
++#include <linux/pci_ids.h>
++#include <linux/pci.h>
++#include <linux/spinlock.h>
++
++#include "ptdma.h"
++
++struct pt_msix {
++	int msix_count;
++	struct msix_entry msix_entry;
++};
++
++/*
++ * pt_alloc_struct - allocate and initialize the pt_device struct
++ *
++ * @dev: device struct of the PTDMA
++ */
++static struct pt_device *pt_alloc_struct(struct device *dev)
++{
++	struct pt_device *pt;
++
++	pt = devm_kzalloc(dev, sizeof(*pt), GFP_KERNEL);
++
++	if (!pt)
++		return NULL;
++	pt->dev = dev;
++
++	INIT_LIST_HEAD(&pt->cmd);
++
++	return pt;
++}
++
++static int pt_get_msix_irqs(struct pt_device *pt)
++{
++	struct pt_msix *pt_msix = pt->pt_msix;
++	struct device *dev = pt->dev;
++	struct pci_dev *pdev = to_pci_dev(dev);
++	int ret;
++
++	pt_msix->msix_entry.entry = 0;
++
++	ret = pci_enable_msix_range(pdev, &pt_msix->msix_entry, 1, 1);
++	if (ret < 0)
++		return ret;
++
++	pt_msix->msix_count = ret;
++
++	pt->pt_irq = pt_msix->msix_entry.vector;
++
++	return 0;
++}
++
++static int pt_get_msi_irq(struct pt_device *pt)
++{
++	struct device *dev = pt->dev;
++	struct pci_dev *pdev = to_pci_dev(dev);
++	int ret;
++
++	ret = pci_enable_msi(pdev);
++	if (ret)
++		return ret;
++
++	pt->pt_irq = pdev->irq;
++
++	return 0;
++}
++
++static int pt_get_irqs(struct pt_device *pt)
++{
++	struct device *dev = pt->dev;
++	int ret;
++
++	ret = pt_get_msix_irqs(pt);
++	if (!ret)
++		return 0;
++
++	/* Couldn't get MSI-X vectors, try MSI */
++	dev_err(dev, "could not enable MSI-X (%d), trying MSI\n", ret);
++	ret = pt_get_msi_irq(pt);
++	if (!ret)
++		return 0;
++
++	/* Couldn't get MSI interrupt */
++	dev_err(dev, "could not enable MSI (%d)\n", ret);
++
++	return ret;
++}
++
++static void pt_free_irqs(struct pt_device *pt)
++{
++	struct pt_msix *pt_msix = pt->pt_msix;
++	struct device *dev = pt->dev;
++	struct pci_dev *pdev = to_pci_dev(dev);
++
++	if (pt_msix->msix_count)
++		pci_disable_msix(pdev);
++	else if (pt->pt_irq)
++		pci_disable_msi(pdev);
++
++	pt->pt_irq = 0;
++}
++
++static int pt_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	struct pt_device *pt;
++	struct pt_msix *pt_msix;
++	struct device *dev = &pdev->dev;
++	void __iomem * const *iomap_table;
++	int bar_mask;
++	int ret = -ENOMEM;
++
++	pt = pt_alloc_struct(dev);
++	if (!pt)
++		goto e_err;
++
++	pt_msix = devm_kzalloc(dev, sizeof(*pt_msix), GFP_KERNEL);
++	if (!pt_msix)
++		goto e_err;
++
++	pt->pt_msix = pt_msix;
++	pt->dev_vdata = (struct pt_dev_vdata *)id->driver_data;
++	if (!pt->dev_vdata) {
++		ret = -ENODEV;
++		dev_err(dev, "missing driver data\n");
++		goto e_err;
++	}
++
++	ret = pcim_enable_device(pdev);
++	if (ret) {
++		dev_err(dev, "pcim_enable_device failed (%d)\n", ret);
++		goto e_err;
++	}
++
++	bar_mask = pci_select_bars(pdev, IORESOURCE_MEM);
++	ret = pcim_iomap_regions(pdev, bar_mask, "ptdma");
++	if (ret) {
++		dev_err(dev, "pcim_iomap_regions failed (%d)\n", ret);
++		goto e_err;
++	}
++
++	iomap_table = pcim_iomap_table(pdev);
++	if (!iomap_table) {
++		dev_err(dev, "pcim_iomap_table failed\n");
++		ret = -ENOMEM;
++		goto e_err;
++	}
++
++	pt->io_regs = iomap_table[pt->dev_vdata->bar];
++	if (!pt->io_regs) {
++		dev_err(dev, "ioremap failed\n");
++		ret = -ENOMEM;
++		goto e_err;
++	}
++
++	ret = pt_get_irqs(pt);
++	if (ret)
++		goto e_err;
++
++	pci_set_master(pdev);
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(48));
++	if (ret) {
++		ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++		if (ret) {
++			dev_err(dev, "dma_set_mask_and_coherent failed (%d)\n",
++				ret);
++			goto e_err;
++		}
++	}
++
++	dev_set_drvdata(dev, pt);
++
++	if (pt->dev_vdata)
++		ret = pt_core_init(pt);
++
++	if (ret)
++		goto e_err;
++
++	return 0;
++
++e_err:
++	dev_err(dev, "initialization failed ret = %d\n", ret);
++
++	return ret;
++}
++
++static void pt_pci_remove(struct pci_dev *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct pt_device *pt = dev_get_drvdata(dev);
++
++	if (!pt)
++		return;
++
++	if (pt->dev_vdata)
++		pt_core_destroy(pt);
++
++	pt_free_irqs(pt);
++}
++
++static const struct pt_dev_vdata dev_vdata[] = {
++	{
++		.bar = 2,
++	},
++};
++
++static const struct pci_device_id pt_pci_table[] = {
++	{ PCI_VDEVICE(AMD, 0x1498), (kernel_ulong_t)&dev_vdata[0] },
++	/* Last entry must be zero */
++	{ 0, }
++};
++MODULE_DEVICE_TABLE(pci, pt_pci_table);
++
++static struct pci_driver pt_pci_driver = {
++	.name = "ptdma",
++	.id_table = pt_pci_table,
++	.probe = pt_pci_probe,
++	.remove = pt_pci_remove,
++};
++
++module_pci_driver(pt_pci_driver);
++
++MODULE_AUTHOR("Sanjay R Mehta <sanju.mehta@amd.com>");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("AMD PassThru DMA driver");
+diff --git a/drivers/dma/ptdma/ptdma.h b/drivers/dma/ptdma/ptdma.h
+new file mode 100644
+index 000000000..f195b15fb
+--- /dev/null
++++ b/drivers/dma/ptdma/ptdma.h
+@@ -0,0 +1,293 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * AMD Passthru DMA device driver
++ * -- Based on the CCP driver
++ *
++ * Copyright (C) 2016,2021 Advanced Micro Devices, Inc.
++ *
++ * Author: Sanjay R Mehta <sanju.mehta@amd.com>
++ * Author: Tom Lendacky <thomas.lendacky@amd.com>
++ * Author: Gary R Hook <gary.hook@amd.com>
++ */
++
++#ifndef __PT_DEV_H__
++#define __PT_DEV_H__
++
++#include <linux/device.h>
++#include <linux/pci.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/wait.h>
++#include <linux/dmapool.h>
++
++#define MAX_PT_NAME_LEN			16
++#define MAX_DMAPOOL_NAME_LEN		32
++
++#define MAX_HW_QUEUES			1
++#define MAX_CMD_QLEN			100
++
++#define PT_ENGINE_PASSTHRU		5
++#define PT_OFFSET			0x0
++
++/* Register Mappings */
++#define IRQ_MASK_REG			0x040
++#define IRQ_STATUS_REG			0x200
++
++#define CMD_Q_ERROR(__qs)		((__qs) & 0x0000003f)
++
++#define CMD_QUEUE_PRIO_OFFSET		0x00
++#define CMD_REQID_CONFIG_OFFSET		0x04
++#define CMD_TIMEOUT_OFFSET		0x08
++#define CMD_PT_VERSION			0x10
++
++#define CMD_Q_CONTROL_BASE		0x0000
++#define CMD_Q_TAIL_LO_BASE		0x0004
++#define CMD_Q_HEAD_LO_BASE		0x0008
++#define CMD_Q_INT_ENABLE_BASE		0x000C
++#define CMD_Q_INTERRUPT_STATUS_BASE	0x0010
++
++#define CMD_Q_STATUS_BASE		0x0100
++#define CMD_Q_INT_STATUS_BASE		0x0104
++#define CMD_Q_DMA_STATUS_BASE		0x0108
++#define CMD_Q_DMA_READ_STATUS_BASE	0x010C
++#define CMD_Q_DMA_WRITE_STATUS_BASE	0x0110
++#define CMD_Q_ABORT_BASE		0x0114
++#define CMD_Q_AX_CACHE_BASE		0x0118
++
++#define CMD_CONFIG_OFFSET		0x1120
++#define CMD_CLK_GATE_CTL_OFFSET		0x6004
++
++#define CMD_DESC_DW0_VAL		0x500012
++
++/* Address offset for virtual queue registers */
++#define CMD_Q_STATUS_INCR		0x1000
++
++/* Bit masks */
++#define CMD_CONFIG_REQID		0
++#define CMD_TIMEOUT_DISABLE		0
++#define CMD_CLK_DYN_GATING_DIS		0
++#define CMD_CLK_SW_GATE_MODE		0
++#define CMD_CLK_GATE_CTL		0
++#define CMD_QUEUE_PRIO			GENMASK(2, 1)
++#define CMD_CONFIG_VHB_EN		BIT(0)
++#define CMD_CLK_DYN_GATING_EN		BIT(0)
++#define CMD_CLK_HW_GATE_MODE		BIT(0)
++#define CMD_CLK_GATE_ON_DELAY		BIT(12)
++#define CMD_CLK_GATE_OFF_DELAY		BIT(12)
++
++#define CMD_CLK_GATE_CONFIG		(CMD_CLK_GATE_CTL | \
++					CMD_CLK_HW_GATE_MODE | \
++					CMD_CLK_GATE_ON_DELAY | \
++					CMD_CLK_DYN_GATING_EN | \
++					CMD_CLK_GATE_OFF_DELAY)
++
++#define CMD_Q_LEN			32
++#define CMD_Q_RUN			BIT(0)
++#define CMD_Q_HALT			BIT(1)
++#define CMD_Q_MEM_LOCATION		BIT(2)
++#define CMD_Q_SIZE_MASK			GENMASK(4, 0)
++#define CMD_Q_SIZE			GENMASK(7, 3)
++#define CMD_Q_SHIFT			GENMASK(1, 0)
++#define QUEUE_SIZE_VAL			((ffs(CMD_Q_LEN) - 2) & \
++								  CMD_Q_SIZE_MASK)
++#define Q_PTR_MASK			(2 << (QUEUE_SIZE_VAL + 5) - 1)
++#define Q_DESC_SIZE			sizeof(struct ptdma_desc)
++#define Q_SIZE(n)			(CMD_Q_LEN * (n))
++
++#define INT_COMPLETION			BIT(0)
++#define INT_ERROR			BIT(1)
++#define INT_QUEUE_STOPPED		BIT(2)
++#define INT_EMPTY_QUEUE			BIT(3)
++#define SUPPORTED_INTERRUPTS		(INT_COMPLETION | INT_ERROR)
++
++/****** Local Storage Block ******/
++#define LSB_START			0
++#define LSB_END				127
++#define LSB_COUNT			(LSB_END - LSB_START + 1)
++
++#define PT_DMAPOOL_MAX_SIZE		64
++#define PT_DMAPOOL_ALIGN		BIT(5)
++
++#define PT_PASSTHRU_BLOCKSIZE		512
++
++struct pt_device;
++
++struct pt_tasklet_data {
++	struct completion completion;
++	struct pt_cmd *cmd;
++};
++
++/*
++ * struct pt_passthru_engine - pass-through operation
++ *   without performing DMA mapping
++ * @mask: mask to be applied to data
++ * @mask_len: length in bytes of mask
++ * @src_dma: data to be used for this operation
++ * @dst_dma: data produced by this operation
++ * @src_len: length in bytes of data used for this operation
++ *
++ * Variables required to be set when calling pt_enqueue_cmd():
++ *   - bit_mod, byte_swap, src, dst, src_len
++ *   - mask, mask_len if bit_mod is not PT_PASSTHRU_BITWISE_NOOP
++ */
++struct pt_passthru_engine {
++	dma_addr_t mask;
++	u32 mask_len;		/* In bytes */
++
++	dma_addr_t src_dma, dst_dma;
++	u64 src_len;		/* In bytes */
++};
++
++/*
++ * struct pt_cmd - PTDMA operation request
++ * @entry: list element
++ * @work: work element used for callbacks
++ * @pt: PT device to be run on
++ * @ret: operation return code
++ * @flags: cmd processing flags
++ * @engine: PTDMA operation to perform (passthru)
++ * @engine_error: PT engine return code
++ * @passthru: engine specific structures, refer to specific engine struct below
++ * @callback: operation completion callback function
++ * @data: parameter value to be supplied to the callback function
++ *
++ * Variables required to be set when calling pt_enqueue_cmd():
++ *   - engine, callback
++ *   - See the operation structures below for what is required for each
++ *     operation.
++ */
++struct pt_cmd {
++	struct list_head entry;
++	struct work_struct work;
++	struct pt_device *pt;
++	int ret;
++	u32 engine;
++	u32 engine_error;
++	struct pt_passthru_engine passthru;
++	/* Completion callback support */
++	void (*pt_cmd_callback)(void *data, int err);
++	void *data;
++};
++
++struct pt_cmd_queue {
++	struct pt_device *pt;
++
++	/* Queue dma pool */
++	struct dma_pool *dma_pool;
++
++	/* Queue base address (not neccessarily aligned)*/
++	struct ptdma_desc *qbase;
++
++	/* Aligned queue start address (per requirement) */
++	struct mutex q_mutex ____cacheline_aligned;
++	unsigned int qidx;
++
++	unsigned int qsize;
++	dma_addr_t qbase_dma;
++	dma_addr_t qdma_tail;
++
++	unsigned int active;
++	unsigned int suspended;
++
++	/* Register addresses for queue */
++	void __iomem *reg_control;
++	u32 qcontrol; /* Cached control register */
++
++	/* Status values from job */
++	u32 int_status;
++	u32 q_status;
++	u32 q_int_status;
++	u32 cmd_error;
++} ____cacheline_aligned;
++
++struct pt_device {
++	struct list_head entry;
++
++	unsigned int ord;
++	char name[MAX_PT_NAME_LEN];
++
++	struct device *dev;
++
++	/* Bus specific device information */
++	struct pt_msix *pt_msix;
++
++	struct pt_dev_vdata *dev_vdata;
++
++	unsigned int pt_irq;
++
++	/* I/O area used for device communication */
++	void __iomem *io_regs;
++
++	spinlock_t cmd_lock ____cacheline_aligned;
++	unsigned int cmd_count;
++	struct list_head cmd;
++
++	/*
++	 * The command queue. This represent the queue available on the
++	 * PTDMA that are available for processing cmds
++	 */
++	struct pt_cmd_queue cmd_q;
++
++	wait_queue_head_t lsb_queue;
++
++	struct pt_tasklet_data tdata;
++};
++
++/*
++ * descriptor for PTDMA commands
++ * 8 32-bit words:
++ * word 0: function; engine; control bits
++ * word 1: length of source data
++ * word 2: low 32 bits of source pointer
++ * word 3: upper 16 bits of source pointer; source memory type
++ * word 4: low 32 bits of destination pointer
++ * word 5: upper 16 bits of destination pointer; destination memory type
++ * word 6: reserved 32 bits
++ * word 7: reserved 32 bits
++ */
++
++#define DWORD0_SOC	BIT(0)
++#define DWORD0_IOC	BIT(1)
++
++struct dword3 {
++	unsigned int  src_hi:16;
++	unsigned int  src_mem:2;
++	unsigned int  lsb_cxt_id:8;
++	unsigned int  rsvd1:5;
++	unsigned int  fixed:1;
++};
++
++struct dword5 {
++	unsigned int  dst_hi:16;
++	unsigned int  dst_mem:2;
++	unsigned int  rsvd1:13;
++	unsigned int  fixed:1;
++};
++
++struct ptdma_desc {
++	u32 dw0;
++	u32 length;
++	u32 src_lo;
++	struct dword3 dw3;
++	u32 dst_lo;
++	struct dword5 dw5;
++	__le32 rsvd1;
++	__le32 rsvd2;
++};
++
++/* Structure to hold PT device data */
++struct pt_dev_vdata {
++	const unsigned int bar;
++};
++
++int pt_core_init(struct pt_device *pt);
++void pt_core_destroy(struct pt_device *pt);
++
++int pt_core_perform_passthru(struct pt_cmd_queue *cmd_q,
++			     struct pt_passthru_engine *pt_engine);
++
++void pt_start_queue(struct pt_cmd_queue *cmd_q);
++void pt_stop_queue(struct pt_cmd_queue *cmd_q);
++
++#endif
+-- 
+2.33.1.711.g9d530dc002
+
+
+From a055fed98e745e028c59cc3c6c97f103d2f2354a Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Tue, 17 Aug 2021 08:55:58 -0500
+Subject: [PATCH 33/41] dmaengine: ptdma: register PTDMA controller as a DMA
+ resource
+
+Register ptdma queue to Linux dmaengine framework as general-purpose
+DMA channels.
+
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/dma/ptdma/Kconfig           |   2 +
+ drivers/dma/ptdma/Makefile          |   2 +-
+ drivers/dma/ptdma/ptdma-dev.c       |  32 +++
+ drivers/dma/ptdma/ptdma-dmaengine.c | 389 ++++++++++++++++++++++++++++
+ drivers/dma/ptdma/ptdma.h           |  26 ++
+ 5 files changed, 450 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/dma/ptdma/ptdma-dmaengine.c
+
+diff --git a/drivers/dma/ptdma/Kconfig b/drivers/dma/ptdma/Kconfig
+index e6b8ca1d4..b430edd70 100644
+--- a/drivers/dma/ptdma/Kconfig
++++ b/drivers/dma/ptdma/Kconfig
+@@ -2,6 +2,8 @@
+ config AMD_PTDMA
+ 	tristate  "AMD PassThru DMA Engine"
+ 	depends on X86_64 && PCI
++	select DMA_ENGINE
++	select DMA_VIRTUAL_CHANNELS
+ 	help
+ 	  Enable support for the AMD PTDMA controller. This controller
+ 	  provides DMA capabilities to perform high bandwidth memory to
+diff --git a/drivers/dma/ptdma/Makefile b/drivers/dma/ptdma/Makefile
+index 320fa8237..a528cb02e 100644
+--- a/drivers/dma/ptdma/Makefile
++++ b/drivers/dma/ptdma/Makefile
+@@ -5,6 +5,6 @@
+ 
+ obj-$(CONFIG_AMD_PTDMA) += ptdma.o
+ 
+-ptdma-objs := ptdma-dev.o
++ptdma-objs := ptdma-dev.o ptdma-dmaengine.o
+ 
+ ptdma-$(CONFIG_PCI) += ptdma-pci.o
+diff --git a/drivers/dma/ptdma/ptdma-dev.c b/drivers/dma/ptdma/ptdma-dev.c
+index 953cdd0b8..46e7eff7b 100644
+--- a/drivers/dma/ptdma/ptdma-dev.c
++++ b/drivers/dma/ptdma/ptdma-dev.c
+@@ -123,6 +123,26 @@ static inline void pt_core_enable_queue_interrupts(struct pt_device *pt)
+ 	iowrite32(SUPPORTED_INTERRUPTS, pt->cmd_q.reg_control + 0x000C);
+ }
+ 
++static void pt_do_cmd_complete(unsigned long data)
++{
++	struct pt_tasklet_data *tdata = (struct pt_tasklet_data *)data;
++	struct pt_cmd *cmd = tdata->cmd;
++	struct pt_cmd_queue *cmd_q = &cmd->pt->cmd_q;
++	u32 tail;
++
++	if (cmd_q->cmd_error) {
++	       /*
++		* Log the error and flush the queue by
++		* moving the head pointer
++		*/
++		tail = lower_32_bits(cmd_q->qdma_tail + cmd_q->qidx * Q_DESC_SIZE);
++		pt_log_error(cmd_q->pt, cmd_q->cmd_error);
++		iowrite32(tail, cmd_q->reg_control + 0x0008);
++	}
++
++	cmd->pt_cmd_callback(cmd->data, cmd->ret);
++}
++
+ static irqreturn_t pt_core_irq_handler(int irq, void *data)
+ {
+ 	struct pt_device *pt = data;
+@@ -143,6 +163,7 @@ static irqreturn_t pt_core_irq_handler(int irq, void *data)
+ 		/* Acknowledge the interrupt */
+ 		iowrite32(status, cmd_q->reg_control + 0x0010);
+ 		pt_core_enable_queue_interrupts(pt);
++		pt_do_cmd_complete((ulong)&pt->tdata);
+ 	}
+ 	return IRQ_HANDLED;
+ }
+@@ -224,8 +245,16 @@ int pt_core_init(struct pt_device *pt)
+ 
+ 	pt_core_enable_queue_interrupts(pt);
+ 
++	/* Register the DMA engine support */
++	ret = pt_dmaengine_register(pt);
++	if (ret)
++		goto e_dmaengine;
++
+ 	return 0;
+ 
++e_dmaengine:
++	free_irq(pt->pt_irq, pt);
++
+ e_dma_alloc:
+ 	dma_free_coherent(dev, cmd_q->qsize, cmd_q->qbase, cmd_q->qbase_dma);
+ 
+@@ -242,6 +271,9 @@ void pt_core_destroy(struct pt_device *pt)
+ 	struct pt_cmd_queue *cmd_q = &pt->cmd_q;
+ 	struct pt_cmd *cmd;
+ 
++	/* Unregister the DMA engine */
++	pt_dmaengine_unregister(pt);
++
+ 	/* Disable and clear interrupts */
+ 	pt_core_disable_queue_interrupts(pt);
+ 
+diff --git a/drivers/dma/ptdma/ptdma-dmaengine.c b/drivers/dma/ptdma/ptdma-dmaengine.c
+new file mode 100644
+index 000000000..c9e52f6f2
+--- /dev/null
++++ b/drivers/dma/ptdma/ptdma-dmaengine.c
+@@ -0,0 +1,389 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * AMD Passthrough DMA device driver
++ * -- Based on the CCP driver
++ *
++ * Copyright (C) 2016,2021 Advanced Micro Devices, Inc.
++ *
++ * Author: Sanjay R Mehta <sanju.mehta@amd.com>
++ * Author: Gary R Hook <gary.hook@amd.com>
++ */
++
++#include "ptdma.h"
++#include "../dmaengine.h"
++#include "../virt-dma.h"
++
++static inline struct pt_dma_chan *to_pt_chan(struct dma_chan *dma_chan)
++{
++	return container_of(dma_chan, struct pt_dma_chan, vc.chan);
++}
++
++static inline struct pt_dma_desc *to_pt_desc(struct virt_dma_desc *vd)
++{
++	return container_of(vd, struct pt_dma_desc, vd);
++}
++
++static void pt_free_chan_resources(struct dma_chan *dma_chan)
++{
++	struct pt_dma_chan *chan = to_pt_chan(dma_chan);
++
++	vchan_free_chan_resources(&chan->vc);
++}
++
++static void pt_synchronize(struct dma_chan *dma_chan)
++{
++	struct pt_dma_chan *chan = to_pt_chan(dma_chan);
++
++	vchan_synchronize(&chan->vc);
++}
++
++static void pt_do_cleanup(struct virt_dma_desc *vd)
++{
++	struct pt_dma_desc *desc = to_pt_desc(vd);
++	struct pt_device *pt = desc->pt;
++
++	kmem_cache_free(pt->dma_desc_cache, desc);
++}
++
++static int pt_dma_start_desc(struct pt_dma_desc *desc)
++{
++	struct pt_passthru_engine *pt_engine;
++	struct pt_device *pt;
++	struct pt_cmd *pt_cmd;
++	struct pt_cmd_queue *cmd_q;
++
++	desc->issued_to_hw = 1;
++
++	pt_cmd = &desc->pt_cmd;
++	pt = pt_cmd->pt;
++	cmd_q = &pt->cmd_q;
++	pt_engine = &pt_cmd->passthru;
++
++	pt->tdata.cmd = pt_cmd;
++
++	/* Execute the command */
++	pt_cmd->ret = pt_core_perform_passthru(cmd_q, pt_engine);
++
++	return 0;
++}
++
++static struct pt_dma_desc *pt_next_dma_desc(struct pt_dma_chan *chan)
++{
++	/* Get the next DMA descriptor on the active list */
++	struct virt_dma_desc *vd = vchan_next_desc(&chan->vc);
++
++	return vd ? to_pt_desc(vd) : NULL;
++}
++
++static struct pt_dma_desc *pt_handle_active_desc(struct pt_dma_chan *chan,
++						 struct pt_dma_desc *desc)
++{
++	struct dma_async_tx_descriptor *tx_desc;
++	struct virt_dma_desc *vd;
++	unsigned long flags;
++
++	/* Loop over descriptors until one is found with commands */
++	do {
++		if (desc) {
++			if (!desc->issued_to_hw) {
++				/* No errors, keep going */
++				if (desc->status != DMA_ERROR)
++					return desc;
++			}
++
++			tx_desc = &desc->vd.tx;
++			vd = &desc->vd;
++		} else {
++			tx_desc = NULL;
++		}
++
++		spin_lock_irqsave(&chan->vc.lock, flags);
++
++		if (desc) {
++			if (desc->status != DMA_ERROR)
++				desc->status = DMA_COMPLETE;
++
++			dma_cookie_complete(tx_desc);
++			dma_descriptor_unmap(tx_desc);
++			list_del(&desc->vd.node);
++		}
++
++		desc = pt_next_dma_desc(chan);
++
++		spin_unlock_irqrestore(&chan->vc.lock, flags);
++
++		if (tx_desc) {
++			dmaengine_desc_get_callback_invoke(tx_desc, NULL);
++			dma_run_dependencies(tx_desc);
++			vchan_vdesc_fini(vd);
++		}
++	} while (desc);
++
++	return NULL;
++}
++
++static void pt_cmd_callback(void *data, int err)
++{
++	struct pt_dma_desc *desc = data;
++	struct dma_chan *dma_chan;
++	struct pt_dma_chan *chan;
++	int ret;
++
++	if (err == -EINPROGRESS)
++		return;
++
++	dma_chan = desc->vd.tx.chan;
++	chan = to_pt_chan(dma_chan);
++
++	if (err)
++		desc->status = DMA_ERROR;
++
++	while (true) {
++		/* Check for DMA descriptor completion */
++		desc = pt_handle_active_desc(chan, desc);
++
++		/* Don't submit cmd if no descriptor or DMA is paused */
++		if (!desc)
++			break;
++
++		ret = pt_dma_start_desc(desc);
++		if (!ret)
++			break;
++
++		desc->status = DMA_ERROR;
++	}
++}
++
++static struct pt_dma_desc *pt_alloc_dma_desc(struct pt_dma_chan *chan,
++					     unsigned long flags)
++{
++	struct pt_dma_desc *desc;
++
++	desc = kmem_cache_zalloc(chan->pt->dma_desc_cache, GFP_NOWAIT);
++	if (!desc)
++		return NULL;
++
++	vchan_tx_prep(&chan->vc, &desc->vd, flags);
++
++	desc->pt = chan->pt;
++	desc->issued_to_hw = 0;
++	desc->status = DMA_IN_PROGRESS;
++
++	return desc;
++}
++
++static struct pt_dma_desc *pt_create_desc(struct dma_chan *dma_chan,
++					  dma_addr_t dst,
++					  dma_addr_t src,
++					  unsigned int len,
++					  unsigned long flags)
++{
++	struct pt_dma_chan *chan = to_pt_chan(dma_chan);
++	struct pt_passthru_engine *pt_engine;
++	struct pt_dma_desc *desc;
++	struct pt_cmd *pt_cmd;
++
++	desc = pt_alloc_dma_desc(chan, flags);
++	if (!desc)
++		return NULL;
++
++	pt_cmd = &desc->pt_cmd;
++	pt_cmd->pt = chan->pt;
++	pt_engine = &pt_cmd->passthru;
++	pt_cmd->engine = PT_ENGINE_PASSTHRU;
++	pt_engine->src_dma = src;
++	pt_engine->dst_dma = dst;
++	pt_engine->src_len = len;
++	pt_cmd->pt_cmd_callback = pt_cmd_callback;
++	pt_cmd->data = desc;
++
++	desc->len = len;
++
++	return desc;
++}
++
++static struct dma_async_tx_descriptor *
++pt_prep_dma_memcpy(struct dma_chan *dma_chan, dma_addr_t dst,
++		   dma_addr_t src, size_t len, unsigned long flags)
++{
++	struct pt_dma_desc *desc;
++
++	desc = pt_create_desc(dma_chan, dst, src, len, flags);
++	if (!desc)
++		return NULL;
++
++	return &desc->vd.tx;
++}
++
++static struct dma_async_tx_descriptor *
++pt_prep_dma_interrupt(struct dma_chan *dma_chan, unsigned long flags)
++{
++	struct pt_dma_chan *chan = to_pt_chan(dma_chan);
++	struct pt_dma_desc *desc;
++
++	desc = pt_alloc_dma_desc(chan, flags);
++	if (!desc)
++		return NULL;
++
++	return &desc->vd.tx;
++}
++
++static void pt_issue_pending(struct dma_chan *dma_chan)
++{
++	struct pt_dma_chan *chan = to_pt_chan(dma_chan);
++	struct pt_dma_desc *desc;
++	unsigned long flags;
++
++	spin_lock_irqsave(&chan->vc.lock, flags);
++
++	vchan_issue_pending(&chan->vc);
++
++	desc = pt_next_dma_desc(chan);
++
++	spin_unlock_irqrestore(&chan->vc.lock, flags);
++
++	/* If there was nothing active, start processing */
++	if (desc)
++		pt_cmd_callback(desc, 0);
++}
++
++static int pt_pause(struct dma_chan *dma_chan)
++{
++	struct pt_dma_chan *chan = to_pt_chan(dma_chan);
++	unsigned long flags;
++
++	spin_lock_irqsave(&chan->vc.lock, flags);
++	pt_stop_queue(&chan->pt->cmd_q);
++	spin_unlock_irqrestore(&chan->vc.lock, flags);
++
++	return 0;
++}
++
++static int pt_resume(struct dma_chan *dma_chan)
++{
++	struct pt_dma_chan *chan = to_pt_chan(dma_chan);
++	struct pt_dma_desc *desc = NULL;
++	unsigned long flags;
++
++	spin_lock_irqsave(&chan->vc.lock, flags);
++	pt_start_queue(&chan->pt->cmd_q);
++	desc = pt_next_dma_desc(chan);
++	spin_unlock_irqrestore(&chan->vc.lock, flags);
++
++	/* If there was something active, re-start */
++	if (desc)
++		pt_cmd_callback(desc, 0);
++
++	return 0;
++}
++
++static int pt_terminate_all(struct dma_chan *dma_chan)
++{
++	struct pt_dma_chan *chan = to_pt_chan(dma_chan);
++	unsigned long flags;
++	LIST_HEAD(head);
++
++	spin_lock_irqsave(&chan->vc.lock, flags);
++	vchan_get_all_descriptors(&chan->vc, &head);
++	spin_unlock_irqrestore(&chan->vc.lock, flags);
++
++	vchan_dma_desc_free_list(&chan->vc, &head);
++	vchan_free_chan_resources(&chan->vc);
++
++	return 0;
++}
++
++int pt_dmaengine_register(struct pt_device *pt)
++{
++	struct pt_dma_chan *chan;
++	struct dma_device *dma_dev = &pt->dma_dev;
++	char *cmd_cache_name;
++	char *desc_cache_name;
++	int ret;
++
++	pt->pt_dma_chan = devm_kzalloc(pt->dev, sizeof(*pt->pt_dma_chan),
++				       GFP_KERNEL);
++	if (!pt->pt_dma_chan)
++		return -ENOMEM;
++
++	cmd_cache_name = devm_kasprintf(pt->dev, GFP_KERNEL,
++					"%s-dmaengine-cmd-cache",
++					dev_name(pt->dev));
++	if (!cmd_cache_name)
++		return -ENOMEM;
++
++	desc_cache_name = devm_kasprintf(pt->dev, GFP_KERNEL,
++					 "%s-dmaengine-desc-cache",
++					 dev_name(pt->dev));
++	if (!desc_cache_name) {
++		ret = -ENOMEM;
++		goto err_cache;
++	}
++
++	pt->dma_desc_cache = kmem_cache_create(desc_cache_name,
++					       sizeof(struct pt_dma_desc), 0,
++					       SLAB_HWCACHE_ALIGN, NULL);
++	if (!pt->dma_desc_cache) {
++		ret = -ENOMEM;
++		goto err_cache;
++	}
++
++	dma_dev->dev = pt->dev;
++	dma_dev->src_addr_widths = DMA_SLAVE_BUSWIDTH_64_BYTES;
++	dma_dev->dst_addr_widths = DMA_SLAVE_BUSWIDTH_64_BYTES;
++	dma_dev->directions = DMA_MEM_TO_MEM;
++	dma_dev->residue_granularity = DMA_RESIDUE_GRANULARITY_DESCRIPTOR;
++	dma_cap_set(DMA_MEMCPY, dma_dev->cap_mask);
++	dma_cap_set(DMA_INTERRUPT, dma_dev->cap_mask);
++
++	/*
++	 * PTDMA is intended to be used with the AMD NTB devices, hence
++	 * marking it as DMA_PRIVATE.
++	 */
++	dma_cap_set(DMA_PRIVATE, dma_dev->cap_mask);
++
++	INIT_LIST_HEAD(&dma_dev->channels);
++
++	chan = pt->pt_dma_chan;
++	chan->pt = pt;
++
++	/* Set base and prep routines */
++	dma_dev->device_free_chan_resources = pt_free_chan_resources;
++	dma_dev->device_prep_dma_memcpy = pt_prep_dma_memcpy;
++	dma_dev->device_prep_dma_interrupt = pt_prep_dma_interrupt;
++	dma_dev->device_issue_pending = pt_issue_pending;
++	dma_dev->device_tx_status = dma_cookie_status;
++	dma_dev->device_pause = pt_pause;
++	dma_dev->device_resume = pt_resume;
++	dma_dev->device_terminate_all = pt_terminate_all;
++	dma_dev->device_synchronize = pt_synchronize;
++
++	chan->vc.desc_free = pt_do_cleanup;
++	vchan_init(&chan->vc, dma_dev);
++
++	dma_set_mask_and_coherent(pt->dev, DMA_BIT_MASK(64));
++
++	ret = dma_async_device_register(dma_dev);
++	if (ret)
++		goto err_reg;
++
++	return 0;
++
++err_reg:
++	kmem_cache_destroy(pt->dma_desc_cache);
++
++err_cache:
++	kmem_cache_destroy(pt->dma_cmd_cache);
++
++	return ret;
++}
++
++void pt_dmaengine_unregister(struct pt_device *pt)
++{
++	struct dma_device *dma_dev = &pt->dma_dev;
++
++	dma_async_device_unregister(dma_dev);
++
++	kmem_cache_destroy(pt->dma_desc_cache);
++	kmem_cache_destroy(pt->dma_cmd_cache);
++}
+diff --git a/drivers/dma/ptdma/ptdma.h b/drivers/dma/ptdma/ptdma.h
+index f195b15fb..1329c5543 100644
+--- a/drivers/dma/ptdma/ptdma.h
++++ b/drivers/dma/ptdma/ptdma.h
+@@ -14,6 +14,7 @@
+ #define __PT_DEV_H__
+ 
+ #include <linux/device.h>
++#include <linux/dmaengine.h>
+ #include <linux/pci.h>
+ #include <linux/spinlock.h>
+ #include <linux/mutex.h>
+@@ -21,6 +22,8 @@
+ #include <linux/wait.h>
+ #include <linux/dmapool.h>
+ 
++#include "../virt-dma.h"
++
+ #define MAX_PT_NAME_LEN			16
+ #define MAX_DMAPOOL_NAME_LEN		32
+ 
+@@ -170,6 +173,20 @@ struct pt_cmd {
+ 	void *data;
+ };
+ 
++struct pt_dma_desc {
++	struct virt_dma_desc vd;
++	struct pt_device *pt;
++	enum dma_status status;
++	size_t len;
++	bool issued_to_hw;
++	struct pt_cmd pt_cmd;
++};
++
++struct pt_dma_chan {
++	struct virt_dma_chan vc;
++	struct pt_device *pt;
++};
++
+ struct pt_cmd_queue {
+ 	struct pt_device *pt;
+ 
+@@ -229,6 +246,12 @@ struct pt_device {
+ 	 */
+ 	struct pt_cmd_queue cmd_q;
+ 
++	/* Support for the DMA Engine capabilities */
++	struct dma_device dma_dev;
++	struct pt_dma_chan *pt_dma_chan;
++	struct kmem_cache *dma_cmd_cache;
++	struct kmem_cache *dma_desc_cache;
++
+ 	wait_queue_head_t lsb_queue;
+ 
+ 	struct pt_tasklet_data tdata;
+@@ -281,6 +304,9 @@ struct pt_dev_vdata {
+ 	const unsigned int bar;
+ };
+ 
++int pt_dmaengine_register(struct pt_device *pt);
++void pt_dmaengine_unregister(struct pt_device *pt);
++
+ int pt_core_init(struct pt_device *pt);
+ void pt_core_destroy(struct pt_device *pt);
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From f2f90101726b6f1428a1d4c16b78a954b7213805 Mon Sep 17 00:00:00 2001
+From: Sanjay R Mehta <sanju.mehta@amd.com>
+Date: Tue, 17 Aug 2021 08:55:59 -0500
+Subject: [PATCH 34/41] dmaengine: ptdma: Add debugfs entries for PTDMA
+
+Expose data about the configuration and operation of the
+PTDMA through debugfs entries: device name, capabilities,
+configuration, statistics.
+
+Signed-off-by: Sanjay R Mehta <sanju.mehta@amd.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/dma/ptdma/Makefile        |   2 +-
+ drivers/dma/ptdma/ptdma-debugfs.c | 106 ++++++++++++++++++++++++++++++
+ drivers/dma/ptdma/ptdma-dev.c     |   5 ++
+ drivers/dma/ptdma/ptdma.h         |   6 ++
+ 4 files changed, 118 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/dma/ptdma/ptdma-debugfs.c
+
+diff --git a/drivers/dma/ptdma/Makefile b/drivers/dma/ptdma/Makefile
+index a528cb02e..ce5410268 100644
+--- a/drivers/dma/ptdma/Makefile
++++ b/drivers/dma/ptdma/Makefile
+@@ -5,6 +5,6 @@
+ 
+ obj-$(CONFIG_AMD_PTDMA) += ptdma.o
+ 
+-ptdma-objs := ptdma-dev.o ptdma-dmaengine.o
++ptdma-objs := ptdma-dev.o ptdma-dmaengine.o ptdma-debugfs.o
+ 
+ ptdma-$(CONFIG_PCI) += ptdma-pci.o
+diff --git a/drivers/dma/ptdma/ptdma-debugfs.c b/drivers/dma/ptdma/ptdma-debugfs.c
+new file mode 100644
+index 000000000..c8307d304
+--- /dev/null
++++ b/drivers/dma/ptdma/ptdma-debugfs.c
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * AMD Passthrough DMA device driver
++ * -- Based on the CCP driver
++ *
++ * Copyright (C) 2016,2021 Advanced Micro Devices, Inc.
++ *
++ * Author: Sanjay R Mehta <sanju.mehta@amd.com>
++ * Author: Gary R Hook <gary.hook@amd.com>
++ */
++
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++
++#include "ptdma.h"
++
++/* DebugFS helpers */
++#define	RI_VERSION_NUM	0x0000003F
++
++#define	RI_NUM_VQM	0x00078000
++#define	RI_NVQM_SHIFT	15
++
++static int pt_debugfs_info_show(struct seq_file *s, void *p)
++{
++	struct pt_device *pt = s->private;
++	unsigned int regval;
++
++	seq_printf(s, "Device name: %s\n", dev_name(pt->dev));
++	seq_printf(s, "   # Queues: %d\n", 1);
++	seq_printf(s, "     # Cmds: %d\n", pt->cmd_count);
++
++	regval = ioread32(pt->io_regs + CMD_PT_VERSION);
++
++	seq_printf(s, "    Version: %d\n", regval & RI_VERSION_NUM);
++	seq_puts(s, "    Engines:");
++	seq_puts(s, "\n");
++	seq_printf(s, "     Queues: %d\n", (regval & RI_NUM_VQM) >> RI_NVQM_SHIFT);
++
++	return 0;
++}
++
++/*
++ * Return a formatted buffer containing the current
++ * statistics of queue for PTDMA
++ */
++static int pt_debugfs_stats_show(struct seq_file *s, void *p)
++{
++	struct pt_device *pt = s->private;
++
++	seq_printf(s, "Total Interrupts Handled: %ld\n", pt->total_interrupts);
++
++	return 0;
++}
++
++static int pt_debugfs_queue_show(struct seq_file *s, void *p)
++{
++	struct pt_cmd_queue *cmd_q = s->private;
++	unsigned int regval;
++
++	if (!cmd_q)
++		return 0;
++
++	seq_printf(s, "               Pass-Thru: %ld\n", cmd_q->total_pt_ops);
++
++	regval = ioread32(cmd_q->reg_control + 0x000C);
++
++	seq_puts(s, "      Enabled Interrupts:");
++	if (regval & INT_EMPTY_QUEUE)
++		seq_puts(s, " EMPTY");
++	if (regval & INT_QUEUE_STOPPED)
++		seq_puts(s, " STOPPED");
++	if (regval & INT_ERROR)
++		seq_puts(s, " ERROR");
++	if (regval & INT_COMPLETION)
++		seq_puts(s, " COMPLETION");
++	seq_puts(s, "\n");
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(pt_debugfs_info);
++DEFINE_SHOW_ATTRIBUTE(pt_debugfs_queue);
++DEFINE_SHOW_ATTRIBUTE(pt_debugfs_stats);
++
++void ptdma_debugfs_setup(struct pt_device *pt)
++{
++	struct pt_cmd_queue *cmd_q;
++	struct dentry *debugfs_q_instance;
++
++	if (!debugfs_initialized())
++		return;
++
++	debugfs_create_file("info", 0400, pt->dma_dev.dbg_dev_root, pt,
++			    &pt_debugfs_info_fops);
++
++	debugfs_create_file("stats", 0400, pt->dma_dev.dbg_dev_root, pt,
++			    &pt_debugfs_stats_fops);
++
++	cmd_q = &pt->cmd_q;
++
++	debugfs_q_instance =
++		debugfs_create_dir("q", pt->dma_dev.dbg_dev_root);
++
++	debugfs_create_file("stats", 0400, debugfs_q_instance, cmd_q,
++			    &pt_debugfs_queue_fops);
++}
+diff --git a/drivers/dma/ptdma/ptdma-dev.c b/drivers/dma/ptdma/ptdma-dev.c
+index 46e7eff7b..8a6bf291a 100644
+--- a/drivers/dma/ptdma/ptdma-dev.c
++++ b/drivers/dma/ptdma/ptdma-dev.c
+@@ -102,6 +102,7 @@ int pt_core_perform_passthru(struct pt_cmd_queue *cmd_q,
+ 	struct ptdma_desc desc;
+ 
+ 	cmd_q->cmd_error = 0;
++	cmd_q->total_pt_ops++;
+ 	memset(&desc, 0, sizeof(desc));
+ 	desc.dw0 = CMD_DESC_DW0_VAL;
+ 	desc.length = pt_engine->src_len;
+@@ -150,6 +151,7 @@ static irqreturn_t pt_core_irq_handler(int irq, void *data)
+ 	u32 status;
+ 
+ 	pt_core_disable_queue_interrupts(pt);
++	pt->total_interrupts++;
+ 	status = ioread32(cmd_q->reg_control + 0x0010);
+ 	if (status) {
+ 		cmd_q->int_status = status;
+@@ -250,6 +252,9 @@ int pt_core_init(struct pt_device *pt)
+ 	if (ret)
+ 		goto e_dmaengine;
+ 
++	/* Set up debugfs entries */
++	ptdma_debugfs_setup(pt);
++
+ 	return 0;
+ 
+ e_dmaengine:
+diff --git a/drivers/dma/ptdma/ptdma.h b/drivers/dma/ptdma/ptdma.h
+index 1329c5543..860e302bc 100644
+--- a/drivers/dma/ptdma/ptdma.h
++++ b/drivers/dma/ptdma/ptdma.h
+@@ -216,6 +216,8 @@ struct pt_cmd_queue {
+ 	u32 q_status;
+ 	u32 q_int_status;
+ 	u32 cmd_error;
++	/* Queue Statistics */
++	unsigned long total_pt_ops;
+ } ____cacheline_aligned;
+ 
+ struct pt_device {
+@@ -254,6 +256,9 @@ struct pt_device {
+ 
+ 	wait_queue_head_t lsb_queue;
+ 
++	/* Device Statistics */
++	unsigned long total_interrupts;
++
+ 	struct pt_tasklet_data tdata;
+ };
+ 
+@@ -307,6 +312,7 @@ struct pt_dev_vdata {
+ int pt_dmaengine_register(struct pt_device *pt);
+ void pt_dmaengine_unregister(struct pt_device *pt);
+ 
++void ptdma_debugfs_setup(struct pt_device *pt);
+ int pt_core_init(struct pt_device *pt);
+ void pt_core_destroy(struct pt_device *pt);
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From fd10f6215b9a60ee679a326e11c0de9ab2c7a253 Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Fri, 23 Jul 2021 02:32:03 -0700
+Subject: [PATCH 35/41] iommu/amd: Selective flush on unmap
+
+Recent patch attempted to enable selective page flushes on AMD IOMMU but
+neglected to adapt amd_iommu_iotlb_sync() to use the selective flushes.
+
+Adapt amd_iommu_iotlb_sync() to use selective flushes and change
+amd_iommu_unmap() to collect the flushes. As a defensive measure, to
+avoid potential issues as those that the Intel IOMMU driver encountered
+recently, flush the page-walk caches by always setting the "pde"
+parameter. This can be removed later.
+
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Jiajun Cao <caojiajun@vmware.com>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: iommu@lists.linux-foundation.org
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/iommu/amd/iommu.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 811a49a95..bfae3928b 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -2054,12 +2054,17 @@ static size_t amd_iommu_unmap(struct iommu_domain *dom, unsigned long iova,
+ {
+ 	struct protection_domain *domain = to_pdomain(dom);
+ 	struct io_pgtable_ops *ops = &domain->iop.iop.ops;
++	size_t r;
+ 
+ 	if ((amd_iommu_pgtable == AMD_IOMMU_V1) &&
+ 	    (domain->iop.mode == PAGE_MODE_NONE))
+ 		return 0;
+ 
+-	return (ops->unmap) ? ops->unmap(ops, iova, page_size, gather) : 0;
++	r = (ops->unmap) ? ops->unmap(ops, iova, page_size, gather) : 0;
++
++	iommu_iotlb_gather_add_page(dom, gather, iova, page_size);
++
++	return r;
+ }
+ 
+ static phys_addr_t amd_iommu_iova_to_phys(struct iommu_domain *dom,
+@@ -2162,7 +2167,13 @@ static void amd_iommu_flush_iotlb_all(struct iommu_domain *domain)
+ static void amd_iommu_iotlb_sync(struct iommu_domain *domain,
+ 				 struct iommu_iotlb_gather *gather)
+ {
+-	amd_iommu_flush_iotlb_all(domain);
++	struct protection_domain *dom = to_pdomain(domain);
++	unsigned long flags;
++
++	spin_lock_irqsave(&dom->lock, flags);
++	__domain_flush_pages(dom, gather->start, gather->end - gather->start, 1);
++	amd_iommu_domain_flush_complete(dom);
++	spin_unlock_irqrestore(&dom->lock, flags);
+ }
+ 
+ static int amd_iommu_def_domain_type(struct device *dev)
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 9c42077127a1a0e4683487eb241c2acf9e1ae2e5 Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Fri, 23 Jul 2021 02:32:04 -0700
+Subject: [PATCH 36/41] iommu/amd: Do not use flush-queue when NpCache is on
+
+Do not use flush-queue on virtualized environments, where the NpCache
+capability of the IOMMU is set. This is required to reduce
+virtualization overheads.
+
+This change follows a similar change to Intel's VT-d and a detailed
+explanation as for the rationale is described in commit 29b32839725f
+("iommu/vt-d: Do not use flush-queue when caching-mode is on").
+
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Jiajun Cao <caojiajun@vmware.com>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: iommu@lists.linux-foundation.org
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/iommu/amd/init.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/iommu/amd/init.c b/drivers/iommu/amd/init.c
+index 5c21f1ee5..0123ef5ab 100644
+--- a/drivers/iommu/amd/init.c
++++ b/drivers/iommu/amd/init.c
+@@ -1859,8 +1859,13 @@ static int __init iommu_init_pci(struct amd_iommu *iommu)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (iommu->cap & (1UL << IOMMU_CAP_NPCACHE))
++	if (iommu->cap & (1UL << IOMMU_CAP_NPCACHE)) {
++		if (!amd_iommu_unmap_flush)
++			pr_info("IOMMU batching is disabled due to virtualization\n");
++
+ 		amd_iommu_np_cache = true;
++		amd_iommu_unmap_flush = true;
++	}
+ 
+ 	init_iommu_perf_ctr(iommu);
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 0cd0072f3deeee75bf1edf631fa9769c2002a556 Mon Sep 17 00:00:00 2001
+From: Robin Murphy <robin.murphy@arm.com>
+Date: Fri, 23 Jul 2021 02:32:05 -0700
+Subject: [PATCH 37/41] iommu: Improve iommu_iotlb_gather helpers
+
+The Mediatek driver is not the only one which might want a basic
+address-based gathering behaviour, so although it's arguably simple
+enough to open-code, let's factor it out for the sake of cleanliness.
+Let's also take this opportunity to document the intent of these
+helpers for clarity.
+
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Jiajun Cao <caojiajun@vmware.com>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: iommu@lists.linux-foundation.org
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/iommu/mtk_iommu.c |  6 +-----
+ include/linux/iommu.h     | 38 +++++++++++++++++++++++++++++++++-----
+ 2 files changed, 34 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/iommu/mtk_iommu.c b/drivers/iommu/mtk_iommu.c
+index 6f7c69688..d9939e4af 100644
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -520,12 +520,8 @@ static size_t mtk_iommu_unmap(struct iommu_domain *domain,
+ 			      struct iommu_iotlb_gather *gather)
+ {
+ 	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
+-	unsigned long end = iova + size - 1;
+ 
+-	if (gather->start > iova)
+-		gather->start = iova;
+-	if (gather->end < end)
+-		gather->end = end;
++	iommu_iotlb_gather_add_range(gather, iova, size);
+ 	return dom->iop->unmap(dom->iop, iova, size, gather);
+ }
+ 
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 32d448050..e554871db 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -497,6 +497,38 @@ static inline void iommu_iotlb_sync(struct iommu_domain *domain,
+ 	iommu_iotlb_gather_init(iotlb_gather);
+ }
+ 
++/**
++ * iommu_iotlb_gather_add_range - Gather for address-based TLB invalidation
++ * @gather: TLB gather data
++ * @iova: start of page to invalidate
++ * @size: size of page to invalidate
++ *
++ * Helper for IOMMU drivers to build arbitrarily-sized invalidation commands
++ * where only the address range matters, and simply minimising intermediate
++ * syncs is preferred.
++ */
++static inline void iommu_iotlb_gather_add_range(struct iommu_iotlb_gather *gather,
++						unsigned long iova, size_t size)
++{
++	unsigned long end = iova + size - 1;
++
++	if (gather->start > iova)
++		gather->start = iova;
++	if (gather->end < end)
++		gather->end = end;
++}
++
++/**
++ * iommu_iotlb_gather_add_page - Gather for page-based TLB invalidation
++ * @domain: IOMMU domain to be invalidated
++ * @gather: TLB gather data
++ * @iova: start of page to invalidate
++ * @size: size of page to invalidate
++ *
++ * Helper for IOMMU drivers to build invalidation commands based on individual
++ * pages, or with page size/table level hints which cannot be gathered if they
++ * differ.
++ */
+ static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
+ 					       struct iommu_iotlb_gather *gather,
+ 					       unsigned long iova, size_t size)
+@@ -515,11 +547,7 @@ static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
+ 		gather->pgsize = size;
+ 	}
+ 
+-	if (gather->end < end)
+-		gather->end = end;
+-
+-	if (gather->start > start)
+-		gather->start = start;
++	iommu_iotlb_gather_add_range(gather, iova, size);
+ }
+ 
+ /* PCI device grouping function */
+-- 
+2.33.1.711.g9d530dc002
+
+
+From ad98dd1acfbcef993aed8df17e672b855764c7e1 Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Fri, 23 Jul 2021 02:32:06 -0700
+Subject: [PATCH 38/41] iommu: Factor iommu_iotlb_gather_is_disjoint() out
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Refactor iommu_iotlb_gather_add_page() and factor out the logic that
+detects whether IOTLB gather range and a new range are disjoint. To be
+used by the next patch that implements different gathering logic for
+AMD.
+
+Note that updating gather->pgsize unconditionally does not affect
+correctness as the function had (and has) an invariant, in which
+gather->pgsize always represents the flushing granularity of its range.
+Arguably, “size" should never be zero, but lets assume for the matter of
+discussion that it might.
+
+If "size" equals to "gather->pgsize", then the assignment in question
+has no impact.
+
+Otherwise, if "size" is non-zero, then iommu_iotlb_sync() would
+initialize the size and range (see iommu_iotlb_gather_init()), and the
+invariant is kept.
+
+Otherwise, "size" is zero, and "gather" already holds a range, so
+gather->pgsize is non-zero and (gather->pgsize && gather->pgsize !=
+size) is true. Therefore, again, iommu_iotlb_sync() would be called and
+initialize the size.
+
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Jiajun Cao <caojiajun@vmware.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: iommu@lists.linux-foundation.org
+Cc: linux-kernel@vger.kernel.org>
+Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+Acked-by: Will Deacon <will@kernel.org>
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ include/linux/iommu.h | 34 ++++++++++++++++++++++++++--------
+ 1 file changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index e554871db..979a5ceee 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -497,6 +497,28 @@ static inline void iommu_iotlb_sync(struct iommu_domain *domain,
+ 	iommu_iotlb_gather_init(iotlb_gather);
+ }
+ 
++/**
++ * iommu_iotlb_gather_is_disjoint - Checks whether a new range is disjoint
++ *
++ * @gather: TLB gather data
++ * @iova: start of page to invalidate
++ * @size: size of page to invalidate
++ *
++ * Helper for IOMMU drivers to check whether a new range and the gathered range
++ * are disjoint. For many IOMMUs, flushing the IOMMU in this case is better
++ * than merging the two, which might lead to unnecessary invalidations.
++ */
++static inline
++bool iommu_iotlb_gather_is_disjoint(struct iommu_iotlb_gather *gather,
++				    unsigned long iova, size_t size)
++{
++	unsigned long start = iova, end = start + size - 1;
++
++	return gather->end != 0 &&
++		(end + 1 < gather->start || start > gather->end + 1);
++}
++
++
+ /**
+  * iommu_iotlb_gather_add_range - Gather for address-based TLB invalidation
+  * @gather: TLB gather data
+@@ -533,20 +555,16 @@ static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
+ 					       struct iommu_iotlb_gather *gather,
+ 					       unsigned long iova, size_t size)
+ {
+-	unsigned long start = iova, end = start + size - 1;
+-
+ 	/*
+ 	 * If the new page is disjoint from the current range or is mapped at
+ 	 * a different granularity, then sync the TLB so that the gather
+ 	 * structure can be rewritten.
+ 	 */
+-	if (gather->pgsize != size ||
+-	    end + 1 < gather->start || start > gather->end + 1) {
+-		if (gather->pgsize)
+-			iommu_iotlb_sync(domain, gather);
+-		gather->pgsize = size;
+-	}
++	if ((gather->pgsize && gather->pgsize != size) ||
++	    iommu_iotlb_gather_is_disjoint(gather, iova, size))
++		iommu_iotlb_sync(domain, gather);
+ 
++	gather->pgsize = size;
+ 	iommu_iotlb_gather_add_range(gather, iova, size);
+ }
+ 
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 5ed10776700b8e97d98233483ae2c165a22019c4 Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Fri, 23 Jul 2021 02:32:07 -0700
+Subject: [PATCH 39/41] iommu/amd: Tailored gather logic for AMD
+
+AMD's IOMMU can flush efficiently (i.e., in a single flush) any range.
+This is in contrast, for instnace, to Intel IOMMUs that have a limit on
+the number of pages that can be flushed in a single flush.  In addition,
+AMD's IOMMU do not care about the page-size, so changes of the page size
+do not need to trigger a TLB flush.
+
+So in most cases, a TLB flush due to disjoint range is not needed for
+AMD. Yet, vIOMMUs require the hypervisor to synchronize the virtualized
+IOMMU's PTEs with the physical ones. This process induce overheads, so
+it is better not to cause unnecessary flushes, i.e., flushes of PTEs
+that were not modified.
+
+Implement and use amd_iommu_iotlb_gather_add_page() and use it instead
+of the generic iommu_iotlb_gather_add_page(). Ignore disjoint regions
+unless "non-present cache" feature is reported by the IOMMU
+capabilities, as this is an indication we are running on a physical
+IOMMU. A similar indication is used by VT-d (see "caching mode"). The
+new logic retains the same flushing behavior that we had before the
+introduction of page-selective IOTLB flushes for AMD.
+
+On virtualized environments, check if the newly flushed region and the
+gathered one are disjoint and flush if it is.
+
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Jiajun Cao <caojiajun@vmware.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: iommu@lists.linux-foundation.org
+Cc: linux-kernel@vger.kernel.org>
+Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/iommu/amd/iommu.c | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index bfae3928b..f5d5f2124 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -2048,6 +2048,27 @@ static int amd_iommu_map(struct iommu_domain *dom, unsigned long iova,
+ 	return ret;
+ }
+ 
++static void amd_iommu_iotlb_gather_add_page(struct iommu_domain *domain,
++					    struct iommu_iotlb_gather *gather,
++					    unsigned long iova, size_t size)
++{
++	/*
++	 * AMD's IOMMU can flush as many pages as necessary in a single flush.
++	 * Unless we run in a virtual machine, which can be inferred according
++	 * to whether "non-present cache" is on, it is probably best to prefer
++	 * (potentially) too extensive TLB flushing (i.e., more misses) over
++	 * mutliple TLB flushes (i.e., more flushes). For virtual machines the
++	 * hypervisor needs to synchronize the host IOMMU PTEs with those of
++	 * the guest, and the trade-off is different: unnecessary TLB flushes
++	 * should be avoided.
++	 */
++	if (amd_iommu_np_cache &&
++	    iommu_iotlb_gather_is_disjoint(gather, iova, size))
++		iommu_iotlb_sync(domain, gather);
++
++	iommu_iotlb_gather_add_range(gather, iova, size);
++}
++
+ static size_t amd_iommu_unmap(struct iommu_domain *dom, unsigned long iova,
+ 			      size_t page_size,
+ 			      struct iommu_iotlb_gather *gather)
+@@ -2062,7 +2083,7 @@ static size_t amd_iommu_unmap(struct iommu_domain *dom, unsigned long iova,
+ 
+ 	r = (ops->unmap) ? ops->unmap(ops, iova, page_size, gather) : 0;
+ 
+-	iommu_iotlb_gather_add_page(dom, gather, iova, page_size);
++	amd_iommu_iotlb_gather_add_page(dom, gather, iova, page_size);
+ 
+ 	return r;
+ }
+-- 
+2.33.1.711.g9d530dc002
+
+
+From 2aaad9e5e6437015425d609924ab236206bd8244 Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Fri, 23 Jul 2021 02:32:08 -0700
+Subject: [PATCH 40/41] iommu/amd: Sync once for scatter-gather operations
+
+On virtual machines, software must flush the IOTLB after each page table
+entry update.
+
+The iommu_map_sg() code iterates through the given scatter-gather list
+and invokes iommu_map() for each element in the scatter-gather list,
+which calls into the vendor IOMMU driver through iommu_ops callback. As
+the result, a single sg mapping may lead to multiple IOTLB flushes.
+
+Fix this by adding amd_iotlb_sync_map() callback and flushing at this
+point after all sg mappings we set.
+
+This commit is followed and inspired by commit 933fcd01e97e2
+("iommu/vt-d: Add iotlb_sync_map callback").
+
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Jiajun Cao <caojiajun@vmware.com>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: iommu@lists.linux-foundation.org
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/iommu/amd/iommu.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index f5d5f2124..7846fcb1e 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -2022,6 +2022,16 @@ static int amd_iommu_attach_device(struct iommu_domain *dom,
+ 	return ret;
+ }
+ 
++static void amd_iommu_iotlb_sync_map(struct iommu_domain *dom,
++				     unsigned long iova, size_t size)
++{
++	struct protection_domain *domain = to_pdomain(dom);
++	struct io_pgtable_ops *ops = &domain->iop.iop.ops;
++
++	if (ops->map)
++		domain_flush_np_cache(domain, iova, size);
++}
++
+ static int amd_iommu_map(struct iommu_domain *dom, unsigned long iova,
+ 			 phys_addr_t paddr, size_t page_size, int iommu_prot,
+ 			 gfp_t gfp)
+@@ -2040,10 +2050,8 @@ static int amd_iommu_map(struct iommu_domain *dom, unsigned long iova,
+ 	if (iommu_prot & IOMMU_WRITE)
+ 		prot |= IOMMU_PROT_IW;
+ 
+-	if (ops->map) {
++	if (ops->map)
+ 		ret = ops->map(ops, iova, paddr, page_size, prot, gfp);
+-		domain_flush_np_cache(domain, iova, page_size);
+-	}
+ 
+ 	return ret;
+ }
+@@ -2223,6 +2231,7 @@ const struct iommu_ops amd_iommu_ops = {
+ 	.attach_dev = amd_iommu_attach_device,
+ 	.detach_dev = amd_iommu_detach_device,
+ 	.map = amd_iommu_map,
++	.iotlb_sync_map	= amd_iommu_iotlb_sync_map,
+ 	.unmap = amd_iommu_unmap,
+ 	.iova_to_phys = amd_iommu_iova_to_phys,
+ 	.probe_device = amd_iommu_probe_device,
+-- 
+2.33.1.711.g9d530dc002
+
+
+From e3f949146af143f826b036ee0a05362f93ff32a7 Mon Sep 17 00:00:00 2001
+From: Nadav Amit <namit@vmware.com>
+Date: Fri, 23 Jul 2021 02:32:09 -0700
+Subject: [PATCH 41/41] iommu/amd: Use only natural aligned flushes in a VM
+
+When running on an AMD vIOMMU, it is better to avoid TLB flushes
+of unmodified PTEs. vIOMMUs require the hypervisor to synchronize the
+virtualized IOMMU's PTEs with the physical ones. This process induce
+overheads.
+
+AMD IOMMU allows us to flush any range that is aligned to the power of
+2. So when running on top of a vIOMMU, break the range into sub-ranges
+that are naturally aligned, and flush each one separately. This apporach
+is better when running with a vIOMMU, but on physical IOMMUs, the
+penalty of IOTLB misses due to unnecessary flushed entries is likely to
+be low.
+
+Repurpose (i.e., keeping the name, changing the logic)
+domain_flush_pages() so it is used to choose whether to perform one
+flush of the whole range or multiple ones to avoid flushing unnecessary
+ranges. Use NpCache, as usual, to infer whether the IOMMU is physical or
+virtual.
+
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Jiajun Cao <caojiajun@vmware.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: iommu@lists.linux-foundation.org
+Cc: linux-kernel@vger.kernel.org
+Suggested-by: Robin Murphy <robin.murphy@arm.com>
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: Tor Vic <torvic9@mailbox.org>
+---
+ drivers/iommu/amd/iommu.c | 47 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 7846fcb1e..3f6428aa6 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -1261,15 +1261,52 @@ static void __domain_flush_pages(struct protection_domain *domain,
+ }
+ 
+ static void domain_flush_pages(struct protection_domain *domain,
+-			       u64 address, size_t size)
++			       u64 address, size_t size, int pde)
+ {
+-	__domain_flush_pages(domain, address, size, 0);
++	if (likely(!amd_iommu_np_cache)) {
++		__domain_flush_pages(domain, address, size, pde);
++		return;
++	}
++
++	/*
++	 * When NpCache is on, we infer that we run in a VM and use a vIOMMU.
++	 * In such setups it is best to avoid flushes of ranges which are not
++	 * naturally aligned, since it would lead to flushes of unmodified
++	 * PTEs. Such flushes would require the hypervisor to do more work than
++	 * necessary. Therefore, perform repeated flushes of aligned ranges
++	 * until you cover the range. Each iteration flushes the smaller
++	 * between the natural alignment of the address that we flush and the
++	 * greatest naturally aligned region that fits in the range.
++	 */
++	while (size != 0) {
++		int addr_alignment = __ffs(address);
++		int size_alignment = __fls(size);
++		int min_alignment;
++		size_t flush_size;
++
++		/*
++		 * size is always non-zero, but address might be zero, causing
++		 * addr_alignment to be negative. As the casting of the
++		 * argument in __ffs(address) to long might trim the high bits
++		 * of the address on x86-32, cast to long when doing the check.
++		 */
++		if (likely((unsigned long)address != 0))
++			min_alignment = min(addr_alignment, size_alignment);
++		else
++			min_alignment = size_alignment;
++
++		flush_size = 1ul << min_alignment;
++
++		__domain_flush_pages(domain, address, flush_size, pde);
++		address += flush_size;
++		size -= flush_size;
++	}
+ }
+ 
+ /* Flush the whole IO/TLB for a given protection domain - including PDE */
+ void amd_iommu_domain_flush_tlb_pde(struct protection_domain *domain)
+ {
+-	__domain_flush_pages(domain, 0, CMD_INV_IOMMU_ALL_PAGES_ADDRESS, 1);
++	domain_flush_pages(domain, 0, CMD_INV_IOMMU_ALL_PAGES_ADDRESS, 1);
+ }
+ 
+ void amd_iommu_domain_flush_complete(struct protection_domain *domain)
+@@ -1296,7 +1333,7 @@ static void domain_flush_np_cache(struct protection_domain *domain,
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(&domain->lock, flags);
+-		domain_flush_pages(domain, iova, size);
++		domain_flush_pages(domain, iova, size, 1);
+ 		amd_iommu_domain_flush_complete(domain);
+ 		spin_unlock_irqrestore(&domain->lock, flags);
+ 	}
+@@ -2200,7 +2237,7 @@ static void amd_iommu_iotlb_sync(struct iommu_domain *domain,
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&dom->lock, flags);
+-	__domain_flush_pages(dom, gather->start, gather->end - gather->start, 1);
++	domain_flush_pages(dom, gather->start, gather->end - gather->start, 1);
+ 	amd_iommu_domain_flush_complete(dom);
+ 	spin_unlock_irqrestore(&dom->lock, flags);
+ }
+-- 
+2.33.1.711.g9d530dc002
+
