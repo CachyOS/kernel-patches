@@ -1,0 +1,1337 @@
+From 7fdd91f62b8da69c35afd3aaf26055bf027d133e Mon Sep 17 00:00:00 2001
+From: "P. Jung" <ptr1337@cachyos.org>
+Date: Tue, 2 Nov 2021 09:51:12 +0100
+Subject: [PATCH] rcu-next
+
+Signed-off-by: P. Jung <ptr1337@cachyos.org>
+---
+ .../Tree-RCU-Memory-Ordering.rst              |  96 ++++++++-------
+ Documentation/RCU/stallwarn.rst               |  10 ++
+ arch/sh/configs/sdk7786_defconfig             |   1 -
+ arch/xtensa/configs/nommu_kc705_defconfig     |   1 -
+ include/linux/rcupdate.h                      |   3 +-
+ include/linux/rcupdate_trace.h                |   5 +-
+ include/linux/torture.h                       |   8 ++
+ kernel/locking/locktorture.c                  |  14 +--
+ kernel/rcu/rcuscale.c                         |  10 +-
+ kernel/rcu/rcutorture.c                       |  86 +++++++++-----
+ kernel/rcu/refscale.c                         |   6 +-
+ kernel/rcu/tasks.h                            | 109 +++++++++---------
+ kernel/rcu/tree.c                             |  36 +++---
+ kernel/rcu/tree_exp.h                         |   3 +-
+ kernel/rcu/tree_nocb.h                        |   2 +-
+ kernel/rcu/tree_plugin.h                      |  11 +-
+ kernel/rcu/update.c                           |   8 +-
+ kernel/scftorture.c                           |  43 ++++---
+ tools/rcu/extract-stall.sh                    |  34 ++++++
+ .../selftests/rcutorture/bin/kvm-remote.sh    |   1 +
+ tools/testing/selftests/rcutorture/bin/kvm.sh |   2 +-
+ .../selftests/rcutorture/bin/torture.sh       |  11 +-
+ 22 files changed, 286 insertions(+), 214 deletions(-)
+ create mode 100644 tools/rcu/extract-stall.sh
+
+diff --git a/Documentation/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.rst b/Documentation/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.rst
+index eeb351296df1..9be144c5ead3 100644
+--- a/Documentation/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.rst
++++ b/Documentation/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.rst
+@@ -197,57 +197,51 @@ section. For example, consider the ``rcu_prepare_for_idle()`` function
+ shown below, which is one of several functions that enforce ordering of
+ newly arrived RCU callbacks against future grace periods:
+ 
+-::
+-
+-    1 static void rcu_prepare_for_idle(void)
+-    2 {
+-    3   bool needwake;
+-    4   struct rcu_data *rdp;
+-    5   struct rcu_dynticks *rdtp = this_cpu_ptr(&rcu_dynticks);
+-    6   struct rcu_node *rnp;
+-    7   struct rcu_state *rsp;
+-    8   int tne;
+-    9
+-   10   if (IS_ENABLED(CONFIG_RCU_NOCB_CPU_ALL) ||
+-   11       rcu_is_nocb_cpu(smp_processor_id()))
+-   12     return;
+-   13   tne = READ_ONCE(tick_nohz_active);
+-   14   if (tne != rdtp->tick_nohz_enabled_snap) {
+-   15     if (rcu_cpu_has_callbacks(NULL))
+-   16       invoke_rcu_core();
+-   17     rdtp->tick_nohz_enabled_snap = tne;
+-   18     return;
+-   19   }
+-   20   if (!tne)
+-   21     return;
+-   22   if (rdtp->all_lazy &&
+-   23       rdtp->nonlazy_posted != rdtp->nonlazy_posted_snap) {
+-   24     rdtp->all_lazy = false;
+-   25     rdtp->nonlazy_posted_snap = rdtp->nonlazy_posted;
+-   26     invoke_rcu_core();
+-   27     return;
+-   28   }
+-   29   if (rdtp->last_accelerate == jiffies)
+-   30     return;
+-   31   rdtp->last_accelerate = jiffies;
+-   32   for_each_rcu_flavor(rsp) {
+-   33     rdp = this_cpu_ptr(rsp->rda);
+-   34     if (rcu_segcblist_pend_cbs(&rdp->cblist))
+-   35       continue;
+-   36     rnp = rdp->mynode;
+-   37     raw_spin_lock_rcu_node(rnp);
+-   38     needwake = rcu_accelerate_cbs(rsp, rnp, rdp);
+-   39     raw_spin_unlock_rcu_node(rnp);
+-   40     if (needwake)
+-   41       rcu_gp_kthread_wake(rsp);
+-   42   }
+-   43 }
+-
+-But the only part of ``rcu_prepare_for_idle()`` that really matters for
+-this discussion are lines 37–39. We will therefore abbreviate this
+-function as follows:
+-
+-.. kernel-figure:: rcu_node-lock.svg
++
++     1 static void rcu_prepare_for_idle(void)
++     2 {
++     3   bool needwake;
++     4   struct rcu_data *rdp = this_cpu_ptr(&rcu_data);
++     5   struct rcu_node *rnp;
++     6   int tne;
++     7
++     8   lockdep_assert_irqs_disabled();
++     9   if (rcu_rdp_is_offloaded(rdp))
++    10     return;
++    11
++    12   /* Handle nohz enablement switches conservatively. */
++    13   tne = READ_ONCE(tick_nohz_active);
++    14   if (tne != rdp->tick_nohz_enabled_snap) {
++    15     if (!rcu_segcblist_empty(&rdp->cblist))
++    16       invoke_rcu_core(); /* force nohz to see update. */
++    17     rdp->tick_nohz_enabled_snap = tne;
++    18     return;
++    19	}
++    20   if (!tne)
++    21     return;
++    22
++    23   /*
++    24    * If we have not yet accelerated this jiffy, accelerate all
++    25    * callbacks on this CPU.
++    26   */
++    27   if (rdp->last_accelerate == jiffies)
++    28     return;
++    29   rdp->last_accelerate = jiffies;
++    30   if (rcu_segcblist_pend_cbs(&rdp->cblist)) {
++    31     rnp = rdp->mynode;
++    32     raw_spin_lock_rcu_node(rnp); /* irqs already disabled. */
++    33     needwake = rcu_accelerate_cbs(rnp, rdp);
++    34     raw_spin_unlock_rcu_node(rnp); /* irqs remain disabled. */
++    35     if (needwake)
++    36       rcu_gp_kthread_wake();
++    37   }
++    38 }
++
++ But the only part of ``rcu_prepare_for_idle()`` that really matters for
++    this discussion are lines 32–34. We will therefore abbreviate this
++ function as follows:
++
++ .. kernel-figure:: rcu_node-lock.svg
+ 
+ The box represents the ``rcu_node`` structure's ``->lock`` critical
+ section, with the double line on top representing the additional
+diff --git a/Documentation/RCU/stallwarn.rst b/Documentation/RCU/stallwarn.rst
+index 5036df24ae61..28f8ad16db25 100644
+--- a/Documentation/RCU/stallwarn.rst
++++ b/Documentation/RCU/stallwarn.rst
+@@ -96,6 +96,16 @@ warnings:
+ 	the ``rcu_.*timer wakeup didn't happen for`` console-log message,
+ 	which will include additional debugging information.
+ 
++-	A low-level kernel issue that either fails to invoke one of the
++	variants of rcu_user_enter(), rcu_user_exit(), rcu_idle_enter(),
++	rcu_idle_exit(), rcu_irq_enter(), or rcu_irq_exit() on the one
++	hand, or that invokes one of them too many times on the other.
++	Historically, the most frequent issue has been an omission
++	of either irq_enter() or irq_exit(), which in turn invoke
++	rcu_irq_enter() or rcu_irq_exit(), respectively.  Building your
++	kernel with CONFIG_RCU_EQS_DEBUG=y can help track down these types
++	of issues, which sometimes arise in architecture-specific code.
++
+ -	A bug in the RCU implementation.
+ 
+ -	A hardware failure.  This is quite unlikely, but has occurred
+diff --git a/arch/sh/configs/sdk7786_defconfig b/arch/sh/configs/sdk7786_defconfig
+index f776a1d0d277..a8662b6927ec 100644
+--- a/arch/sh/configs/sdk7786_defconfig
++++ b/arch/sh/configs/sdk7786_defconfig
+@@ -5,7 +5,6 @@ CONFIG_BSD_PROCESS_ACCT=y
+ CONFIG_BSD_PROCESS_ACCT_V3=y
+ CONFIG_AUDIT=y
+ CONFIG_AUDITSYSCALL=y
+-CONFIG_TREE_PREEMPT_RCU=y
+ CONFIG_RCU_TRACE=y
+ CONFIG_IKCONFIG=y
+ CONFIG_IKCONFIG_PROC=y
+diff --git a/arch/xtensa/configs/nommu_kc705_defconfig b/arch/xtensa/configs/nommu_kc705_defconfig
+index 88b2e222d4bf..fcb620ef3799 100644
+--- a/arch/xtensa/configs/nommu_kc705_defconfig
++++ b/arch/xtensa/configs/nommu_kc705_defconfig
+@@ -119,7 +119,6 @@ CONFIG_DEBUG_SPINLOCK=y
+ CONFIG_DEBUG_MUTEXES=y
+ CONFIG_DEBUG_ATOMIC_SLEEP=y
+ CONFIG_STACKTRACE=y
+-# CONFIG_RCU_CPU_STALL_INFO is not set
+ CONFIG_RCU_TRACE=y
+ # CONFIG_FTRACE is not set
+ # CONFIG_LD_NO_RELAX is not set
+diff --git a/include/linux/rcupdate.h b/include/linux/rcupdate.h
+index 434d12fe2d4f..5e0beb5c5659 100644
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@ -71,7 +71,8 @@ static inline void __rcu_read_lock(void)
+ static inline void __rcu_read_unlock(void)
+ {
+ 	preempt_enable();
+-	rcu_read_unlock_strict();
++	if (IS_ENABLED(CONFIG_RCU_STRICT_GRACE_PERIOD))
++		rcu_read_unlock_strict();
+ }
+ 
+ static inline int rcu_preempt_depth(void)
+diff --git a/include/linux/rcupdate_trace.h b/include/linux/rcupdate_trace.h
+index 86c8f6c98412..6f9c35817398 100644
+--- a/include/linux/rcupdate_trace.h
++++ b/include/linux/rcupdate_trace.h
+@@ -31,7 +31,7 @@ static inline int rcu_read_lock_trace_held(void)
+ 
+ #ifdef CONFIG_TASKS_TRACE_RCU
+ 
+-void rcu_read_unlock_trace_special(struct task_struct *t, int nesting);
++void rcu_read_unlock_trace_special(struct task_struct *t);
+ 
+ /**
+  * rcu_read_lock_trace - mark beginning of RCU-trace read-side critical section
+@@ -80,7 +80,8 @@ static inline void rcu_read_unlock_trace(void)
+ 		WRITE_ONCE(t->trc_reader_nesting, nesting);
+ 		return;  // We assume shallow reader nesting.
+ 	}
+-	rcu_read_unlock_trace_special(t, nesting);
++	WARN_ON_ONCE(nesting != 0);
++	rcu_read_unlock_trace_special(t);
+ }
+ 
+ void call_rcu_tasks_trace(struct rcu_head *rhp, rcu_callback_t func);
+diff --git a/include/linux/torture.h b/include/linux/torture.h
+index 0910c5803f35..24f58e50a94b 100644
+--- a/include/linux/torture.h
++++ b/include/linux/torture.h
+@@ -47,6 +47,14 @@ do {										\
+ } while (0)
+ void verbose_torout_sleep(void);
+ 
++#define torture_init_error(firsterr)						\
++({										\
++	int ___firsterr = (firsterr);						\
++										\
++	WARN_ONCE(!IS_MODULE(CONFIG_RCU_TORTURE_TEST) && ___firsterr < 0, "Torture-test initialization failed with error code %d\n", ___firsterr); \
++	___firsterr < 0;								\
++})
++
+ /* Definitions for online/offline exerciser. */
+ #ifdef CONFIG_HOTPLUG_CPU
+ int torture_num_online_cpus(void);
+diff --git a/kernel/locking/locktorture.c b/kernel/locking/locktorture.c
+index 7c5a4a087cc7..397ac13d2ef7 100644
+--- a/kernel/locking/locktorture.c
++++ b/kernel/locking/locktorture.c
+@@ -1022,23 +1022,23 @@ static int __init lock_torture_init(void)
+ 	if (onoff_interval > 0) {
+ 		firsterr = torture_onoff_init(onoff_holdoff * HZ,
+ 					      onoff_interval * HZ, NULL);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (shuffle_interval > 0) {
+ 		firsterr = torture_shuffle_init(shuffle_interval);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (shutdown_secs > 0) {
+ 		firsterr = torture_shutdown_init(shutdown_secs,
+ 						 lock_torture_cleanup);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (stutter > 0) {
+ 		firsterr = torture_stutter_init(stutter, stutter);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 
+@@ -1082,7 +1082,7 @@ static int __init lock_torture_init(void)
+ 		/* Create writer. */
+ 		firsterr = torture_create_kthread(lock_torture_writer, &cxt.lwsa[i],
+ 						  writer_tasks[i]);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 
+ 	create_reader:
+@@ -1091,13 +1091,13 @@ static int __init lock_torture_init(void)
+ 		/* Create reader. */
+ 		firsterr = torture_create_kthread(lock_torture_reader, &cxt.lrsa[j],
+ 						  reader_tasks[j]);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (stat_interval > 0) {
+ 		firsterr = torture_create_kthread(lock_torture_stats, NULL,
+ 						  stats_task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	torture_init_end();
+diff --git a/kernel/rcu/rcuscale.c b/kernel/rcu/rcuscale.c
+index 2cc34a22a506..228f143bf935 100644
+--- a/kernel/rcu/rcuscale.c
++++ b/kernel/rcu/rcuscale.c
+@@ -758,7 +758,7 @@ kfree_scale_init(void)
+ 		init_waitqueue_head(&shutdown_wq);
+ 		firsterr = torture_create_kthread(kfree_scale_shutdown, NULL,
+ 						  shutdown_task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 		schedule_timeout_uninterruptible(1);
+ 	}
+@@ -775,7 +775,7 @@ kfree_scale_init(void)
+ 	for (i = 0; i < kfree_nrealthreads; i++) {
+ 		firsterr = torture_create_kthread(kfree_scale_thread, (void *)i,
+ 						  kfree_reader_tasks[i]);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 
+@@ -838,7 +838,7 @@ rcu_scale_init(void)
+ 		init_waitqueue_head(&shutdown_wq);
+ 		firsterr = torture_create_kthread(rcu_scale_shutdown, NULL,
+ 						  shutdown_task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 		schedule_timeout_uninterruptible(1);
+ 	}
+@@ -852,7 +852,7 @@ rcu_scale_init(void)
+ 	for (i = 0; i < nrealreaders; i++) {
+ 		firsterr = torture_create_kthread(rcu_scale_reader, (void *)i,
+ 						  reader_tasks[i]);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	while (atomic_read(&n_rcu_scale_reader_started) < nrealreaders)
+@@ -879,7 +879,7 @@ rcu_scale_init(void)
+ 		}
+ 		firsterr = torture_create_kthread(rcu_scale_writer, (void *)i,
+ 						  writer_tasks[i]);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	torture_init_end();
+diff --git a/kernel/rcu/rcutorture.c b/kernel/rcu/rcutorture.c
+index ab4215266ebe..8b410d982990 100644
+--- a/kernel/rcu/rcutorture.c
++++ b/kernel/rcu/rcutorture.c
+@@ -1432,28 +1432,34 @@ static void rcutorture_one_extend(int *readstate, int newstate,
+ 	/* First, put new protection in place to avoid critical-section gap. */
+ 	if (statesnew & RCUTORTURE_RDR_BH)
+ 		local_bh_disable();
++	if (statesnew & RCUTORTURE_RDR_RBH)
++		rcu_read_lock_bh();
+ 	if (statesnew & RCUTORTURE_RDR_IRQ)
+ 		local_irq_disable();
+ 	if (statesnew & RCUTORTURE_RDR_PREEMPT)
+ 		preempt_disable();
+-	if (statesnew & RCUTORTURE_RDR_RBH)
+-		rcu_read_lock_bh();
+ 	if (statesnew & RCUTORTURE_RDR_SCHED)
+ 		rcu_read_lock_sched();
+ 	if (statesnew & RCUTORTURE_RDR_RCU)
+ 		idxnew = cur_ops->readlock() << RCUTORTURE_RDR_SHIFT;
+ 
+-	/* Next, remove old protection, irq first due to bh conflict. */
++	/*
++	 * Next, remove old protection, in decreasing order of strength
++	 * to avoid unlock paths that aren't safe in the stronger
++	 * context. Namely: BH can not be enabled with disabled interrupts.
++	 * Additionally PREEMPT_RT requires that BH is enabled in preemptible
++	 * context.
++	 */
+ 	if (statesold & RCUTORTURE_RDR_IRQ)
+ 		local_irq_enable();
+-	if (statesold & RCUTORTURE_RDR_BH)
+-		local_bh_enable();
+ 	if (statesold & RCUTORTURE_RDR_PREEMPT)
+ 		preempt_enable();
+-	if (statesold & RCUTORTURE_RDR_RBH)
+-		rcu_read_unlock_bh();
+ 	if (statesold & RCUTORTURE_RDR_SCHED)
+ 		rcu_read_unlock_sched();
++	if (statesold & RCUTORTURE_RDR_BH)
++		local_bh_enable();
++	if (statesold & RCUTORTURE_RDR_RBH)
++		rcu_read_unlock_bh();
+ 	if (statesold & RCUTORTURE_RDR_RCU) {
+ 		bool lockit = !statesnew && !(torture_random(trsp) & 0xffff);
+ 
+@@ -1496,6 +1502,9 @@ rcutorture_extend_mask(int oldmask, struct torture_random_state *trsp)
+ 	int mask = rcutorture_extend_mask_max();
+ 	unsigned long randmask1 = torture_random(trsp) >> 8;
+ 	unsigned long randmask2 = randmask1 >> 3;
++	unsigned long preempts = RCUTORTURE_RDR_PREEMPT | RCUTORTURE_RDR_SCHED;
++	unsigned long preempts_irq = preempts | RCUTORTURE_RDR_IRQ;
++	unsigned long bhs = RCUTORTURE_RDR_BH | RCUTORTURE_RDR_RBH;
+ 
+ 	WARN_ON_ONCE(mask >> RCUTORTURE_RDR_SHIFT);
+ 	/* Mostly only one bit (need preemption!), sometimes lots of bits. */
+@@ -1503,11 +1512,26 @@ rcutorture_extend_mask(int oldmask, struct torture_random_state *trsp)
+ 		mask = mask & randmask2;
+ 	else
+ 		mask = mask & (1 << (randmask2 % RCUTORTURE_RDR_NBITS));
+-	/* Can't enable bh w/irq disabled. */
+-	if ((mask & RCUTORTURE_RDR_IRQ) &&
+-	    ((!(mask & RCUTORTURE_RDR_BH) && (oldmask & RCUTORTURE_RDR_BH)) ||
+-	     (!(mask & RCUTORTURE_RDR_RBH) && (oldmask & RCUTORTURE_RDR_RBH))))
+-		mask |= RCUTORTURE_RDR_BH | RCUTORTURE_RDR_RBH;
++
++	/*
++	 * Can't enable bh w/irq disabled.
++	 */
++	if (mask & RCUTORTURE_RDR_IRQ)
++		mask |= oldmask & bhs;
++
++	/*
++	 * Ideally these sequences would be detected in debug builds
++	 * (regardless of RT), but until then don't stop testing
++	 * them on non-RT.
++	 */
++	if (IS_ENABLED(CONFIG_PREEMPT_RT)) {
++		/* Can't modify BH in atomic context */
++		if (oldmask & preempts_irq)
++			mask &= ~bhs;
++		if ((oldmask | mask) & preempts_irq)
++			mask |= oldmask & bhs;
++	}
++
+ 	return mask ?: RCUTORTURE_RDR_RCU;
+ }
+ 
+@@ -2449,7 +2473,7 @@ static int __init rcu_torture_fwd_prog_init(void)
+ 	}
+ 	if (stall_cpu > 0) {
+ 		VERBOSE_TOROUT_STRING("rcu_torture_fwd_prog_init: Disabled, conflicts with CPU-stall testing");
+-		if (IS_MODULE(CONFIG_RCU_TORTURE_TESTS))
++		if (IS_MODULE(CONFIG_RCU_TORTURE_TEST))
+ 			return -EINVAL; /* In module, can fail back to user. */
+ 		WARN_ON(1); /* Make sure rcutorture notices conflict. */
+ 		return 0;
+@@ -2741,7 +2765,7 @@ static int rcu_torture_read_exit(void *unused)
+ static int rcu_torture_read_exit_init(void)
+ {
+ 	if (read_exit_burst <= 0)
+-		return -EINVAL;
++		return 0;
+ 	init_waitqueue_head(&read_exit_wq);
+ 	read_exit_child_stop = false;
+ 	read_exit_child_stopped = false;
+@@ -2819,7 +2843,7 @@ rcu_torture_cleanup(void)
+ 		 rcutorture_seq_diff(gp_seq, start_gp_seq));
+ 	torture_stop_kthread(rcu_torture_stats, stats_task);
+ 	torture_stop_kthread(rcu_torture_fqs, fqs_task);
+-	if (rcu_torture_can_boost())
++	if (rcu_torture_can_boost() && rcutor_hp >= 0)
+ 		cpuhp_remove_state(rcutor_hp);
+ 
+ 	/*
+@@ -3037,7 +3061,7 @@ rcu_torture_init(void)
+ 	rcu_torture_write_types();
+ 	firsterr = torture_create_kthread(rcu_torture_writer, NULL,
+ 					  writer_task);
+-	if (firsterr)
++	if (torture_init_error(firsterr))
+ 		goto unwind;
+ 	if (nfakewriters > 0) {
+ 		fakewriter_tasks = kcalloc(nfakewriters,
+@@ -3052,7 +3076,7 @@ rcu_torture_init(void)
+ 	for (i = 0; i < nfakewriters; i++) {
+ 		firsterr = torture_create_kthread(rcu_torture_fakewriter,
+ 						  NULL, fakewriter_tasks[i]);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	reader_tasks = kcalloc(nrealreaders, sizeof(reader_tasks[0]),
+@@ -3068,7 +3092,7 @@ rcu_torture_init(void)
+ 		rcu_torture_reader_mbchk[i].rtc_chkrdr = -1;
+ 		firsterr = torture_create_kthread(rcu_torture_reader, (void *)i,
+ 						  reader_tasks[i]);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	nrealnocbers = nocbs_nthreads;
+@@ -3088,18 +3112,18 @@ rcu_torture_init(void)
+ 	}
+ 	for (i = 0; i < nrealnocbers; i++) {
+ 		firsterr = torture_create_kthread(rcu_nocb_toggle, NULL, nocb_tasks[i]);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (stat_interval > 0) {
+ 		firsterr = torture_create_kthread(rcu_torture_stats, NULL,
+ 						  stats_task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (test_no_idle_hz && shuffle_interval > 0) {
+ 		firsterr = torture_shuffle_init(shuffle_interval * HZ);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (stutter < 0)
+@@ -3109,7 +3133,7 @@ rcu_torture_init(void)
+ 
+ 		t = cur_ops->stall_dur ? cur_ops->stall_dur() : stutter * HZ;
+ 		firsterr = torture_stutter_init(stutter * HZ, t);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (fqs_duration < 0)
+@@ -3118,7 +3142,7 @@ rcu_torture_init(void)
+ 		/* Create the fqs thread */
+ 		firsterr = torture_create_kthread(rcu_torture_fqs, NULL,
+ 						  fqs_task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (test_boost_interval < 1)
+@@ -3132,9 +3156,9 @@ rcu_torture_init(void)
+ 		firsterr = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "RCU_TORTURE",
+ 					     rcutorture_booster_init,
+ 					     rcutorture_booster_cleanup);
+-		if (firsterr < 0)
+-			goto unwind;
+ 		rcutor_hp = firsterr;
++		if (torture_init_error(firsterr))
++			goto unwind;
+ 
+ 		// Testing RCU priority boosting requires rcutorture do
+ 		// some serious abuse.  Counter this by running ksoftirqd
+@@ -3153,23 +3177,23 @@ rcu_torture_init(void)
+ 	}
+ 	shutdown_jiffies = jiffies + shutdown_secs * HZ;
+ 	firsterr = torture_shutdown_init(shutdown_secs, rcu_torture_cleanup);
+-	if (firsterr)
++	if (torture_init_error(firsterr))
+ 		goto unwind;
+ 	firsterr = torture_onoff_init(onoff_holdoff * HZ, onoff_interval,
+ 				      rcutorture_sync);
+-	if (firsterr)
++	if (torture_init_error(firsterr))
+ 		goto unwind;
+ 	firsterr = rcu_torture_stall_init();
+-	if (firsterr)
++	if (torture_init_error(firsterr))
+ 		goto unwind;
+ 	firsterr = rcu_torture_fwd_prog_init();
+-	if (firsterr)
++	if (torture_init_error(firsterr))
+ 		goto unwind;
+ 	firsterr = rcu_torture_barrier_init();
+-	if (firsterr)
++	if (torture_init_error(firsterr))
+ 		goto unwind;
+ 	firsterr = rcu_torture_read_exit_init();
+-	if (firsterr)
++	if (torture_init_error(firsterr))
+ 		goto unwind;
+ 	if (object_debug)
+ 		rcu_test_debug_objects();
+diff --git a/kernel/rcu/refscale.c b/kernel/rcu/refscale.c
+index 66dc14cf5687..1631ef8a138d 100644
+--- a/kernel/rcu/refscale.c
++++ b/kernel/rcu/refscale.c
+@@ -824,7 +824,7 @@ ref_scale_init(void)
+ 		init_waitqueue_head(&shutdown_wq);
+ 		firsterr = torture_create_kthread(ref_scale_shutdown, NULL,
+ 						  shutdown_task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 		schedule_timeout_uninterruptible(1);
+ 	}
+@@ -851,7 +851,7 @@ ref_scale_init(void)
+ 	for (i = 0; i < nreaders; i++) {
+ 		firsterr = torture_create_kthread(ref_scale_reader, (void *)i,
+ 						  reader_tasks[i].task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 
+ 		init_waitqueue_head(&(reader_tasks[i].wq));
+@@ -860,7 +860,7 @@ ref_scale_init(void)
+ 	// Main Task
+ 	init_waitqueue_head(&main_wq);
+ 	firsterr = torture_create_kthread(main_func, NULL, main_task);
+-	if (firsterr)
++	if (torture_init_error(firsterr))
+ 		goto unwind;
+ 
+ 	torture_init_end();
+diff --git a/kernel/rcu/tasks.h b/kernel/rcu/tasks.h
+index 806160c44b17..66e7586a33e9 100644
+--- a/kernel/rcu/tasks.h
++++ b/kernel/rcu/tasks.h
+@@ -197,6 +197,7 @@ static int __noreturn rcu_tasks_kthread(void *arg)
+ 	 * This loop is terminated by the system going down.  ;-)
+ 	 */
+ 	for (;;) {
++		set_tasks_gp_state(rtp, RTGS_WAIT_CBS);
+ 
+ 		/* Pick up any new callbacks. */
+ 		raw_spin_lock_irqsave(&rtp->cbs_lock, flags);
+@@ -236,8 +237,6 @@ static int __noreturn rcu_tasks_kthread(void *arg)
+ 		}
+ 		/* Paranoid sleep to keep this from entering a tight loop */
+ 		schedule_timeout_idle(rtp->gp_sleep);
+-
+-		set_tasks_gp_state(rtp, RTGS_WAIT_CBS);
+ 	}
+ }
+ 
+@@ -369,7 +368,7 @@ static void rcu_tasks_wait_gp(struct rcu_tasks *rtp)
+ ////////////////////////////////////////////////////////////////////////
+ //
+ // Simple variant of RCU whose quiescent states are voluntary context
+-// switch, cond_resched_rcu_qs(), user-space execution, and idle.
++// switch, cond_resched_tasks_rcu_qs(), user-space execution, and idle.
+ // As such, grace periods can take one good long time.  There are no
+ // read-side primitives similar to rcu_read_lock() and rcu_read_unlock()
+ // because this implementation is intended to get the system into a safe
+@@ -540,7 +539,7 @@ DEFINE_RCU_TASKS(rcu_tasks, rcu_tasks_wait_gp, call_rcu_tasks, "RCU Tasks");
+  * period elapses, in other words after all currently executing RCU
+  * read-side critical sections have completed. call_rcu_tasks() assumes
+  * that the read-side critical sections end at a voluntary context
+- * switch (not a preemption!), cond_resched_rcu_qs(), entry into idle,
++ * switch (not a preemption!), cond_resched_tasks_rcu_qs(), entry into idle,
+  * or transition to usermode execution.  As such, there are no read-side
+  * primitives analogous to rcu_read_lock() and rcu_read_unlock() because
+  * this primitive is intended to determine that all tasks have passed
+@@ -678,11 +677,11 @@ DEFINE_RCU_TASKS(rcu_tasks_rude, rcu_tasks_rude_wait_gp, call_rcu_tasks_rude,
+  * period elapses, in other words after all currently executing RCU
+  * read-side critical sections have completed. call_rcu_tasks_rude()
+  * assumes that the read-side critical sections end at context switch,
+- * cond_resched_rcu_qs(), or transition to usermode execution.  As such,
+- * there are no read-side primitives analogous to rcu_read_lock() and
+- * rcu_read_unlock() because this primitive is intended to determine
+- * that all tasks have passed through a safe state, not so much for
+- * data-structure synchronization.
++ * cond_resched_tasks_rcu_qs(), or transition to usermode execution (as
++ * usermode execution is schedulable). As such, there are no read-side
++ * primitives analogous to rcu_read_lock() and rcu_read_unlock() because
++ * this primitive is intended to determine that all tasks have passed
++ * through a safe state, not so much for data-structure synchronization.
+  *
+  * See the description of call_rcu() for more detailed information on
+  * memory ordering guarantees.
+@@ -700,8 +699,8 @@ EXPORT_SYMBOL_GPL(call_rcu_tasks_rude);
+  * grace period has elapsed, in other words after all currently
+  * executing rcu-tasks read-side critical sections have elapsed.  These
+  * read-side critical sections are delimited by calls to schedule(),
+- * cond_resched_tasks_rcu_qs(), userspace execution, and (in theory,
+- * anyway) cond_resched().
++ * cond_resched_tasks_rcu_qs(), userspace execution (which is a schedulable
++ * context), and (in theory, anyway) cond_resched().
+  *
+  * This is a very specialized primitive, intended only for a few uses in
+  * tracing and other situations requiring manipulation of function preambles
+@@ -758,7 +757,7 @@ EXPORT_SYMBOL_GPL(show_rcu_tasks_rude_gp_kthread);
+ // 2.	Protects code in the idle loop, exception entry/exit, and
+ //	CPU-hotplug code paths, similar to the capabilities of SRCU.
+ //
+-// 3.	Avoids expensive read-side instruction, having overhead similar
++// 3.	Avoids expensive read-side instructions, having overhead similar
+ //	to that of Preemptible RCU.
+ //
+ // There are of course downsides.  The grace-period code can send IPIs to
+@@ -848,7 +847,7 @@ static void rcu_read_unlock_iw(struct irq_work *iwp)
+ static DEFINE_IRQ_WORK(rcu_tasks_trace_iw, rcu_read_unlock_iw);
+ 
+ /* If we are the last reader, wake up the grace-period kthread. */
+-void rcu_read_unlock_trace_special(struct task_struct *t, int nesting)
++void rcu_read_unlock_trace_special(struct task_struct *t)
+ {
+ 	int nq = READ_ONCE(t->trc_reader_special.b.need_qs);
+ 
+@@ -858,7 +857,7 @@ void rcu_read_unlock_trace_special(struct task_struct *t, int nesting)
+ 	// Update .need_qs before ->trc_reader_nesting for irq/NMI handlers.
+ 	if (nq)
+ 		WRITE_ONCE(t->trc_reader_special.b.need_qs, false);
+-	WRITE_ONCE(t->trc_reader_nesting, nesting);
++	WRITE_ONCE(t->trc_reader_nesting, 0);
+ 	if (nq && atomic_dec_and_test(&trc_n_readers_need_end))
+ 		irq_work_queue(&rcu_tasks_trace_iw);
+ }
+@@ -890,32 +889,24 @@ static void trc_read_check_handler(void *t_in)
+ 
+ 	// If the task is no longer running on this CPU, leave.
+ 	if (unlikely(texp != t)) {
+-		if (WARN_ON_ONCE(atomic_dec_and_test(&trc_n_readers_need_end)))
+-			wake_up(&trc_wait);
+ 		goto reset_ipi; // Already on holdout list, so will check later.
+ 	}
+ 
+ 	// If the task is not in a read-side critical section, and
+ 	// if this is the last reader, awaken the grace-period kthread.
+ 	if (likely(!READ_ONCE(t->trc_reader_nesting))) {
+-		if (WARN_ON_ONCE(atomic_dec_and_test(&trc_n_readers_need_end)))
+-			wake_up(&trc_wait);
+-		// Mark as checked after decrement to avoid false
+-		// positives on the above WARN_ON_ONCE().
+ 		WRITE_ONCE(t->trc_reader_checked, true);
+ 		goto reset_ipi;
+ 	}
+ 	// If we are racing with an rcu_read_unlock_trace(), try again later.
+-	if (unlikely(READ_ONCE(t->trc_reader_nesting) < 0)) {
+-		if (WARN_ON_ONCE(atomic_dec_and_test(&trc_n_readers_need_end)))
+-			wake_up(&trc_wait);
++	if (unlikely(READ_ONCE(t->trc_reader_nesting) < 0))
+ 		goto reset_ipi;
+-	}
+ 	WRITE_ONCE(t->trc_reader_checked, true);
+ 
+ 	// Get here if the task is in a read-side critical section.  Set
+ 	// its state so that it will awaken the grace-period kthread upon
+ 	// exit from that critical section.
++	atomic_inc(&trc_n_readers_need_end); // One more to wait on.
+ 	WARN_ON_ONCE(READ_ONCE(t->trc_reader_special.b.need_qs));
+ 	WRITE_ONCE(t->trc_reader_special.b.need_qs, true);
+ 
+@@ -931,7 +922,7 @@ static void trc_read_check_handler(void *t_in)
+ static bool trc_inspect_reader(struct task_struct *t, void *arg)
+ {
+ 	int cpu = task_cpu(t);
+-	bool in_qs = false;
++	int nesting;
+ 	bool ofl = cpu_is_offline(cpu);
+ 
+ 	if (task_curr(t)) {
+@@ -951,18 +942,18 @@ static bool trc_inspect_reader(struct task_struct *t, void *arg)
+ 		n_heavy_reader_updates++;
+ 		if (ofl)
+ 			n_heavy_reader_ofl_updates++;
+-		in_qs = true;
++		nesting = 0;
+ 	} else {
+ 		// The task is not running, so C-language access is safe.
+-		in_qs = likely(!t->trc_reader_nesting);
++		nesting = t->trc_reader_nesting;
+ 	}
+ 
+-	// Mark as checked so that the grace-period kthread will
+-	// remove it from the holdout list.
+-	t->trc_reader_checked = true;
+-
+-	if (in_qs)
+-		return true;  // Already in quiescent state, done!!!
++	// If not exiting a read-side critical section, mark as checked
++	// so that the grace-period kthread will remove it from the
++	// holdout list.
++	t->trc_reader_checked = nesting >= 0;
++	if (nesting <= 0)
++		return !nesting;  // If in QS, done, otherwise try again later.
+ 
+ 	// The task is in a read-side critical section, so set up its
+ 	// state so that it will awaken the grace-period kthread upon exit
+@@ -1000,7 +991,7 @@ static void trc_wait_for_one_reader(struct task_struct *t,
+ 
+ 	// If this task is not yet on the holdout list, then we are in
+ 	// an RCU read-side critical section.  Otherwise, the invocation of
+-	// rcu_add_holdout() that added it to the list did the necessary
++	// trc_add_holdout() that added it to the list did the necessary
+ 	// get_task_struct().  Either way, the task cannot be freed out
+ 	// from under this code.
+ 
+@@ -1015,21 +1006,17 @@ static void trc_wait_for_one_reader(struct task_struct *t,
+ 		if (per_cpu(trc_ipi_to_cpu, cpu) || t->trc_ipi_to_cpu >= 0)
+ 			return;
+ 
+-		atomic_inc(&trc_n_readers_need_end);
+ 		per_cpu(trc_ipi_to_cpu, cpu) = true;
+ 		t->trc_ipi_to_cpu = cpu;
+ 		rcu_tasks_trace.n_ipis++;
+-		if (smp_call_function_single(cpu,
+-					     trc_read_check_handler, t, 0)) {
++		if (smp_call_function_single(cpu, trc_read_check_handler, t, 0)) {
+ 			// Just in case there is some other reason for
+ 			// failure than the target CPU being offline.
++			WARN_ONCE(1, "%s():  smp_call_function_single() failed for CPU: %d\n",
++				  __func__, cpu);
+ 			rcu_tasks_trace.n_ipis_fails++;
+ 			per_cpu(trc_ipi_to_cpu, cpu) = false;
+-			t->trc_ipi_to_cpu = cpu;
+-			if (atomic_dec_and_test(&trc_n_readers_need_end)) {
+-				WARN_ON_ONCE(1);
+-				wake_up(&trc_wait);
+-			}
++			t->trc_ipi_to_cpu = -1;
+ 		}
+ 	}
+ }
+@@ -1099,9 +1086,9 @@ static void show_stalled_task_trace(struct task_struct *t, bool *firstreport)
+ 	cpu = task_cpu(t);
+ 	pr_alert("P%d: %c%c%c nesting: %d%c cpu: %d\n",
+ 		 t->pid,
+-		 ".I"[READ_ONCE(t->trc_ipi_to_cpu) > 0],
++		 ".I"[READ_ONCE(t->trc_ipi_to_cpu) >= 0],
+ 		 ".i"[is_idle_task(t)],
+-		 ".N"[cpu > 0 && tick_nohz_full_cpu(cpu)],
++		 ".N"[cpu >= 0 && tick_nohz_full_cpu(cpu)],
+ 		 READ_ONCE(t->trc_reader_nesting),
+ 		 " N"[!!READ_ONCE(t->trc_reader_special.b.need_qs)],
+ 		 cpu);
+@@ -1144,20 +1131,34 @@ static void check_all_holdout_tasks_trace(struct list_head *hop,
+ 	cpus_read_unlock();
+ 
+ 	if (needreport) {
+-		if (firstreport)
++		if (*firstreport)
+ 			pr_err("INFO: rcu_tasks_trace detected stalls? (Late IPI?)\n");
+ 		show_stalled_ipi_trace();
+ 	}
+ }
+ 
++static void rcu_tasks_trace_empty_fn(void *unused)
++{
++}
++
+ /* Wait for grace period to complete and provide ordering. */
+ static void rcu_tasks_trace_postgp(struct rcu_tasks *rtp)
+ {
++	int cpu;
+ 	bool firstreport;
+ 	struct task_struct *g, *t;
+ 	LIST_HEAD(holdouts);
+ 	long ret;
+ 
++	// Wait for any lingering IPI handlers to complete.  Note that
++	// if a CPU has gone offline or transitioned to userspace in the
++	// meantime, all IPI handlers should have been drained beforehand.
++	// Yes, this assumes that CPUs process IPIs in order.  If that ever
++	// changes, there will need to be a recheck and/or timed wait.
++	for_each_online_cpu(cpu)
++		if (smp_load_acquire(per_cpu_ptr(&trc_ipi_to_cpu, cpu)))
++			smp_call_function_single(cpu, rcu_tasks_trace_empty_fn, NULL, 1);
++
+ 	// Remove the safety count.
+ 	smp_mb__before_atomic();  // Order vs. earlier atomics
+ 	atomic_dec(&trc_n_readers_need_end);
+@@ -1200,7 +1201,7 @@ static void exit_tasks_rcu_finish_trace(struct task_struct *t)
+ 	WARN_ON_ONCE(READ_ONCE(t->trc_reader_nesting));
+ 	WRITE_ONCE(t->trc_reader_nesting, 0);
+ 	if (WARN_ON_ONCE(READ_ONCE(t->trc_reader_special.b.need_qs)))
+-		rcu_read_unlock_trace_special(t, 0);
++		rcu_read_unlock_trace_special(t);
+ }
+ 
+ /**
+@@ -1208,15 +1209,11 @@ static void exit_tasks_rcu_finish_trace(struct task_struct *t)
+  * @rhp: structure to be used for queueing the RCU updates.
+  * @func: actual callback function to be invoked after the grace period
+  *
+- * The callback function will be invoked some time after a full grace
+- * period elapses, in other words after all currently executing RCU
+- * read-side critical sections have completed. call_rcu_tasks_trace()
+- * assumes that the read-side critical sections end at context switch,
+- * cond_resched_rcu_qs(), or transition to usermode execution.  As such,
+- * there are no read-side primitives analogous to rcu_read_lock() and
+- * rcu_read_unlock() because this primitive is intended to determine
+- * that all tasks have passed through a safe state, not so much for
+- * data-structure synchronization.
++ * The callback function will be invoked some time after a trace rcu-tasks
++ * grace period elapses, in other words after all currently executing
++ * trace rcu-tasks read-side critical sections have completed. These
++ * read-side critical sections are delimited by calls to rcu_read_lock_trace()
++ * and rcu_read_unlock_trace().
+  *
+  * See the description of call_rcu() for more detailed information on
+  * memory ordering guarantees.
+@@ -1232,7 +1229,7 @@ EXPORT_SYMBOL_GPL(call_rcu_tasks_trace);
+  *
+  * Control will return to the caller some time after a trace rcu-tasks
+  * grace period has elapsed, in other words after all currently executing
+- * rcu-tasks read-side critical sections have elapsed.  These read-side
++ * trace rcu-tasks read-side critical sections have elapsed. These read-side
+  * critical sections are delimited by calls to rcu_read_lock_trace()
+  * and rcu_read_unlock_trace().
+  *
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index bce848e50512..ef8d36f580fc 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -327,7 +327,7 @@ static void rcu_dynticks_eqs_online(void)
+  */
+ static __always_inline bool rcu_dynticks_curr_cpu_in_eqs(void)
+ {
+-	return !(atomic_read(this_cpu_ptr(&rcu_data.dynticks)) & 0x1);
++	return !(arch_atomic_read(this_cpu_ptr(&rcu_data.dynticks)) & 0x1);
+ }
+ 
+ /*
+@@ -1219,8 +1219,6 @@ static int dyntick_save_progress_counter(struct rcu_data *rdp)
+ static int rcu_implicit_dynticks_qs(struct rcu_data *rdp)
+ {
+ 	unsigned long jtsq;
+-	bool *rnhqp;
+-	bool *ruqp;
+ 	struct rcu_node *rnp = rdp->mynode;
+ 
+ 	/*
+@@ -1285,17 +1283,15 @@ static int rcu_implicit_dynticks_qs(struct rcu_data *rdp)
+ 	 * is set way high.
+ 	 */
+ 	jtsq = READ_ONCE(jiffies_to_sched_qs);
+-	ruqp = per_cpu_ptr(&rcu_data.rcu_urgent_qs, rdp->cpu);
+-	rnhqp = per_cpu_ptr(&rcu_data.rcu_need_heavy_qs, rdp->cpu);
+-	if (!READ_ONCE(*rnhqp) &&
++	if (!READ_ONCE(rdp->rcu_need_heavy_qs) &&
+ 	    (time_after(jiffies, rcu_state.gp_start + jtsq * 2) ||
+ 	     time_after(jiffies, rcu_state.jiffies_resched) ||
+ 	     rcu_state.cbovld)) {
+-		WRITE_ONCE(*rnhqp, true);
++		WRITE_ONCE(rdp->rcu_need_heavy_qs, true);
+ 		/* Store rcu_need_heavy_qs before rcu_urgent_qs. */
+-		smp_store_release(ruqp, true);
++		smp_store_release(&rdp->rcu_urgent_qs, true);
+ 	} else if (time_after(jiffies, rcu_state.gp_start + jtsq)) {
+-		WRITE_ONCE(*ruqp, true);
++		WRITE_ONCE(rdp->rcu_urgent_qs, true);
+ 	}
+ 
+ 	/*
+@@ -1309,7 +1305,7 @@ static int rcu_implicit_dynticks_qs(struct rcu_data *rdp)
+ 	if (tick_nohz_full_cpu(rdp->cpu) &&
+ 	    (time_after(jiffies, READ_ONCE(rdp->last_fqs_resched) + jtsq * 3) ||
+ 	     rcu_state.cbovld)) {
+-		WRITE_ONCE(*ruqp, true);
++		WRITE_ONCE(rdp->rcu_urgent_qs, true);
+ 		resched_cpu(rdp->cpu);
+ 		WRITE_ONCE(rdp->last_fqs_resched, jiffies);
+ 	}
+@@ -1779,6 +1775,8 @@ static noinline_for_stack bool rcu_gp_init(void)
+ 	 */
+ 	WRITE_ONCE(rcu_state.gp_state, RCU_GP_ONOFF);
+ 	rcu_for_each_leaf_node(rnp) {
++		// Wait for CPU-hotplug operations that might have
++		// started before this grace period did.
+ 		smp_mb(); // Pair with barriers used when updating ->ofl_seq to odd values.
+ 		firstseq = READ_ONCE(rnp->ofl_seq);
+ 		if (firstseq & 0x1)
+@@ -1907,7 +1905,7 @@ static void rcu_gp_fqs(bool first_time)
+ 	struct rcu_node *rnp = rcu_get_root();
+ 
+ 	WRITE_ONCE(rcu_state.gp_activity, jiffies);
+-	rcu_state.n_force_qs++;
++	WRITE_ONCE(rcu_state.n_force_qs, rcu_state.n_force_qs + 1);
+ 	if (first_time) {
+ 		/* Collect dyntick-idle snapshots. */
+ 		force_qs_rnp(dyntick_save_progress_counter);
+@@ -2358,7 +2356,7 @@ rcu_check_quiescent_state(struct rcu_data *rdp)
+ int rcutree_dying_cpu(unsigned int cpu)
+ {
+ 	bool blkd;
+-	struct rcu_data *rdp = this_cpu_ptr(&rcu_data);
++	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
+ 	struct rcu_node *rnp = rdp->mynode;
+ 
+ 	if (!IS_ENABLED(CONFIG_HOTPLUG_CPU))
+@@ -2550,7 +2548,7 @@ static void rcu_do_batch(struct rcu_data *rdp)
+ 	/* Reset ->qlen_last_fqs_check trigger if enough CBs have drained. */
+ 	if (count == 0 && rdp->qlen_last_fqs_check != 0) {
+ 		rdp->qlen_last_fqs_check = 0;
+-		rdp->n_force_qs_snap = rcu_state.n_force_qs;
++		rdp->n_force_qs_snap = READ_ONCE(rcu_state.n_force_qs);
+ 	} else if (count < rdp->qlen_last_fqs_check - qhimark)
+ 		rdp->qlen_last_fqs_check = count;
+ 
+@@ -2898,10 +2896,10 @@ static void __call_rcu_core(struct rcu_data *rdp, struct rcu_head *head,
+ 		} else {
+ 			/* Give the grace period a kick. */
+ 			rdp->blimit = DEFAULT_MAX_RCU_BLIMIT;
+-			if (rcu_state.n_force_qs == rdp->n_force_qs_snap &&
++			if (READ_ONCE(rcu_state.n_force_qs) == rdp->n_force_qs_snap &&
+ 			    rcu_segcblist_first_pend_cb(&rdp->cblist) != head)
+ 				rcu_force_quiescent_state();
+-			rdp->n_force_qs_snap = rcu_state.n_force_qs;
++			rdp->n_force_qs_snap = READ_ONCE(rcu_state.n_force_qs);
+ 			rdp->qlen_last_fqs_check = rcu_segcblist_n_cbs(&rdp->cblist);
+ 		}
+ 	}
+@@ -4128,10 +4126,9 @@ int rcutree_prepare_cpu(unsigned int cpu)
+ 	/* Set up local state, ensuring consistent view of global state. */
+ 	raw_spin_lock_irqsave_rcu_node(rnp, flags);
+ 	rdp->qlen_last_fqs_check = 0;
+-	rdp->n_force_qs_snap = rcu_state.n_force_qs;
++	rdp->n_force_qs_snap = READ_ONCE(rcu_state.n_force_qs);
+ 	rdp->blimit = blimit;
+ 	rdp->dynticks_nesting = 1;	/* CPU not up, no tearing. */
+-	rcu_dynticks_eqs_online();
+ 	raw_spin_unlock_rcu_node(rnp);		/* irqs remain disabled. */
+ 
+ 	/*
+@@ -4251,6 +4248,7 @@ void rcu_cpu_starting(unsigned int cpu)
+ 	mask = rdp->grpmask;
+ 	WRITE_ONCE(rnp->ofl_seq, rnp->ofl_seq + 1);
+ 	WARN_ON_ONCE(!(rnp->ofl_seq & 0x1));
++	rcu_dynticks_eqs_online();
+ 	smp_mb(); // Pair with rcu_gp_cleanup()'s ->ofl_seq barrier().
+ 	raw_spin_lock_irqsave_rcu_node(rnp, flags);
+ 	WRITE_ONCE(rnp->qsmaskinitnext, rnp->qsmaskinitnext | mask);
+@@ -4296,9 +4294,7 @@ void rcu_report_dead(unsigned int cpu)
+ 	do_nocb_deferred_wakeup(rdp);
+ 
+ 	/* QS for any half-done expedited grace period. */
+-	preempt_disable();
+-	rcu_report_exp_rdp(this_cpu_ptr(&rcu_data));
+-	preempt_enable();
++	rcu_report_exp_rdp(rdp);
+ 	rcu_preempt_deferred_qs(current);
+ 
+ 	/* Remove outgoing CPU from mask in the leaf rcu_node structure. */
+diff --git a/kernel/rcu/tree_exp.h b/kernel/rcu/tree_exp.h
+index 2796084ef85a..f3947c49eee7 100644
+--- a/kernel/rcu/tree_exp.h
++++ b/kernel/rcu/tree_exp.h
+@@ -512,7 +512,6 @@ static void synchronize_rcu_expedited_wait(void)
+ 		j = READ_ONCE(jiffies_till_first_fqs);
+ 		if (synchronize_rcu_expedited_wait_once(j + HZ))
+ 			return;
+-		WARN_ON_ONCE(IS_ENABLED(CONFIG_PREEMPT_RT));
+ 	}
+ 
+ 	for (;;) {
+@@ -760,7 +759,7 @@ static void sync_sched_exp_online_cleanup(int cpu)
+ 	my_cpu = get_cpu();
+ 	/* Quiescent state either not needed or already requested, leave. */
+ 	if (!(READ_ONCE(rnp->expmask) & rdp->grpmask) ||
+-	    __this_cpu_read(rcu_data.cpu_no_qs.b.exp)) {
++	    rdp->cpu_no_qs.b.exp) {
+ 		put_cpu();
+ 		return;
+ 	}
+diff --git a/kernel/rcu/tree_nocb.h b/kernel/rcu/tree_nocb.h
+index 8fdf44f8523f..368ef7b9af4f 100644
+--- a/kernel/rcu/tree_nocb.h
++++ b/kernel/rcu/tree_nocb.h
+@@ -549,7 +549,6 @@ static void __call_rcu_nocb_wake(struct rcu_data *rdp, bool was_alldone,
+ 		rcu_nocb_unlock_irqrestore(rdp, flags);
+ 		trace_rcu_nocb_wake(rcu_state.name, rdp->cpu, TPS("WakeNot"));
+ 	}
+-	return;
+ }
+ 
+ /*
+@@ -767,6 +766,7 @@ static int rcu_nocb_gp_kthread(void *arg)
+ static inline bool nocb_cb_can_run(struct rcu_data *rdp)
+ {
+ 	u8 flags = SEGCBLIST_OFFLOADED | SEGCBLIST_KTHREAD_CB;
++
+ 	return rcu_segcblist_test_flags(&rdp->cblist, flags);
+ }
+ 
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index d070059163d7..5199559fbbf0 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -814,8 +814,7 @@ void rcu_read_unlock_strict(void)
+ {
+ 	struct rcu_data *rdp;
+ 
+-	if (!IS_ENABLED(CONFIG_RCU_STRICT_GRACE_PERIOD) ||
+-	   irqs_disabled() || preempt_count() || !rcu_state.gp_kthread)
++	if (irqs_disabled() || preempt_count() || !rcu_state.gp_kthread)
+ 		return;
+ 	rdp = this_cpu_ptr(&rcu_data);
+ 	rcu_report_qs_rdp(rdp);
+@@ -1480,7 +1479,7 @@ static void rcu_bind_gp_kthread(void)
+ }
+ 
+ /* Record the current task on dyntick-idle entry. */
+-static void noinstr rcu_dynticks_task_enter(void)
++static __always_inline void rcu_dynticks_task_enter(void)
+ {
+ #if defined(CONFIG_TASKS_RCU) && defined(CONFIG_NO_HZ_FULL)
+ 	WRITE_ONCE(current->rcu_tasks_idle_cpu, smp_processor_id());
+@@ -1488,7 +1487,7 @@ static void noinstr rcu_dynticks_task_enter(void)
+ }
+ 
+ /* Record no current task on dyntick-idle exit. */
+-static void noinstr rcu_dynticks_task_exit(void)
++static __always_inline void rcu_dynticks_task_exit(void)
+ {
+ #if defined(CONFIG_TASKS_RCU) && defined(CONFIG_NO_HZ_FULL)
+ 	WRITE_ONCE(current->rcu_tasks_idle_cpu, -1);
+@@ -1496,7 +1495,7 @@ static void noinstr rcu_dynticks_task_exit(void)
+ }
+ 
+ /* Turn on heavyweight RCU tasks trace readers on idle/user entry. */
+-static void rcu_dynticks_task_trace_enter(void)
++static __always_inline void rcu_dynticks_task_trace_enter(void)
+ {
+ #ifdef CONFIG_TASKS_TRACE_RCU
+ 	if (IS_ENABLED(CONFIG_TASKS_TRACE_RCU_READ_MB))
+@@ -1505,7 +1504,7 @@ static void rcu_dynticks_task_trace_enter(void)
+ }
+ 
+ /* Turn off heavyweight RCU tasks trace readers on idle/user exit. */
+-static void rcu_dynticks_task_trace_exit(void)
++static __always_inline void rcu_dynticks_task_trace_exit(void)
+ {
+ #ifdef CONFIG_TASKS_TRACE_RCU
+ 	if (IS_ENABLED(CONFIG_TASKS_TRACE_RCU_READ_MB))
+diff --git a/kernel/rcu/update.c b/kernel/rcu/update.c
+index c21b38cc25e9..94282dc12bab 100644
+--- a/kernel/rcu/update.c
++++ b/kernel/rcu/update.c
+@@ -54,11 +54,11 @@
+ #define MODULE_PARAM_PREFIX "rcupdate."
+ 
+ #ifndef CONFIG_TINY_RCU
+-module_param(rcu_expedited, int, 0);
+-module_param(rcu_normal, int, 0);
++module_param(rcu_expedited, int, 0444);
++module_param(rcu_normal, int, 0444);
+ static int rcu_normal_after_boot = IS_ENABLED(CONFIG_PREEMPT_RT);
+-#ifndef CONFIG_PREEMPT_RT
+-module_param(rcu_normal_after_boot, int, 0);
++#if !defined(CONFIG_PREEMPT_RT) || defined(CONFIG_NO_HZ_FULL)
++module_param(rcu_normal_after_boot, int, 0444);
+ #endif
+ #endif /* #ifndef CONFIG_TINY_RCU */
+ 
+diff --git a/kernel/scftorture.c b/kernel/scftorture.c
+index 64a08288b1a6..5d42f44e3e1a 100644
+--- a/kernel/scftorture.c
++++ b/kernel/scftorture.c
+@@ -341,6 +341,7 @@ static void scftorture_invoke_one(struct scf_statistics *scfp, struct torture_ra
+ 			cpu = torture_random(trsp) % nr_cpu_ids;
+ 			scfp->n_resched++;
+ 			resched_cpu(cpu);
++			this_cpu_inc(scf_invoked_count);
+ 		}
+ 		break;
+ 	case SCF_PRIM_SINGLE:
+@@ -553,18 +554,18 @@ static int __init scf_torture_init(void)
+ 
+ 	scftorture_print_module_parms("Start of test");
+ 
+-	if (weight_resched == -1 &&
+-	    weight_single == -1 && weight_single_rpc == -1 && weight_single_wait == -1 &&
+-	    weight_many == -1 && weight_many_wait == -1 &&
+-	    weight_all == -1 && weight_all_wait == -1) {
+-		weight_resched1 = 2 * nr_cpu_ids;
+-		weight_single1 = 2 * nr_cpu_ids;
+-		weight_single_rpc1 = 2 * nr_cpu_ids;
+-		weight_single_wait1 = 2 * nr_cpu_ids;
+-		weight_many1 = 2;
+-		weight_many_wait1 = 2;
+-		weight_all1 = 1;
+-		weight_all_wait1 = 1;
++	if (weight_resched <= 0 &&
++	    weight_single <= 0 && weight_single_rpc <= 0 && weight_single_wait <= 0 &&
++	    weight_many <= 0 && weight_many_wait <= 0 &&
++	    weight_all <= 0 && weight_all_wait <= 0) {
++		weight_resched1 = weight_resched == 0 ? 0 : 2 * nr_cpu_ids;
++		weight_single1 = weight_single == 0 ? 0 : 2 * nr_cpu_ids;
++		weight_single_rpc1 = weight_single_rpc == 0 ? 0 : 2 * nr_cpu_ids;
++		weight_single_wait1 = weight_single_wait == 0 ? 0 : 2 * nr_cpu_ids;
++		weight_many1 = weight_many == 0 ? 0 : 2;
++		weight_many_wait1 = weight_many_wait == 0 ? 0 : 2;
++		weight_all1 = weight_all == 0 ? 0 : 1;
++		weight_all_wait1 = weight_all_wait == 0 ? 0 : 1;
+ 	} else {
+ 		if (weight_resched == -1)
+ 			weight_resched1 = 0;
+@@ -583,8 +584,8 @@ static int __init scf_torture_init(void)
+ 		if (weight_all_wait == -1)
+ 			weight_all_wait1 = 0;
+ 	}
+-	if (weight_single1 == 0 && weight_single_rpc1 == 0 && weight_single_wait1 == 0 &&
+-	    weight_many1 == 0 && weight_many_wait1 == 0 &&
++	if (weight_resched1 == 0 && weight_single1 == 0 && weight_single_rpc1 == 0 &&
++	    weight_single_wait1 == 0 && weight_many1 == 0 && weight_many_wait1 == 0 &&
+ 	    weight_all1 == 0 && weight_all_wait1 == 0) {
+ 		VERBOSE_SCFTORTOUT_ERRSTRING("all zero weights makes no sense");
+ 		firsterr = -EINVAL;
+@@ -605,17 +606,17 @@ static int __init scf_torture_init(void)
+ 
+ 	if (onoff_interval > 0) {
+ 		firsterr = torture_onoff_init(onoff_holdoff * HZ, onoff_interval, NULL);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (shutdown_secs > 0) {
+ 		firsterr = torture_shutdown_init(shutdown_secs, scf_torture_cleanup);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (stutter > 0) {
+ 		firsterr = torture_stutter_init(stutter, stutter);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 
+@@ -636,12 +637,12 @@ static int __init scf_torture_init(void)
+ 		scf_stats_p[i].cpu = i;
+ 		firsterr = torture_create_kthread(scftorture_invoker, (void *)&scf_stats_p[i],
+ 						  scf_stats_p[i].task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 	if (stat_interval > 0) {
+ 		firsterr = torture_create_kthread(scf_torture_stats, NULL, scf_torture_stats_task);
+-		if (firsterr)
++		if (torture_init_error(firsterr))
+ 			goto unwind;
+ 	}
+ 
+@@ -651,6 +652,10 @@ static int __init scf_torture_init(void)
+ unwind:
+ 	torture_init_end();
+ 	scf_torture_cleanup();
++	if (shutdown_secs) {
++		WARN_ON(!IS_MODULE(CONFIG_SCF_TORTURE_TEST));
++		kernel_power_off();
++	}
+ 	return firsterr;
+ }
+ 
+diff --git a/tools/rcu/extract-stall.sh b/tools/rcu/extract-stall.sh
+new file mode 100644
+index 000000000000..e565697c9f90
+--- /dev/null
++++ b/tools/rcu/extract-stall.sh
+@@ -0,0 +1,34 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0+
++#
++# Extract any RCU CPU stall warnings present in specified file.
++# Filter out clocksource lines.  Note that preceding-lines excludes the
++# initial line of the stall warning but trailing-lines includes it.
++#
++# Usage: extract-stall.sh dmesg-file [ preceding-lines [ trailing-lines ] ]
++
++echo $1
++preceding_lines="${2-3}"
++trailing_lines="${3-10}"
++
++awk -v preceding_lines="$preceding_lines" -v trailing_lines="$trailing_lines" '
++suffix <= 0 {
++	for (i = preceding_lines; i > 0; i--)
++		last[i] = last[i - 1];
++	last[0] = $0;
++}
++
++suffix > 0 {
++	print $0;
++	suffix--;
++	if (suffix <= 0)
++		print "";
++}
++
++suffix <= 0 && /detected stall/ {
++	for (i = preceding_lines; i >= 0; i--)
++		if (last[i] != "")
++			print last[i];
++	suffix = trailing_lines;
++}' < "$1" | tr -d '\015' | grep -v clocksource
++
+diff --git a/tools/testing/selftests/rcutorture/bin/kvm-remote.sh b/tools/testing/selftests/rcutorture/bin/kvm-remote.sh
+index 03126eb6ec5a..c7d42ef80c53 100755
+--- a/tools/testing/selftests/rcutorture/bin/kvm-remote.sh
++++ b/tools/testing/selftests/rcutorture/bin/kvm-remote.sh
+@@ -149,6 +149,7 @@ do
+ done
+ 
+ # Download and expand the tarball on all systems.
++echo Build-products tarball: `du -h $T/binres.tgz` | tee -a "$oldrun/remote-log"
+ for i in $systems
+ do
+ 	echo Downloading tarball to $i `date` | tee -a "$oldrun/remote-log"
+diff --git a/tools/testing/selftests/rcutorture/bin/kvm.sh b/tools/testing/selftests/rcutorture/bin/kvm.sh
+index f442d84fb2a3..6cf9ec6a3d1c 100755
+--- a/tools/testing/selftests/rcutorture/bin/kvm.sh
++++ b/tools/testing/selftests/rcutorture/bin/kvm.sh
+@@ -184,7 +184,7 @@ do
+ 		TORTURE_KCONFIG_KASAN_ARG="CONFIG_DEBUG_INFO=y CONFIG_KASAN=y"; export TORTURE_KCONFIG_KASAN_ARG
+ 		;;
+ 	--kcsan)
+-		TORTURE_KCONFIG_KCSAN_ARG="CONFIG_DEBUG_INFO=y CONFIG_KCSAN=y CONFIG_KCSAN_ASSUME_PLAIN_WRITES_ATOMIC=n CONFIG_KCSAN_REPORT_VALUE_CHANGE_ONLY=n CONFIG_KCSAN_REPORT_ONCE_IN_MS=100000 CONFIG_KCSAN_INTERRUPT_WATCHER=y CONFIG_KCSAN_VERBOSE=y CONFIG_DEBUG_LOCK_ALLOC=y CONFIG_PROVE_LOCKING=y"; export TORTURE_KCONFIG_KCSAN_ARG
++		TORTURE_KCONFIG_KCSAN_ARG="CONFIG_DEBUG_INFO=y CONFIG_KCSAN=y CONFIG_KCSAN_STRICT=y CONFIG_KCSAN_REPORT_ONCE_IN_MS=100000 CONFIG_KCSAN_VERBOSE=y CONFIG_DEBUG_LOCK_ALLOC=y CONFIG_PROVE_LOCKING=y"; export TORTURE_KCONFIG_KCSAN_ARG
+ 		;;
+ 	--kmake-arg|--kmake-args)
+ 		checkarg --kmake-arg "(kernel make arguments)" $# "$2" '.*' '^error$'
+diff --git a/tools/testing/selftests/rcutorture/bin/torture.sh b/tools/testing/selftests/rcutorture/bin/torture.sh
+index 363f56081eff..eae88aacca2a 100755
+--- a/tools/testing/selftests/rcutorture/bin/torture.sh
++++ b/tools/testing/selftests/rcutorture/bin/torture.sh
+@@ -351,7 +351,7 @@ fi
+ if test "$do_scftorture" = "yes"
+ then
+ 	torture_bootargs="scftorture.nthreads=$HALF_ALLOTED_CPUS torture.disable_onoff_at_boot"
+-	torture_set "scftorture" tools/testing/selftests/rcutorture/bin/kvm.sh --torture scf --allcpus --duration "$duration_scftorture" --configs "$configs_scftorture" --kconfig "CONFIG_NR_CPUS=$HALF_ALLOTED_CPUS" --trust-make
++	torture_set "scftorture" tools/testing/selftests/rcutorture/bin/kvm.sh --torture scf --allcpus --duration "$duration_scftorture" --configs "$configs_scftorture" --kconfig "CONFIG_NR_CPUS=$HALF_ALLOTED_CPUS" --memory 1G --trust-make
+ fi
+ 
+ if test "$do_refscale" = yes
+@@ -434,7 +434,12 @@ then
+ 	batchno=1
+ 	if test -s $T/xz-todo
+ 	then
+-		echo Size before compressing: `du -sh $tdir | awk '{ print $1 }'` `date` 2>&1 | tee -a "$tdir/log-xz" | tee -a $T/log
++		for i in `cat $T/xz-todo`
++		do
++			find $i -name 'vmlinux*' -print
++		done | wc -l | awk '{ print $1 }' > $T/xz-todo-count
++		n2compress="`cat $T/xz-todo-count`"
++		echo Size before compressing $n2compress files: `du -sh $tdir | awk '{ print $1 }'` `date` 2>&1 | tee -a "$tdir/log-xz" | tee -a $T/log
+ 		for i in `cat $T/xz-todo`
+ 		do
+ 			echo Compressing vmlinux files in ${i}: `date` >> "$tdir/log-xz" 2>&1
+@@ -456,7 +461,7 @@ then
+ 			echo Waiting for final batch $batchno of $ncompresses compressions `date` | tee -a "$tdir/log-xz" | tee -a $T/log
+ 		fi
+ 		wait
+-		echo Size after compressing: `du -sh $tdir | awk '{ print $1 }'` `date` 2>&1 | tee -a "$tdir/log-xz" | tee -a $T/log
++		echo Size after compressing $n2compress files: `du -sh $tdir | awk '{ print $1 }'` `date` 2>&1 | tee -a "$tdir/log-xz" | tee -a $T/log
+ 		echo Total duration `get_starttime_duration $starttime`. | tee -a $T/log
+ 	else
+ 		echo No compression needed: `date` >> "$tdir/log-xz" 2>&1
+-- 
+2.33.1
+
