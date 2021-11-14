@@ -1,6 +1,6 @@
-From 746db9fa6f526d307063cd5cc3edd4daf2700f65 Mon Sep 17 00:00:00 2001
+From bd26bd8caab3d65dce8252c0b3beea23424aec9d Mon Sep 17 00:00:00 2001
 From: "P. Jung" <ptr1337@cachyos.org>
-Date: Sat, 13 Nov 2021 19:11:43 +0000
+Date: Sat, 13 Nov 2021 23:25:52 +0000
 Subject: [PATCH] tt-pstate-fix
 
 Signed-off-by: P. Jung <ptr1337@cachyos.org>
@@ -10,16 +10,16 @@ Signed-off-by: P. Jung <ptr1337@cachyos.org>
  init/Kconfig                 |   18 +-
  kernel/Kconfig.preempt       |    1 +
  kernel/sched/Makefile        |    2 +-
- kernel/sched/bs.c            | 1122 +++++++++++++++++++
- kernel/sched/bs.h            |  301 ++++++
+ kernel/sched/bs.c            | 1172 ++++++++++++++++++++
+ kernel/sched/bs.h            |  305 ++++++
  kernel/sched/bs_nohz.h       |  691 ++++++++++++
  kernel/sched/core.c          |   13 +-
  kernel/sched/debug.c         |   37 +-
  kernel/sched/fair_numa.h     | 1959 ++++++++++++++++++++++++++++++++++
  kernel/sched/sched.h         |   12 +
- kernel/sched/tt_stats.h      |  915 ++++++++++++++++
+ kernel/sched/tt_stats.h      |  919 ++++++++++++++++
  kernel/sysctl.c              |    9 +
- 14 files changed, 5102 insertions(+), 6 deletions(-)
+ 14 files changed, 5160 insertions(+), 6 deletions(-)
  create mode 100644 kernel/sched/bs.c
  create mode 100644 kernel/sched/bs.h
  create mode 100644 kernel/sched/bs_nohz.h
@@ -162,10 +162,10 @@ index 978fcfca5871..464b134de739 100644
  obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o pelt.o
 diff --git a/kernel/sched/bs.c b/kernel/sched/bs.c
 new file mode 100644
-index 000000000000..2813bf71cb24
+index 000000000000..0b289f655e65
 --- /dev/null
 +++ b/kernel/sched/bs.c
-@@ -0,0 +1,1122 @@
+@@ -0,0 +1,1172 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * TT Scheduler Class (SCHED_NORMAL/SCHED_BATCH)
@@ -360,6 +360,9 @@ index 000000000000..2813bf71cb24
 +	struct tt_node *ttn = &curr->tt_node;
 +	u64 now = sched_clock();
 +	u64 delta_exec;
++#ifdef CONFIG_TT_ACCOUNTING_STATS
++	struct task_struct *curtask = task_of(curr);
++#endif
 +
 +	if (unlikely(!curr))
 +		return;
@@ -369,13 +372,26 @@ index 000000000000..2813bf71cb24
 +		return;
 +
 +	curr->exec_start = now;
++
++#ifdef CONFIG_TT_ACCOUNTING_STATS
++	schedstat_set(curr->statistics.exec_max,
++		      max(delta_exec, curr->statistics.exec_max));
++#endif
 +	curr->sum_exec_runtime += delta_exec;
 +
++#ifdef CONFIG_TT_ACCOUNTING_STATS
++	schedstat_add(cfs_rq->exec_clock, delta_exec);
++#endif
 +	ttn->curr_burst += delta_exec;
 +	ttn->vruntime += convert_to_vruntime(delta_exec, curr);
 +	detect_type(ttn, now, 0);
-+
 +	normalize_lifetime(now, &curr->tt_node);
++
++#ifdef CONFIG_TT_ACCOUNTING_STATS
++	trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
++	cgroup_account_cputime(curtask, delta_exec);
++	account_group_exec_runtime(curtask, delta_exec);
++#endif
 +}
 +
 +static void update_curr_fair(struct rq *rq)
@@ -602,11 +618,33 @@ index 000000000000..2813bf71cb24
 +static void
 +set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 +{
-+	if (se->on_rq)
++	if (se->on_rq) {
++		/*
++		 * Any task has to be enqueued before it get to execute on
++		 * a CPU. So account for the time it spent waiting on the
++		 * runqueue.
++		 */
++		update_stats_wait_end(cfs_rq, se);
 +		__dequeue_entity(cfs_rq, se);
++		update_load_avg(cfs_rq, se, UPDATE_TG);
++	}
 +
 +	se->exec_start = sched_clock();
 +	cfs_rq->curr = se;
++
++#ifdef CONFIG_TT_ACCOUNTING_STATS
++	/*
++	 * Track our maximum slice length, if the CPU's load is at
++	 * least twice that of our own weight (i.e. dont track it
++	 * when there are only lesser-weight tasks around):
++	 */
++	if (schedstat_enabled() &&
++	    rq_of(cfs_rq)->cfs.load.weight >= 2*se->load.weight) {
++		schedstat_set(se->statistics.slice_max,
++			max((u64)schedstat_val(se->statistics.slice_max),
++			    se->sum_exec_runtime - se->prev_sum_exec_runtime));
++	}
++#endif
 +	se->prev_sum_exec_runtime = se->sum_exec_runtime;
 +}
 +
@@ -665,6 +703,8 @@ index 000000000000..2813bf71cb24
 +	 */
 +	list_move(&p->se.group_node, &rq->cfs_tasks);
 +#endif
++
++	update_misfit_status(p, rq);
 +
 +	return p;
 +
@@ -729,11 +769,12 @@ index 000000000000..2813bf71cb24
 +	 * If still on the runqueue then deactivate_task()
 +	 * was not called and update_curr() has to be done:
 +	 */
-+	if (prev->on_rq)
++	if (prev->on_rq) {
 +		update_curr(cfs_rq);
-+
-+	if (prev->on_rq)
++		update_stats_wait_start(cfs_rq, prev);
 +		__enqueue_entity(cfs_rq, prev);
++		update_load_avg(cfs_rq, prev, 0);
++	}
 +
 +	cfs_rq->curr = NULL;
 +}
@@ -774,6 +815,11 @@ index 000000000000..2813bf71cb24
 +entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 +{
 +	update_curr(cfs_rq);
++
++	/*
++	 * Ensure that runnable average is periodically updated.
++	 */
++	update_load_avg(cfs_rq, curr, UPDATE_TG);
 +
 +	if (cfs_rq->nr_running > 1)
 +		check_preempt_tick(cfs_rq, curr);
@@ -1180,6 +1226,7 @@ index 000000000000..2813bf71cb24
 +	if (unlikely(on_null_domain(this_rq) || !cpu_active(cpu_of(this_rq))))
 +		return;
 +
++	update_blocked_averages(this_rq->cpu);
 +	nohz_balancer_kick(this_rq);
 +}
 +
@@ -1195,6 +1242,9 @@ index 000000000000..2813bf71cb24
 +
 +	if (static_branch_unlikely(&sched_numa_balancing))
 +		task_tick_numa(rq, curr);
++
++	update_misfit_status(curr, rq);
++	update_overutilized_status(task_rq(curr));
 +}
 +
 +static void task_fork_fair(struct task_struct *p)
@@ -1290,10 +1340,10 @@ index 000000000000..2813bf71cb24
 +}
 diff --git a/kernel/sched/bs.h b/kernel/sched/bs.h
 new file mode 100644
-index 000000000000..80f813826406
+index 000000000000..d413aad1d0a3
 --- /dev/null
 +++ b/kernel/sched/bs.h
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,305 @@
 +
 +/*
 + * After fork, child runs first. If set to 0 (default) then
@@ -1354,12 +1404,16 @@ index 000000000000..80f813826406
 +static void rq_offline_fair(struct rq *rq) {}
 +static void task_dead_fair(struct task_struct *p)
 +{
++#ifdef CONFIG_TT_ACCOUNTING_STATS
++	remove_entity_load_avg(&p->se);
++#else
 +	struct cfs_rq *cfs_rq = cfs_rq_of(&p->se);
 +	unsigned long flags;
 +
 +	raw_spin_lock_irqsave(&cfs_rq->removed.lock, flags);
 +	++cfs_rq->removed.nr;
 +	raw_spin_unlock_irqrestore(&cfs_rq->removed.lock, flags);
++#endif
 +}
 +
 +#endif /** CONFIG_SMP */
@@ -4480,10 +4534,10 @@ index 3d3e5793e117..c2b483ece82c 100644
  	unsigned int		nr_spread_over;
 diff --git a/kernel/sched/tt_stats.h b/kernel/sched/tt_stats.h
 new file mode 100644
-index 000000000000..2e897866c7f8
+index 000000000000..7aa1e8936be4
 --- /dev/null
 +++ b/kernel/sched/tt_stats.h
-@@ -0,0 +1,915 @@
+@@ -0,0 +1,919 @@
 +#ifdef CONFIG_TT_ACCOUNTING_STATS
 +/*
 + * Unsigned subtract and clamp on underflow.
@@ -4678,6 +4732,10 @@ index 000000000000..2e897866c7f8
 +	}
 +}
 +#else
++static inline void
++update_stats_wait_start(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
++static inline void
++update_stats_wait_end(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
 +static inline void
 +update_stats_enqueue(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags) {}
 +static inline void
