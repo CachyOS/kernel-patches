@@ -1,6 +1,6 @@
-From 1958a42524dde013e871e4e2d16a4929bd4be146 Mon Sep 17 00:00:00 2001
+From 022403b26fa4b198af67f978ab72c9f7a1fb98c0 Mon Sep 17 00:00:00 2001
 From: "P. Jung" <ptr1337@cachyos.org>
-Date: Tue, 16 Nov 2021 22:16:17 +0000
+Date: Wed, 17 Nov 2021 18:21:34 +0000
 Subject: [PATCH] mm-lru
 
 Signed-off-by: P. Jung <ptr1337@cachyos.org>
@@ -18,10 +18,7 @@ Signed-off-by: P. Jung <ptr1337@cachyos.org>
  arch/x86/mm/pgtable.c                   |    5 +-
  fs/exec.c                               |    2 +
  fs/fuse/dev.c                           |    3 +-
- fs/inode.c                              |   46 +-
- fs/internal.h                           |    1 -
  include/linux/cgroup.h                  |   15 +-
- include/linux/fs.h                      |    1 +
  include/linux/memcontrol.h              |    7 +
  include/linux/mm.h                      |   40 +
  include/linux/mm_inline.h               |  198 ++
@@ -31,7 +28,6 @@ Signed-off-by: P. Jung <ptr1337@cachyos.org>
  include/linux/oom.h                     |   16 +
  include/linux/page-flags-layout.h       |   19 +-
  include/linux/page-flags.h              |    4 +-
- include/linux/pagemap.h                 |   50 +
  include/linux/pgtable.h                 |   17 +-
  include/linux/sched.h                   |    3 +
  include/linux/swap.h                    |    3 +
@@ -43,7 +39,6 @@ Signed-off-by: P. Jung <ptr1337@cachyos.org>
  kernel/sched/core.c                     |    2 +
  kernel/sysctl.c                         |   21 +
  mm/Kconfig                              |  122 +
- mm/filemap.c                            |    8 +
  mm/huge_memory.c                        |    3 +-
  mm/memcontrol.c                         |   31 +
  mm/memory.c                             |   21 +-
@@ -53,10 +48,9 @@ Signed-off-by: P. Jung <ptr1337@cachyos.org>
  mm/rmap.c                               |    8 +
  mm/swap.c                               |   51 +-
  mm/swapfile.c                           |    2 +
- mm/truncate.c                           |   19 +-
- mm/vmscan.c                             | 2999 +++++++++++++++++++++--
- mm/workingset.c                         |  130 +-
- 51 files changed, 4146 insertions(+), 257 deletions(-)
+ mm/vmscan.c                             | 2992 +++++++++++++++++++++--
+ mm/workingset.c                         |  120 +-
+ 45 files changed, 4026 insertions(+), 235 deletions(-)
  create mode 100644 Documentation/vm/multigen_lru.rst
 
 diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
@@ -500,129 +494,6 @@ index 5a1f142bdb48..ae8960675911 100644
  		dump_page(page, "fuse: trying to steal weird page");
  		return 1;
  	}
-diff --git a/fs/inode.c b/fs/inode.c
-index ed0cab8a32db..a49695f57e1e 100644
---- a/fs/inode.c
-+++ b/fs/inode.c
-@@ -428,11 +428,20 @@ void ihold(struct inode *inode)
- }
- EXPORT_SYMBOL(ihold);
- 
--static void inode_lru_list_add(struct inode *inode)
-+static void __inode_add_lru(struct inode *inode, bool rotate)
- {
-+	if (inode->i_state & (I_DIRTY_ALL | I_SYNC | I_FREEING | I_WILL_FREE))
-+		return;
-+	if (atomic_read(&inode->i_count))
-+		return;
-+	if (!(inode->i_sb->s_flags & SB_ACTIVE))
-+		return;
-+	if (!mapping_shrinkable(&inode->i_data))
-+		return;
-+
- 	if (list_lru_add(&inode->i_sb->s_inode_lru, &inode->i_lru))
- 		this_cpu_inc(nr_unused);
--	else
-+	else if (rotate)
- 		inode->i_state |= I_REFERENCED;
- }
- 
-@@ -443,16 +452,11 @@ static void inode_lru_list_add(struct inode *inode)
-  */
- void inode_add_lru(struct inode *inode)
- {
--	if (!(inode->i_state & (I_DIRTY_ALL | I_SYNC |
--				I_FREEING | I_WILL_FREE)) &&
--	    !atomic_read(&inode->i_count) && inode->i_sb->s_flags & SB_ACTIVE)
--		inode_lru_list_add(inode);
-+	__inode_add_lru(inode, false);
- }
- 
--
- static void inode_lru_list_del(struct inode *inode)
- {
--
- 	if (list_lru_del(&inode->i_sb->s_inode_lru, &inode->i_lru))
- 		this_cpu_dec(nr_unused);
- }
-@@ -728,10 +732,6 @@ int invalidate_inodes(struct super_block *sb, bool kill_dirty)
- /*
-  * Isolate the inode from the LRU in preparation for freeing it.
-  *
-- * Any inodes which are pinned purely because of attached pagecache have their
-- * pagecache removed.  If the inode has metadata buffers attached to
-- * mapping->private_list then try to remove them.
-- *
-  * If the inode has the I_REFERENCED flag set, then it means that it has been
-  * used recently - the flag is set in iput_final(). When we encounter such an
-  * inode, clear the flag and move it to the back of the LRU so it gets another
-@@ -747,31 +747,39 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
- 	struct inode	*inode = container_of(item, struct inode, i_lru);
- 
- 	/*
--	 * we are inverting the lru lock/inode->i_lock here, so use a trylock.
--	 * If we fail to get the lock, just skip it.
-+	 * We are inverting the lru lock/inode->i_lock here, so use a
-+	 * trylock. If we fail to get the lock, just skip it.
- 	 */
- 	if (!spin_trylock(&inode->i_lock))
- 		return LRU_SKIP;
- 
- 	/*
--	 * Referenced or dirty inodes are still in use. Give them another pass
--	 * through the LRU as we canot reclaim them now.
-+	 * Inodes can get referenced, redirtied, or repopulated while
-+	 * they're already on the LRU, and this can make them
-+	 * unreclaimable for a while. Remove them lazily here; iput,
-+	 * sync, or the last page cache deletion will requeue them.
- 	 */
- 	if (atomic_read(&inode->i_count) ||
--	    (inode->i_state & ~I_REFERENCED)) {
-+	    (inode->i_state & ~I_REFERENCED) ||
-+	    !mapping_shrinkable(&inode->i_data)) {
- 		list_lru_isolate(lru, &inode->i_lru);
- 		spin_unlock(&inode->i_lock);
- 		this_cpu_dec(nr_unused);
- 		return LRU_REMOVED;
- 	}
- 
--	/* recently referenced inodes get one more pass */
-+	/* Recently referenced inodes get one more pass */
- 	if (inode->i_state & I_REFERENCED) {
- 		inode->i_state &= ~I_REFERENCED;
- 		spin_unlock(&inode->i_lock);
- 		return LRU_ROTATE;
- 	}
- 
-+	/*
-+	 * On highmem systems, mapping_shrinkable() permits dropping
-+	 * page cache in order to free up struct inodes: lowmem might
-+	 * be under pressure before the cache inside the highmem zone.
-+	 */
- 	if (inode_has_buffers(inode) || !mapping_empty(&inode->i_data)) {
- 		__iget(inode);
- 		spin_unlock(&inode->i_lock);
-@@ -1638,7 +1646,7 @@ static void iput_final(struct inode *inode)
- 	if (!drop &&
- 	    !(inode->i_state & I_DONTCACHE) &&
- 	    (sb->s_flags & SB_ACTIVE)) {
--		inode_add_lru(inode);
-+		__inode_add_lru(inode, true);
- 		spin_unlock(&inode->i_lock);
- 		return;
- 	}
-diff --git a/fs/internal.h b/fs/internal.h
-index 3cd065c8a66b..2854ff29f116 100644
---- a/fs/internal.h
-+++ b/fs/internal.h
-@@ -149,7 +149,6 @@ extern int vfs_open(const struct path *, struct file *);
-  * inode.c
-  */
- extern long prune_icache_sb(struct super_block *sb, struct shrink_control *sc);
--extern void inode_add_lru(struct inode *inode);
- extern int dentry_needs_remove_privs(struct dentry *dentry);
- 
- /*
 diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
 index 75c151413fda..b145025f3eac 100644
 --- a/include/linux/cgroup.h
@@ -663,18 +534,6 @@ index 75c151413fda..b145025f3eac 100644
  static inline int cgroup_attach_task_all(struct task_struct *from,
  					 struct task_struct *t) { return 0; }
  static inline int cgroupstats_build(struct cgroupstats *stats,
-diff --git a/include/linux/fs.h b/include/linux/fs.h
-index e7a633353fd2..be0afaea2eae 100644
---- a/include/linux/fs.h
-+++ b/include/linux/fs.h
-@@ -3192,6 +3192,7 @@ static inline void remove_inode_hash(struct inode *inode)
- }
- 
- extern void inode_sb_list_add(struct inode *inode);
-+extern void inode_add_lru(struct inode *inode);
- 
- extern int sb_set_blocksize(struct super_block *, int);
- extern int sb_min_blocksize(struct super_block *, int);
 diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
 index 3096c9a0ee01..e284a4aa1bd8 100644
 --- a/include/linux/memcontrol.h
@@ -1440,67 +1299,6 @@ index fbfd3fad48f2..a7d7ff4c621d 100644
  
  #define PAGE_FLAGS_PRIVATE				\
  	(1UL << PG_private | 1UL << PG_private_2)
-diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
-index 62db6b0176b9..5c74a45ff97a 100644
---- a/include/linux/pagemap.h
-+++ b/include/linux/pagemap.h
-@@ -23,6 +23,56 @@ static inline bool mapping_empty(struct address_space *mapping)
- 	return xa_empty(&mapping->i_pages);
- }
- 
-+/*
-+ * mapping_shrinkable - test if page cache state allows inode reclaim
-+ * @mapping: the page cache mapping
-+ *
-+ * This checks the mapping's cache state for the pupose of inode
-+ * reclaim and LRU management.
-+ *
-+ * The caller is expected to hold the i_lock, but is not required to
-+ * hold the i_pages lock, which usually protects cache state. That's
-+ * because the i_lock and the list_lru lock that protect the inode and
-+ * its LRU state don't nest inside the irq-safe i_pages lock.
-+ *
-+ * Cache deletions are performed under the i_lock, which ensures that
-+ * when an inode goes empty, it will reliably get queued on the LRU.
-+ *
-+ * Cache additions do not acquire the i_lock and may race with this
-+ * check, in which case we'll report the inode as shrinkable when it
-+ * has cache pages. This is okay: the shrinker also checks the
-+ * refcount and the referenced bit, which will be elevated or set in
-+ * the process of adding new cache pages to an inode.
-+ */
-+static inline bool mapping_shrinkable(struct address_space *mapping)
-+{
-+	void *head;
-+
-+	/*
-+	 * On highmem systems, there could be lowmem pressure from the
-+	 * inodes before there is highmem pressure from the page
-+	 * cache. Make inodes shrinkable regardless of cache state.
-+	 */
-+	if (IS_ENABLED(CONFIG_HIGHMEM))
-+		return true;
-+
-+	/* Cache completely empty? Shrink away. */
-+	head = rcu_access_pointer(mapping->i_pages.xa_head);
-+	if (!head)
-+		return true;
-+
-+	/*
-+	 * The xarray stores single offset-0 entries directly in the
-+	 * head pointer, which allows non-resident page cache entries
-+	 * to escape the shadow shrinker's list of xarray nodes. The
-+	 * inode shrinker needs to pick them up under memory pressure.
-+	 */
-+	if (!xa_is_node(head) && xa_is_value(head))
-+		return true;
-+
-+	return false;
-+}
-+
- /*
-  * Bits in mapping->flags.
-  */
 diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
 index e24d2c992b11..afb9004b778a 100644
 --- a/include/linux/pgtable.h
@@ -1853,42 +1651,6 @@ index d16ba9249bc5..9167c043b1a9 100644
 +# }
 +
  endmenu
-diff --git a/mm/filemap.c b/mm/filemap.c
-index 82a17c35eb96..b432165a7581 100644
---- a/mm/filemap.c
-+++ b/mm/filemap.c
-@@ -262,9 +262,13 @@ void delete_from_page_cache(struct page *page)
- 	struct address_space *mapping = page_mapping(page);
- 
- 	BUG_ON(!PageLocked(page));
-+	spin_lock(&mapping->host->i_lock);
- 	xa_lock_irq(&mapping->i_pages);
- 	__delete_from_page_cache(page, NULL);
- 	xa_unlock_irq(&mapping->i_pages);
-+	if (mapping_shrinkable(mapping))
-+		inode_add_lru(mapping->host);
-+	spin_unlock(&mapping->host->i_lock);
- 
- 	page_cache_free_page(mapping, page);
- }
-@@ -340,6 +344,7 @@ void delete_from_page_cache_batch(struct address_space *mapping,
- 	if (!pagevec_count(pvec))
- 		return;
- 
-+	spin_lock(&mapping->host->i_lock);
- 	xa_lock_irq(&mapping->i_pages);
- 	for (i = 0; i < pagevec_count(pvec); i++) {
- 		trace_mm_filemap_delete_from_page_cache(pvec->pages[i]);
-@@ -348,6 +353,9 @@ void delete_from_page_cache_batch(struct address_space *mapping,
- 	}
- 	page_cache_delete_batch(mapping, pvec);
- 	xa_unlock_irq(&mapping->i_pages);
-+	if (mapping_shrinkable(mapping))
-+		inode_add_lru(mapping->host);
-+	spin_unlock(&mapping->host->i_lock);
- 
- 	for (i = 0; i < pagevec_count(pvec); i++)
- 		page_cache_free_page(mapping, pvec->pages[i]);
 diff --git a/mm/huge_memory.c b/mm/huge_memory.c
 index c5142d237e48..875ed5559d95 100644
 --- a/mm/huge_memory.c
@@ -2223,78 +1985,8 @@ index 22d10f713848..2ac9ac0b5ec3 100644
  
  	error = 0;
  	goto out;
-diff --git a/mm/truncate.c b/mm/truncate.c
-index 714eaf19821d..cc83a3f7c1ad 100644
---- a/mm/truncate.c
-+++ b/mm/truncate.c
-@@ -45,9 +45,13 @@ static inline void __clear_shadow_entry(struct address_space *mapping,
- static void clear_shadow_entry(struct address_space *mapping, pgoff_t index,
- 			       void *entry)
- {
-+	spin_lock(&mapping->host->i_lock);
- 	xa_lock_irq(&mapping->i_pages);
- 	__clear_shadow_entry(mapping, index, entry);
- 	xa_unlock_irq(&mapping->i_pages);
-+	if (mapping_shrinkable(mapping))
-+		inode_add_lru(mapping->host);
-+	spin_unlock(&mapping->host->i_lock);
- }
- 
- /*
-@@ -73,8 +77,10 @@ static void truncate_exceptional_pvec_entries(struct address_space *mapping,
- 		return;
- 
- 	dax = dax_mapping(mapping);
--	if (!dax)
-+	if (!dax) {
-+		spin_lock(&mapping->host->i_lock);
- 		xa_lock_irq(&mapping->i_pages);
-+	}
- 
- 	for (i = j; i < pagevec_count(pvec); i++) {
- 		struct page *page = pvec->pages[i];
-@@ -93,8 +99,12 @@ static void truncate_exceptional_pvec_entries(struct address_space *mapping,
- 		__clear_shadow_entry(mapping, index, page);
- 	}
- 
--	if (!dax)
-+	if (!dax) {
- 		xa_unlock_irq(&mapping->i_pages);
-+		if (mapping_shrinkable(mapping))
-+			inode_add_lru(mapping->host);
-+		spin_unlock(&mapping->host->i_lock);
-+	}
- 	pvec->nr = j;
- }
- 
-@@ -567,6 +577,7 @@ invalidate_complete_page2(struct address_space *mapping, struct page *page)
- 	if (page_has_private(page) && !try_to_release_page(page, GFP_KERNEL))
- 		return 0;
- 
-+	spin_lock(&mapping->host->i_lock);
- 	xa_lock_irq(&mapping->i_pages);
- 	if (PageDirty(page))
- 		goto failed;
-@@ -574,6 +585,9 @@ invalidate_complete_page2(struct address_space *mapping, struct page *page)
- 	BUG_ON(page_has_private(page));
- 	__delete_from_page_cache(page, NULL);
- 	xa_unlock_irq(&mapping->i_pages);
-+	if (mapping_shrinkable(mapping))
-+		inode_add_lru(mapping->host);
-+	spin_unlock(&mapping->host->i_lock);
- 
- 	if (mapping->a_ops->freepage)
- 		mapping->a_ops->freepage(page);
-@@ -582,6 +596,7 @@ invalidate_complete_page2(struct address_space *mapping, struct page *page)
- 	return 1;
- failed:
- 	xa_unlock_irq(&mapping->i_pages);
-+	spin_unlock(&mapping->host->i_lock);
- 	return 0;
- }
- 
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 74296c2d1fed..f91beff1b674 100644
+index 74296c2d1fed..701510094c6d 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -50,6 +50,11 @@
@@ -2336,16 +2028,7 @@ index 74296c2d1fed..f91beff1b674 100644
  /*
   * From 0 .. 200.  Higher means more swappy.
   */
-@@ -1105,6 +1123,8 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
- 	BUG_ON(!PageLocked(page));
- 	BUG_ON(mapping != page_mapping(page));
- 
-+	if (!PageSwapCache(page))
-+		spin_lock(&mapping->host->i_lock);
- 	xa_lock_irq(&mapping->i_pages);
- 	/*
- 	 * The non racy check for a busy page.
-@@ -1142,9 +1162,11 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
+@@ -1142,9 +1160,11 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
  
  	if (PageSwapCache(page)) {
  		swp_entry_t swap = { .val = page_private(page) };
@@ -2358,26 +2041,7 @@ index 74296c2d1fed..f91beff1b674 100644
  		__delete_from_swap_cache(page, swap, shadow);
  		xa_unlock_irq(&mapping->i_pages);
  		put_swap_page(page, swap);
-@@ -1173,6 +1195,9 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
- 			shadow = workingset_eviction(page, target_memcg);
- 		__delete_from_page_cache(page, shadow);
- 		xa_unlock_irq(&mapping->i_pages);
-+		if (mapping_shrinkable(mapping))
-+			inode_add_lru(mapping->host);
-+		spin_unlock(&mapping->host->i_lock);
- 
- 		if (freepage != NULL)
- 			freepage(page);
-@@ -1182,6 +1207,8 @@ static int __remove_mapping(struct address_space *mapping, struct page *page,
- 
- cannot_free:
- 	xa_unlock_irq(&mapping->i_pages);
-+	if (!PageSwapCache(page))
-+		spin_unlock(&mapping->host->i_lock);
- 	return 0;
- }
- 
-@@ -1407,6 +1434,11 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+@@ -1407,6 +1427,11 @@ static unsigned int shrink_page_list(struct list_head *page_list,
  		if (!sc->may_unmap && page_mapped(page))
  			goto keep_locked;
  
@@ -2389,7 +2053,7 @@ index 74296c2d1fed..f91beff1b674 100644
  		may_enter_fs = (sc->gfp_mask & __GFP_FS) ||
  			(PageSwapCache(page) && (sc->gfp_mask & __GFP_IO));
  
-@@ -2562,6 +2594,156 @@ enum scan_balance {
+@@ -2562,6 +2587,156 @@ enum scan_balance {
  	SCAN_FILE,
  };
  
@@ -2546,7 +2210,7 @@ index 74296c2d1fed..f91beff1b674 100644
  /*
   * Determine how aggressively the anon and file LRU lists should be
   * scanned.  The relative value of each set of LRU lists is determined
-@@ -2620,6 +2802,15 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+@@ -2620,6 +2795,15 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
  		goto out;
  	}
  
@@ -2562,7 +2226,7 @@ index 74296c2d1fed..f91beff1b674 100644
  	/*
  	 * If there is enough inactive page cache, we do not reclaim
  	 * anything from the anonymous working right now.
-@@ -2764,6 +2955,25 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+@@ -2764,6 +2948,25 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
  			BUG();
  		}
  
@@ -2588,7 +2252,7 @@ index 74296c2d1fed..f91beff1b674 100644
  		nr[lru] = scan;
  	}
  }
-@@ -2783,123 +2993,2609 @@ static bool can_age_anon_pages(struct pglist_data *pgdat,
+@@ -2783,123 +2986,2609 @@ static bool can_age_anon_pages(struct pglist_data *pgdat,
  	return can_demote(pgdat->node_id, sc);
  }
  
@@ -5300,7 +4964,7 @@ index 74296c2d1fed..f91beff1b674 100644
  {
  	if (IS_ENABLED(CONFIG_COMPACTION) && sc->order &&
  			(sc->order > PAGE_ALLOC_COSTLY_ORDER ||
-@@ -3032,7 +5728,6 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -3032,7 +5721,6 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	unsigned long nr_reclaimed, nr_scanned;
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
@@ -5308,7 +4972,7 @@ index 74296c2d1fed..f91beff1b674 100644
  
  	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
  
-@@ -3048,93 +5743,7 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -3048,93 +5736,7 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	nr_reclaimed = sc->nr_reclaimed;
  	nr_scanned = sc->nr_scanned;
  
@@ -5403,7 +5067,7 @@ index 74296c2d1fed..f91beff1b674 100644
  
  	shrink_node_memcgs(pgdat, sc);
  
-@@ -3354,6 +5963,9 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
+@@ -3354,6 +5956,9 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  	struct lruvec *target_lruvec;
  	unsigned long refaults;
  
@@ -5413,7 +5077,7 @@ index 74296c2d1fed..f91beff1b674 100644
  	target_lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
  	refaults = lruvec_page_state(target_lruvec, WORKINGSET_ACTIVATE_ANON);
  	target_lruvec->refaults[0] = refaults;
-@@ -3724,6 +6336,11 @@ static void age_active_anon(struct pglist_data *pgdat,
+@@ -3724,6 +6329,11 @@ static void age_active_anon(struct pglist_data *pgdat,
  	struct mem_cgroup *memcg;
  	struct lruvec *lruvec;
  
@@ -5426,7 +5090,7 @@ index 74296c2d1fed..f91beff1b674 100644
  		return;
  
 diff --git a/mm/workingset.c b/mm/workingset.c
-index d5b81e4f4cbe..68ceb1015b0f 100644
+index d5b81e4f4cbe..27d504a5d998 100644
 --- a/mm/workingset.c
 +++ b/mm/workingset.c
 @@ -187,7 +187,6 @@ static unsigned int bucket_order __read_mostly;
@@ -5585,30 +5249,6 @@ index d5b81e4f4cbe..68ceb1015b0f 100644
  
  	rcu_read_lock();
  	/*
-@@ -543,6 +659,13 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
- 		goto out;
- 	}
- 
-+	if (!spin_trylock(&mapping->host->i_lock)) {
-+		xa_unlock(&mapping->i_pages);
-+		spin_unlock_irq(lru_lock);
-+		ret = LRU_RETRY;
-+		goto out;
-+	}
-+
- 	list_lru_isolate(lru, item);
- 	__dec_lruvec_kmem_state(node, WORKINGSET_NODES);
- 
-@@ -562,6 +685,9 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
- 
- out_invalid:
- 	xa_unlock_irq(&mapping->i_pages);
-+	if (mapping_shrinkable(mapping))
-+		inode_add_lru(mapping->host);
-+	spin_unlock(&mapping->host->i_lock);
- 	ret = LRU_REMOVED_RETRY;
- out:
- 	cond_resched();
 -- 
 2.34.0.rc2.16.g5a73c6bdc7
 
