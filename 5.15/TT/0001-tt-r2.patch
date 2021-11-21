@@ -1,36 +1,8 @@
-From 469bcbf7bb16040c349a528ade29d603ef5067ef Mon Sep 17 00:00:00 2001
-From: "P. Jung" <ptr1337@cachyos.org>
-Date: Thu, 18 Nov 2021 22:49:21 +0000
-Subject: [PATCH] tt-r2
-
-Signed-off-by: P. Jung <ptr1337@cachyos.org>
----
- include/linux/sched.h        |   25 +-
- include/linux/sched/sysctl.h |   12 +
- init/Kconfig                 |   18 +-
- kernel/Kconfig.preempt       |    1 +
- kernel/sched/Makefile        |    2 +-
- kernel/sched/bs.c            | 1379 ++++++++++++++++++++++++
- kernel/sched/bs.h            |  309 ++++++
- kernel/sched/bs_nohz.h       |  689 ++++++++++++
- kernel/sched/core.c          |   13 +-
- kernel/sched/debug.c         |   37 +-
- kernel/sched/fair_numa.h     | 1959 ++++++++++++++++++++++++++++++++++
- kernel/sched/sched.h         |   12 +
- kernel/sched/tt_stats.h      |  919 ++++++++++++++++
- kernel/sysctl.c              |   79 ++
- 14 files changed, 5448 insertions(+), 6 deletions(-)
- create mode 100644 kernel/sched/bs.c
- create mode 100644 kernel/sched/bs.h
- create mode 100644 kernel/sched/bs_nohz.h
- create mode 100644 kernel/sched/fair_numa.h
- create mode 100644 kernel/sched/tt_stats.h
-
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index c1a927ddec64..d05743dfd0b4 100644
+index c1a927ddec64..a16beb71e911 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -524,6 +524,24 @@ struct sched_statistics {
+@@ -524,6 +524,23 @@ struct sched_statistics {
  #endif
  };
  
@@ -41,7 +13,6 @@ index c1a927ddec64..d05743dfd0b4 100644
 +	unsigned int			task_type;
 +	u64				vruntime;
 +	u64				start_time;
-+	u64				last_run;
 +
 +	u64				prev_wait_time;
 +	u64				wait_time;
@@ -55,7 +26,7 @@ index c1a927ddec64..d05743dfd0b4 100644
  struct sched_entity {
  	/* For load-balancing: */
  	struct load_weight		load;
-@@ -533,9 +551,14 @@ struct sched_entity {
+@@ -533,9 +550,14 @@ struct sched_entity {
  
  	u64				exec_start;
  	u64				sum_exec_runtime;
@@ -72,23 +43,16 @@ index c1a927ddec64..d05743dfd0b4 100644
  
  	struct sched_statistics		statistics;
 diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
-index 304f431178fd..0516fd122de7 100644
+index 304f431178fd..bddf5f917584 100644
 --- a/include/linux/sched/sysctl.h
 +++ b/include/linux/sched/sysctl.h
-@@ -28,6 +28,18 @@ enum { sysctl_hung_task_timeout_secs = 0 };
+@@ -28,6 +28,11 @@ enum { sysctl_hung_task_timeout_secs = 0 };
  
  extern unsigned int sysctl_sched_child_runs_first;
  
 +#ifdef CONFIG_TT_SCHED
 +extern unsigned int tt_max_lifetime;
-+extern unsigned int interactivity_factor;
-+extern unsigned int starve_factor;
-+extern unsigned int starve_divisor;
 +extern int tt_rt_prio;
-+extern int tt_interactive_prio;
-+extern int tt_notype_prio;
-+extern int tt_cpubound_prio;
-+extern int tt_batch_prio;
 +#endif
 +
  enum sched_tunable_scaling {
@@ -171,10 +135,10 @@ index 978fcfca5871..464b134de739 100644
  obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o pelt.o
 diff --git a/kernel/sched/bs.c b/kernel/sched/bs.c
 new file mode 100644
-index 000000000000..7e274ca4c40f
+index 000000000000..793bb1c338d1
 --- /dev/null
 +++ b/kernel/sched/bs.c
-@@ -0,0 +1,1379 @@
+@@ -0,0 +1,1277 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * TT Scheduler Class (SCHED_NORMAL/SCHED_BATCH)
@@ -188,15 +152,7 @@ index 000000000000..7e274ca4c40f
 +#include "bs.h"
 +
 +unsigned int __read_mostly tt_max_lifetime	= 22000; // in ms
-+unsigned int __read_mostly interactivity_factor	= 32768;
-+unsigned int __read_mostly starve_factor	= 12288;
-+unsigned int __read_mostly starve_divisor	= 2000000; // 2ms
-+
 +int __read_mostly tt_rt_prio			= -20;
-+int __read_mostly tt_interactive_prio		= -3;
-+int __read_mostly tt_notype_prio		= -2;
-+int __read_mostly tt_cpubound_prio		= 1;
-+int __read_mostly tt_batch_prio			= 0;
 +
 +#define INTERACTIVE_HRRN	2U
 +#define RT_WAIT_DELTA		800000U
@@ -217,6 +173,8 @@ index 000000000000..7e274ca4c40f
 +#define LEQ(a, b) ((s64)((a) - (b)) <= 0)	// is a <= b
 +#define LES(a, b) ((s64)((a) - (b)) < 0)	// is a <  b
 +#define EQ_D(a, b, d) (LEQ(a, b + d) && GEQ(a, b - d))
++
++#define HRRN_PERCENT(ttn, now) (((ttn)->vruntime * 1000ULL) / ((now) - (ttn)->start_time))
 +
 +static inline bool is_interactive(struct tt_node *ttn, u64 now, u64 _hrrn)
 +{
@@ -353,24 +311,7 @@ index 000000000000..7e274ca4c40f
 +{
 +	struct task_struct *p = task_of(se);
 +	s64 prio_diff;
-+	int prio = PRIO_TO_NICE(p->prio);
-+
-+	switch (se->tt_node.task_type) {
-+		case TT_REALTIME:
-+			prio = tt_rt_prio ? tt_rt_prio : prio;
-+			break;
-+		case TT_INTERACTIVE:
-+			prio = tt_interactive_prio ? tt_interactive_prio : prio;
-+			break;
-+		case TT_NO_TYPE:
-+			prio = tt_notype_prio ? tt_notype_prio : prio;
-+			break;
-+		case TT_CPU_BOUND:
-+			prio = tt_cpubound_prio ? tt_cpubound_prio : prio;
-+			break;
-+		case TT_BATCH:
-+			prio = tt_batch_prio ? tt_batch_prio : prio;
-+	}
++	int prio = IS_REALTIME(&se->tt_node) ? tt_rt_prio : PRIO_TO_NICE(p->prio);
 +
 +	if (prio == 0)
 +		return delta;
@@ -402,7 +343,6 @@ index 000000000000..7e274ca4c40f
 +		return;
 +
 +	curr->exec_start = now;
-+	curr->tt_node.last_run = now;
 +
 +#ifdef CONFIG_TT_ACCOUNTING_STATS
 +	schedstat_set(curr->statistics.exec_max,
@@ -430,93 +370,15 @@ index 000000000000..7e274ca4c40f
 +	update_curr(cfs_rq_of(&rq->curr->se));
 +}
 +
-+static inline int cn_has_idle_policy(struct tt_node *ttn)
-+{
-+	return task_has_idle_policy(task_of(se_of(ttn)));
-+}
-+
-+static inline unsigned int
-+calc_interactivity(u64 now, struct tt_node *ttn)
-+{
-+	u64 l_se, vr_se, sleep_se = 1ULL, u64_factor_m, _2m;
-+	unsigned int score_se;
-+
-+	l_se		= now - ttn->start_time;
-+	vr_se		= ttn->vruntime;
-+	u64_factor_m	= interactivity_factor;
-+	_2m		= u64_factor_m << 1;
-+
-+	/* safety check */
-+	if (likely(l_se > vr_se))
-+		sleep_se = (l_se - vr_se) | 1;
-+
-+	if (sleep_se >= vr_se)
-+		score_se = u64_factor_m / (sleep_se / vr_se);
-+	else
-+		score_se = _2m - (u64_factor_m / (vr_se / sleep_se));
-+
-+	return score_se;
-+}
-+
-+static inline unsigned int
-+calc_starve_score(u64 now, struct tt_node *ttn)
-+{
-+	struct sched_entity *se = se_of(ttn);
-+	struct cfs_rq *cfs_rq = cfs_rq_of(se);
-+	u64 s_div = starve_divisor;
-+	u64 starving = 1ULL;
-+	u64 u64_factor_m = starve_factor;
-+	u64 _2m = u64_factor_m << 1;
-+	unsigned int score;
-+
-+	if (!starve_factor)
-+		return 0;
-+
-+	if (se == cfs_rq->curr)
-+		return _2m;
-+
-+	starving = (now - ttn->last_run) | 1;
-+
-+	if (s_div >= starving)
-+		score = _2m - (u64_factor_m / (s_div / starving));
-+	else
-+		score = u64_factor_m / (starving / s_div);
-+
-+	return score;
-+}
-+
-+/*
-+ * Does a has lower interactivity score value
-+ * (i.e. interactive) than b? If yes, return 1,
-+ * otherwise return 0
-+ * a is before b if a has lower interactivity score value
-+ * the lower score, the more interactive
++/**
++ * Should `a` preempts `b`?
 + */
 +static inline bool
 +entity_before(struct tt_node *a, struct tt_node *b)
 +{
 +	u64 now = sched_clock();
-+	unsigned int score_a, score_b;
-+	int diff;
-+	int is_a_idle = cn_has_idle_policy(a);
-+	int is_b_idle = cn_has_idle_policy(b);
 +
-+	/* if a is normal but b is idle class, then yes */
-+	if (!is_a_idle && is_b_idle)
-+		return true;
-+
-+	/* if a is idle class and b is normal, then no */
-+	if (is_a_idle && !is_b_idle)
-+		return false;
-+
-+	score_a = calc_interactivity(now, a);
-+	score_a += calc_starve_score(now, a);
-+
-+	score_b = calc_interactivity(now, b);
-+	score_b	+= calc_starve_score(now, b);
-+
-+	diff = score_a - score_b;
-+	return (diff < 0);
++	return (int)(HRRN_PERCENT(a, now) - HRRN_PERCENT(b, now)) < 0;
 +}
 +
 +static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -739,7 +601,7 @@ index 000000000000..7e274ca4c40f
 +		update_load_avg(cfs_rq, se, UPDATE_TG);
 +	}
 +
-+	se->tt_node.last_run = se->exec_start = sched_clock();
++	se->exec_start = sched_clock();
 +	cfs_rq->curr = se;
 +
 +#ifdef CONFIG_TT_ACCOUNTING_STATS
@@ -2565,10 +2427,10 @@ index 000000000000..89466954743c
 +		return;
 +}
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index aea60eae21a7..dcac8dc6d572 100644
+index f21714ea3db8..a900f15b7b11 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -4460,7 +4460,9 @@ void wake_up_new_task(struct task_struct *p)
+@@ -4459,7 +4459,9 @@ void wake_up_new_task(struct task_struct *p)
  	rq = __task_rq_lock(p, &rf);
  	update_rq_clock(rq);
  	post_init_entity_util_avg(p);
@@ -2579,7 +2441,7 @@ index aea60eae21a7..dcac8dc6d572 100644
  	activate_task(rq, p, ENQUEUE_NOCLOCK);
  	trace_sched_wakeup_new(p);
  	check_preempt_curr(rq, p, WF_FORK);
-@@ -5272,7 +5274,9 @@ static void sched_tick_remote(struct work_struct *work)
+@@ -5271,7 +5273,9 @@ static void sched_tick_remote(struct work_struct *work)
  	struct rq *rq = cpu_rq(cpu);
  	struct task_struct *curr;
  	struct rq_flags rf;
@@ -2589,7 +2451,7 @@ index aea60eae21a7..dcac8dc6d572 100644
  	int os;
  
  	/*
-@@ -5291,7 +5295,7 @@ static void sched_tick_remote(struct work_struct *work)
+@@ -5290,7 +5294,7 @@ static void sched_tick_remote(struct work_struct *work)
  		goto out_unlock;
  
  	update_rq_clock(rq);
@@ -2598,7 +2460,7 @@ index aea60eae21a7..dcac8dc6d572 100644
  	if (!is_idle_task(curr)) {
  		/*
  		 * Make sure the next tick runs within a reasonable
-@@ -5300,6 +5304,7 @@ static void sched_tick_remote(struct work_struct *work)
+@@ -5299,6 +5303,7 @@ static void sched_tick_remote(struct work_struct *work)
  		delta = rq_clock_task(rq) - curr->se.exec_start;
  		WARN_ON_ONCE(delta > (u64)NSEC_PER_SEC * 3);
  	}
@@ -2606,7 +2468,7 @@ index aea60eae21a7..dcac8dc6d572 100644
  	curr->sched_class->task_tick(rq, curr, 0);
  
  	calc_load_nohz_remote(rq);
-@@ -9297,6 +9302,10 @@ void __init sched_init(void)
+@@ -9296,6 +9301,10 @@ void __init sched_init(void)
  
  	wait_bit_init();
  
@@ -5676,7 +5538,7 @@ index 000000000000..7aa1e8936be4
 +#endif
 +
 diff --git a/kernel/sysctl.c b/kernel/sysctl.c
-index 083be6af29d7..7b02e289a9db 100644
+index 083be6af29d7..28ba66fc183b 100644
 --- a/kernel/sysctl.c
 +++ b/kernel/sysctl.c
 @@ -113,6 +113,10 @@
@@ -5690,7 +5552,7 @@ index 083be6af29d7..7b02e289a9db 100644
  static int __maybe_unused neg_one = -1;
  static int __maybe_unused two = 2;
  static int __maybe_unused four = 4;
-@@ -1778,6 +1782,81 @@ static struct ctl_table kern_table[] = {
+@@ -1778,6 +1782,24 @@ static struct ctl_table kern_table[] = {
  		.mode		= 0644,
  		.proc_handler	= proc_dointvec,
  	},
@@ -5698,27 +5560,6 @@ index 083be6af29d7..7b02e289a9db 100644
 +	{
 +		.procname	= "sched_tt_max_lifetime",
 +		.data		= &tt_max_lifetime,
-+		.maxlen		= sizeof(unsigned int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec,
-+	},
-+	{
-+		.procname	= "sched_tt_interactivity_factor",
-+		.data		= &interactivity_factor,
-+		.maxlen		= sizeof(unsigned int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec,
-+	},
-+	{
-+		.procname	= "sched_tt_starve_factor",
-+		.data		= &starve_factor,
-+		.maxlen		= sizeof(unsigned int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec,
-+	},
-+	{
-+		.procname	= "sched_tt_starve_divisor",
-+		.data		= &starve_divisor,
 +		.maxlen		= sizeof(unsigned int),
 +		.mode		= 0644,
 +		.proc_handler	= proc_dointvec,
@@ -5732,46 +5573,7 @@ index 083be6af29d7..7b02e289a9db 100644
 +		.extra1		= &neg_twenty,
 +		.extra2		= &thirty_nine,
 +	},
-+	{
-+		.procname	= "sched_tt_interactive_prio",
-+		.data		= &tt_interactive_prio,
-+		.maxlen		= sizeof(int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec_minmax,
-+		.extra1		= &neg_twenty,
-+		.extra2		= &thirty_nine,
-+	},
-+	{
-+		.procname	= "sched_tt_notype_prio",
-+		.data		= &tt_notype_prio,
-+		.maxlen		= sizeof(int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec_minmax,
-+		.extra1		= &neg_twenty,
-+		.extra2		= &thirty_nine,
-+	},
-+	{
-+		.procname	= "sched_tt_cpubound_prio",
-+		.data		= &tt_cpubound_prio,
-+		.maxlen		= sizeof(int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec_minmax,
-+		.extra1		= &neg_twenty,
-+		.extra2		= &thirty_nine,
-+	},
-+	{
-+		.procname	= "sched_tt_batch_prio",
-+		.data		= &tt_batch_prio,
-+		.maxlen		= sizeof(int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec_minmax,
-+		.extra1		= &neg_twenty,
-+		.extra2		= &thirty_nine,
-+	},
 +#endif
  #ifdef CONFIG_SCHEDSTATS
  	{
  		.procname	= "sched_schedstats",
--- 
-2.34.0
-
