@@ -1,7 +1,7 @@
-From eae67c71ef806d7d3750321d59d93e12ed742aef Mon Sep 17 00:00:00 2001
+From d74572c6e556bf4e08d55be6a5fcacb484cf075f Mon Sep 17 00:00:00 2001
 From: "P. Jung" <ptr1337@cachyos.org>
-Date: Tue, 16 Nov 2021 22:56:34 +0000
-Subject: [PATCH] tt-r2
+Date: Sat, 27 Nov 2021 18:46:13 +0000
+Subject: [PATCH] tt-r2-5.16
 
 Signed-off-by: P. Jung <ptr1337@cachyos.org>
 ---
@@ -10,21 +10,19 @@ Signed-off-by: P. Jung <ptr1337@cachyos.org>
  init/Kconfig                 |   18 +-
  kernel/Kconfig.preempt       |    1 +
  kernel/sched/Makefile        |    2 +-
- kernel/sched/bs.c            | 1180 ++++++++++++++++++++
- kernel/sched/bs.h            |  306 ++++++
+ kernel/sched/bs.c            | 1277 ++++++++++++++++++++++
+ kernel/sched/bs.h            |  309 ++++++
  kernel/sched/bs_nohz.h       |  689 ++++++++++++
  kernel/sched/core.c          |   13 +-
  kernel/sched/debug.c         |   37 +-
- kernel/sched/debug.c.rej     |   40 +
  kernel/sched/fair_numa.h     | 1959 ++++++++++++++++++++++++++++++++++
  kernel/sched/sched.h         |   12 +
  kernel/sched/tt_stats.h      |  919 ++++++++++++++++
  kernel/sysctl.c              |   22 +
- 15 files changed, 5221 insertions(+), 6 deletions(-)
+ 14 files changed, 5281 insertions(+), 6 deletions(-)
  create mode 100644 kernel/sched/bs.c
  create mode 100644 kernel/sched/bs.h
  create mode 100644 kernel/sched/bs_nohz.h
- create mode 100644 kernel/sched/debug.c.rej
  create mode 100644 kernel/sched/fair_numa.h
  create mode 100644 kernel/sched/tt_stats.h
 
@@ -165,10 +163,10 @@ index c7421f2d05e1..eed372013759 100644
  obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o pelt.o
 diff --git a/kernel/sched/bs.c b/kernel/sched/bs.c
 new file mode 100644
-index 000000000000..df645d722e76
+index 000000000000..793bb1c338d1
 --- /dev/null
 +++ b/kernel/sched/bs.c
-@@ -0,0 +1,1180 @@
+@@ -0,0 +1,1277 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * TT Scheduler Class (SCHED_NORMAL/SCHED_BATCH)
@@ -1010,17 +1008,114 @@ index 000000000000..df645d722e76
 +	return new_cpu;
 +}
 +
-+static int
-+can_migrate_task(struct task_struct *p, int dst_cpu, struct rq *src_rq)
++/*
++ * Is this task likely cache-hot:
++ */
++static int task_hot(struct task_struct *p, struct rq *dst_rq, struct rq *src_rq)
 +{
-+	if (task_running(src_rq, p))
++	s64 delta;
++
++	lockdep_assert_rq_held(src_rq);
++
++	if (p->sched_class != &fair_sched_class)
 +		return 0;
++
++	if (unlikely(task_has_idle_policy(p)))
++		return 0;
++
++	/* SMT siblings share cache */
++	if (cpus_share_cache(cpu_of(dst_rq), cpu_of(src_rq)))
++		return 0;
++
++	if (sysctl_sched_migration_cost == -1)
++		return 1;
++
++	if (sysctl_sched_migration_cost == 0)
++		return 0;
++
++	delta = sched_clock() - p->se.exec_start;
++
++	return delta < (s64)sysctl_sched_migration_cost;
++}
++
++#ifdef CONFIG_NUMA_BALANCING
++/*
++ * Returns 1, if task migration degrades locality
++ * Returns 0, if task migration improves locality i.e migration preferred.
++ * Returns -1, if task migration is not affected by locality.
++ */
++static int
++migrate_degrades_locality(struct task_struct *p, struct rq *dst_rq, struct rq *src_rq)
++{
++	struct numa_group *numa_group = rcu_dereference(p->numa_group);
++	unsigned long src_weight, dst_weight;
++	int src_nid, dst_nid, dist;
++
++	if (!static_branch_likely(&sched_numa_balancing))
++		return -1;
++
++	src_nid = cpu_to_node(cpu_of(src_rq));
++	dst_nid = cpu_to_node(cpu_of(dst_rq));
++
++	if (src_nid == dst_nid)
++		return -1;
++
++	/* Migrating away from the preferred node is always bad. */
++	if (src_nid == p->numa_preferred_nid) {
++		if (src_rq->nr_running > src_rq->nr_preferred_running)
++			return 1;
++		else
++			return -1;
++	}
++
++	/* Encourage migration to the preferred node. */
++	if (dst_nid == p->numa_preferred_nid)
++		return 0;
++
++	/* Leaving a core idle is often worse than degrading locality. */
++	if (dst_rq->idle_balance)
++		return -1;
++
++	dist = node_distance(src_nid, dst_nid);
++	if (numa_group) {
++		src_weight = group_weight(p, src_nid, dist);
++		dst_weight = group_weight(p, dst_nid, dist);
++	} else {
++		src_weight = task_weight(p, src_nid, dist);
++		dst_weight = task_weight(p, dst_nid, dist);
++	}
++
++	return dst_weight < src_weight;
++}
++
++#else
++static inline int migrate_degrades_locality(struct task_struct *p,
++					     struct rq *dst_rq, struct rq *src_rq)
++{
++	return -1;
++}
++#endif
++
++static int
++can_migrate_task(struct task_struct *p, struct rq *dst_rq, struct rq *src_rq)
++{
++	int tsk_cache_hot;
 +
 +	/* Disregard pcpu kthreads; they are where they need to be. */
 +	if (kthread_is_per_cpu(p))
 +		return 0;
 +
-+	if (!cpumask_test_cpu(dst_cpu, p->cpus_ptr))
++	if (!cpumask_test_cpu(cpu_of(dst_rq), p->cpus_ptr))
++		return 0;
++
++	if (task_running(src_rq, p))
++		return 0;
++
++	tsk_cache_hot = migrate_degrades_locality(p, dst_rq, src_rq);
++	if (tsk_cache_hot == -1)
++		tsk_cache_hot = task_hot(p, dst_rq, src_rq);
++
++	if (tsk_cache_hot > 0)
 +		return 0;
 +
 +	return 1;
@@ -1062,7 +1157,7 @@ index 000000000000..df645d722e76
 +
 +	while (ttn) {
 +		p = task_of(se_of(ttn));
-+		if (can_migrate_task(p, cpu_of(dist_rq), src_rq)) {
++		if (can_migrate_task(p, dist_rq, src_rq)) {
 +			pull_from(dist_rq, src_rq, src_rf, p);
 +			return 1;
 +		}
@@ -1351,10 +1446,10 @@ index 000000000000..df645d722e76
 +}
 diff --git a/kernel/sched/bs.h b/kernel/sched/bs.h
 new file mode 100644
-index 000000000000..721eb690abeb
+index 000000000000..b3d99cf13576
 --- /dev/null
 +++ b/kernel/sched/bs.h
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,309 @@
 +#define YIELD_MARK(ttn)		((ttn)->vruntime |= 0x8000000000000000ULL)
 +#define YIELD_UNMARK(ttn)	((ttn)->vruntime &= 0x7FFFFFFFFFFFFFFFULL)
 +
@@ -1406,6 +1501,9 @@ index 000000000000..721eb690abeb
 +#endif
 +	/* Tell new CPU we are migrated */
 +	p->se.avg.last_update_time = 0;
++
++	/* We have migrated, no longer consider this task hot */
++	p->se.exec_start = 0;
 +
 +	YIELD_UNMARK(&p->se.tt_node);
 +
@@ -2549,52 +2647,6 @@ index 7dcbaa31c5d9..eed776c622a6 100644
  	PN(se.exec_start);
  	PN(se.vruntime);
  	PN(se.sum_exec_runtime);
-diff --git a/kernel/sched/debug.c.rej b/kernel/sched/debug.c.rej
-new file mode 100644
-index 000000000000..fda2a3a89632
---- /dev/null
-+++ b/kernel/sched/debug.c.rej
-@@ -0,0 +1,40 @@
-+--- kernel/sched/debug.c
-++++ kernel/sched/debug.c
-+@@ -315,10 +321,11 @@ static __init int sched_init_debug(void)
-+ 	debugfs_create_file("preempt", 0644, debugfs_sched, NULL, &sched_dynamic_fops);
-+ #endif
-+ 
-++#ifndef CONFIG_TT_SCHED
-+ 	debugfs_create_u32("latency_ns", 0644, debugfs_sched, &sysctl_sched_latency);
-+ 	debugfs_create_u32("min_granularity_ns", 0644, debugfs_sched, &sysctl_sched_min_granularity);
-+ 	debugfs_create_u32("wakeup_granularity_ns", 0644, debugfs_sched, &sysctl_sched_wakeup_granularity);
-+-
-++#endif
-+ 	debugfs_create_u32("latency_warn_ms", 0644, debugfs_sched, &sysctl_resched_latency_warn_ms);
-+ 	debugfs_create_u32("latency_warn_once", 0644, debugfs_sched, &sysctl_resched_latency_warn_once);
-+ 
-+@@ -820,18 +833,24 @@ static void sched_debug_header(struct seq_file *m)
-+ 	SEQ_printf(m, "  .%-40s: %Ld\n", #x, (long long)(x))
-+ #define PN(x) \
-+ 	SEQ_printf(m, "  .%-40s: %Ld.%06ld\n", #x, SPLIT_NS(x))
-++
-++#ifndef CONFIG_TT_SCHED
-+ 	PN(sysctl_sched_latency);
-+ 	PN(sysctl_sched_min_granularity);
-+ 	PN(sysctl_sched_wakeup_granularity);
-+ 	P(sysctl_sched_child_runs_first);
-+ 	P(sysctl_sched_features);
-++#endif
-++
-+ #undef PN
-+ #undef P
-+ 
-++#ifndef CONFIG_TT_SCHED
-+ 	SEQ_printf(m, "  .%-40s: %d (%s)\n",
-+ 		"sysctl_sched_tunable_scaling",
-+ 		sysctl_sched_tunable_scaling,
-+ 		sched_tunable_scaling_names[sysctl_sched_tunable_scaling]);
-++#endif
-+ 	SEQ_printf(m, "\n");
-+ }
-+ 
 diff --git a/kernel/sched/fair_numa.h b/kernel/sched/fair_numa.h
 new file mode 100644
 index 000000000000..a0860a283286
@@ -5559,5 +5611,5 @@ index 083be6af29d7..28ba66fc183b 100644
  	{
  		.procname	= "sched_schedstats",
 -- 
-2.34.0.rc2.16.g5a73c6bdc7
+2.34.1
 
