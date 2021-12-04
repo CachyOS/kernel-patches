@@ -1,0 +1,626 @@
+From fb701b66ee661c8d2cb1819c7cf45590f4aa8bcf Mon Sep 17 00:00:00 2001
+From: "P. Jung" <ptr1337@cachyos.org>
+Date: Sat, 4 Dec 2021 22:27:44 +0100
+Subject: [PATCH] wireguard
+
+Signed-off-by: P. Jung <ptr1337@cachyos.org>
+---
+ drivers/net/wireguard/allowedips.c            |  2 +-
+ drivers/net/wireguard/device.c                | 39 ++++++++++---------
+ drivers/net/wireguard/device.h                |  9 ++---
+ drivers/net/wireguard/main.c                  |  8 ++--
+ drivers/net/wireguard/queueing.c              |  6 +--
+ drivers/net/wireguard/queueing.h              |  2 +-
+ drivers/net/wireguard/ratelimiter.c           |  4 +-
+ drivers/net/wireguard/receive.c               | 39 +++++++++++--------
+ drivers/net/wireguard/socket.c                |  2 +-
+ include/linux/siphash.h                       | 14 ++-----
+ include/net/dst_cache.h                       | 11 ++++++
+ lib/siphash.c                                 | 12 +++---
+ net/core/dst_cache.c                          | 19 +++++++++
+ tools/testing/selftests/wireguard/netns.sh    | 30 +++++++++++++-
+ .../selftests/wireguard/qemu/debug.config     |  2 +-
+ .../selftests/wireguard/qemu/kernel.config    |  1 +
+ 16 files changed, 129 insertions(+), 71 deletions(-)
+
+diff --git a/drivers/net/wireguard/allowedips.c b/drivers/net/wireguard/allowedips.c
+index b7197e80f226..9a4c8ff32d9d 100644
+--- a/drivers/net/wireguard/allowedips.c
++++ b/drivers/net/wireguard/allowedips.c
+@@ -163,7 +163,7 @@ static bool node_placement(struct allowedips_node __rcu *trie, const u8 *key,
+ 	return exact;
+ }
+ 
+-static inline void connect_node(struct allowedips_node **parent, u8 bit, struct allowedips_node *node)
++static inline void connect_node(struct allowedips_node __rcu **parent, u8 bit, struct allowedips_node *node)
+ {
+ 	node->parent_bit_packed = (unsigned long)parent | bit;
+ 	rcu_assign_pointer(*parent, node);
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+index 551ddaaaf540..a46067c38bf5 100644
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -98,6 +98,7 @@ static int wg_stop(struct net_device *dev)
+ {
+ 	struct wg_device *wg = netdev_priv(dev);
+ 	struct wg_peer *peer;
++	struct sk_buff *skb;
+ 
+ 	mutex_lock(&wg->device_update_lock);
+ 	list_for_each_entry(peer, &wg->peer_list, peer_list) {
+@@ -108,7 +109,9 @@ static int wg_stop(struct net_device *dev)
+ 		wg_noise_reset_last_sent_handshake(&peer->last_sent_handshake);
+ 	}
+ 	mutex_unlock(&wg->device_update_lock);
+-	skb_queue_purge(&wg->incoming_handshakes);
++	while ((skb = ptr_ring_consume(&wg->handshake_queue.ring)) != NULL)
++		kfree_skb(skb);
++	atomic_set(&wg->handshake_queue_len, 0);
+ 	wg_socket_reinit(wg, NULL, NULL);
+ 	return 0;
+ }
+@@ -235,14 +238,13 @@ static void wg_destruct(struct net_device *dev)
+ 	destroy_workqueue(wg->handshake_receive_wq);
+ 	destroy_workqueue(wg->handshake_send_wq);
+ 	destroy_workqueue(wg->packet_crypt_wq);
+-	wg_packet_queue_free(&wg->decrypt_queue);
+-	wg_packet_queue_free(&wg->encrypt_queue);
++	wg_packet_queue_free(&wg->handshake_queue, true);
++	wg_packet_queue_free(&wg->decrypt_queue, false);
++	wg_packet_queue_free(&wg->encrypt_queue, false);
+ 	rcu_barrier(); /* Wait for all the peers to be actually freed. */
+ 	wg_ratelimiter_uninit();
+ 	memzero_explicit(&wg->static_identity, sizeof(wg->static_identity));
+-	skb_queue_purge(&wg->incoming_handshakes);
+ 	free_percpu(dev->tstats);
+-	free_percpu(wg->incoming_handshakes_worker);
+ 	kvfree(wg->index_hashtable);
+ 	kvfree(wg->peer_hashtable);
+ 	mutex_unlock(&wg->device_update_lock);
+@@ -298,7 +300,6 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
+ 	init_rwsem(&wg->static_identity.lock);
+ 	mutex_init(&wg->socket_update_lock);
+ 	mutex_init(&wg->device_update_lock);
+-	skb_queue_head_init(&wg->incoming_handshakes);
+ 	wg_allowedips_init(&wg->peer_allowedips);
+ 	wg_cookie_checker_init(&wg->cookie_checker, wg);
+ 	INIT_LIST_HEAD(&wg->peer_list);
+@@ -316,16 +317,10 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
+ 	if (!dev->tstats)
+ 		goto err_free_index_hashtable;
+ 
+-	wg->incoming_handshakes_worker =
+-		wg_packet_percpu_multicore_worker_alloc(
+-				wg_packet_handshake_receive_worker, wg);
+-	if (!wg->incoming_handshakes_worker)
+-		goto err_free_tstats;
+-
+ 	wg->handshake_receive_wq = alloc_workqueue("wg-kex-%s",
+ 			WQ_CPU_INTENSIVE | WQ_FREEZABLE, 0, dev->name);
+ 	if (!wg->handshake_receive_wq)
+-		goto err_free_incoming_handshakes;
++		goto err_free_tstats;
+ 
+ 	wg->handshake_send_wq = alloc_workqueue("wg-kex-%s",
+ 			WQ_UNBOUND | WQ_FREEZABLE, 0, dev->name);
+@@ -347,10 +342,15 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
+ 	if (ret < 0)
+ 		goto err_free_encrypt_queue;
+ 
+-	ret = wg_ratelimiter_init();
++	ret = wg_packet_queue_init(&wg->handshake_queue, wg_packet_handshake_receive_worker,
++				   MAX_QUEUED_INCOMING_HANDSHAKES);
+ 	if (ret < 0)
+ 		goto err_free_decrypt_queue;
+ 
++	ret = wg_ratelimiter_init();
++	if (ret < 0)
++		goto err_free_handshake_queue;
++
+ 	ret = register_netdevice(dev);
+ 	if (ret < 0)
+ 		goto err_uninit_ratelimiter;
+@@ -367,18 +367,18 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
+ 
+ err_uninit_ratelimiter:
+ 	wg_ratelimiter_uninit();
++err_free_handshake_queue:
++	wg_packet_queue_free(&wg->handshake_queue, false);
+ err_free_decrypt_queue:
+-	wg_packet_queue_free(&wg->decrypt_queue);
++	wg_packet_queue_free(&wg->decrypt_queue, false);
+ err_free_encrypt_queue:
+-	wg_packet_queue_free(&wg->encrypt_queue);
++	wg_packet_queue_free(&wg->encrypt_queue, false);
+ err_destroy_packet_crypt:
+ 	destroy_workqueue(wg->packet_crypt_wq);
+ err_destroy_handshake_send:
+ 	destroy_workqueue(wg->handshake_send_wq);
+ err_destroy_handshake_receive:
+ 	destroy_workqueue(wg->handshake_receive_wq);
+-err_free_incoming_handshakes:
+-	free_percpu(wg->incoming_handshakes_worker);
+ err_free_tstats:
+ 	free_percpu(dev->tstats);
+ err_free_index_hashtable:
+@@ -398,6 +398,7 @@ static struct rtnl_link_ops link_ops __read_mostly = {
+ static void wg_netns_pre_exit(struct net *net)
+ {
+ 	struct wg_device *wg;
++	struct wg_peer *peer;
+ 
+ 	rtnl_lock();
+ 	list_for_each_entry(wg, &device_list, device_list) {
+@@ -407,6 +408,8 @@ static void wg_netns_pre_exit(struct net *net)
+ 			mutex_lock(&wg->device_update_lock);
+ 			rcu_assign_pointer(wg->creating_net, NULL);
+ 			wg_socket_reinit(wg, NULL, NULL);
++			list_for_each_entry(peer, &wg->peer_list, peer_list)
++				wg_socket_clear_peer_endpoint_src(peer);
+ 			mutex_unlock(&wg->device_update_lock);
+ 		}
+ 	}
+diff --git a/drivers/net/wireguard/device.h b/drivers/net/wireguard/device.h
+index 854bc3d97150..43c7cebbf50b 100644
+--- a/drivers/net/wireguard/device.h
++++ b/drivers/net/wireguard/device.h
+@@ -39,21 +39,18 @@ struct prev_queue {
+ 
+ struct wg_device {
+ 	struct net_device *dev;
+-	struct crypt_queue encrypt_queue, decrypt_queue;
++	struct crypt_queue encrypt_queue, decrypt_queue, handshake_queue;
+ 	struct sock __rcu *sock4, *sock6;
+ 	struct net __rcu *creating_net;
+ 	struct noise_static_identity static_identity;
+-	struct workqueue_struct *handshake_receive_wq, *handshake_send_wq;
+-	struct workqueue_struct *packet_crypt_wq;
+-	struct sk_buff_head incoming_handshakes;
+-	int incoming_handshake_cpu;
+-	struct multicore_worker __percpu *incoming_handshakes_worker;
++	struct workqueue_struct *packet_crypt_wq,*handshake_receive_wq, *handshake_send_wq;
+ 	struct cookie_checker cookie_checker;
+ 	struct pubkey_hashtable *peer_hashtable;
+ 	struct index_hashtable *index_hashtable;
+ 	struct allowedips peer_allowedips;
+ 	struct mutex device_update_lock, socket_update_lock;
+ 	struct list_head device_list, peer_list;
++	atomic_t handshake_queue_len;
+ 	unsigned int num_peers, device_update_gen;
+ 	u32 fwmark;
+ 	u16 incoming_port;
+diff --git a/drivers/net/wireguard/main.c b/drivers/net/wireguard/main.c
+index 75dbe77b0b4b..ee4da9ab8013 100644
+--- a/drivers/net/wireguard/main.c
++++ b/drivers/net/wireguard/main.c
+@@ -17,7 +17,7 @@
+ #include <linux/genetlink.h>
+ #include <net/rtnetlink.h>
+ 
+-static int __init mod_init(void)
++static int __init wg_mod_init(void)
+ {
+ 	int ret;
+ 
+@@ -60,7 +60,7 @@ static int __init mod_init(void)
+ 	return ret;
+ }
+ 
+-static void __exit mod_exit(void)
++static void __exit wg_mod_exit(void)
+ {
+ 	wg_genetlink_uninit();
+ 	wg_device_uninit();
+@@ -68,8 +68,8 @@ static void __exit mod_exit(void)
+ 	wg_allowedips_slab_uninit();
+ }
+ 
+-module_init(mod_init);
+-module_exit(mod_exit);
++module_init(wg_mod_init);
++module_exit(wg_mod_exit);
+ MODULE_LICENSE("GPL v2");
+ MODULE_DESCRIPTION("WireGuard secure network tunnel");
+ MODULE_AUTHOR("Jason A. Donenfeld <Jason@zx2c4.com>");
+diff --git a/drivers/net/wireguard/queueing.c b/drivers/net/wireguard/queueing.c
+index 48e7b982a307..1de413b19e34 100644
+--- a/drivers/net/wireguard/queueing.c
++++ b/drivers/net/wireguard/queueing.c
+@@ -38,11 +38,11 @@ int wg_packet_queue_init(struct crypt_queue *queue, work_func_t function,
+ 	return 0;
+ }
+ 
+-void wg_packet_queue_free(struct crypt_queue *queue)
++void wg_packet_queue_free(struct crypt_queue *queue, bool purge)
+ {
+ 	free_percpu(queue->worker);
+-	WARN_ON(!__ptr_ring_empty(&queue->ring));
+-	ptr_ring_cleanup(&queue->ring, NULL);
++	WARN_ON(!purge && !__ptr_ring_empty(&queue->ring));
++	ptr_ring_cleanup(&queue->ring, purge ? (void(*)(void*))kfree_skb : NULL);
+ }
+ 
+ #define NEXT(skb) ((skb)->prev)
+diff --git a/drivers/net/wireguard/queueing.h b/drivers/net/wireguard/queueing.h
+index 4ef2944a68bc..e2388107f7fd 100644
+--- a/drivers/net/wireguard/queueing.h
++++ b/drivers/net/wireguard/queueing.h
+@@ -23,7 +23,7 @@ struct sk_buff;
+ /* queueing.c APIs: */
+ int wg_packet_queue_init(struct crypt_queue *queue, work_func_t function,
+ 			 unsigned int len);
+-void wg_packet_queue_free(struct crypt_queue *queue);
++void wg_packet_queue_free(struct crypt_queue *queue, bool purge);
+ struct multicore_worker __percpu *
+ wg_packet_percpu_multicore_worker_alloc(work_func_t function, void *ptr);
+ 
+diff --git a/drivers/net/wireguard/ratelimiter.c b/drivers/net/wireguard/ratelimiter.c
+index 3fedd1d21f5e..dd55e5c26f46 100644
+--- a/drivers/net/wireguard/ratelimiter.c
++++ b/drivers/net/wireguard/ratelimiter.c
+@@ -176,12 +176,12 @@ int wg_ratelimiter_init(void)
+ 			(1U << 14) / sizeof(struct hlist_head)));
+ 	max_entries = table_size * 8;
+ 
+-	table_v4 = kvzalloc(table_size * sizeof(*table_v4), GFP_KERNEL);
++	table_v4 = kvcalloc(table_size, sizeof(*table_v4), GFP_KERNEL);
+ 	if (unlikely(!table_v4))
+ 		goto err_kmemcache;
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+-	table_v6 = kvzalloc(table_size * sizeof(*table_v6), GFP_KERNEL);
++	table_v6 = kvcalloc(table_size, sizeof(*table_v6), GFP_KERNEL);
+ 	if (unlikely(!table_v6)) {
+ 		kvfree(table_v4);
+ 		goto err_kmemcache;
+diff --git a/drivers/net/wireguard/receive.c b/drivers/net/wireguard/receive.c
+index 7dc84bcca261..7b8df406c773 100644
+--- a/drivers/net/wireguard/receive.c
++++ b/drivers/net/wireguard/receive.c
+@@ -116,8 +116,8 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
+ 		return;
+ 	}
+ 
+-	under_load = skb_queue_len(&wg->incoming_handshakes) >=
+-		     MAX_QUEUED_INCOMING_HANDSHAKES / 8;
++	under_load = atomic_read(&wg->handshake_queue_len) >=
++			MAX_QUEUED_INCOMING_HANDSHAKES / 8;
+ 	if (under_load) {
+ 		last_under_load = ktime_get_coarse_boottime_ns();
+ 	} else if (last_under_load) {
+@@ -212,13 +212,14 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
+ 
+ void wg_packet_handshake_receive_worker(struct work_struct *work)
+ {
+-	struct wg_device *wg = container_of(work, struct multicore_worker,
+-					    work)->ptr;
++	struct crypt_queue *queue = container_of(work, struct multicore_worker, work)->ptr;
++	struct wg_device *wg = container_of(queue, struct wg_device, handshake_queue);
+ 	struct sk_buff *skb;
+ 
+-	while ((skb = skb_dequeue(&wg->incoming_handshakes)) != NULL) {
++	while ((skb = ptr_ring_consume_bh(&queue->ring)) != NULL) {
+ 		wg_receive_handshake_packet(wg, skb);
+ 		dev_kfree_skb(skb);
++		atomic_dec(&wg->handshake_queue_len);
+ 		cond_resched();
+ 	}
+ }
+@@ -553,22 +554,28 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
+ 	case cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION):
+ 	case cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE):
+ 	case cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE): {
+-		int cpu;
+-
+-		if (skb_queue_len(&wg->incoming_handshakes) >
+-			    MAX_QUEUED_INCOMING_HANDSHAKES ||
+-		    unlikely(!rng_is_initialized())) {
++		int cpu, ret = -EBUSY;
++
++		if (unlikely(!rng_is_initialized()))
++			goto drop;
++		if (atomic_read(&wg->handshake_queue_len) > MAX_QUEUED_INCOMING_HANDSHAKES / 2) {
++			if (spin_trylock_bh(&wg->handshake_queue.ring.producer_lock)) {
++				ret = __ptr_ring_produce(&wg->handshake_queue.ring, skb);
++				spin_unlock_bh(&wg->handshake_queue.ring.producer_lock);
++			}
++		} else
++			ret = ptr_ring_produce_bh(&wg->handshake_queue.ring, skb);
++		if (ret) {
++	drop:
+ 			net_dbg_skb_ratelimited("%s: Dropping handshake packet from %pISpfsc\n",
+ 						wg->dev->name, skb);
+ 			goto err;
+ 		}
+-		skb_queue_tail(&wg->incoming_handshakes, skb);
+-		/* Queues up a call to packet_process_queued_handshake_
+-		 * packets(skb):
+-		 */
+-		cpu = wg_cpumask_next_online(&wg->incoming_handshake_cpu);
++		atomic_inc(&wg->handshake_queue_len);
++		cpu = wg_cpumask_next_online(&wg->handshake_queue.last_cpu);
++		/* Queues up a call to packet_process_queued_handshake_packets(skb): */
+ 		queue_work_on(cpu, wg->handshake_receive_wq,
+-			&per_cpu_ptr(wg->incoming_handshakes_worker, cpu)->work);
++			      &per_cpu_ptr(wg->handshake_queue.worker, cpu)->work);
+ 		break;
+ 	}
+ 	case cpu_to_le32(MESSAGE_DATA):
+diff --git a/drivers/net/wireguard/socket.c b/drivers/net/wireguard/socket.c
+index 8c496b747108..6f07b949cb81 100644
+--- a/drivers/net/wireguard/socket.c
++++ b/drivers/net/wireguard/socket.c
+@@ -308,7 +308,7 @@ void wg_socket_clear_peer_endpoint_src(struct wg_peer *peer)
+ {
+ 	write_lock_bh(&peer->endpoint_lock);
+ 	memset(&peer->endpoint.src6, 0, sizeof(peer->endpoint.src6));
+-	dst_cache_reset(&peer->endpoint_cache);
++	dst_cache_reset_now(&peer->endpoint_cache);
+ 	write_unlock_bh(&peer->endpoint_lock);
+ }
+ 
+diff --git a/include/linux/siphash.h b/include/linux/siphash.h
+index bf21591a9e5e..0cda61855d90 100644
+--- a/include/linux/siphash.h
++++ b/include/linux/siphash.h
+@@ -27,9 +27,7 @@ static inline bool siphash_key_is_zero(const siphash_key_t *key)
+ }
+ 
+ u64 __siphash_aligned(const void *data, size_t len, const siphash_key_t *key);
+-#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u64 __siphash_unaligned(const void *data, size_t len, const siphash_key_t *key);
+-#endif
+ 
+ u64 siphash_1u64(const u64 a, const siphash_key_t *key);
+ u64 siphash_2u64(const u64 a, const u64 b, const siphash_key_t *key);
+@@ -82,10 +80,9 @@ static inline u64 ___siphash_aligned(const __le64 *data, size_t len,
+ static inline u64 siphash(const void *data, size_t len,
+ 			  const siphash_key_t *key)
+ {
+-#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+-	if (!IS_ALIGNED((unsigned long)data, SIPHASH_ALIGNMENT))
++	if (IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) ||
++	    !IS_ALIGNED((unsigned long)data, SIPHASH_ALIGNMENT))
+ 		return __siphash_unaligned(data, len, key);
+-#endif
+ 	return ___siphash_aligned(data, len, key);
+ }
+ 
+@@ -96,10 +93,8 @@ typedef struct {
+ 
+ u32 __hsiphash_aligned(const void *data, size_t len,
+ 		       const hsiphash_key_t *key);
+-#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u32 __hsiphash_unaligned(const void *data, size_t len,
+ 			 const hsiphash_key_t *key);
+-#endif
+ 
+ u32 hsiphash_1u32(const u32 a, const hsiphash_key_t *key);
+ u32 hsiphash_2u32(const u32 a, const u32 b, const hsiphash_key_t *key);
+@@ -135,10 +130,9 @@ static inline u32 ___hsiphash_aligned(const __le32 *data, size_t len,
+ static inline u32 hsiphash(const void *data, size_t len,
+ 			   const hsiphash_key_t *key)
+ {
+-#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+-	if (!IS_ALIGNED((unsigned long)data, HSIPHASH_ALIGNMENT))
++	if (IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) ||
++	    !IS_ALIGNED((unsigned long)data, HSIPHASH_ALIGNMENT))
+ 		return __hsiphash_unaligned(data, len, key);
+-#endif
+ 	return ___hsiphash_aligned(data, len, key);
+ }
+ 
+diff --git a/include/net/dst_cache.h b/include/net/dst_cache.h
+index 67634675e919..df6622a5fe98 100644
+--- a/include/net/dst_cache.h
++++ b/include/net/dst_cache.h
+@@ -79,6 +79,17 @@ static inline void dst_cache_reset(struct dst_cache *dst_cache)
+ 	dst_cache->reset_ts = jiffies;
+ }
+ 
++/**
++ *	dst_cache_reset_now - invalidate the cache contents immediately
++ *	@dst_cache: the cache
++ *
++ *	The caller must be sure there are no concurrent users, as this frees
++ *	all dst_cache users immediately, rather than waiting for the next
++ *	per-cpu usage like dst_cache_reset does. Most callers should use the
++ *	higher speed lazily-freed dst_cache_reset function instead.
++ */
++void dst_cache_reset_now(struct dst_cache *dst_cache);
++
+ /**
+  *	dst_cache_init - initialize the cache, allocating the required storage
+  *	@dst_cache: the cache
+diff --git a/lib/siphash.c b/lib/siphash.c
+index a90112ee72a1..72b9068ab57b 100644
+--- a/lib/siphash.c
++++ b/lib/siphash.c
+@@ -49,6 +49,7 @@
+ 	SIPROUND; \
+ 	return (v0 ^ v1) ^ (v2 ^ v3);
+ 
++#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u64 __siphash_aligned(const void *data, size_t len, const siphash_key_t *key)
+ {
+ 	const u8 *end = data + len - (len % sizeof(u64));
+@@ -80,8 +81,8 @@ u64 __siphash_aligned(const void *data, size_t len, const siphash_key_t *key)
+ 	POSTAMBLE
+ }
+ EXPORT_SYMBOL(__siphash_aligned);
++#endif
+ 
+-#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u64 __siphash_unaligned(const void *data, size_t len, const siphash_key_t *key)
+ {
+ 	const u8 *end = data + len - (len % sizeof(u64));
+@@ -113,7 +114,6 @@ u64 __siphash_unaligned(const void *data, size_t len, const siphash_key_t *key)
+ 	POSTAMBLE
+ }
+ EXPORT_SYMBOL(__siphash_unaligned);
+-#endif
+ 
+ /**
+  * siphash_1u64 - compute 64-bit siphash PRF value of a u64
+@@ -250,6 +250,7 @@ EXPORT_SYMBOL(siphash_3u32);
+ 	HSIPROUND; \
+ 	return (v0 ^ v1) ^ (v2 ^ v3);
+ 
++#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u32 __hsiphash_aligned(const void *data, size_t len, const hsiphash_key_t *key)
+ {
+ 	const u8 *end = data + len - (len % sizeof(u64));
+@@ -280,8 +281,8 @@ u32 __hsiphash_aligned(const void *data, size_t len, const hsiphash_key_t *key)
+ 	HPOSTAMBLE
+ }
+ EXPORT_SYMBOL(__hsiphash_aligned);
++#endif
+ 
+-#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u32 __hsiphash_unaligned(const void *data, size_t len,
+ 			 const hsiphash_key_t *key)
+ {
+@@ -313,7 +314,6 @@ u32 __hsiphash_unaligned(const void *data, size_t len,
+ 	HPOSTAMBLE
+ }
+ EXPORT_SYMBOL(__hsiphash_unaligned);
+-#endif
+ 
+ /**
+  * hsiphash_1u32 - compute 64-bit hsiphash PRF value of a u32
+@@ -418,6 +418,7 @@ EXPORT_SYMBOL(hsiphash_4u32);
+ 	HSIPROUND; \
+ 	return v1 ^ v3;
+ 
++#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u32 __hsiphash_aligned(const void *data, size_t len, const hsiphash_key_t *key)
+ {
+ 	const u8 *end = data + len - (len % sizeof(u32));
+@@ -438,8 +439,8 @@ u32 __hsiphash_aligned(const void *data, size_t len, const hsiphash_key_t *key)
+ 	HPOSTAMBLE
+ }
+ EXPORT_SYMBOL(__hsiphash_aligned);
++#endif
+ 
+-#ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u32 __hsiphash_unaligned(const void *data, size_t len,
+ 			 const hsiphash_key_t *key)
+ {
+@@ -461,7 +462,6 @@ u32 __hsiphash_unaligned(const void *data, size_t len,
+ 	HPOSTAMBLE
+ }
+ EXPORT_SYMBOL(__hsiphash_unaligned);
+-#endif
+ 
+ /**
+  * hsiphash_1u32 - compute 32-bit hsiphash PRF value of a u32
+diff --git a/net/core/dst_cache.c b/net/core/dst_cache.c
+index be74ab4551c2..0ccfd5fa5cb9 100644
+--- a/net/core/dst_cache.c
++++ b/net/core/dst_cache.c
+@@ -162,3 +162,22 @@ void dst_cache_destroy(struct dst_cache *dst_cache)
+ 	free_percpu(dst_cache->cache);
+ }
+ EXPORT_SYMBOL_GPL(dst_cache_destroy);
++
++void dst_cache_reset_now(struct dst_cache *dst_cache)
++{
++	int i;
++
++	if (!dst_cache->cache)
++		return;
++
++	dst_cache->reset_ts = jiffies;
++	for_each_possible_cpu(i) {
++		struct dst_cache_pcpu *idst = per_cpu_ptr(dst_cache->cache, i);
++		struct dst_entry *dst = idst->dst;
++
++		idst->cookie = 0;
++		idst->dst = NULL;
++		dst_release(dst);
++	}
++}
++EXPORT_SYMBOL_GPL(dst_cache_reset_now);
+diff --git a/tools/testing/selftests/wireguard/netns.sh b/tools/testing/selftests/wireguard/netns.sh
+index ebc4ee0fe179..8a9461aa0878 100755
+--- a/tools/testing/selftests/wireguard/netns.sh
++++ b/tools/testing/selftests/wireguard/netns.sh
+@@ -276,7 +276,11 @@ n0 ping -W 1 -c 1 192.168.241.2
+ n1 wg set wg0 peer "$pub2" endpoint 192.168.241.2:7
+ ip2 link del wg0
+ ip2 link del wg1
+-! n0 ping -W 1 -c 10 -f 192.168.241.2 || false # Should not crash kernel
++read _ _ tx_bytes_before < <(n0 wg show wg1 transfer)
++! n0 ping -W 1 -c 10 -f 192.168.241.2 || false
++sleep 1
++read _ _ tx_bytes_after < <(n0 wg show wg1 transfer)
++(( tx_bytes_after - tx_bytes_before < 70000 ))
+ 
+ ip0 link del wg1
+ ip1 link del wg0
+@@ -609,6 +613,28 @@ ip0 link set wg0 up
+ kill $ncat_pid
+ ip0 link del wg0
+ 
++# Ensure that dst_cache references don't outlive netns lifetime
++ip1 link add dev wg0 type wireguard
++ip2 link add dev wg0 type wireguard
++configure_peers
++ip1 link add veth1 type veth peer name veth2
++ip1 link set veth2 netns $netns2
++ip1 addr add fd00:aa::1/64 dev veth1
++ip2 addr add fd00:aa::2/64 dev veth2
++ip1 link set veth1 up
++ip2 link set veth2 up
++waitiface $netns1 veth1
++waitiface $netns2 veth2
++ip1 -6 route add default dev veth1 via fd00:aa::2
++ip2 -6 route add default dev veth2 via fd00:aa::1
++n1 wg set wg0 peer "$pub2" endpoint [fd00:aa::2]:2
++n2 wg set wg0 peer "$pub1" endpoint [fd00:aa::1]:1
++n1 ping6 -c 1 fd00::2
++pp ip netns delete $netns1
++pp ip netns delete $netns2
++pp ip netns add $netns1
++pp ip netns add $netns2
++
+ # Ensure there aren't circular reference loops
+ ip1 link add wg1 type wireguard
+ ip2 link add wg2 type wireguard
+@@ -627,7 +653,7 @@ while read -t 0.1 -r line 2>/dev/null || [[ $? -ne 142 ]]; do
+ done < /dev/kmsg
+ alldeleted=1
+ for object in "${!objects[@]}"; do
+-	if [[ ${objects["$object"]} != *createddestroyed ]]; then
++	if [[ ${objects["$object"]} != *createddestroyed && ${objects["$object"]} != *createdcreateddestroyeddestroyed ]]; then
+ 		echo "Error: $object: merely ${objects["$object"]}" >&3
+ 		alldeleted=0
+ 	fi
+diff --git a/tools/testing/selftests/wireguard/qemu/debug.config b/tools/testing/selftests/wireguard/qemu/debug.config
+index fe07d97df9fa..2b321b8a96cf 100644
+--- a/tools/testing/selftests/wireguard/qemu/debug.config
++++ b/tools/testing/selftests/wireguard/qemu/debug.config
+@@ -47,7 +47,7 @@ CONFIG_DEBUG_ATOMIC_SLEEP=y
+ CONFIG_TRACE_IRQFLAGS=y
+ CONFIG_DEBUG_BUGVERBOSE=y
+ CONFIG_DEBUG_LIST=y
+-CONFIG_DEBUG_PI_LIST=y
++CONFIG_DEBUG_PLIST=y
+ CONFIG_PROVE_RCU=y
+ CONFIG_SPARSE_RCU_POINTER=y
+ CONFIG_RCU_CPU_STALL_TIMEOUT=21
+diff --git a/tools/testing/selftests/wireguard/qemu/kernel.config b/tools/testing/selftests/wireguard/qemu/kernel.config
+index 74db83a0aedd..a9b5a520a1d2 100644
+--- a/tools/testing/selftests/wireguard/qemu/kernel.config
++++ b/tools/testing/selftests/wireguard/qemu/kernel.config
+@@ -66,6 +66,7 @@ CONFIG_PROC_SYSCTL=y
+ CONFIG_SYSFS=y
+ CONFIG_TMPFS=y
+ CONFIG_CONSOLE_LOGLEVEL_DEFAULT=15
++CONFIG_LOG_BUF_SHIFT=18
+ CONFIG_PRINTK_TIME=y
+ CONFIG_BLK_DEV_INITRD=y
+ CONFIG_LEGACY_VSYSCALL_NONE=y
+-- 
+2.34.1
+
