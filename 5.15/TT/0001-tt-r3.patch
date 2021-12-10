@@ -43,15 +43,16 @@ index c1a927ddec64..a16beb71e911 100644
  
  	struct sched_statistics		statistics;
 diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
-index 304f431178fd..6be0a24b8254 100644
+index 304f431178fd..afe4d348a6cf 100644
 --- a/include/linux/sched/sysctl.h
 +++ b/include/linux/sched/sysctl.h
-@@ -28,6 +28,12 @@ enum { sysctl_hung_task_timeout_secs = 0 };
+@@ -28,6 +28,13 @@ enum { sysctl_hung_task_timeout_secs = 0 };
  
  extern unsigned int sysctl_sched_child_runs_first;
  
 +#ifdef CONFIG_TT_SCHED
 +extern unsigned int tt_balancer_opt;
++extern unsigned int tt_grq_balance_ms;
 +extern unsigned int tt_max_lifetime;
 +extern int tt_rt_prio;
 +#endif
@@ -139,10 +140,10 @@ index 978fcfca5871..bfde8e0d851b 100644
  obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o pelt.o
 diff --git a/kernel/sched/bs.c b/kernel/sched/bs.c
 new file mode 100644
-index 000000000000..9777d3592c0a
+index 000000000000..bca0de488e0c
 --- /dev/null
 +++ b/kernel/sched/bs.c
-@@ -0,0 +1,1923 @@
+@@ -0,0 +1,1782 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * TT Scheduler Class (SCHED_NORMAL/SCHED_BATCH)
@@ -169,12 +170,23 @@ index 000000000000..9777d3592c0a
 +struct global_candidate global_candidate = {0, 0, MAX_HRRN};
 +
 +unsigned int __read_mostly tt_balancer_opt	= 0;
++unsigned int __read_mostly tt_grq_balance_ms	= 6;
 +
 +unsigned int __read_mostly tt_max_lifetime	= 22000; // in ms
 +int __read_mostly tt_rt_prio			= -20;
 +
 +#define IS_CAND_BL_ENABLED (tt_balancer_opt == TT_BL_CAND)
 +#define IS_GRQ_BL_ENABLED (tt_balancer_opt == TT_BL_GRQ)
++
++#define LOCK_GRQ(grf) ({ \
++	rq_lock_irqsave(grq, &(grf)); \
++	update_rq_clock(grq); \
++})
++
++#define UNLOCK_GRQ(grf) ({ \
++	rq_unlock(grq, &(grf)); \
++	local_irq_restore((grf).flags); \
++})
 +
 +#define INTERACTIVE_HRRN	2U
 +#define RT_WAIT_DELTA		800000U
@@ -1480,7 +1492,7 @@ index 000000000000..9777d3592c0a
 +}
 +
 +static struct sched_entity *
-+pick_next_entity_from_grq(struct rq *dist_rq)
++pick_next_entity_from_grq(struct rq *dist_rq, struct sched_entity *local)
 +{
 +	struct tt_node *ttn = grq->cfs.head;
 +	struct tt_node *next;
@@ -1489,7 +1501,7 @@ index 000000000000..9777d3592c0a
 +		ttn = ttn->next;
 +
 +	if (!ttn)
-+		return NULL;
++		return local;
 +
 +	next = ttn->next;
 +	while (next) {
@@ -1498,6 +1510,9 @@ index 000000000000..9777d3592c0a
 +
 +		next = next->next;
 +	}
++
++	if (local && entity_before(&local->tt_node, ttn))
++		return local;
 +
 +	return se_of(ttn);
 +}
@@ -1512,10 +1527,14 @@ index 000000000000..9777d3592c0a
 +	if (dist_rq == grq)
 +		return 0;
 +
++	/* if no tasks to pull, exit */
++	if (!grq->cfs.head)
++		return 0;
++
 +	rq_lock_irqsave(grq, &grf);
 +	update_rq_clock(grq);
 +
-+	se = pick_next_entity_from_grq(dist_rq);
++	se = pick_next_entity_from_grq(dist_rq, NULL);
 +
 +	if (!se) {
 +		rq_unlock(grq, &grf);
@@ -1720,161 +1739,6 @@ index 000000000000..9777d3592c0a
 +	local_irq_restore(src_rf.flags);
 +}
 +
-+static int task_can_move_to_grq(struct task_struct *p)
-+{
-+	if (task_running(task_rq(p), p))
-+		return 0;
-+
-+	if (kthread_is_per_cpu(p))
-+		return 0;
-+
-+	if (is_migration_disabled(p))
-+		return 0;
-+
-+	if (p->nr_cpus_allowed == 1)
-+		return 0;
-+
-+	return 1;
-+}
-+
-+#define LOCK_GRQ(grf) ({ \
-+	rq_lock_irqsave(grq, &(grf)); \
-+	update_rq_clock(grq); \
-+})
-+
-+#define UNLOCK_GRQ(grf) ({ \
-+	rq_unlock(grq, &(grf)); \
-+	local_irq_restore((grf).flags); \
-+})
-+
-+static void push_to_grq_unlocked(struct rq *rq)
-+{
-+	struct cfs_rq *cfs_rq = &rq->cfs;
-+	struct sched_entity *se;
-+	struct tt_node *ttn, *next, *port = NULL;
-+	struct task_struct *p;
-+	struct rq_flags rf, grf;
-+
-+	if (rq == grq)
-+		return;
-+
-+	if (!cfs_rq->head)
-+		return;
-+
-+	rq_lock_irqsave(rq, &rf);
-+	update_rq_clock(rq);
-+
-+	/// dequeue tasks from this rq
-+	ttn = cfs_rq->head;
-+	while (ttn) {
-+		next = ttn->next;
-+
-+		se = se_of(ttn);
-+		p = task_of(se);
-+
-+		if (!task_can_move_to_grq(p))
-+			goto next;
-+
-+		// deactivate
-+		deactivate_task(rq, p, DEQUEUE_NOCLOCK);
-+		// enqueue to port
-+		__enqueue_entity_port(&port, se);
-+
-+		set_task_cpu(p, cpu_of(grq));
-+
-+next:
-+		ttn = next;
-+	}
-+
-+	rq_unlock_irqrestore(rq, &rf);
-+
-+	if (!port)
-+		return;
-+
-+	LOCK_GRQ(grf);
-+
-+	/// enqueue tasks to grq
-+	while (port) {
-+		se = se_of(port);
-+		p = task_of(se);
-+		// enqueue to port
-+		__dequeue_entity_port(&port, se);
-+
-+		// activate
-+		activate_task(grq, p, ENQUEUE_NOCLOCK);
-+	}
-+
-+	UNLOCK_GRQ(grf);
-+}
-+
-+static void try_pull_from_grq(struct rq *dist_rq)
-+{
-+	struct rq_flags rf;
-+	struct rq_flags grf;
-+	struct sched_entity *se;
-+	struct task_struct *p = NULL;
-+	struct sched_entity *curr_se = NULL;
-+	struct tt_node *curr = NULL;
-+	struct tt_node *head = dist_rq->cfs.head;
-+	struct tt_node *ttn;
-+
-+	if (dist_rq == grq)
-+		return;
-+
-+	curr_se = dist_rq->cfs.curr;
-+	if (curr_se)
-+		curr = &curr_se->tt_node;
-+
-+	if (!curr && !head)
-+		return;
-+
-+	rq_lock_irqsave(grq, &grf);
-+	update_rq_clock(grq);
-+
-+	se = pick_next_entity_from_grq(dist_rq);
-+
-+	if (!se) {
-+		rq_unlock(grq, &grf);
-+		local_irq_restore(grf.flags);
-+		return;
-+	}
-+
-+	ttn = &se->tt_node;
-+
-+	if (curr && head && entity_before(ttn, curr) && entity_before(ttn, head)) {
-+		goto pull;
-+	} else if (curr && entity_before(ttn, curr)) {
-+		goto pull;
-+	} else if (head && entity_before(ttn, head)) {
-+		goto pull;
-+	}
-+
-+	rq_unlock(grq, &grf);
-+	local_irq_restore(grf.flags);
-+	return;
-+
-+pull:
-+	p = task_of(se);
-+
-+	// detach task
-+	deactivate_task(grq, p, DEQUEUE_NOCLOCK);
-+	set_task_cpu(p, cpu_of(dist_rq));
-+
-+	// unlock src rq
-+	rq_unlock(grq, &grf);
-+
-+	// lock dist rq
-+	rq_lock(dist_rq, &rf);
-+	update_rq_clock(dist_rq);
-+
-+	activate_task(dist_rq, p, ENQUEUE_NOCLOCK);
-+	check_preempt_curr(dist_rq, p, 0);
-+
-+	// unlock dist rq
-+	rq_unlock(dist_rq, &rf);
-+	local_irq_restore(grf.flags);
-+}
-+
 +void trigger_load_balance(struct rq *this_rq)
 +{
 +	int this_cpu = cpu_of(this_rq);
@@ -1886,26 +1750,20 @@ index 000000000000..9777d3592c0a
 +	if (unlikely(on_null_domain(this_rq) || !cpu_active(cpu_of(this_rq))))
 +		return;
 +
-+	nohz_balancer_kick(this_rq);
-+
 +	if (IS_CAND_BL_ENABLED) {
 +		if (this_rq->idle_balance || !sched_fair_runnable(this_rq))
 +			idle_pull_global_candidate(this_rq);
 +		else
 +			active_pull_global_candidate(this_rq, 1);
-+	} else if (IS_GRQ_BL_ENABLED) {
-+		if (this_rq->idle_balance)
-+			pull_from_grq(this_rq);
-+		else {
-+			push_to_grq_unlocked(this_rq);
-+			try_pull_from_grq(this_rq);
-+		}
-+
-+		goto out;
 +	}
 +
 +	if (this_cpu != 0)
 +		goto out;
++
++	if (IS_GRQ_BL_ENABLED) {
++		nohz_try_pull_from_grq();
++		goto out;
++	}
 +
 +	max = min = this_rq->nr_running;
 +	max_rq = min_rq = this_rq;
@@ -1956,6 +1814,8 @@ index 000000000000..9777d3592c0a
 +		this_rq->lat_decay = jiffies + msecs_to_jiffies(4);
 +		dec_nr_lat_sensitive(this_rq->cpu);
 +	}
++
++	nohz_balancer_kick(this_rq);
 +}
 +
 +void update_group_capacity(struct sched_domain *sd, int cpu) {}
@@ -2383,10 +2243,10 @@ index 000000000000..b3d99cf13576
 +#endif
 diff --git a/kernel/sched/bs_nohz.h b/kernel/sched/bs_nohz.h
 new file mode 100644
-index 000000000000..c553e23918e5
+index 000000000000..1bef67f7d871
 --- /dev/null
 +++ b/kernel/sched/bs_nohz.h
-@@ -0,0 +1,697 @@
+@@ -0,0 +1,869 @@
 +
 +#ifdef CONFIG_NO_HZ_COMMON
 +
@@ -3063,6 +2923,179 @@ index 000000000000..c553e23918e5
 +static inline void nohz_newidle_balance(struct rq *this_rq) { }
 +#endif /* CONFIG_NO_HZ_COMMON */
 +
++static int task_can_move_to_grq(struct task_struct *p)
++{
++	if (task_running(task_rq(p), p))
++		return 0;
++
++	if (kthread_is_per_cpu(p))
++		return 0;
++
++	if (is_migration_disabled(p))
++		return 0;
++
++	if (p->nr_cpus_allowed <= 1)
++		return 0;
++
++	return 1;
++}
++
++void push_to_grq(struct rq *rq)
++{
++	struct cfs_rq *cfs_rq = &rq->cfs;
++	struct sched_entity *se;
++	struct tt_node *ttn, *next, *port = NULL;
++	struct task_struct *p;
++	struct rq_flags rf, grf;
++
++	if (rq == grq)
++		return;
++
++	if (!cfs_rq->head)
++		return;
++
++	/* no need to push a single task and take it again */
++	if (cfs_rq->h_nr_running == 1 && !grq->cfs.head)
++		return;
++
++	rq_lock_irqsave(rq, &rf);
++	update_rq_clock(rq);
++
++	/// dequeue tasks from this rq
++	ttn = cfs_rq->head;
++	while (ttn) {
++		next = ttn->next;
++
++		se = se_of(ttn);
++		p = task_of(se);
++
++		if (!task_can_move_to_grq(p))
++			goto next;
++
++		// deactivate
++		deactivate_task(rq, p, DEQUEUE_NOCLOCK);
++		// enqueue to port
++		__enqueue_entity_port(&port, se);
++
++		set_task_cpu(p, cpu_of(grq));
++
++next:
++		ttn = next;
++	}
++
++	rq_unlock_irqrestore(rq, &rf);
++
++	if (!port)
++		return;
++
++	LOCK_GRQ(grf);
++
++	/// enqueue tasks to grq
++	while (port) {
++		se = se_of(port);
++		p = task_of(se);
++		// enqueue to port
++		__dequeue_entity_port(&port, se);
++
++		// activate
++		activate_task(grq, p, ENQUEUE_NOCLOCK);
++	}
++
++	UNLOCK_GRQ(grf);
++}
++
++static void try_pull_from_grq(struct rq *dist_rq)
++{
++	struct rq_flags rf;
++	struct rq_flags grf;
++	struct cfs_rq *cfs_rq = &dist_rq->cfs;
++	struct sched_entity *se_global = NULL, *se_local = NULL;
++	struct task_struct *p = NULL;
++	struct tt_node *ttn;
++
++	if (dist_rq == grq)
++		return;
++
++	/* if no tasks to pull, exit */
++	if (!grq->cfs.head)
++		return;
++
++	rq_lock_irqsave(dist_rq, &rf);
++	update_rq_clock(dist_rq);
++	se_local = pick_next_entity(cfs_rq, cfs_rq->curr);
++	rq_unlock_irqrestore(dist_rq, &rf);
++
++	rq_lock_irqsave(grq, &grf);
++	update_rq_clock(grq);
++	se_global = pick_next_entity_from_grq(dist_rq, se_local);
++
++	if (se_global == se_local) {
++		rq_unlock(grq, &grf);
++		local_irq_restore(grf.flags);
++		return;
++	}
++
++	ttn = &se_global->tt_node;
++	p = task_of(se_global);
++
++	// detach task
++	deactivate_task(grq, p, DEQUEUE_NOCLOCK);
++	set_task_cpu(p, cpu_of(dist_rq));
++
++	// unlock src rq
++	rq_unlock(grq, &grf);
++
++	// lock dist rq
++	rq_lock(dist_rq, &rf);
++	update_rq_clock(dist_rq);
++
++	activate_task(dist_rq, p, ENQUEUE_NOCLOCK);
++	check_preempt_curr(dist_rq, p, 0);
++
++	// unlock dist rq
++	rq_unlock(dist_rq, &rf);
++	local_irq_restore(grf.flags);
++}
++
++static void nohz_try_pull_from_grq(void)
++{
++	int cpu;
++	struct cpumask idle_mask;
++	struct cpumask non_idle_mask;
++
++	cpumask_clear(&non_idle_mask);
++
++	/* first, push to grq*/
++	for_each_online_cpu(cpu) {
++		if (cpu == 0) continue;
++		if (!idle_cpu(cpu)) {
++			push_to_grq(cpu_rq(cpu));
++			cpumask_set_cpu(cpu, &non_idle_mask);
++		} else {
++			cpumask_set_cpu(cpu, &idle_mask);
++		}
++	}
++
++	/* second, idle cpus pull first */
++	for_each_cpu(cpu, &idle_mask) {
++		if (cpu == 0) continue;
++		if (idle_cpu(cpu))
++			pull_from_grq(cpu_rq(cpu));
++	}
++
++	/* last, non idle pull */
++	for_each_cpu(cpu, &non_idle_mask) {
++		/* mybe it is idle now */
++		if (idle_cpu(cpu)) {
++			pull_from_grq(cpu_rq(cpu));
++		} else if (time_after_eq(jiffies, grq->grq_next_balance)) {
++			/* if not idle, try pull every grq_next_balance */
++			try_pull_from_grq(cpu_rq(cpu));
++			grq->grq_next_balance = jiffies + msecs_to_jiffies(tt_grq_balance_ms);
++		}
++	}
++}
++
 +/*
 + * run_rebalance_domains is triggered when needed from the scheduler tick.
 + * Also triggered for nohz idle balancing (with nohz_balancing_kick set).
@@ -3081,11 +3114,10 @@ index 000000000000..c553e23918e5
 +	 * load balance only within the local sched_domain hierarchy
 +	 * and abort nohz_idle_balance altogether if we pull some load.
 +	 */
-+	if (nohz_idle_balance(this_rq, idle))
-+		return;
++	nohz_idle_balance(this_rq, idle);
 +}
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 6f4625f8276f..9736c735425f 100644
+index 6f4625f8276f..08d97b70d22c 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -44,6 +44,10 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_update_nr_running_tp);
@@ -3225,11 +3257,12 @@ index 6f4625f8276f..9736c735425f 100644
  #ifdef CONFIG_FAIR_GROUP_SCHED
  	ptr += 2 * nr_cpu_ids * sizeof(void **);
  #endif
-@@ -9401,8 +9449,15 @@ void __init sched_init(void)
+@@ -9401,8 +9449,16 @@ void __init sched_init(void)
  		rq->balance_callback = &balance_push_callback;
  		rq->active_balance = 0;
  		rq->next_balance = jiffies;
 +		rq->lat_decay = jiffies;
++		rq->grq_next_balance = jiffies;
  		rq->push_cpu = 0;
  		rq->cpu = i;
 +#ifdef CONFIG_TT_SCHED
@@ -3241,7 +3274,7 @@ index 6f4625f8276f..9736c735425f 100644
  		rq->online = 0;
  		rq->idle_stamp = 0;
  		rq->avg_idle = 2*sysctl_sched_migration_cost;
-@@ -9425,6 +9480,9 @@ void __init sched_init(void)
+@@ -9425,6 +9481,9 @@ void __init sched_init(void)
  #endif /* CONFIG_SMP */
  		hrtick_rq_init(rq);
  		atomic_set(&rq->nr_iowait, 0);
@@ -5379,7 +5412,7 @@ index d17b0a5ce6ac..735f177551e2 100644
  			cpu_idle_poll();
  		} else {
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 4f432826933d..4d38366b98b3 100644
+index 4f432826933d..68ad8d71337d 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -85,6 +85,19 @@
@@ -5433,17 +5466,18 @@ index 4f432826933d..4d38366b98b3 100644
  
  #ifdef	CONFIG_SCHED_DEBUG
  	unsigned int		nr_spread_over;
-@@ -978,6 +1005,9 @@ struct rq {
+@@ -978,6 +1005,10 @@ struct rq {
  	struct task_struct	*idle;
  	struct task_struct	*stop;
  	unsigned long		next_balance;
 +#ifdef CONFIG_TT_SCHED
 +	unsigned long		lat_decay;
++	unsigned long		grq_next_balance;
 +#endif
  	struct mm_struct	*prev_mm;
  
  	unsigned int		clock_update_flags;
-@@ -1782,6 +1812,9 @@ DECLARE_PER_CPU(struct sched_domain_shared __rcu *, sd_llc_shared);
+@@ -1782,6 +1813,9 @@ DECLARE_PER_CPU(struct sched_domain_shared __rcu *, sd_llc_shared);
  DECLARE_PER_CPU(struct sched_domain __rcu *, sd_numa);
  DECLARE_PER_CPU(struct sched_domain __rcu *, sd_asym_packing);
  DECLARE_PER_CPU(struct sched_domain __rcu *, sd_asym_cpucapacity);
@@ -5453,7 +5487,7 @@ index 4f432826933d..4d38366b98b3 100644
  extern struct static_key_false sched_asym_cpucapacity;
  
  struct sched_group_capacity {
-@@ -2253,6 +2286,10 @@ extern void update_group_capacity(struct sched_domain *sd, int cpu);
+@@ -2253,6 +2287,10 @@ extern void update_group_capacity(struct sched_domain *sd, int cpu);
  
  extern void trigger_load_balance(struct rq *rq);
  
@@ -5464,7 +5498,7 @@ index 4f432826933d..4d38366b98b3 100644
  extern void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
  
  static inline struct task_struct *get_push_task(struct rq *rq)
-@@ -2397,6 +2434,10 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+@@ -2397,6 +2435,10 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
  
  extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
  
@@ -6401,7 +6435,7 @@ index 000000000000..7aa1e8936be4
 +#endif
 +
 diff --git a/kernel/sysctl.c b/kernel/sysctl.c
-index 083be6af29d7..ebadd129f1ae 100644
+index 083be6af29d7..20eaa6e451de 100644
 --- a/kernel/sysctl.c
 +++ b/kernel/sysctl.c
 @@ -113,6 +113,10 @@
@@ -6415,7 +6449,7 @@ index 083be6af29d7..ebadd129f1ae 100644
  static int __maybe_unused neg_one = -1;
  static int __maybe_unused two = 2;
  static int __maybe_unused four = 4;
-@@ -1778,6 +1782,33 @@ static struct ctl_table kern_table[] = {
+@@ -1778,6 +1782,40 @@ static struct ctl_table kern_table[] = {
  		.mode		= 0644,
  		.proc_handler	= proc_dointvec,
  	},
@@ -6428,6 +6462,13 @@ index 083be6af29d7..ebadd129f1ae 100644
 +		.proc_handler	= proc_dointvec_minmax,
 +		.extra1		= &zero_ul,
 +		.extra2		= &two,
++	},
++	{
++		.procname	= "sched_tt_grq_balance_ms",
++		.data		= &tt_grq_balance_ms,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
 +	},
 +	{
 +		.procname	= "sched_tt_max_lifetime",
