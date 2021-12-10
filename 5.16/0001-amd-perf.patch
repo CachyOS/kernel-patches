@@ -1,0 +1,1503 @@
+From db216a46c69c1307096d03fd4c2d4cc474ea4b65 Mon Sep 17 00:00:00 2001
+From: "P. Jung" <ptr1337@cachyos.org>
+Date: Fri, 10 Dec 2021 21:39:46 +0000
+Subject: [PATCH] amd-perf
+
+Signed-off-by: P. Jung <ptr1337@cachyos.org>
+---
+ arch/x86/events/Kconfig            |   8 +
+ arch/x86/events/amd/Makefile       |   1 +
+ arch/x86/events/amd/brs.c          | 363 +++++++++++++++++++++++++++++
+ arch/x86/events/amd/core.c         | 217 ++++++++++++++++-
+ arch/x86/events/core.c             |  17 +-
+ arch/x86/events/intel/lbr.c        |  36 ++-
+ arch/x86/events/perf_event.h       | 143 ++++++++++--
+ arch/x86/include/asm/cpufeatures.h |   1 +
+ arch/x86/include/asm/msr-index.h   |   4 +
+ arch/x86/include/asm/perf_event.h  |  21 ++
+ drivers/acpi/acpi_pad.c            |   6 +
+ drivers/acpi/processor_idle.c      |   5 +
+ include/linux/perf_event.h         |  22 ++
+ tools/perf/util/evsel.c            |  40 +++-
+ tools/perf/util/hist.c             |   2 +
+ tools/perf/util/hist.h             |   2 +
+ tools/perf/util/parse-events.l     |   1 +
+ tools/perf/util/sort.c             | 128 ++++++++++
+ tools/perf/util/sort.h             |   2 +
+ 19 files changed, 978 insertions(+), 41 deletions(-)
+ create mode 100644 arch/x86/events/amd/brs.c
+
+diff --git a/arch/x86/events/Kconfig b/arch/x86/events/Kconfig
+index d6cdfe631674..1dc002ef66da 100644
+--- a/arch/x86/events/Kconfig
++++ b/arch/x86/events/Kconfig
+@@ -44,4 +44,12 @@ config PERF_EVENTS_AMD_UNCORE
+ 
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called 'amd-uncore'.
++
++config PERF_EVENTS_AMD_BRS
++	depends on PERF_EVENTS && CPU_SUP_AMD
++	tristate "AMD Zen3 Branch Sampling support"
++	help
++	  Enable AMD Zen3 branch sampling support (BRS) which samples up to
++	  16 consecutive taken branches in registers.
++
+ endmenu
+diff --git a/arch/x86/events/amd/Makefile b/arch/x86/events/amd/Makefile
+index 6cbe38d5fd9d..b9f5d4610256 100644
+--- a/arch/x86/events/amd/Makefile
++++ b/arch/x86/events/amd/Makefile
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_CPU_SUP_AMD)		+= core.o
++obj-$(CONFIG_PERF_EVENTS_AMD_BRS)	+= brs.o
+ obj-$(CONFIG_PERF_EVENTS_AMD_POWER)	+= power.o
+ obj-$(CONFIG_X86_LOCAL_APIC)		+= ibs.o
+ obj-$(CONFIG_PERF_EVENTS_AMD_UNCORE)	+= amd-uncore.o
+diff --git a/arch/x86/events/amd/brs.c b/arch/x86/events/amd/brs.c
+new file mode 100644
+index 000000000000..bedff27c4b03
+--- /dev/null
++++ b/arch/x86/events/amd/brs.c
+@@ -0,0 +1,363 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Implement support for AMD Fam19h Branch Sampling feature
++ * Based on specifications published in AMD PPR Fam19 Model 01
++ *
++ * Copyright 2021 Google LLC
++ * Contributed by Stephane Eranian <eranian@google.com>
++ */
++#include <linux/kernel.h>
++#include <linux/jump_label.h>
++#include <asm/msr.h>
++#include <asm/cpufeature.h>
++
++#include "../perf_event.h"
++
++#define BRS_POISON	0xFFFFFFFFFFFFFFFEULL /* mark limit of valid entries */
++
++/* Debug Extension Configuration register layout */
++union amd_debug_extn_cfg {
++	__u64 val;
++	struct {
++		__u64	rsvd0:2,  /* reserved */
++			brsmen:1, /* branch sample enable */
++			rsvd4_3:2,/* reserved - must be 0x3 */
++			vb:1,     /* valid branches recorded */
++			rsvd2:10, /* reserved */
++			msroff:4, /* index of next entry to write */
++			rsvd3:4,  /* reserved */
++			pmc:3,    /* #PMC holding the sampling event */
++			rsvd4:37; /* reserved */
++	};
++};
++
++static inline unsigned int brs_from(int idx)
++{
++	return MSR_AMD_SAMP_BR_FROM + 2 * idx;
++}
++
++static inline unsigned int brs_to(int idx)
++{
++	return MSR_AMD_SAMP_BR_FROM + 2 * idx + 1;
++}
++
++static inline void set_debug_extn_cfg(u64 val)
++{
++	/* bits[4:3] must always be set to 11b */
++	wrmsrl(MSR_AMD_DBG_EXTN_CFG, val | 3ULL << 3);
++}
++
++static inline u64 get_debug_extn_cfg(void)
++{
++	u64 val;
++
++	rdmsrl(MSR_AMD_DBG_EXTN_CFG, val);
++	return val;
++}
++
++static bool __init amd_brs_detect(void)
++{
++	if (!boot_cpu_has(X86_FEATURE_AMD_BRS))
++		return false;
++
++	switch (boot_cpu_data.x86) {
++	case 0x19: /* AMD Fam19h (Zen3) */
++		x86_pmu.lbr_nr = 16;
++
++		/* No hardware filtering supported */
++		x86_pmu.lbr_sel_map = NULL;
++		x86_pmu.lbr_sel_mask = 0;
++		break;
++	default:
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ * Current BRS implementation does not support branch type or privilege level
++ * filtering. Therefore, this function simply enforces these limitations. No need for
++ * a br_sel_map. Software filtering is not supported because it would not correlate well
++ * with a sampling period.
++ */
++int amd_brs_setup_filter(struct perf_event *event)
++{
++	u64 type = event->attr.branch_sample_type;
++
++	/* No BRS support */
++	if (!x86_pmu.lbr_nr)
++		return -EOPNOTSUPP;
++
++	/* Can only capture all branches, i.e., no filtering */
++	if ((type & ~PERF_SAMPLE_BRANCH_PLM_ALL) != PERF_SAMPLE_BRANCH_ANY)
++		return -EINVAL;
++
++	return 0;
++}
++
++/* tos = top of stack, i.e., last valid entry written */
++static inline int amd_brs_get_tos(union amd_debug_extn_cfg *cfg)
++{
++	/*
++	 * msroff: index of next entry to write so top-of-stack is one off
++	 * if BRS is full then msroff is set back to 0.
++	 */
++	return (cfg->msroff ? cfg->msroff : x86_pmu.lbr_nr) - 1;
++}
++
++/*
++ * make sure we have a sane BRS offset to begin with
++ * especially with kexec
++ */
++void amd_brs_reset(void)
++{
++	/*
++	 * Reset config
++	 */
++	set_debug_extn_cfg(0);
++
++	/*
++	 * Mark first entry as poisoned
++	 */
++	wrmsrl(brs_to(0), BRS_POISON);
++}
++
++int __init amd_brs_init(void)
++{
++	if (!amd_brs_detect())
++		return -EOPNOTSUPP;
++
++	pr_cont("%d-deep BRS, ", x86_pmu.lbr_nr);
++
++	return 0;
++}
++
++void amd_brs_enable(void)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++	union amd_debug_extn_cfg cfg;
++
++	/* Activate only on first user */
++	if (++cpuc->brs_active > 1)
++		return;
++
++	cfg.val    = 0; /* reset all fields */
++	cfg.brsmen = 1; /* enable branch sampling */
++
++	/* Set enable bit */
++	set_debug_extn_cfg(cfg.val);
++}
++
++void amd_brs_enable_all(void)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++	if (cpuc->lbr_users)
++		amd_brs_enable();
++}
++
++void amd_brs_disable(void)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++	union amd_debug_extn_cfg cfg;
++
++	/* Check if active (could be disabled via x86_pmu_disable_all()) */
++	if (!cpuc->brs_active)
++		return;
++
++	/* Only disable for last user */
++	if (--cpuc->brs_active)
++		return;
++
++	/*
++	 * Clear the brsmen bit but preserve the others as they contain
++	 * useful state such as vb and msroff
++	 */
++	cfg.val = get_debug_extn_cfg();
++
++	/*
++	 * When coming in on interrupt and BRS is full, then hw will have
++	 * already stopped BRS, no need to issue wrmsr again
++	 */
++	if (cfg.brsmen) {
++		cfg.brsmen = 0;
++		set_debug_extn_cfg(cfg.val);
++	}
++}
++
++void amd_brs_disable_all(void)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++	if (cpuc->lbr_users)
++		amd_brs_disable();
++}
++
++static bool amd_brs_match_plm(struct perf_event *event, u64 to)
++{
++	int type = event->attr.branch_sample_type;
++	int plm_k = PERF_SAMPLE_BRANCH_KERNEL | PERF_SAMPLE_BRANCH_HV;
++	int plm_u = PERF_SAMPLE_BRANCH_USER;
++
++	if (!(type & plm_k) && kernel_ip(to))
++		return 0;
++
++	if (!(type & plm_u) && !kernel_ip(to))
++		return 0;
++
++	return 1;
++}
++
++/*
++ * Caller must ensure amd_brs_inuse() is true before calling
++ * return:
++ */
++void amd_brs_drain(void)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++	struct perf_event *event = cpuc->events[0];
++	struct perf_branch_entry *br = cpuc->lbr_entries;
++	union amd_debug_extn_cfg cfg;
++	u32 i, nr = 0, num, tos, start;
++	u32 shift = 64 - boot_cpu_data.x86_virt_bits;
++
++	/*
++	 * BRS event forced on PMC0,
++	 * so check if there is an event.
++	 * It is possible to have lbr_users > 0 but the event
++	 * not yet scheduled due to long latency PMU irq
++	 */
++	if (!event)
++		goto empty;
++
++	cfg.val = get_debug_extn_cfg();
++
++	/* Sanity check [0-x86_pmu.lbr_nr] */
++	if (WARN_ON_ONCE(cfg.msroff >= x86_pmu.lbr_nr))
++		goto empty;
++
++	/* No valid branch */
++	if (cfg.vb == 0)
++		goto empty;
++
++	/*
++	 * msr.off points to next entry to be written
++	 * tos = most recent entry index = msr.off - 1
++	 * BRS register buffer saturates, so we know we have
++	 * start < tos and that we have to read from start to tos
++	 */
++	start = 0;
++	tos = amd_brs_get_tos(&cfg);
++
++	num = tos - start + 1;
++
++	/*
++	 * BRS is only one pass (saturation) from MSROFF to depth-1
++	 * MSROFF wraps to zero when buffer is full
++	 */
++	for (i = 0; i < num; i++) {
++		u32 brs_idx = tos - i;
++		u64 from, to;
++
++		rdmsrl(brs_to(brs_idx), to);
++
++		/* Entry does not belong to us (as marked by kernel) */
++		if (to == BRS_POISON)
++			break;
++
++		/*
++		 * Sign-extend SAMP_BR_TO to 64 bits, bits 61-63 are reserved.
++		 * Necessary to generate proper virtual addresses suitable for
++		 * symbolization
++		 */
++		to = (u64)(((s64)to << shift) >> shift);
++
++		if (!amd_brs_match_plm(event, to))
++			continue;
++
++		rdmsrl(brs_from(brs_idx), from);
++
++		perf_clear_branch_entry_bitfields(br+nr);
++
++		br[nr].from = from;
++		br[nr].to   = to;
++
++		nr++;
++	}
++empty:
++	/* Record number of sampled branches */
++	cpuc->lbr_stack.nr = nr;
++}
++
++/*
++ * Poison most recent entry to prevent reuse by next task
++ * required because BRS entry are not tagged by PID
++ */
++static void amd_brs_poison_buffer(void)
++{
++	union amd_debug_extn_cfg cfg;
++	unsigned int idx;
++
++	/* Get current state */
++	cfg.val = get_debug_extn_cfg();
++
++	/* idx is most recently written entry */
++	idx = amd_brs_get_tos(&cfg);
++
++	/* Poison target of entry */
++	wrmsrl(brs_to(idx), BRS_POISON);
++}
++
++/*
++ * On context switch in, we need to make sure no samples from previous user
++ * are left in the BRS.
++ *
++ * On ctxswin, sched_in = true, called after the PMU has started
++ * On ctxswout, sched_in = false, called before the PMU is stopped
++ */
++void amd_pmu_brs_sched_task(struct perf_event_context *ctx, bool sched_in)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++
++	/* no active users */
++	if (!cpuc->lbr_users)
++		return;
++
++	/*
++	 * On context switch in, we need to ensure we do not use entries
++	 * from previous BRS user on that CPU, so we poison the buffer as
++	 * a faster way compared to resetting all entries.
++	 */
++	if (sched_in)
++		amd_brs_poison_buffer();
++}
++
++DEFINE_STATIC_KEY_FALSE(perf_lopwr_needed);
++
++/*
++ * called from ACPI processor_idle.c or acpi_pad.c
++ * with interrupts disabled
++ */
++void perf_amd_brs_lopwr_cb(bool lopwr_in)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++	union amd_debug_extn_cfg cfg;
++
++	/*
++	 * on mwait in, we may end up in non C0 state.
++	 * we must disable branch sampling to avoid holding the NMI
++	 * for too long. We disable it in hardware but we
++	 * keep the state in cpuc, so we can re-enable.
++	 *
++	 * The hardware will deliver the NMI if needed when brsmen cleared
++	 */
++	if (cpuc->brs_active) {
++		cfg.val = get_debug_extn_cfg();
++		cfg.brsmen = !lopwr_in;
++		set_debug_extn_cfg(cfg.val);
++	}
++}
++
++void __init amd_brs_lopwr_init(void)
++{
++	static_branch_enable(&perf_lopwr_needed);
++}
+diff --git a/arch/x86/events/amd/core.c b/arch/x86/events/amd/core.c
+index 9687a8aef01c..ea71ee52b758 100644
+--- a/arch/x86/events/amd/core.c
++++ b/arch/x86/events/amd/core.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/perf_event.h>
++#include <linux/jump_label.h>
+ #include <linux/export.h>
+ #include <linux/types.h>
+ #include <linux/init.h>
+@@ -327,6 +328,8 @@ static inline bool amd_is_pair_event_code(struct hw_perf_event *hwc)
+ 
+ static int amd_core_hw_config(struct perf_event *event)
+ {
++	int ret = 0;
++
+ 	if (event->attr.exclude_host && event->attr.exclude_guest)
+ 		/*
+ 		 * When HO == GO == 1 the hardware treats that as GO == HO == 0
+@@ -343,7 +346,32 @@ static int amd_core_hw_config(struct perf_event *event)
+ 	if ((x86_pmu.flags & PMU_FL_PAIR) && amd_is_pair_event_code(&event->hw))
+ 		event->hw.flags |= PERF_X86_EVENT_PAIR;
+ 
+-	return 0;
++	/*
++	 * if branch stack is requested
++	 */
++	if (has_branch_stack(event) && is_sampling_event(event)) {
++		/*
++		 * BRS implementation does not work with frequency mode
++		 * reprogramming of the period.
++		 */
++		if (event->attr.freq)
++			return -EINVAL;
++		/*
++		 * The kernel subtracts BRS depth from period, so it must be big enough
++		 */
++		if (event->attr.sample_period <= x86_pmu.lbr_nr)
++			return -EINVAL;
++
++		/*
++		 * Check if we can allow PERF_SAMPLE_BRANCH_STACK
++		 */
++		ret = amd_brs_setup_filter(event);
++
++		/* only set in case of success */
++		if (!ret)
++			event->hw.flags |= PERF_X86_EVENT_AMD_BRS;
++	}
++	return ret;
+ }
+ 
+ static inline int amd_is_nb_event(struct hw_perf_event *hwc)
+@@ -366,7 +394,7 @@ static int amd_pmu_hw_config(struct perf_event *event)
+ 	if (event->attr.precise_ip && get_ibs_caps())
+ 		return -ENOENT;
+ 
+-	if (has_branch_stack(event))
++	if (has_branch_stack(event) && !x86_pmu.lbr_nr)
+ 		return -EOPNOTSUPP;
+ 
+ 	ret = x86_pmu_hw_config(event);
+@@ -555,6 +583,8 @@ static void amd_pmu_cpu_starting(int cpu)
+ 
+ 	cpuc->amd_nb->nb_id = nb_id;
+ 	cpuc->amd_nb->refcnt++;
++
++	amd_brs_reset();
+ }
+ 
+ static void amd_pmu_cpu_dead(int cpu)
+@@ -610,6 +640,8 @@ static void amd_pmu_disable_all(void)
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ 	int idx;
+ 
++	amd_brs_disable_all();
++
+ 	x86_pmu_disable_all();
+ 
+ 	/*
+@@ -634,6 +666,30 @@ static void amd_pmu_disable_all(void)
+ 	}
+ }
+ 
++static void amd_pmu_enable_event(struct perf_event *event)
++{
++	x86_pmu_enable_event(event);
++}
++
++static void amd_pmu_enable_all(int added)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++	struct hw_perf_event *hwc;
++	int idx;
++
++	amd_brs_enable_all();
++
++	for (idx = 0; idx < x86_pmu.num_counters; idx++) {
++		hwc = &cpuc->events[idx]->hw;
++
++		/* only activate events which are marked as active */
++		if (!test_bit(idx, cpuc->active_mask))
++			continue;
++
++		amd_pmu_enable_event(cpuc->events[idx]);
++	}
++}
++
+ static void amd_pmu_disable_event(struct perf_event *event)
+ {
+ 	x86_pmu_disable_event(event);
+@@ -651,6 +707,18 @@ static void amd_pmu_disable_event(struct perf_event *event)
+ 	amd_pmu_wait_on_overflow(event->hw.idx);
+ }
+ 
++static void amd_pmu_add_event(struct perf_event *event)
++{
++	if (needs_branch_stack(event))
++		amd_pmu_brs_add(event);
++}
++
++static void amd_pmu_del_event(struct perf_event *event)
++{
++	if (needs_branch_stack(event))
++		amd_pmu_brs_del(event);
++}
++
+ /*
+  * Because of NMI latency, if multiple PMC counters are active or other sources
+  * of NMIs are received, the perf NMI handler can handle one or more overflowed
+@@ -671,11 +739,31 @@ static void amd_pmu_disable_event(struct perf_event *event)
+  */
+ static int amd_pmu_handle_irq(struct pt_regs *regs)
+ {
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+ 	int handled;
++	int pmu_enabled;
++
++	/*
++	 * Save the PMU state.
++	 * It needs to be restored when leaving the handler.
++	 */
++	pmu_enabled = cpuc->enabled;
++	cpuc->enabled = 0;
++
++	/* stop everything (includes BRS) */
++	amd_pmu_disable_all();
++
++	/* Drain BRS is in use (could be inactive) */
++	if (cpuc->lbr_users)
++		amd_brs_drain();
+ 
+ 	/* Process any counter overflows */
+ 	handled = x86_pmu_handle_irq(regs);
+ 
++	cpuc->enabled = pmu_enabled;
++	if (pmu_enabled)
++		amd_pmu_enable_all(0);
++
+ 	/*
+ 	 * If a counter was handled, record a timestamp such that un-handled
+ 	 * NMIs will be claimed if arriving within that window.
+@@ -897,6 +985,51 @@ static void amd_put_event_constraints_f17h(struct cpu_hw_events *cpuc,
+ 		--cpuc->n_pair;
+ }
+ 
++/*
++ * Because of the way BRS operates with an inactive and active phases, and
++ * the link to one counter, it is not possible to have two events using BRS
++ * scheduled at the same time. There would be an issue with enforcing the
++ * period of each one and given that the BRS saturates, it would not be possible
++ * to guarantee correlated content for all events. Therefore, in situations
++ * where multiple events want to use BRS, the kernel enforces mutual exclusion.
++ * Exclusion is enforced by chosing only one counter for events using BRS.
++ * The event scheduling logic will then automatically multiplex the
++ * events and ensure that at most one event is actively using BRS.
++ *
++ * The BRS counter could be any counter, but there is no constraint on Fam19h,
++ * therefore all counters are equal and thus we pick the first one: PMC0
++ */
++static struct event_constraint amd_fam19h_brs_cntr0_constraint =
++	EVENT_CONSTRAINT(0, 0x1, AMD64_RAW_EVENT_MASK);
++
++static struct event_constraint amd_fam19h_brs_pair_cntr0_constraint =
++	__EVENT_CONSTRAINT(0, 0x1, AMD64_RAW_EVENT_MASK, 1, 0, PERF_X86_EVENT_PAIR);
++
++static struct event_constraint *
++amd_get_event_constraints_f19h(struct cpu_hw_events *cpuc, int idx,
++			  struct perf_event *event)
++{
++	struct hw_perf_event *hwc = &event->hw;
++	bool has_brs = has_amd_brs(hwc);
++
++	/*
++	 * In case BRS is used with an event requiring a counter pair,
++	 * the kernel allows it but only on counter 0 & 1 to enforce
++	 * multiplexing requiring to protect BRS in case of multiple
++	 * BRS users
++	 */
++	if (amd_is_pair_event_code(hwc)) {
++		return has_brs ? &amd_fam19h_brs_pair_cntr0_constraint
++			       : &pair_constraint;
++	}
++
++	if (has_brs)
++		return &amd_fam19h_brs_cntr0_constraint;
++
++	return &unconstrained;
++}
++
++
+ static ssize_t amd_event_sysfs_show(char *page, u64 config)
+ {
+ 	u64 event = (config & ARCH_PERFMON_EVENTSEL_EVENT) |
+@@ -905,12 +1038,19 @@ static ssize_t amd_event_sysfs_show(char *page, u64 config)
+ 	return x86_event_sysfs_show(page, config, event);
+ }
+ 
++static void amd_pmu_sched_task(struct perf_event_context *ctx,
++				 bool sched_in)
++{
++	if (sched_in && x86_pmu.lbr_nr)
++		amd_pmu_brs_sched_task(ctx, sched_in);
++}
++
+ static __initconst const struct x86_pmu amd_pmu = {
+ 	.name			= "AMD",
+ 	.handle_irq		= amd_pmu_handle_irq,
+ 	.disable_all		= amd_pmu_disable_all,
+-	.enable_all		= x86_pmu_enable_all,
+-	.enable			= x86_pmu_enable_event,
++	.enable_all		= amd_pmu_enable_all,
++	.enable			= amd_pmu_enable_event,
+ 	.disable		= amd_pmu_disable_event,
+ 	.hw_config		= amd_pmu_hw_config,
+ 	.schedule_events	= x86_schedule_events,
+@@ -920,6 +1060,8 @@ static __initconst const struct x86_pmu amd_pmu = {
+ 	.event_map		= amd_pmu_event_map,
+ 	.max_events		= ARRAY_SIZE(amd_perfmon_event_map),
+ 	.num_counters		= AMD64_NUM_COUNTERS,
++	.add			= amd_pmu_add_event,
++	.del			= amd_pmu_del_event,
+ 	.cntval_bits		= 48,
+ 	.cntval_mask		= (1ULL << 48) - 1,
+ 	.apic			= 1,
+@@ -938,6 +1080,53 @@ static __initconst const struct x86_pmu amd_pmu = {
+ 	.amd_nb_constraints	= 1,
+ };
+ 
++static ssize_t branches_show(struct device *cdev,
++			      struct device_attribute *attr,
++			      char *buf)
++{
++	return snprintf(buf, PAGE_SIZE, "%d\n", x86_pmu.lbr_nr);
++}
++
++static DEVICE_ATTR_RO(branches);
++
++static struct attribute *amd_pmu_brs_attrs[] = {
++	&dev_attr_branches.attr,
++	NULL,
++};
++
++static umode_t
++amd_brs_is_visible(struct kobject *kobj, struct attribute *attr, int i)
++{
++	return x86_pmu.lbr_nr ? attr->mode : 0;
++}
++
++static struct attribute_group group_caps_amd_brs = {
++	.name  = "caps",
++	.attrs = amd_pmu_brs_attrs,
++	.is_visible = amd_brs_is_visible,
++};
++
++#define AMD_FAM19H_BRS_EVENT 0xc4 /* Fam19h RETIRED_TAKEN_BRANCH_INSTRUCTIONS */
++EVENT_ATTR_STR(branch-brs, amd_branch_brs,
++	       "event=" __stringify(AMD_FAM19H_BRS_EVENT)"\n");
++
++static struct attribute *amd_brs_events_attrs[] = {
++	EVENT_PTR(amd_branch_brs),
++	NULL,
++};
++
++static struct attribute_group group_events_amd_brs = {
++	.name       = "events",
++	.attrs      = amd_brs_events_attrs,
++	.is_visible = amd_brs_is_visible,
++};
++
++static const struct attribute_group *amd_attr_update[] = {
++	&group_caps_amd_brs,
++	&group_events_amd_brs,
++	NULL,
++};
++
+ static int __init amd_core_pmu_init(void)
+ {
+ 	u64 even_ctr_mask = 0ULL;
+@@ -989,6 +1178,26 @@ static int __init amd_core_pmu_init(void)
+ 		x86_pmu.flags |= PMU_FL_PAIR;
+ 	}
+ 
++	if (boot_cpu_data.x86 >= 0x19) {
++		/*
++		 * On AMD, invoking pmu_disable_all() is very expensive and the function is
++		 * invoked on context-switch in via sched_task_in(), so enable only when necessary
++		 */
++		if (!amd_brs_init()) {
++			x86_pmu.get_event_constraints = amd_get_event_constraints_f19h;
++			x86_pmu.sched_task = amd_pmu_sched_task;
++			/*
++			 * The put_event_constraints callback is shared with
++			 * Fam17h, set above
++			 */
++
++			/* branch sampling must be stopped when entering low power */
++			amd_brs_lopwr_init();
++		}
++	}
++
++	x86_pmu.attr_update = amd_attr_update;
++
+ 	pr_cont("core perfctr, ");
+ 	return 0;
+ }
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 38b2c779146f..c75f2dab3447 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -1338,6 +1338,10 @@ static void x86_pmu_enable(struct pmu *pmu)
+ 			if (hwc->state & PERF_HES_ARCH)
+ 				continue;
+ 
++			/*
++			 * if cpuc->enabled = 0, then no wrmsr as
++			 * per x86_pmu_enable_event()
++			 */
+ 			x86_pmu_start(event, PERF_EF_RELOAD);
+ 		}
+ 		cpuc->n_added = 0;
+@@ -1370,6 +1374,13 @@ int x86_perf_event_set_period(struct perf_event *event)
+ 	    x86_pmu.set_topdown_event_period)
+ 		return x86_pmu.set_topdown_event_period(event);
+ 
++	/*
++	 * decrease period by the depth of the BRS feature to get
++	 * the last N taken branches and approximate the desired period
++	 */
++	if (has_branch_stack(event))
++		period = amd_brs_adjust_period(period);
++
+ 	/*
+ 	 * If we are way outside a reasonable range then just skip forward:
+ 	 */
+@@ -1704,11 +1715,15 @@ int x86_pmu_handle_irq(struct pt_regs *regs)
+ 		 * event overflow
+ 		 */
+ 		handled++;
+-		perf_sample_data_init(&data, 0, event->hw.last_period);
+ 
+ 		if (!x86_perf_event_set_period(event))
+ 			continue;
+ 
++		perf_sample_data_init(&data, 0, event->hw.last_period);
++
++		if (has_branch_stack(event))
++			data.br_stack = &cpuc->lbr_stack;
++
+ 		if (perf_event_overflow(event, &data, regs))
+ 			x86_pmu_stop(event, 0);
+ 	}
+diff --git a/arch/x86/events/intel/lbr.c b/arch/x86/events/intel/lbr.c
+index 8043213b75a5..96f1b10a855f 100644
+--- a/arch/x86/events/intel/lbr.c
++++ b/arch/x86/events/intel/lbr.c
+@@ -778,6 +778,7 @@ void intel_pmu_lbr_disable_all(void)
+ void intel_pmu_lbr_read_32(struct cpu_hw_events *cpuc)
+ {
+ 	unsigned long mask = x86_pmu.lbr_nr - 1;
++	struct perf_branch_entry *br = cpuc->lbr_entries;
+ 	u64 tos = intel_pmu_lbr_tos();
+ 	int i;
+ 
+@@ -793,15 +794,11 @@ void intel_pmu_lbr_read_32(struct cpu_hw_events *cpuc)
+ 
+ 		rdmsrl(x86_pmu.lbr_from + lbr_idx, msr_lastbranch.lbr);
+ 
+-		cpuc->lbr_entries[i].from	= msr_lastbranch.from;
+-		cpuc->lbr_entries[i].to		= msr_lastbranch.to;
+-		cpuc->lbr_entries[i].mispred	= 0;
+-		cpuc->lbr_entries[i].predicted	= 0;
+-		cpuc->lbr_entries[i].in_tx	= 0;
+-		cpuc->lbr_entries[i].abort	= 0;
+-		cpuc->lbr_entries[i].cycles	= 0;
+-		cpuc->lbr_entries[i].type	= 0;
+-		cpuc->lbr_entries[i].reserved	= 0;
++		perf_clear_branch_entry_bitfields(br);
++
++		br->from	= msr_lastbranch.from;
++		br->to		= msr_lastbranch.to;
++		br++;
+ 	}
+ 	cpuc->lbr_stack.nr = i;
+ 	cpuc->lbr_stack.hw_idx = tos;
+@@ -816,6 +813,7 @@ void intel_pmu_lbr_read_64(struct cpu_hw_events *cpuc)
+ {
+ 	bool need_info = false, call_stack = false;
+ 	unsigned long mask = x86_pmu.lbr_nr - 1;
++	struct perf_branch_entry *br = cpuc->lbr_entries;
+ 	int lbr_format = x86_pmu.intel_cap.lbr_format;
+ 	u64 tos = intel_pmu_lbr_tos();
+ 	int i;
+@@ -888,15 +886,14 @@ void intel_pmu_lbr_read_64(struct cpu_hw_events *cpuc)
+ 		if (abort && x86_pmu.lbr_double_abort && out > 0)
+ 			out--;
+ 
+-		cpuc->lbr_entries[out].from	 = from;
+-		cpuc->lbr_entries[out].to	 = to;
+-		cpuc->lbr_entries[out].mispred	 = mis;
+-		cpuc->lbr_entries[out].predicted = pred;
+-		cpuc->lbr_entries[out].in_tx	 = in_tx;
+-		cpuc->lbr_entries[out].abort	 = abort;
+-		cpuc->lbr_entries[out].cycles	 = cycles;
+-		cpuc->lbr_entries[out].type	 = 0;
+-		cpuc->lbr_entries[out].reserved	 = 0;
++		perf_clear_branch_entry_bitfields(br+out);
++		br[out].from	 = from;
++		br[out].to	 = to;
++		br[out].mispred	 = mis;
++		br[out].predicted = pred;
++		br[out].in_tx	 = in_tx;
++		br[out].abort	 = abort;
++		br[out].cycles	 = cycles;
+ 		out++;
+ 	}
+ 	cpuc->lbr_stack.nr = out;
+@@ -958,6 +955,8 @@ static void intel_pmu_store_lbr(struct cpu_hw_events *cpuc,
+ 		to = rdlbr_to(i, lbr);
+ 		info = rdlbr_info(i, lbr);
+ 
++		perf_clear_branch_entry_bitfields(e);
++
+ 		e->from		= from;
+ 		e->to		= to;
+ 		e->mispred	= get_lbr_mispred(info);
+@@ -966,7 +965,6 @@ static void intel_pmu_store_lbr(struct cpu_hw_events *cpuc,
+ 		e->abort	= !!(info & LBR_INFO_ABORT);
+ 		e->cycles	= get_lbr_cycles(info);
+ 		e->type		= get_lbr_br_type(info);
+-		e->reserved	= 0;
+ 	}
+ 
+ 	cpuc->lbr_stack.nr = i;
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 5480db242083..5167755619df 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -67,22 +67,23 @@ static inline bool constraint_match(struct event_constraint *c, u64 ecode)
+ /*
+  * struct hw_perf_event.flags flags
+  */
+-#define PERF_X86_EVENT_PEBS_LDLAT	0x0001 /* ld+ldlat data address sampling */
+-#define PERF_X86_EVENT_PEBS_ST		0x0002 /* st data address sampling */
+-#define PERF_X86_EVENT_PEBS_ST_HSW	0x0004 /* haswell style datala, store */
+-#define PERF_X86_EVENT_PEBS_LD_HSW	0x0008 /* haswell style datala, load */
+-#define PERF_X86_EVENT_PEBS_NA_HSW	0x0010 /* haswell style datala, unknown */
+-#define PERF_X86_EVENT_EXCL		0x0020 /* HT exclusivity on counter */
+-#define PERF_X86_EVENT_DYNAMIC		0x0040 /* dynamic alloc'd constraint */
+-#define PERF_X86_EVENT_RDPMC_ALLOWED	0x0080 /* grant rdpmc permission */
+-#define PERF_X86_EVENT_EXCL_ACCT	0x0100 /* accounted EXCL event */
+-#define PERF_X86_EVENT_AUTO_RELOAD	0x0200 /* use PEBS auto-reload */
+-#define PERF_X86_EVENT_LARGE_PEBS	0x0400 /* use large PEBS */
+-#define PERF_X86_EVENT_PEBS_VIA_PT	0x0800 /* use PT buffer for PEBS */
+-#define PERF_X86_EVENT_PAIR		0x1000 /* Large Increment per Cycle */
+-#define PERF_X86_EVENT_LBR_SELECT	0x2000 /* Save/Restore MSR_LBR_SELECT */
+-#define PERF_X86_EVENT_TOPDOWN		0x4000 /* Count Topdown slots/metrics events */
+-#define PERF_X86_EVENT_PEBS_STLAT	0x8000 /* st+stlat data address sampling */
++#define PERF_X86_EVENT_PEBS_LDLAT	0x00001 /* ld+ldlat data address sampling */
++#define PERF_X86_EVENT_PEBS_ST		0x00002 /* st data address sampling */
++#define PERF_X86_EVENT_PEBS_ST_HSW	0x00004 /* haswell style datala, store */
++#define PERF_X86_EVENT_PEBS_LD_HSW	0x00008 /* haswell style datala, load */
++#define PERF_X86_EVENT_PEBS_NA_HSW	0x00010 /* haswell style datala, unknown */
++#define PERF_X86_EVENT_EXCL		0x00020 /* HT exclusivity on counter */
++#define PERF_X86_EVENT_DYNAMIC		0x00040 /* dynamic alloc'd constraint */
++#define PERF_X86_EVENT_RDPMC_ALLOWED	0x00080 /* grant rdpmc permission */
++#define PERF_X86_EVENT_EXCL_ACCT	0x00100 /* accounted EXCL event */
++#define PERF_X86_EVENT_AUTO_RELOAD	0x00200 /* use PEBS auto-reload */
++#define PERF_X86_EVENT_LARGE_PEBS	0x00400 /* use large PEBS */
++#define PERF_X86_EVENT_PEBS_VIA_PT	0x00800 /* use PT buffer for PEBS */
++#define PERF_X86_EVENT_PAIR		0x01000 /* Large Increment per Cycle */
++#define PERF_X86_EVENT_LBR_SELECT	0x02000 /* Save/Restore MSR_LBR_SELECT */
++#define PERF_X86_EVENT_TOPDOWN		0x04000 /* Count Topdown slots/metrics events */
++#define PERF_X86_EVENT_PEBS_STLAT	0x08000 /* st+stlat data address sampling */
++#define PERF_X86_EVENT_AMD_BRS		0x10000 /* AMD Branch Sampling */
+ 
+ static inline bool is_topdown_count(struct perf_event *event)
+ {
+@@ -324,6 +325,8 @@ struct cpu_hw_events {
+ 	 * AMD specific bits
+ 	 */
+ 	struct amd_nb			*amd_nb;
++	int				brs_active; /* BRS is enabled */
++
+ 	/* Inverted mask of bits to clear in the perf_ctr ctrl registers */
+ 	u64				perf_ctr_virt_mask;
+ 	int				n_pair; /* Large increment events */
+@@ -1099,6 +1102,11 @@ int x86_pmu_hw_config(struct perf_event *event);
+ 
+ void x86_pmu_disable_all(void);
+ 
++static inline bool has_amd_brs(struct hw_perf_event *hwc)
++{
++	return hwc->flags & PERF_X86_EVENT_AMD_BRS;
++}
++
+ static inline bool is_counter_pair(struct hw_perf_event *hwc)
+ {
+ 	return hwc->flags & PERF_X86_EVENT_PAIR;
+@@ -1205,6 +1213,88 @@ static inline bool fixed_counter_disabled(int i, struct pmu *pmu)
+ 
+ int amd_pmu_init(void);
+ 
++#ifdef CONFIG_PERF_EVENTS_AMD_BRS
++int amd_brs_init(void);
++void amd_brs_disable(void);
++void amd_brs_enable(void);
++void amd_brs_enable_all(void);
++void amd_brs_disable_all(void);
++void amd_brs_drain(void);
++void amd_brs_lopwr_init(void);
++void amd_brs_disable_all(void);
++int amd_brs_setup_filter(struct perf_event *event);
++void amd_brs_reset(void);
++
++static inline void amd_pmu_brs_add(struct perf_event *event)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++
++	perf_sched_cb_inc(event->ctx->pmu);
++	cpuc->lbr_users++;
++	/*
++	 * No need to reset BRS because it is reset
++	 * on brs_enable() and it is saturating
++	 */
++}
++
++static inline void amd_pmu_brs_del(struct perf_event *event)
++{
++	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++
++	cpuc->lbr_users--;
++	WARN_ON_ONCE(cpuc->lbr_users < 0);
++
++	perf_sched_cb_dec(event->ctx->pmu);
++}
++
++void amd_pmu_brs_sched_task(struct perf_event_context *ctx, bool sched_in);
++
++static inline s64 amd_brs_adjust_period(s64 period)
++{
++	if (period > x86_pmu.lbr_nr)
++		return period - x86_pmu.lbr_nr;
++
++	return period;
++}
++#else
++static inline int amd_brs_init(void)
++{
++	return 0;
++}
++static inline void amd_brs_disable(void) {}
++static inline void amd_brs_enable(void) {}
++static inline void amd_brs_drain(void) {}
++static inline void amd_brs_lopwr_init(void) {}
++static inline void amd_brs_disable_all(void) {}
++static inline int amd_brs_setup_filter(struct perf_event *event)
++{
++	return 0;
++}
++static inline void amd_brs_reset(void) {}
++
++static inline void amd_pmu_brs_add(struct perf_event *event)
++{
++}
++
++static inline void amd_pmu_brs_del(struct perf_event *event)
++{
++}
++
++static inline void amd_pmu_brs_sched_task(struct perf_event_context *ctx, bool sched_in)
++{
++}
++
++static inline s64 amd_brs_adjust_period(s64 period)
++{
++	return period;
++}
++
++static inline void amd_brs_enable_all(void)
++{
++}
++
++#endif
++
+ #else /* CONFIG_CPU_SUP_AMD */
+ 
+ static inline int amd_pmu_init(void)
+@@ -1212,6 +1302,27 @@ static inline int amd_pmu_init(void)
+ 	return 0;
+ }
+ 
++static inline int amd_brs_init(void)
++{
++	return 0;
++}
++
++static inline void amd_brs_drain(void)
++{
++}
++
++static inline void amd_brs_enable_all(void)
++{
++}
++
++static inline void amd_brs_disable_all(void)
++{
++}
++
++static inline s64 amd_brs_adjust_period(s64 period)
++{
++	return period;
++}
+ #endif /* CONFIG_CPU_SUP_AMD */
+ 
+ static inline int is_pebs_pt(struct perf_event *event)
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index d5b5f2ab87a0..e71443f93f04 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -315,6 +315,7 @@
+ #define X86_FEATURE_AMD_SSBD		(13*32+24) /* "" Speculative Store Bypass Disable */
+ #define X86_FEATURE_VIRT_SSBD		(13*32+25) /* Virtualized Speculative Store Bypass Disable */
+ #define X86_FEATURE_AMD_SSB_NO		(13*32+26) /* "" Speculative Store Bypass is fixed in hardware. */
++#define X86_FEATURE_AMD_BRS		(13*32+31) /* Branch Sampling available */
+ 
+ /* Thermal and Power Management Leaf, CPUID level 0x00000006 (EAX), word 14 */
+ #define X86_FEATURE_DTHERM		(14*32+ 0) /* Digital Thermal Sensor */
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 01e2650b9585..bc7481fd8513 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -650,6 +650,10 @@
+ #define MSR_IA32_PERF_CTL		0x00000199
+ #define INTEL_PERF_CTL_MASK		0xffff
+ 
++/* AMD Branch Sampling configuration */
++#define MSR_AMD_DBG_EXTN_CFG		0xc000010f
++#define MSR_AMD_SAMP_BR_FROM		0xc0010300
++
+ #define MSR_IA32_MPERF			0x000000e7
+ #define MSR_IA32_APERF			0x000000e8
+ 
+diff --git a/arch/x86/include/asm/perf_event.h b/arch/x86/include/asm/perf_event.h
+index 8fc1b5003713..e405847ccb56 100644
+--- a/arch/x86/include/asm/perf_event.h
++++ b/arch/x86/include/asm/perf_event.h
+@@ -513,6 +513,27 @@ static inline void intel_pt_handle_vmx(int on)
+ #if defined(CONFIG_PERF_EVENTS) && defined(CONFIG_CPU_SUP_AMD)
+  extern void amd_pmu_enable_virt(void);
+  extern void amd_pmu_disable_virt(void);
++
++#if defined(CONFIG_PERF_EVENTS_AMD_BRS)
++
++#define PERF_NEEDS_LOPWR_CB 1
++
++/*
++ * architectural low power callback impacts
++ * drivers/acpi/processor_idle.c
++ * drivers/acpi/acpi_pad.c
++ */
++extern void perf_amd_brs_lopwr_cb(bool lopwr_in);
++DECLARE_STATIC_KEY_FALSE(perf_lopwr_needed);
++
++static inline void perf_lopwr_cb(bool mode)
++{
++	/* key enabled only when BRS is available */
++	if (static_branch_unlikely(&perf_lopwr_needed))
++		perf_amd_brs_lopwr_cb(mode);
++}
++#endif /* PERF_NEEDS_LOPWR_CB */
++
+ #else
+  static inline void amd_pmu_enable_virt(void) { }
+  static inline void amd_pmu_disable_virt(void) { }
+diff --git a/drivers/acpi/acpi_pad.c b/drivers/acpi/acpi_pad.c
+index f45979aa2d64..a306a07a60b5 100644
+--- a/drivers/acpi/acpi_pad.c
++++ b/drivers/acpi/acpi_pad.c
+@@ -164,6 +164,9 @@ static int power_saving_thread(void *data)
+ 				tsc_marked_unstable = 1;
+ 			}
+ 			local_irq_disable();
++
++			perf_lopwr_cb(true);
++
+ 			tick_broadcast_enable();
+ 			tick_broadcast_enter();
+ 			stop_critical_timings();
+@@ -172,6 +175,9 @@ static int power_saving_thread(void *data)
+ 
+ 			start_critical_timings();
+ 			tick_broadcast_exit();
++
++			perf_lopwr_cb(false);
++
+ 			local_irq_enable();
+ 
+ 			if (time_before(expire_time, jiffies)) {
+diff --git a/drivers/acpi/processor_idle.c b/drivers/acpi/processor_idle.c
+index 76ef1bcc8848..7a3a613ae5ed 100644
+--- a/drivers/acpi/processor_idle.c
++++ b/drivers/acpi/processor_idle.c
+@@ -20,6 +20,7 @@
+ #include <linux/tick.h>
+ #include <linux/cpuidle.h>
+ #include <linux/cpu.h>
++#include <linux/perf_event.h>
+ #include <acpi/processor.h>
+ 
+ /*
+@@ -546,6 +547,8 @@ static void wait_for_freeze(void)
+  */
+ static void __cpuidle acpi_idle_do_entry(struct acpi_processor_cx *cx)
+ {
++	perf_lopwr_cb(true);
++
+ 	if (cx->entry_method == ACPI_CSTATE_FFH) {
+ 		/* Call into architectural FFH based C-state */
+ 		acpi_processor_ffh_cstate_enter(cx);
+@@ -556,6 +559,8 @@ static void __cpuidle acpi_idle_do_entry(struct acpi_processor_cx *cx)
+ 		inb(cx->address);
+ 		wait_for_freeze();
+ 	}
++
++	perf_lopwr_cb(false);
+ }
+ 
+ /**
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 0dcfd265beed..ebef56b552ba 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1059,6 +1059,22 @@ static inline void perf_sample_data_init(struct perf_sample_data *data,
+ 	data->txn = 0;
+ }
+ 
++/*
++ * Clear all bitfields in the perf_branch_entry.
++ * The to and from fields are not cleared because they are
++ * systematically modified by caller.
++ */
++static inline void perf_clear_branch_entry_bitfields(struct perf_branch_entry *br)
++{
++	br->mispred = 0;
++	br->predicted = 0;
++	br->in_tx = 0;
++	br->abort = 0;
++	br->cycles = 0;
++	br->type = 0;
++	br->reserved = 0;
++}
++
+ extern void perf_output_sample(struct perf_output_handle *handle,
+ 			       struct perf_event_header *header,
+ 			       struct perf_sample_data *data,
+@@ -1638,4 +1654,10 @@ typedef int (perf_snapshot_branch_stack_t)(struct perf_branch_entry *entries,
+ 					   unsigned int cnt);
+ DECLARE_STATIC_CALL(perf_snapshot_branch_stack, perf_snapshot_branch_stack_t);
+ 
++#ifndef PERF_NEEDS_LOPWR_CB
++static inline void perf_lopwr_cb(bool mode)
++{
++}
++#endif
++
+ #endif /* _LINUX_PERF_EVENT_H */
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index ac0127be0459..5de8f6901fa5 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -2852,9 +2852,28 @@ static bool find_process(const char *name)
+ 	return ret ? false : true;
+ }
+ 
++static bool is_amd_brs(struct evsel *evsel)
++{
++	return ((evsel->core.attr.config & 0xff) == 0xc4) &&
++	       (evsel->core.attr.sample_type & PERF_SAMPLE_BRANCH_STACK);
++}
++
++static bool is_amd(const char *arch, const char *cpuid)
++{
++	return arch && !strcmp("x86", arch) && cpuid && strstarts(cpuid, "AuthenticAMD");
++}
++
++static bool is_amd_ibs(struct evsel *evsel)
++{
++	return evsel->core.attr.precise_ip || !strncmp(evsel->pmu_name, "ibs", 3);
++}
++
+ int evsel__open_strerror(struct evsel *evsel, struct target *target,
+ 			 int err, char *msg, size_t size)
+ {
++	struct perf_env *env = evsel__env(evsel);
++	const char *arch = perf_env__arch(env);
++	const char *cpuid = perf_env__cpuid(env);
+ 	char sbuf[STRERR_BUFSIZE];
+ 	int printed = 0, enforced = 0;
+ 
+@@ -2871,6 +2890,14 @@ int evsel__open_strerror(struct evsel *evsel, struct target *target,
+ 					"monitoring and observability operations. Inspect system audit records for\n"
+ 					"more perf_event access control information and adjusting the policy.\n");
+ 			}
++			if (is_amd_brs(evsel)) {
++				if (evsel->core.attr.freq)
++					return scnprintf(msg, size,
++	"AMD Branch Sampling does not support frequency mode sampling, must pass a fixed sampling period via -c option or cpu/branch-brs,period=xxxx/.");
++				/* another reason is that the period is too small */
++				return scnprintf(msg, size,
++	"AMD Branch Sampling does not support sampling period smaller than what is reported in /sys/devices/cpu/caps/branches.");
++			}
+ 		}
+ 
+ 		if (err == EPERM)
+@@ -2950,6 +2977,17 @@ int evsel__open_strerror(struct evsel *evsel, struct target *target,
+ 			return scnprintf(msg, size, "wrong clockid (%d).", clockid);
+ 		if (perf_missing_features.aux_output)
+ 			return scnprintf(msg, size, "The 'aux_output' feature is not supported, update the kernel.");
++		if (is_amd(arch, cpuid)) {
++			if (is_amd_ibs(evsel)) {
++				if (evsel->core.attr.exclude_kernel)
++					return scnprintf(msg, size, 
++	"AMD IBS can't exclude kernel events.  Try running at a higher privilege level.");
++				if (!evsel->core.system_wide)
++					return scnprintf(msg, size,
++	"AMD IBS may only be available in system-wide/per-cpu mode.  Try using -a, or -C and workload affinity");
++			}
++		}
++
+ 		break;
+ 	case ENODATA:
+ 		return scnprintf(msg, size, "Cannot collect data source with the load latency event alone. "
+@@ -2966,7 +3004,7 @@ int evsel__open_strerror(struct evsel *evsel, struct target *target,
+ 
+ struct perf_env *evsel__env(struct evsel *evsel)
+ {
+-	if (evsel && evsel->evlist)
++	if (evsel && evsel->evlist && evsel->evlist->env)
+ 		return evsel->evlist->env;
+ 	return &perf_env;
+ }
+diff --git a/tools/perf/util/hist.c b/tools/perf/util/hist.c
+index b776465e04ef..bfdf64a64476 100644
+--- a/tools/perf/util/hist.c
++++ b/tools/perf/util/hist.c
+@@ -124,6 +124,7 @@ void hists__calc_col_len(struct hists *hists, struct hist_entry *h)
+ 		} else {
+ 			symlen = unresolved_col_width + 4 + 2;
+ 			hists__new_col_len(hists, HISTC_SYMBOL_FROM, symlen);
++			hists__new_col_len(hists, HISTC_ADDR_FROM, symlen);
+ 			hists__set_unres_dso_col_len(hists, HISTC_DSO_FROM);
+ 		}
+ 
+@@ -138,6 +139,7 @@ void hists__calc_col_len(struct hists *hists, struct hist_entry *h)
+ 		} else {
+ 			symlen = unresolved_col_width + 4 + 2;
+ 			hists__new_col_len(hists, HISTC_SYMBOL_TO, symlen);
++			hists__new_col_len(hists, HISTC_ADDR_TO, symlen);
+ 			hists__set_unres_dso_col_len(hists, HISTC_DSO_TO);
+ 		}
+ 
+diff --git a/tools/perf/util/hist.h b/tools/perf/util/hist.h
+index 621f35ae1efa..dbe1473adca0 100644
+--- a/tools/perf/util/hist.h
++++ b/tools/perf/util/hist.h
+@@ -76,6 +76,8 @@ enum hist_column {
+ 	HISTC_LOCAL_INS_LAT,
+ 	HISTC_GLOBAL_INS_LAT,
+ 	HISTC_P_STAGE_CYC,
++	HISTC_ADDR_FROM,
++	HISTC_ADDR_TO,
+ 	HISTC_NR_COLS, /* Last entry */
+ };
+ 
+diff --git a/tools/perf/util/parse-events.l b/tools/perf/util/parse-events.l
+index 4efe9872c667..97e70368e7c7 100644
+--- a/tools/perf/util/parse-events.l
++++ b/tools/perf/util/parse-events.l
+@@ -366,6 +366,7 @@ mem-loads-aux				|
+ mem-stores				|
+ topdown-[a-z-]+				|
+ tx-capacity-[a-z-]+			|
++branch-brs				|
+ el-capacity-[a-z-]+			{ return str(yyscanner, PE_KERNEL_PMU_EVENT); }
+ 
+ L1-dcache|l1-d|l1d|L1-data		|
+diff --git a/tools/perf/util/sort.c b/tools/perf/util/sort.c
+index a111065b484e..779b65acdc02 100644
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@ -990,6 +990,128 @@ struct sort_entry sort_sym_to = {
+ 	.se_width_idx	= HISTC_SYMBOL_TO,
+ };
+ 
++static int _hist_entry__addr_snprintf(struct map_symbol *ms,
++				     u64 ip, char level, char *bf, size_t size,
++				     unsigned int width)
++{
++	struct symbol *sym = ms->sym;
++	struct map *map = ms->map;
++	size_t ret = 0, offs;
++
++	ret += repsep_snprintf(bf + ret, size - ret, "[%c] ", level);
++	if (sym && map) {
++		if (sym->type == STT_OBJECT) {
++			ret += repsep_snprintf(bf + ret, size - ret, "%s", sym->name);
++			ret += repsep_snprintf(bf + ret, size - ret, "+0x%llx",
++					ip - map->unmap_ip(map, sym->start));
++		} else {
++			ret += repsep_snprintf(bf + ret, size - ret, "%.*s",
++					       width - ret,
++					       sym->name);
++			offs = ip - sym->start;
++			if (offs)
++				ret += repsep_snprintf(bf + ret, size - ret, "+0x%llx", offs);
++		}
++	} else {
++		size_t len = BITS_PER_LONG / 4;
++		ret += repsep_snprintf(bf + ret, size - ret, "%-#.*llx",
++				       len, ip);
++	}
++
++	return ret;
++}
++
++static int hist_entry__addr_from_snprintf(struct hist_entry *he, char *bf,
++					 size_t size, unsigned int width)
++{
++	if (he->branch_info) {
++		struct addr_map_symbol *from = &he->branch_info->from;
++
++		return _hist_entry__addr_snprintf(&from->ms, from->al_addr,
++						 he->level, bf, size, width);
++	}
++
++	return repsep_snprintf(bf, size, "%-*.*s", width, width, "N/A");
++}
++
++static int hist_entry__addr_to_snprintf(struct hist_entry *he, char *bf,
++				       size_t size, unsigned int width)
++{
++	if (he->branch_info) {
++		struct addr_map_symbol *to = &he->branch_info->to;
++
++		return _hist_entry__addr_snprintf(&to->ms, to->al_addr,
++						 he->level, bf, size, width);
++	}
++
++	return repsep_snprintf(bf, size, "%-*.*s", width, width, "N/A");
++}
++
++static int64_t
++sort__addr_from_cmp(struct hist_entry *left, struct hist_entry *right)
++{
++	struct addr_map_symbol *from_l;
++	struct addr_map_symbol *from_r;
++	int64_t ret;
++
++	if (!left->branch_info || !right->branch_info)
++		return cmp_null(left->branch_info, right->branch_info);
++
++	from_l = &left->branch_info->from;
++	from_r = &right->branch_info->from;
++
++	/*
++	 * comparing symbol address alone is not enough since it's a
++	 * relative address within a dso.
++	 */
++	ret = _sort__dso_cmp(from_l->ms.map, from_r->ms.map);
++	if (ret != 0)
++		return ret;
++
++	return _sort__addr_cmp(from_l->addr, from_r->addr);
++}
++
++static int64_t
++sort__addr_to_cmp(struct hist_entry *left, struct hist_entry *right)
++{
++	struct addr_map_symbol *to_l;
++	struct addr_map_symbol *to_r;
++	int64_t ret;
++
++	if (!left->branch_info || !right->branch_info)
++		return cmp_null(left->branch_info, right->branch_info);
++
++	to_l = &left->branch_info->to;
++	to_r = &right->branch_info->to;
++
++	/*
++	 * comparing symbol address alone is not enough since it's a
++	 * relative address within a dso.
++	 */
++	ret = _sort__dso_cmp(to_l->ms.map, to_r->ms.map);
++	if (ret != 0)
++		return ret;
++
++	return _sort__addr_cmp(to_l->addr, to_r->addr);
++}
++
++struct sort_entry sort_addr_from = {
++	.se_header	= "Source Address",
++	.se_cmp		= sort__addr_from_cmp,
++	.se_snprintf	= hist_entry__addr_from_snprintf,
++	.se_filter	= hist_entry__sym_from_filter, /* shared with sym_from */
++	.se_width_idx	= HISTC_ADDR_FROM,
++};
++
++struct sort_entry sort_addr_to = {
++	.se_header	= "Target Address",
++	.se_cmp		= sort__addr_to_cmp,
++	.se_snprintf	= hist_entry__addr_to_snprintf,
++	.se_filter	= hist_entry__sym_to_filter, /* shared with sym_to */
++	.se_width_idx	= HISTC_ADDR_TO,
++};
++
++
+ static int64_t
+ sort__mispredict_cmp(struct hist_entry *left, struct hist_entry *right)
+ {
+@@ -1877,6 +1999,8 @@ static struct sort_dimension bstack_sort_dimensions[] = {
+ 	DIM(SORT_SRCLINE_FROM, "srcline_from", sort_srcline_from),
+ 	DIM(SORT_SRCLINE_TO, "srcline_to", sort_srcline_to),
+ 	DIM(SORT_SYM_IPC, "ipc_lbr", sort_sym_ipc),
++	DIM(SORT_ADDR_FROM, "addr_from", sort_addr_from),
++	DIM(SORT_ADDR_TO, "addr_to", sort_addr_to),
+ };
+ 
+ #undef DIM
+@@ -3108,6 +3232,10 @@ static bool get_elide(int idx, FILE *output)
+ 		return __get_elide(symbol_conf.dso_from_list, "dso_from", output);
+ 	case HISTC_DSO_TO:
+ 		return __get_elide(symbol_conf.dso_to_list, "dso_to", output);
++	case HISTC_ADDR_FROM:
++		return __get_elide(symbol_conf.sym_from_list, "addr_from", output);
++	case HISTC_ADDR_TO:
++		return __get_elide(symbol_conf.sym_to_list, "addr_to", output);
+ 	default:
+ 		break;
+ 	}
+diff --git a/tools/perf/util/sort.h b/tools/perf/util/sort.h
+index 7b7145501933..b918a9eda048 100644
+--- a/tools/perf/util/sort.h
++++ b/tools/perf/util/sort.h
+@@ -250,6 +250,8 @@ enum sort_type {
+ 	SORT_SRCLINE_FROM,
+ 	SORT_SRCLINE_TO,
+ 	SORT_SYM_IPC,
++	SORT_ADDR_FROM,
++	SORT_ADDR_TO,
+ 
+ 	/* memory mode specific sort keys */
+ 	__SORT_MEMORY_MODE,
+-- 
+2.34.1
+
