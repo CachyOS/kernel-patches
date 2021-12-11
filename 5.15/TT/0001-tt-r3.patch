@@ -140,10 +140,10 @@ index 978fcfca5871..bfde8e0d851b 100644
  obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o pelt.o
 diff --git a/kernel/sched/bs.c b/kernel/sched/bs.c
 new file mode 100644
-index 000000000000..4f650734b5bb
+index 000000000000..e72b0357a83c
 --- /dev/null
 +++ b/kernel/sched/bs.c
-@@ -0,0 +1,1784 @@
+@@ -0,0 +1,1875 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * TT Scheduler Class (SCHED_NORMAL/SCHED_BATCH)
@@ -174,9 +174,6 @@ index 000000000000..4f650734b5bb
 +
 +unsigned int __read_mostly tt_max_lifetime	= 22000; // in ms
 +int __read_mostly tt_rt_prio			= -20;
-+
-+#define IS_CAND_BL_ENABLED (tt_balancer_opt == TT_BL_CAND)
-+#define IS_GRQ_BL_ENABLED (tt_balancer_opt == TT_BL_GRQ)
 +
 +#define LOCK_GRQ(grf) ({ \
 +	rq_lock_irqsave(grq, &(grf)); \
@@ -1184,6 +1181,35 @@ index 000000000000..4f650734b5bb
 +	return target;
 +}
 +
++static int find_energy_efficient_cpu(struct rq *rq, struct task_struct *p)
++{
++	int target = -1, cpu;
++	struct tt_node *ttn = &p->se.tt_node;
++	unsigned int min = ~0;
++
++	/*
++	 * If type is realtime, interactive, or no type,
++	 * find non idle cpu. Otherwise, use normal balancing
++	 */
++	if (ttn->vruntime > 1 && ttn->task_type > TT_NO_TYPE)
++		return -1;
++
++	for_each_online_cpu(cpu) {
++		if (unlikely(!cpumask_test_cpu(cpu, p->cpus_ptr)))
++			continue;
++
++		if (idle_cpu(cpu))
++			continue;
++
++		if (cpu_rq(cpu)->nr_running < min) {
++			target = cpu;
++			min = cpu_rq(cpu)->nr_running;
++		}
++	}
++
++	return target;
++}
++
 +static int
 +select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 +{
@@ -1195,6 +1221,12 @@ index 000000000000..4f650734b5bb
 +	int new_cpu = prev_cpu;
 +	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
 +	int want_affine = 0;
++
++	if (IS_PWR_BL_ENABLED) {
++		int pe_cpu = find_energy_efficient_cpu(rq, p);
++		if (pe_cpu != -1)
++			return pe_cpu;
++	}
 +
 +	/*
 +	 * required for stable ->cpus_allowed
@@ -1323,6 +1355,34 @@ index 000000000000..4f650734b5bb
 +#endif
 +
 +static int
++can_migrate_task_powersave(struct task_struct *p, struct rq *dst_rq, struct rq *src_rq)
++{
++	int tsk_cache_hot;
++
++	/* Disregard pcpu kthreads; they are where they need to be. */
++	if (kthread_is_per_cpu(p))
++		return 0;
++
++	if (!cpumask_test_cpu(cpu_of(dst_rq), p->cpus_ptr))
++		return 0;
++
++	if (task_running(src_rq, p))
++		return 0;
++
++	tsk_cache_hot = migrate_degrades_locality(p, dst_rq, src_rq);
++	if (tsk_cache_hot == -1)
++		tsk_cache_hot = task_hot(p, dst_rq, src_rq);
++
++	if (tsk_cache_hot > 0)
++		return 0;
++
++	if (p->se.tt_node.task_type < TT_CPU_BOUND)
++		return 0;
++
++	return 1;
++}
++
++static int
 +can_migrate_task(struct task_struct *p, struct rq *dst_rq, struct rq *src_rq)
 +{
 +	int tsk_cache_hot;
@@ -1372,6 +1432,34 @@ index 000000000000..4f650734b5bb
 +	rq_unlock(dist_rq, &rf);
 +
 +	local_irq_restore(src_rf->flags);
++}
++
++static int move_task_powersave(struct rq *dist_rq, struct rq *src_rq,
++			struct rq_flags *src_rf)
++{
++	struct cfs_rq *src_cfs_rq = &src_rq->cfs;
++	struct task_struct *p;
++	struct tt_node *ttn = src_cfs_rq->head;
++
++	while (ttn) {
++		p = task_of(se_of(ttn));
++		if (can_migrate_task_powersave(p, dist_rq, src_rq)) {
++			pull_from(dist_rq, src_rq, src_rf, p);
++			return 1;
++		}
++
++		ttn = ttn->next;
++	}
++
++	/*
++	 * Here we know we have not migrated any task,
++	 * thus, we need to unlock and return 0
++	 * Note: the pull_from does the unlocking for us.
++	 */
++	rq_unlock(src_rq, src_rf);
++	local_irq_restore(src_rf->flags);
++
++	return 0;
 +}
 +
 +static int move_task(struct rq *dist_rq, struct rq *src_rq,
@@ -1590,7 +1678,7 @@ index 000000000000..4f650734b5bb
 +	/*
 +	 * Do not pull tasks towards !active CPUs...
 +	 */
-+	if (!cpu_active(this_cpu))
++	if (IS_PWR_BL_ENABLED || !cpu_active(this_cpu))
 +		return 0;
 +
 +	rq_unpin_lock(this_rq, rf);
@@ -1803,7 +1891,10 @@ index 000000000000..4f650734b5bb
 +		goto out;
 +	}
 +
-+	move_task(min_rq, max_rq, &src_rf);
++	if (IS_PWR_BL_ENABLED && idle_cpu(cpu_of(min_rq)) && max - min == 2)
++		move_task_powersave(min_rq, max_rq, &src_rf);
++	else
++		move_task(min_rq, max_rq, &src_rf);
 +
 +out:
 +#ifdef CONFIG_TT_ACCOUNTING_STATS
@@ -2245,10 +2336,10 @@ index 000000000000..b3d99cf13576
 +#endif
 diff --git a/kernel/sched/bs_nohz.h b/kernel/sched/bs_nohz.h
 new file mode 100644
-index 000000000000..363160c05b83
+index 000000000000..78b1062b121c
 --- /dev/null
 +++ b/kernel/sched/bs_nohz.h
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,882 @@
 +
 +#ifdef CONFIG_NO_HZ_COMMON
 +
@@ -2713,7 +2804,8 @@ index 000000000000..363160c05b83
 +	} else if (IS_GRQ_BL_ENABLED) {
 +		pull_from_grq(this_rq);
 +		return;
-+	}
++	} else if (IS_PWR_BL_ENABLED)
++		return;
 +
 +	for_each_online_cpu(cpu) {
 +		/*
@@ -5399,20 +5491,23 @@ index 000000000000..a0860a283286
 +
 +#endif /* CONFIG_NUMA_BALANCING */
 diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
-index d17b0a5ce6ac..735f177551e2 100644
+index d17b0a5ce6ac..1fe74ec9b019 100644
 --- a/kernel/sched/idle.c
 +++ b/kernel/sched/idle.c
-@@ -261,6 +261,9 @@ static void cpuidle_idle_call(void)
+@@ -261,6 +261,12 @@ static void cpuidle_idle_call(void)
  static void do_idle(void)
  {
  	int cpu = smp_processor_id();
 +#ifdef CONFIG_TT_SCHED
 +	int pm_disabled = per_cpu(nr_lat_sensitive, cpu);
++
++	if (IS_PWR_BL_ENABLED)
++		pm_disabled = 0;
 +#endif
  
  	/*
  	 * Check if we need to update blocked load
-@@ -299,7 +302,11 @@ static void do_idle(void)
+@@ -299,7 +305,11 @@ static void do_idle(void)
  		 * broadcast device expired for us, we don't want to go deep
  		 * idle as we know that the IPI is going to arrive right away.
  		 */
@@ -5426,10 +5521,10 @@ index d17b0a5ce6ac..735f177551e2 100644
  			cpu_idle_poll();
  		} else {
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 4f432826933d..68ad8d71337d 100644
+index 4f432826933d..23cba09fdb00 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -85,6 +85,19 @@
+@@ -85,6 +85,24 @@
  # define SCHED_WARN_ON(x)	({ (void)(x), 0; })
  #endif
  
@@ -5443,13 +5538,18 @@ index 4f432826933d..68ad8d71337d 100644
 +#define TT_BL_NORM	0
 +#define TT_BL_CAND	1
 +#define TT_BL_GRQ	2
++#define TT_BL_PWR	3
 +extern struct rq *grq;
++
++#define IS_CAND_BL_ENABLED (tt_balancer_opt == TT_BL_CAND)
++#define IS_GRQ_BL_ENABLED (tt_balancer_opt == TT_BL_GRQ)
++#define IS_PWR_BL_ENABLED (tt_balancer_opt == TT_BL_PWR)
 +#endif
 +
  struct rq;
  struct cpuidle_state;
  
-@@ -198,6 +211,15 @@ static inline int task_has_dl_policy(struct task_struct *p)
+@@ -198,6 +216,15 @@ static inline int task_has_dl_policy(struct task_struct *p)
  	return dl_policy(p->policy);
  }
  
@@ -5465,7 +5565,7 @@ index 4f432826933d..68ad8d71337d 100644
  #define cap_scale(v, s) ((v)*(s) >> SCHED_CAPACITY_SHIFT)
  
  static inline void update_avg(u64 *avg, u64 sample)
-@@ -551,9 +573,14 @@ struct cfs_rq {
+@@ -551,9 +578,14 @@ struct cfs_rq {
  	 * It is set to NULL otherwise (i.e when none are currently running).
  	 */
  	struct sched_entity	*curr;
@@ -5480,7 +5580,7 @@ index 4f432826933d..68ad8d71337d 100644
  
  #ifdef	CONFIG_SCHED_DEBUG
  	unsigned int		nr_spread_over;
-@@ -978,6 +1005,10 @@ struct rq {
+@@ -978,6 +1010,10 @@ struct rq {
  	struct task_struct	*idle;
  	struct task_struct	*stop;
  	unsigned long		next_balance;
@@ -5491,7 +5591,7 @@ index 4f432826933d..68ad8d71337d 100644
  	struct mm_struct	*prev_mm;
  
  	unsigned int		clock_update_flags;
-@@ -1782,6 +1813,9 @@ DECLARE_PER_CPU(struct sched_domain_shared __rcu *, sd_llc_shared);
+@@ -1782,6 +1818,9 @@ DECLARE_PER_CPU(struct sched_domain_shared __rcu *, sd_llc_shared);
  DECLARE_PER_CPU(struct sched_domain __rcu *, sd_numa);
  DECLARE_PER_CPU(struct sched_domain __rcu *, sd_asym_packing);
  DECLARE_PER_CPU(struct sched_domain __rcu *, sd_asym_cpucapacity);
@@ -5501,7 +5601,7 @@ index 4f432826933d..68ad8d71337d 100644
  extern struct static_key_false sched_asym_cpucapacity;
  
  struct sched_group_capacity {
-@@ -2253,6 +2287,10 @@ extern void update_group_capacity(struct sched_domain *sd, int cpu);
+@@ -2253,6 +2292,10 @@ extern void update_group_capacity(struct sched_domain *sd, int cpu);
  
  extern void trigger_load_balance(struct rq *rq);
  
@@ -5512,7 +5612,7 @@ index 4f432826933d..68ad8d71337d 100644
  extern void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
  
  static inline struct task_struct *get_push_task(struct rq *rq)
-@@ -2397,6 +2435,10 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+@@ -2397,6 +2440,10 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
  
  extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
  
@@ -6449,21 +6549,22 @@ index 000000000000..7aa1e8936be4
 +#endif
 +
 diff --git a/kernel/sysctl.c b/kernel/sysctl.c
-index 083be6af29d7..20eaa6e451de 100644
+index 083be6af29d7..a3d91c5c2a98 100644
 --- a/kernel/sysctl.c
 +++ b/kernel/sysctl.c
-@@ -113,6 +113,10 @@
+@@ -113,6 +113,11 @@
  static int sixty = 60;
  #endif
  
 +#ifdef CONFIG_TT_SCHED
 +static int neg_twenty	= -20;
 +static int nineteen	= 19;
++static unsigned long three = 3;
 +#endif
  static int __maybe_unused neg_one = -1;
  static int __maybe_unused two = 2;
  static int __maybe_unused four = 4;
-@@ -1778,6 +1782,40 @@ static struct ctl_table kern_table[] = {
+@@ -1778,6 +1783,40 @@ static struct ctl_table kern_table[] = {
  		.mode		= 0644,
  		.proc_handler	= proc_dointvec,
  	},
@@ -6475,7 +6576,7 @@ index 083be6af29d7..20eaa6e451de 100644
 +		.mode		= 0644,
 +		.proc_handler	= proc_dointvec_minmax,
 +		.extra1		= &zero_ul,
-+		.extra2		= &two,
++		.extra2		= &three,
 +	},
 +	{
 +		.procname	= "sched_tt_grq_balance_ms",
