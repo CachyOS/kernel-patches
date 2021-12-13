@@ -1,0 +1,673 @@
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 9725c546a0d46db7eda7b138f34511af5558d453..3618c80582f0cd41d9039465c6f9fa9152ea763c 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -6193,6 +6193,22 @@
+ 			  P	Enable page structure init time poisoning
+ 			  -	Disable all of the above options
+ 
++	vm_unevictable_file_kbytes_low=nn[KMG]	[KNL]
++		Keep some file pages still mapped under memory pressure,
++		value defines a threshold to activate file pages eviction throttling.
++
++	vm_unevictable_file_kbytes_min=nn[KMG]	[KNL]
++		Keep some file pages still mapped under memory pressure,
++		value defines a hard limit.
++
++	vm_unevictable_anon_kbytes_low=nn[KMG]	[KNL]
++		Keep some anonymous pages under memory pressure,
++		value defines a threshold to throttle swapping of anonymous pages.
++
++	vm_unevictable_anon_kbytes_min=nn[KMG]	[KNL]
++		Keep some anonymous pages under memory pressure,
++		value defines a hard limit.
++
+ 	vmalloc=nn[KMG]	[KNL,BOOT] Forces the vmalloc area to have an exact
+ 			size of <nn>. This can be used to increase the
+ 			minimum size (128MB on x86). It can also be used to
+diff --git a/Documentation/admin-guide/sysctl/vm.rst b/Documentation/admin-guide/sysctl/vm.rst
+index 5e795202111f2fb206851701bafbaaec7100d8bc..5c69841a8cfe54a15c4495f1685f2dd0ca3f0ab2 100644
+--- a/Documentation/admin-guide/sysctl/vm.rst
++++ b/Documentation/admin-guide/sysctl/vm.rst
+@@ -68,6 +68,10 @@ Currently, these files are in /proc/sys/vm:
+ - stat_refresh
+ - numa_stat
+ - swappiness
++- unevictable_file_kbytes_low
++- unevictable_file_kbytes_min
++- unevictable_anon_kbytes_low
++- unevictable_anon_kbytes_min
+ - unprivileged_userfaultfd
+ - user_reserve_kbytes
+ - vfs_cache_pressure
+@@ -881,6 +885,48 @@ calls without any restrictions.
+ The default value is 0.
+ 
+ 
++unevictable_file_kbytes_low
++===========================
++
++Keep some file pages still mapped under memory pressure to avoid potential
++disk thrashing that may occur due to evicting running executables code.
++This implements soft eviction throttling, and some file pages can still
++be discarded.
++
++Setting it to 0 effectively disables this feature.
++
++
++unevictable_file_kbytes_min
++===========================
++
++Keep all file pages still mapped under memory pressure to avoid potential
++disk thrashing that may occur due to evicting running executables code.
++This is the hard limit.
++
++Setting it to 0 effectively disables this feature.
++
++
++unevictable_anon_kbytes_low
++===========================
++
++Keep some anonymous pages still mapped under memory pressure to avoid
++potential stalls that may occur due to swapping.
++This implements soft swapping throttling, and some anonymous pages can
++still be swapped out.
++
++Setting it to 0 effectively disables this feature.
++
++
++unevictable_anon_kbytes_min
++===========================
++
++Keep all anonymous pages still mapped under memory pressure to avoid
++potential stalls that may occur due to swapping.
++This is the hard limit.
++
++Setting it to 0 effectively disables this feature.
++
++
+ user_reserve_kbytes
+ ===================
+ 
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 58e744b78c2c1f22a9142c2d5c221c83851f817f..936dc0b6c226a0a7f130b55e4bed189fdb1960bd 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -277,6 +277,7 @@ enum vmscan_throttle_state {
+ 	VMSCAN_THROTTLE_WRITEBACK,
+ 	VMSCAN_THROTTLE_ISOLATED,
+ 	VMSCAN_THROTTLE_NOPROGRESS,
++	VMSCAN_THROTTLE_CONGESTED,
+ 	NR_VMSCAN_THROTTLE,
+ };
+ 
+diff --git a/include/trace/events/vmscan.h b/include/trace/events/vmscan.h
+index f25a6149d3ba56517ad42781eef1bf3b33f27e29..ca2e9009a651294997e146a645295ee246358d4f 100644
+--- a/include/trace/events/vmscan.h
++++ b/include/trace/events/vmscan.h
+@@ -30,12 +30,14 @@
+ #define _VMSCAN_THROTTLE_WRITEBACK	(1 << VMSCAN_THROTTLE_WRITEBACK)
+ #define _VMSCAN_THROTTLE_ISOLATED	(1 << VMSCAN_THROTTLE_ISOLATED)
+ #define _VMSCAN_THROTTLE_NOPROGRESS	(1 << VMSCAN_THROTTLE_NOPROGRESS)
++#define _VMSCAN_THROTTLE_CONGESTED	(1 << VMSCAN_THROTTLE_CONGESTED)
+ 
+ #define show_throttle_flags(flags)						\
+ 	(flags) ? __print_flags(flags, "|",					\
+ 		{_VMSCAN_THROTTLE_WRITEBACK,	"VMSCAN_THROTTLE_WRITEBACK"},	\
+ 		{_VMSCAN_THROTTLE_ISOLATED,	"VMSCAN_THROTTLE_ISOLATED"},	\
+-		{_VMSCAN_THROTTLE_NOPROGRESS,	"VMSCAN_THROTTLE_NOPROGRESS"}	\
++		{_VMSCAN_THROTTLE_NOPROGRESS,	"VMSCAN_THROTTLE_NOPROGRESS"},	\
++		{_VMSCAN_THROTTLE_CONGESTED,	"VMSCAN_THROTTLE_CONGESTED"}	\
+ 		) : "VMSCAN_THROTTLE_NONE"
+ 
+ 
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 42aa3c7835b96d7a3eff607c356e9b63a966ef8f..78c22ea487d4b8bc6da6b9e68c067f9413ea6293 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -2733,6 +2733,92 @@ static struct ctl_table kern_table[] = {
+ 	{ }
+ };
+ 
++#if defined(CONFIG_UNEVICTABLE_FILE)
++extern unsigned long vm_unevictable_file_kbytes_low;
++extern unsigned long vm_unevictable_file_kbytes_min;
++
++static int vm_unevictable_file_kbytes_low_handler(struct ctl_table *table, int write,
++						  void *buffer, size_t *length, loff_t *ppos)
++{
++	int rc;
++
++	rc = proc_doulongvec_minmax(table, write, buffer, length, ppos);
++	if (rc)
++		return rc;
++
++	if (write) {
++		if (vm_unevictable_file_kbytes_low <
++		    vm_unevictable_file_kbytes_min)
++		    vm_unevictable_file_kbytes_min =
++		    vm_unevictable_file_kbytes_low;
++	}
++
++	return 0;
++}
++
++static int vm_unevictable_file_kbytes_min_handler(struct ctl_table *table, int write,
++						  void *buffer, size_t *length, loff_t *ppos)
++{
++	int rc;
++
++	rc = proc_doulongvec_minmax(table, write, buffer, length, ppos);
++	if (rc)
++		return rc;
++
++	if (write) {
++		if (vm_unevictable_file_kbytes_min >
++		    vm_unevictable_file_kbytes_low)
++		    vm_unevictable_file_kbytes_low =
++		    vm_unevictable_file_kbytes_min;
++	}
++
++	return 0;
++}
++#endif /* CONFIG_UNEVICTABLE_FILE */
++
++#if defined(CONFIG_UNEVICTABLE_ANON)
++extern unsigned long vm_unevictable_anon_kbytes_low;
++extern unsigned long vm_unevictable_anon_kbytes_min;
++
++static int vm_unevictable_anon_kbytes_low_handler(struct ctl_table *table, int write,
++						  void *buffer, size_t *length, loff_t *ppos)
++{
++	int rc;
++
++	rc = proc_doulongvec_minmax(table, write, buffer, length, ppos);
++	if (rc)
++		return rc;
++
++	if (write) {
++		if (vm_unevictable_anon_kbytes_low <
++		    vm_unevictable_anon_kbytes_min)
++		    vm_unevictable_anon_kbytes_min =
++		    vm_unevictable_anon_kbytes_low;
++	}
++
++	return 0;
++}
++
++static int vm_unevictable_anon_kbytes_min_handler(struct ctl_table *table, int write,
++						  void *buffer, size_t *length, loff_t *ppos)
++{
++	int rc;
++
++	rc = proc_doulongvec_minmax(table, write, buffer, length, ppos);
++	if (rc)
++		return rc;
++
++	if (write) {
++		if (vm_unevictable_anon_kbytes_min >
++		    vm_unevictable_anon_kbytes_low)
++		    vm_unevictable_anon_kbytes_low =
++		    vm_unevictable_anon_kbytes_min;
++	}
++
++	return 0;
++}
++#endif /* CONFIG_UNEVICTABLE_ANON */
++
+ static struct ctl_table vm_table[] = {
+ 	{
+ 		.procname	= "overcommit_memory",
+@@ -3190,6 +3276,42 @@ static struct ctl_table vm_table[] = {
+ 		.extra2		= SYSCTL_ONE,
+ 	},
+ #endif
++#if defined(CONFIG_UNEVICTABLE_FILE)
++	{
++		.procname	= "unevictable_file_kbytes_low",
++		.data		= &vm_unevictable_file_kbytes_low,
++		.maxlen		= sizeof(vm_unevictable_file_kbytes_low),
++		.mode		= 0644,
++		.proc_handler	= vm_unevictable_file_kbytes_low_handler,
++		.extra1		= &zero_ul,
++	},
++	{
++		.procname	= "unevictable_file_kbytes_min",
++		.data		= &vm_unevictable_file_kbytes_min,
++		.maxlen		= sizeof(vm_unevictable_file_kbytes_min),
++		.mode		= 0644,
++		.proc_handler	= vm_unevictable_file_kbytes_min_handler,
++		.extra1		= &zero_ul,
++	},
++#endif /* CONFIG_UNEVICTABLE_FILE */
++#if defined(CONFIG_UNEVICTABLE_ANON)
++	{
++		.procname	= "unevictable_anon_kbytes_low",
++		.data		= &vm_unevictable_anon_kbytes_low,
++		.maxlen		= sizeof(vm_unevictable_anon_kbytes_low),
++		.mode		= 0644,
++		.proc_handler	= vm_unevictable_anon_kbytes_low_handler,
++		.extra1		= &zero_ul,
++	},
++	{
++		.procname	= "unevictable_anon_kbytes_min",
++		.data		= &vm_unevictable_anon_kbytes_min,
++		.maxlen		= sizeof(vm_unevictable_anon_kbytes_min),
++		.mode		= 0644,
++		.proc_handler	= vm_unevictable_anon_kbytes_min_handler,
++		.extra1		= &zero_ul,
++	},
++#endif /* CONFIG_UNEVICTABLE_ANON */
+ 	{ }
+ };
+ 
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 28edafc820adfc9b434cbc76fbb774992a45ff5b..061bc9eafda9cabeb3596b5d790e4c1b1e8deb25 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -47,6 +47,69 @@ config SPARSEMEM_MANUAL
+ 
+ endchoice
+ 
++config UNEVICTABLE_FILE
++	bool "Keep some file pages under memory pressure"
++	def_bool n
++	help
++	  Keep some file pages still mapped under memory pressure
++	  to avoid potential disk thrashing that may occur due to
++	  evicting running executables code.
++
++	  The UNEVICTABLE_FILE_KBYTES_LOW value defines a threshold
++	  to activate file pages eviction throttling.
++	  The vm.unevictable_file_kbytes_low sysctl knob is used to
++	  change the amount in the runtime (setting it to 0
++	  effectively disables this feature).
++
++	  The UNEVICTABLE_FILE_KBYTES_MIN value sets the amount of
++	  pages to keep as a hard limit.
++	  The vm.unevictable_file_kbytes_min sysctl knob is used to
++	  change the amount in the runtime (setting it to 0
++	  effectively disables this feature).
++
++	  See also: Documentation/admin-guide/sysctl/vm.rst
++
++config UNEVICTABLE_FILE_KBYTES_LOW
++	int "Default value for vm.unevictable_file_kbytes_low"
++	depends on UNEVICTABLE_FILE
++	default "0"
++
++config UNEVICTABLE_FILE_KBYTES_MIN
++	int "Default value for vm.unevictable_file_kbytes_min"
++	depends on UNEVICTABLE_FILE
++	default "0"
++
++config UNEVICTABLE_ANON
++	bool "Keep some anonymous pages under memory pressure"
++	def_bool n
++	help
++	  Keep some anonymous pages still mapped under memory pressure
++	  to avoid potential stalls that may occur due to swapping.
++
++	  The UNEVICTABLE_ANON_KBYTES_LOW value defines a threshold
++	  to throttle swapping of anonymous pages.
++	  The vm.unevictable_anon_kbytes_low sysctl knob is used to
++	  change the amount in the runtime (setting it to 0
++	  effectively disables this feature).
++
++	  The UNEVICTABLE_ANON_KBYTES_MIN value sets the amount of
++	  pages to keep as a hard limit.
++	  The vm.unevictable_anon_kbytes_min sysctl knob is used to
++	  change the amount in the runtime (setting it to 0
++	  effectively disables this feature).
++
++	  See also: Documentation/admin-guide/sysctl/vm.rst
++
++config UNEVICTABLE_ANON_KBYTES_LOW
++	int "Default value for vm.unevictable_anon_kbytes_low"
++	depends on UNEVICTABLE_ANON
++	default "0"
++
++config UNEVICTABLE_ANON_KBYTES_MIN
++	int "Default value for vm.unevictable_anon_kbytes_min"
++	depends on UNEVICTABLE_ANON
++	default "0"
++
+ config SPARSEMEM
+ 	def_bool y
+ 	depends on (!SELECT_MEMORY_MODEL && ARCH_SPARSEMEM_ENABLE) || SPARSEMEM_MANUAL
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index fb9584641ac7f71dbe6d992029203dc599356b05..a18e91687dd8954e4671b2d3e67fc0df4384bc10 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -119,9 +119,25 @@ struct scan_control {
+ 	/* There is easily reclaimable cold cache in the current node */
+ 	unsigned int cache_trim_mode:1;
+ 
++#if defined(CONFIG_UNEVICTABLE_FILE)
++	/* The file pages on the current node are low */
++	unsigned int file_is_low:1;
++
++	/* The file pages on the current node are minimal */
++	unsigned int file_is_min:1;
++#endif
++
+ 	/* The file pages on the current node are dangerously low */
+ 	unsigned int file_is_tiny:1;
+ 
++#if defined(CONFIG_UNEVICTABLE_ANON)
++	/* The anonymous pages on the current node are low */
++	unsigned int anon_is_low:1;
++
++	/* The anonymous pages on the current node are minimal */
++	unsigned int anon_is_min:1;
++#endif
++
+ 	/* Always discard instead of demoting to lower tier memory */
+ 	unsigned int no_demotion:1;
+ 
+@@ -171,6 +187,78 @@ struct scan_control {
+ #define prefetchw_prev_lru_page(_page, _base, _field) do { } while (0)
+ #endif
+ 
++#if defined(CONFIG_UNEVICTABLE_FILE)
++#if CONFIG_UNEVICTABLE_FILE_KBYTES_LOW < 0
++#error "CONFIG_UNEVICTABLE_FILE_KBYTES_LOW must be >= 0"
++#endif
++#if CONFIG_UNEVICTABLE_FILE_KBYTES_MIN < 0
++#error "CONFIG_UNEVICTABLE_FILE_KBYTES_MIN must be >= 0"
++#endif
++#if CONFIG_UNEVICTABLE_FILE_KBYTES_LOW < CONFIG_UNEVICTABLE_FILE_KBYTES_MIN
++#error "CONFIG_UNEVICTABLE_FILE_KBYTES_LOW must be >= CONFIG_UNEVICTABLE_FILE_KBYTES_MIN"
++#endif
++unsigned long vm_unevictable_file_kbytes_low __read_mostly =
++	CONFIG_UNEVICTABLE_FILE_KBYTES_LOW;
++unsigned long vm_unevictable_file_kbytes_min __read_mostly =
++	CONFIG_UNEVICTABLE_FILE_KBYTES_MIN;
++
++static int __init vm_unevictable_file_kbytes_low_setup(char *str)
++{
++	vm_unevictable_file_kbytes_low = memparse(str, NULL) >> 10;
++	if (vm_unevictable_file_kbytes_low < vm_unevictable_file_kbytes_min)
++	    vm_unevictable_file_kbytes_min = vm_unevictable_file_kbytes_low;
++
++	return 1;
++}
++__setup("vm_unevictable_file_kbytes_low=", vm_unevictable_file_kbytes_low_setup);
++
++static int __init vm_unevictable_file_kbytes_min_setup(char *str)
++{
++	vm_unevictable_file_kbytes_min = memparse(str, NULL) >> 10;
++	if (vm_unevictable_file_kbytes_min > vm_unevictable_file_kbytes_low)
++	    vm_unevictable_file_kbytes_low = vm_unevictable_file_kbytes_min;
++
++	return 1;
++}
++__setup("vm_unevictable_file_kbytes_min=", vm_unevictable_file_kbytes_min_setup);
++#endif /* CONFIG_UNEVICTABLE_FILE */
++
++#if defined(CONFIG_UNEVICTABLE_ANON)
++#if CONFIG_UNEVICTABLE_ANON_KBYTES_LOW < 0
++#error "CONFIG_UNEVICTABLE_ANON_KBYTES_LOW must be >= 0"
++#endif
++#if CONFIG_UNEVICTABLE_ANON_KBYTES_MIN < 0
++#error "CONFIG_UNEVICTABLE_ANON_KBYTES_MIN must be >= 0"
++#endif
++#if CONFIG_UNEVICTABLE_ANON_KBYTES_LOW < CONFIG_UNEVICTABLE_ANON_KBYTES_MIN
++#error "CONFIG_UNEVICTABLE_ANON_KBYTES_LOW must be >= CONFIG_UNEVICTABLE_ANON_KBYTES_MIN"
++#endif
++unsigned long vm_unevictable_anon_kbytes_low __read_mostly =
++	CONFIG_UNEVICTABLE_ANON_KBYTES_LOW;
++unsigned long vm_unevictable_anon_kbytes_min __read_mostly =
++	CONFIG_UNEVICTABLE_ANON_KBYTES_MIN;
++
++static int __init vm_unevictable_anon_kbytes_low_setup(char *str)
++{
++	vm_unevictable_anon_kbytes_low = memparse(str, NULL) >> 10;
++	if (vm_unevictable_anon_kbytes_low < vm_unevictable_anon_kbytes_min)
++	    vm_unevictable_anon_kbytes_min = vm_unevictable_anon_kbytes_low;
++
++	return 1;
++}
++__setup("vm_unevictable_anon_kbytes_low=", vm_unevictable_anon_kbytes_low_setup);
++
++static int __init vm_unevictable_anon_kbytes_min_setup(char *str)
++{
++	vm_unevictable_anon_kbytes_min = memparse(str, NULL) >> 10;
++	if (vm_unevictable_anon_kbytes_min > vm_unevictable_anon_kbytes_low)
++	    vm_unevictable_anon_kbytes_low = vm_unevictable_anon_kbytes_min;
++
++	return 1;
++}
++__setup("vm_unevictable_anon_kbytes_min=", vm_unevictable_anon_kbytes_min_setup);
++#endif /* CONFIG_UNEVICTABLE_ANON */
++
+ /*
+  * From 0 .. 200.  Higher means more swappy.
+  */
+@@ -1021,6 +1109,39 @@ static void handle_write_error(struct address_space *mapping,
+ 	unlock_page(page);
+ }
+ 
++static bool skip_throttle_noprogress(pg_data_t *pgdat)
++{
++	int reclaimable = 0, write_pending = 0;
++	int i;
++
++	/*
++	 * If kswapd is disabled, reschedule if necessary but do not
++	 * throttle as the system is likely near OOM.
++	 */
++	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES)
++		return true;
++
++	/*
++	 * If there are a lot of dirty/writeback pages then do not
++	 * throttle as throttling will occur when the pages cycle
++	 * towards the end of the LRU if still under writeback.
++	 */
++	for (i = 0; i < MAX_NR_ZONES; i++) {
++		struct zone *zone = pgdat->node_zones + i;
++
++		if (!populated_zone(zone))
++			continue;
++
++		reclaimable += zone_reclaimable_pages(zone);
++		write_pending += zone_page_state_snapshot(zone,
++						  NR_ZONE_WRITE_PENDING);
++	}
++	if (2 * write_pending <= reclaimable)
++		return true;
++
++	return false;
++}
++
+ void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason)
+ {
+ 	wait_queue_head_t *wqh = &pgdat->reclaim_wait[reason];
+@@ -1056,8 +1177,16 @@ void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason)
+ 		}
+ 
+ 		break;
++	case VMSCAN_THROTTLE_CONGESTED:
++		fallthrough;
+ 	case VMSCAN_THROTTLE_NOPROGRESS:
+-		timeout = HZ/2;
++		if (skip_throttle_noprogress(pgdat)) {
++			cond_resched();
++			return;
++		}
++
++		timeout = 1;
++
+ 		break;
+ 	case VMSCAN_THROTTLE_ISOLATED:
+ 		timeout = HZ/50;
+@@ -2877,6 +3006,23 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+ 			BUG();
+ 		}
+ 
++#if defined(CONFIG_UNEVICTABLE_FILE)
++		if (file && scan) {
++			if (sc->file_is_low)
++				scan = min(scan, SWAP_CLUSTER_MAX >> sc->priority);
++			else if (sc->file_is_min)
++				scan = 0;
++		}
++#endif
++#if defined(CONFIG_UNEVICTABLE_ANON)
++		if (!file && scan) {
++			if (sc->anon_is_low)
++				scan = min(scan, SWAP_CLUSTER_MAX >> sc->priority);
++			else if (sc->anon_is_min)
++				scan = 0;
++		}
++#endif
++
+ 		nr[lru] = scan;
+ 	}
+ }
+@@ -3139,6 +3285,10 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
+ }
+ 
++#if defined(CONFIG_UNEVICTABLE_FILE) || defined(CONFIG_UNEVICTABLE_ANON)
++#define K(x) ((x) << (PAGE_SHIFT - 10))
++#endif
++
+ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ {
+ 	struct reclaim_state *reclaim_state = current->reclaim_state;
+@@ -3222,11 +3372,26 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 	if (!cgroup_reclaim(sc)) {
+ 		unsigned long total_high_wmark = 0;
+ 		unsigned long free, anon;
++#if defined(CONFIG_UNEVICTABLE_FILE)
++		unsigned long reclaimable_file, clean_file, dirty_file;
++#endif
++#if defined(CONFIG_UNEVICTABLE_ANON)
++		unsigned long reclaimable_anon;
++#endif
+ 		int z;
+ 
+ 		free = sum_zone_node_page_state(pgdat->node_id, NR_FREE_PAGES);
+ 		file = node_page_state(pgdat, NR_ACTIVE_FILE) +
+ 			   node_page_state(pgdat, NR_INACTIVE_FILE);
++#if defined(CONFIG_UNEVICTABLE_FILE)
++		reclaimable_file = file + node_page_state(pgdat, NR_ISOLATED_FILE);
++		dirty_file = node_page_state(pgdat, NR_FILE_DIRTY);
++#endif
++#if defined(CONFIG_UNEVICTABLE_ANON)
++		reclaimable_anon = node_page_state(pgdat, NR_ACTIVE_ANON) +
++				   node_page_state(pgdat, NR_INACTIVE_ANON) +
++				   node_page_state(pgdat, NR_ISOLATED_ANON);
++#endif
+ 
+ 		for (z = 0; z < MAX_NR_ZONES; z++) {
+ 			struct zone *zone = &pgdat->node_zones[z];
+@@ -3247,6 +3412,32 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 			file + free <= total_high_wmark &&
+ 			!(sc->may_deactivate & DEACTIVATE_ANON) &&
+ 			anon >> sc->priority;
++
++#if defined(CONFIG_UNEVICTABLE_FILE)
++		/*
++		 * node_page_state() sum can go out of sync since
++		 * all the values are not read at once
++		 */
++		if (unlikely(reclaimable_file < dirty_file))
++			/*
++			 * in this case assume the system does not have
++			 * clean file pages anymore
++			 */
++			clean_file = 0;
++		else
++			clean_file = reclaimable_file - dirty_file;
++
++		sc->file_is_low = K(clean_file) < vm_unevictable_file_kbytes_low &&
++			          K(clean_file) > vm_unevictable_file_kbytes_min;
++
++		sc->file_is_min = K(clean_file) <= vm_unevictable_file_kbytes_min;
++#endif
++#if defined(CONFIG_UNEVICTABLE_ANON)
++		sc->anon_is_low = K(reclaimable_anon) < vm_unevictable_anon_kbytes_low &&
++				  K(reclaimable_anon) > vm_unevictable_anon_kbytes_min;
++
++		sc->anon_is_min = K(reclaimable_anon) <= vm_unevictable_anon_kbytes_min;
++#endif
+ 	}
+ 
+ 	shrink_node_memcgs(pgdat, sc);
+@@ -3321,7 +3512,7 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ 	if (!current_is_kswapd() && current_may_throttle() &&
+ 	    !sc->hibernation_mode &&
+ 	    test_bit(LRUVEC_CONGESTED, &target_lruvec->flags))
+-		reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
++		reclaim_throttle(pgdat, VMSCAN_THROTTLE_CONGESTED);
+ 
+ 	if (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
+ 				    sc))
+@@ -3386,16 +3577,16 @@ static void consider_reclaim_throttle(pg_data_t *pgdat, struct scan_control *sc)
+ 	}
+ 
+ 	/*
+-	 * Do not throttle kswapd on NOPROGRESS as it will throttle on
+-	 * VMSCAN_THROTTLE_WRITEBACK if there are too many pages under
+-	 * writeback and marked for immediate reclaim at the tail of
+-	 * the LRU.
++	 * Do not throttle kswapd or cgroup reclaim on NOPROGRESS as it will
++	 * throttle on VMSCAN_THROTTLE_WRITEBACK if there are too many pages
++	 * under writeback and marked for immediate reclaim at the tail of the
++	 * LRU.
+ 	 */
+-	if (current_is_kswapd())
++	if (current_is_kswapd() || cgroup_reclaim(sc))
+ 		return;
+ 
+ 	/* Throttle if making no progress at high prioities. */
+-	if (sc->priority < DEF_PRIORITY - 2)
++	if (sc->priority == 1 && !sc->nr_reclaimed)
+ 		reclaim_throttle(pgdat, VMSCAN_THROTTLE_NOPROGRESS);
+ }
+ 
+@@ -3415,6 +3606,7 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
+ 	unsigned long nr_soft_scanned;
+ 	gfp_t orig_mask;
+ 	pg_data_t *last_pgdat = NULL;
++	pg_data_t *first_pgdat = NULL;
+ 
+ 	/*
+ 	 * If the number of buffer_heads in the machine exceeds the maximum
+@@ -3478,14 +3670,18 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
+ 			/* need some check for avoid more shrink_zone() */
+ 		}
+ 
++		if (!first_pgdat)
++			first_pgdat = zone->zone_pgdat;
++
+ 		/* See comment about same check for global reclaim above */
+ 		if (zone->zone_pgdat == last_pgdat)
+ 			continue;
+ 		last_pgdat = zone->zone_pgdat;
+ 		shrink_node(zone->zone_pgdat, sc);
+-		consider_reclaim_throttle(zone->zone_pgdat, sc);
+ 	}
+ 
++	consider_reclaim_throttle(first_pgdat, sc);
++
+ 	/*
+ 	 * Restore to original mask to avoid the impact on the caller if we
+ 	 * promoted it to __GFP_HIGHMEM.
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index a18e91687dd8954e4671b2d3e67fc0df4384bc10..a998612031f8b84bd7d5011102f34f5d3511da87 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3680,7 +3680,8 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
+ 		shrink_node(zone->zone_pgdat, sc);
+ 	}
+
+-	consider_reclaim_throttle(first_pgdat, sc);
++	if (first_pgdat)
++		consider_reclaim_throttle(first_pgdat, sc);
+
+ 	/*
+ 	 * Restore to original mask to avoid the impact on the caller if we
