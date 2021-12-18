@@ -1,0 +1,2026 @@
+From 7fc38f0a326fdb3a75fb785305d5174a0723b114 Mon Sep 17 00:00:00 2001
+From: "P. Jung" <ptr1337@cachyos.org>
+Date: Sat, 18 Dec 2021 18:06:53 +0100
+Subject: [PATCH] mm-cow
+
+Signed-off-by: P. Jung <ptr1337@cachyos.org>
+---
+ Documentation/locking/seqlock.rst         |  50 ++++
+ include/linux/huge_mm.h                   |  72 +++++
+ include/linux/mm.h                        |  14 +
+ include/linux/mm_types.h                  |   9 +
+ include/linux/seqlock.h                   | 145 +++++++---
+ mm/gup.c                                  |  89 +++++-
+ mm/huge_memory.c                          | 120 +++++++--
+ mm/hugetlb.c                              | 129 +++++++--
+ mm/memory.c                               | 136 ++++++++--
+ mm/rmap.c                                 |  40 +--
+ mm/swapfile.c                             |  35 ++-
+ mm/util.c                                 |  24 +-
+ tools/testing/selftests/vm/Makefile       |   1 +
+ tools/testing/selftests/vm/gup_cow.c      | 312 ++++++++++++++++++++++
+ tools/testing/selftests/vm/run_vmtests.sh |  16 ++
+ 15 files changed, 1044 insertions(+), 148 deletions(-)
+ create mode 100644 tools/testing/selftests/vm/gup_cow.c
+
+diff --git a/Documentation/locking/seqlock.rst b/Documentation/locking/seqlock.rst
+index 64405e5da63e..6f66ae29cc07 100644
+--- a/Documentation/locking/seqlock.rst
++++ b/Documentation/locking/seqlock.rst
+@@ -87,6 +87,56 @@ Read path::
+ 	} while (read_seqcount_retry(&foo_seqcount, seq));
+ 
+ 
++Raw sequence counters (``raw_seqcount_t``)
++==========================================
++
++This is the raw counting mechanism, which does not protect against multiple
++writers and does not perform any lockdep tracking.  Write side critical sections
++must thus be serialized by an external lock.
++
++It is primary useful when a fixed, minimal sequence counter size is
++required and the lockdep overhead cannot be tolerated or is unused.
++Prefer using a :ref:`seqcount_t`, a :ref:`seqlock_t` or a
++:ref:`seqcount_locktype_t` if possible.
++
++The raw sequence counter is very similar to the :ref:`seqcount_t`, however,
++it can only be used with functions that don't perform any implicit lockdep
++tracking: primarily the *raw* function variants.
++
++Initialization::
++
++	/* dynamic */
++	raw_seqcount_t foo_seqcount;
++	raw_seqcount_init(&foo_seqcount);
++
++	/* static */
++	static raw_seqcount_t foo_seqcount = RAW_SEQCNT_ZERO(foo_seqcount);
++
++	/* C99 struct init */
++	struct {
++		.seq   = RAW_SEQCNT_ZERO(foo.seq),
++	} foo;
++
++Write path::
++
++	/* Serialized context with disabled preemption */
++
++	raw_write_seqcount_begin(&foo_seqcount);
++
++	/* ... [[write-side critical section]] ... */
++
++	raw_write_seqcount_end(&foo_seqcount);
++
++Read path::
++
++	do {
++		seq = raw_read_seqcount_begin(&foo_seqcount);
++
++		/* ... [[read-side critical section]] ... */
++
++	} while (raw_read_seqcount_retry(&foo_seqcount, seq));
++
++
+ .. _seqcount_locktype_t:
+ 
+ Sequence counters with associated locks (``seqcount_LOCKNAME_t``)
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index f123e15d966e..9c3dbeceb487 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -327,6 +327,51 @@ static inline struct list_head *page_deferred_list(struct page *page)
+ 	return &page[2].deferred_list;
+ }
+ 
++static inline void thp_mapcount_seqcount_init(struct page *page)
++{
++	raw_seqcount_init(&page[1].mapcount_seqcount);
++}
++
++static inline unsigned int thp_mapcount_read_begin(struct page *page)
++{
++	VM_BUG_ON_PAGE(PageTail(page), page);
++	return raw_read_seqcount_begin(&page[1].mapcount_seqcount);
++}
++
++static inline bool thp_mapcount_read_retry(struct page *page,
++					   unsigned int seqcount)
++{
++	VM_BUG_ON_PAGE(PageTail(page), page);
++	if (!raw_read_seqcount_retry(&page[1].mapcount_seqcount, seqcount))
++		return false;
++	cpu_relax();
++	return true;
++}
++
++static inline void thp_mapcount_lock(struct page *page,
++				     unsigned long *irq_flags)
++{
++	VM_BUG_ON_PAGE(PageTail(page), page);
++	/*
++	 * Prevent deadlocks in thp_mapcount_read_begin() if it is called in IRQ
++	 * context.
++	 */
++	local_irq_save(*irq_flags);
++	bit_spin_lock(PG_locked, &page[1].flags);
++	raw_write_seqcount_begin(&page[1].mapcount_seqcount);
++}
++
++static inline void thp_mapcount_unlock(struct page *page,
++				       unsigned long irq_flags)
++{
++	VM_BUG_ON_PAGE(PageTail(page), page);
++	raw_write_seqcount_end(&page[1].mapcount_seqcount);
++	bit_spin_unlock(PG_locked, &page[1].flags);
++	local_irq_restore(irq_flags);
++}
++
++extern bool page_trans_huge_anon_shared(struct page *page);
++
+ #else /* CONFIG_TRANSPARENT_HUGEPAGE */
+ #define HPAGE_PMD_SHIFT ({ BUILD_BUG(); 0; })
+ #define HPAGE_PMD_MASK ({ BUILD_BUG(); 0; })
+@@ -482,6 +527,33 @@ static inline bool thp_migration_supported(void)
+ {
+ 	return false;
+ }
++
++static inline unsigned int thp_mapcount_read_begin(struct page *page)
++{
++	return 0;
++}
++
++static inline bool thp_mapcount_read_retry(struct page *page,
++					   unsigned int seqcount)
++{
++	return false;
++}
++
++static inline void thp_mapcount_lock(struct page *page,
++				     unsigned long *irq_flags)
++{
++}
++
++static inline void thp_mapcount_unlock(struct page *page,
++				       unsigned long irq_flags)
++{
++}
++
++static inline bool page_trans_huge_anon_shared(struct page *page)
++{
++	return false;
++}
++
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ /**
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 73a52aba448f..bfd1e6f175d3 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -446,6 +446,9 @@ extern pgprot_t protection_map[16];
+  * @FAULT_FLAG_REMOTE: The fault is not for current task/mm.
+  * @FAULT_FLAG_INSTRUCTION: The fault was during an instruction fetch.
+  * @FAULT_FLAG_INTERRUPTIBLE: The fault can be interrupted by non-fatal signals.
++ * @FAULT_FLAG_UNSHARE: The fault is an unsharing request to unshare a
++ *                      shared anonymous page (-> mapped R/O). Does not apply
++ *                      to KSM.
+  *
+  * About @FAULT_FLAG_ALLOW_RETRY and @FAULT_FLAG_TRIED: we can specify
+  * whether we would allow page faults to retry by specifying these two
+@@ -477,6 +480,7 @@ enum fault_flag {
+ 	FAULT_FLAG_REMOTE =		1 << 7,
+ 	FAULT_FLAG_INSTRUCTION =	1 << 8,
+ 	FAULT_FLAG_INTERRUPTIBLE =	1 << 9,
++	FAULT_FLAG_UNSHARE =		1 << 10,
+ };
+ 
+ /*
+@@ -2864,6 +2868,7 @@ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
+ #define FOLL_SPLIT_PMD	0x20000	/* split huge pmd before returning */
+ #define FOLL_PIN	0x40000	/* pages must be released via unpin_user_page */
+ #define FOLL_FAST_ONLY	0x80000	/* gup_fast: prevent fall-back to slow gup */
++#define FOLL_NOUNSHARE	0x100000 /* don't trigger unsharing on shared anon pages */
+ 
+ /*
+  * FOLL_PIN and FOLL_LONGTERM may be used in various combinations with each
+@@ -2918,6 +2923,12 @@ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
+  * releasing pages: get_user_pages*() pages must be released via put_page(),
+  * while pin_user_pages*() pages must be released via unpin_user_page().
+  *
++ * FOLL_NOUNSHARE should be set when no unsharing should be triggered when
++ * eventually taking a read-only reference on a shared anonymous page, because
++ * we are sure that user space cannot use that reference for reading the page
++ * after eventually unmapping the page. FOLL_NOUNSHARE is implicitly set for the
++ * follow_page() API.
++ *
+  * Please see Documentation/core-api/pin_user_pages.rst for more information.
+  */
+ 
+@@ -2932,6 +2943,9 @@ static inline int vm_fault_to_errno(vm_fault_t vm_fault, int foll_flags)
+ 	return 0;
+ }
+ 
++extern bool gup_must_unshare(unsigned int flags, struct page *page,
++			     bool is_head);
++
+ typedef int (*pte_fn_t)(pte_t *pte, unsigned long addr, void *data);
+ extern int apply_to_page_range(struct mm_struct *mm, unsigned long address,
+ 			       unsigned long size, pte_fn_t fn, void *data);
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index e9672de22cf2..308fdee5342a 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -153,6 +153,15 @@ struct page {
+ 			unsigned char compound_order;
+ 			atomic_t compound_mapcount;
+ 			unsigned int compound_nr; /* 1 << compound_order */
++			/*
++			 * THP only: allow for atomic reading of the mapcount,
++			 * for example when we might be racing with a concurrent
++			 * THP split. Initialized for all THP but locking is
++			 * so far only required for anon THP where such races
++			 * apply. Write access is serialized via the
++			 * PG_locked-based spinlock in the first tail page.
++			 */
++			raw_seqcount_t mapcount_seqcount;
+ 		};
+ 		struct {	/* Second tail page of compound page */
+ 			unsigned long _compound_pad_1;	/* compound_head */
+diff --git a/include/linux/seqlock.h b/include/linux/seqlock.h
+index 37ded6b8fee6..c61fba1f9893 100644
+--- a/include/linux/seqlock.h
++++ b/include/linux/seqlock.h
+@@ -60,15 +60,27 @@
+  * serialization and non-preemptibility requirements, use a sequential
+  * lock (seqlock_t) instead.
+  *
++ * If it's undesired to have lockdep, especially when a fixed, minimal,
++ * structure size is required, use raw_seqcount_t along with the raw
++ * function variants.
++ *
+  * See Documentation/locking/seqlock.rst
+  */
++
++typedef unsigned int raw_seqcount_t;
++
+ typedef struct seqcount {
+-	unsigned sequence;
++	raw_seqcount_t sequence;
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 	struct lockdep_map dep_map;
+ #endif
+ } seqcount_t;
+ 
++static inline void __raw_seqcount_init(raw_seqcount_t *s)
++{
++	*s = 0;
++}
++
+ static inline void __seqcount_init(seqcount_t *s, const char *name,
+ 					  struct lock_class_key *key)
+ {
+@@ -76,9 +88,15 @@ static inline void __seqcount_init(seqcount_t *s, const char *name,
+ 	 * Make sure we are not reinitializing a held lock:
+ 	 */
+ 	lockdep_init_map(&s->dep_map, name, key, 0);
+-	s->sequence = 0;
++	__raw_seqcount_init(&s->sequence);
+ }
+ 
++/**
++ * raw_seqcount_init() - runtime initializer for raw_seqcount_t
++ * @s: Pointer to the raw_seqcount_t instance
++ */
++# define raw_seqcount_init(s) __raw_seqcount_init(s)
++
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 
+ # define SEQCOUNT_DEP_MAP_INIT(lockname)				\
+@@ -111,11 +129,16 @@ static inline void seqcount_lockdep_reader_access(const seqcount_t *s)
+ # define seqcount_lockdep_reader_access(x)
+ #endif
+ 
++/**
++ * RAW_SEQCNT_ZERO() - static initializer for raw_seqcount_t
++ */
++#define RAW_SEQCNT_ZERO() 0
++
+ /**
+  * SEQCNT_ZERO() - static initializer for seqcount_t
+  * @name: Name of the seqcount_t instance
+  */
+-#define SEQCNT_ZERO(name) { .sequence = 0, SEQCOUNT_DEP_MAP_INIT(name) }
++#define SEQCNT_ZERO(name) { .sequence = RAW_SEQCNT_ZERO(), SEQCOUNT_DEP_MAP_INIT(name) }
+ 
+ /*
+  * Sequence counters with associated locks (seqcount_LOCKNAME_t)
+@@ -203,6 +226,12 @@ typedef struct seqcount_##lockname {					\
+ 	__SEQ_LOCK(locktype	*lock);					\
+ } seqcount_##lockname##_t;						\
+ 									\
++static __always_inline raw_seqcount_t *					\
++__seqprop_##lockname##_raw_ptr(seqcount_##lockname##_t *s)		\
++{									\
++	return &s->seqcount.sequence;					\
++}									\
++									\
+ static __always_inline seqcount_t *					\
+ __seqprop_##lockname##_ptr(seqcount_##lockname##_t *s)			\
+ {									\
+@@ -247,10 +276,45 @@ __seqprop_##lockname##_assert(const seqcount_##lockname##_t *s)		\
+ 	__SEQ_LOCK(lockdep_assert_held(lockmember));			\
+ }
+ 
++/*
++ * __raw_seqprop() for raw_seqcount_t
++ */
++
++static inline raw_seqcount_t *__raw_seqprop_raw_ptr(raw_seqcount_t *s)
++{
++	return s;
++}
++
++static inline seqcount_t *__raw_seqprop_ptr(raw_seqcount_t *s)
++{
++	BUILD_BUG();
++	return NULL;
++}
++
++static inline unsigned int __raw_seqprop_sequence(const raw_seqcount_t *s)
++{
++	return READ_ONCE(*s);
++}
++
++static inline bool __raw_seqprop_preemptible(const raw_seqcount_t *s)
++{
++	return false;
++}
++
++static inline void __raw_seqprop_assert(const raw_seqcount_t *s)
++{
++	lockdep_assert_preemption_disabled();
++}
++
+ /*
+  * __seqprop() for seqcount_t
+  */
+ 
++static inline raw_seqcount_t *__seqprop_raw_ptr(seqcount_t *s)
++{
++	return &s->sequence;
++}
++
+ static inline seqcount_t *__seqprop_ptr(seqcount_t *s)
+ {
+ 	return s;
+@@ -300,6 +364,7 @@ SEQCOUNT_LOCKNAME(ww_mutex,     struct ww_mutex, true,     &s->lock->base, ww_mu
+ 	seqcount_##lockname##_t: __seqprop_##lockname##_##prop((void *)(s))
+ 
+ #define __seqprop(s, prop) _Generic(*(s),				\
++	raw_seqcount_t:		__raw_seqprop_##prop((void *)(s)),	\
+ 	seqcount_t:		__seqprop_##prop((void *)(s)),		\
+ 	__seqprop_case((s),	raw_spinlock,	prop),			\
+ 	__seqprop_case((s),	spinlock,	prop),			\
+@@ -307,6 +372,7 @@ SEQCOUNT_LOCKNAME(ww_mutex,     struct ww_mutex, true,     &s->lock->base, ww_mu
+ 	__seqprop_case((s),	mutex,		prop),			\
+ 	__seqprop_case((s),	ww_mutex,	prop))
+ 
++#define seqprop_raw_ptr(s)		__seqprop(s, raw_ptr)
+ #define seqprop_ptr(s)			__seqprop(s, ptr)
+ #define seqprop_sequence(s)		__seqprop(s, sequence)
+ #define seqprop_preemptible(s)		__seqprop(s, preemptible)
+@@ -314,7 +380,8 @@ SEQCOUNT_LOCKNAME(ww_mutex,     struct ww_mutex, true,     &s->lock->base, ww_mu
+ 
+ /**
+  * __read_seqcount_begin() - begin a seqcount_t read section w/o barrier
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the seqcount_LOCKNAME_t
++ *     variants
+  *
+  * __read_seqcount_begin is like read_seqcount_begin, but has no smp_rmb()
+  * barrier. Callers should ensure that smp_rmb() or equivalent ordering is
+@@ -339,7 +406,8 @@ SEQCOUNT_LOCKNAME(ww_mutex,     struct ww_mutex, true,     &s->lock->base, ww_mu
+ 
+ /**
+  * raw_read_seqcount_begin() - begin a seqcount_t read section w/o lockdep
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the
++ *     seqcount_LOCKNAME_t variants
+  *
+  * Return: count to be passed to read_seqcount_retry()
+  */
+@@ -365,7 +433,8 @@ SEQCOUNT_LOCKNAME(ww_mutex,     struct ww_mutex, true,     &s->lock->base, ww_mu
+ 
+ /**
+  * raw_read_seqcount() - read the raw seqcount_t counter value
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the seqcount_LOCKNAME_t
++ *     variants
+  *
+  * raw_read_seqcount opens a read critical section of the given
+  * seqcount_t, without any lockdep checking, and without checking or
+@@ -386,7 +455,8 @@ SEQCOUNT_LOCKNAME(ww_mutex,     struct ww_mutex, true,     &s->lock->base, ww_mu
+ /**
+  * raw_seqcount_begin() - begin a seqcount_t read critical section w/o
+  *                        lockdep and w/o counter stabilization
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t, or any of the seqcount_LOCKNAME_t
++ *     variants
+  *
+  * raw_seqcount_begin opens a read critical section of the given
+  * seqcount_t. Unlike read_seqcount_begin(), this function will not wait
+@@ -411,7 +481,8 @@ SEQCOUNT_LOCKNAME(ww_mutex,     struct ww_mutex, true,     &s->lock->base, ww_mu
+ 
+ /**
+  * __read_seqcount_retry() - end a seqcount_t read section w/o barrier
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the seqcount_LOCKNAME_t
++ *     variants
+  * @start: count, from read_seqcount_begin()
+  *
+  * __read_seqcount_retry is like read_seqcount_retry, but has no smp_rmb()
+@@ -425,17 +496,19 @@ SEQCOUNT_LOCKNAME(ww_mutex,     struct ww_mutex, true,     &s->lock->base, ww_mu
+  * Return: true if a read section retry is required, else false
+  */
+ #define __read_seqcount_retry(s, start)					\
+-	do___read_seqcount_retry(seqprop_ptr(s), start)
++	do___read_seqcount_retry(seqprop_raw_ptr(s), start)
+ 
+-static inline int do___read_seqcount_retry(const seqcount_t *s, unsigned start)
++static inline int do___read_seqcount_retry(const raw_seqcount_t *s,
++					   unsigned int start)
+ {
+ 	kcsan_atomic_next(0);
+-	return unlikely(READ_ONCE(s->sequence) != start);
++	return unlikely(READ_ONCE(*s) != start);
+ }
+ 
+ /**
+  * read_seqcount_retry() - end a seqcount_t read critical section
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the seqcount_LOCKNAME_t
++ *     variants
+  * @start: count, from read_seqcount_begin()
+  *
+  * read_seqcount_retry closes the read critical section of given
+@@ -445,9 +518,11 @@ static inline int do___read_seqcount_retry(const seqcount_t *s, unsigned start)
+  * Return: true if a read section retry is required, else false
+  */
+ #define read_seqcount_retry(s, start)					\
+-	do_read_seqcount_retry(seqprop_ptr(s), start)
++	do_read_seqcount_retry(seqprop_raw_ptr(s), start)
++#define raw_read_seqcount_retry(s, start) read_seqcount_retry(s, start)
+ 
+-static inline int do_read_seqcount_retry(const seqcount_t *s, unsigned start)
++static inline int do_read_seqcount_retry(const raw_seqcount_t *s,
++					 unsigned int start)
+ {
+ 	smp_rmb();
+ 	return do___read_seqcount_retry(s, start);
+@@ -455,7 +530,8 @@ static inline int do_read_seqcount_retry(const seqcount_t *s, unsigned start)
+ 
+ /**
+  * raw_write_seqcount_begin() - start a seqcount_t write section w/o lockdep
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the seqcount_LOCKNAME_t
++ *     variants
+  *
+  * Context: check write_seqcount_begin()
+  */
+@@ -464,34 +540,35 @@ do {									\
+ 	if (seqprop_preemptible(s))					\
+ 		preempt_disable();					\
+ 									\
+-	do_raw_write_seqcount_begin(seqprop_ptr(s));			\
++	do_raw_write_seqcount_begin(seqprop_raw_ptr(s));		\
+ } while (0)
+ 
+-static inline void do_raw_write_seqcount_begin(seqcount_t *s)
++static inline void do_raw_write_seqcount_begin(raw_seqcount_t *s)
+ {
+ 	kcsan_nestable_atomic_begin();
+-	s->sequence++;
++	(*s)++;
+ 	smp_wmb();
+ }
+ 
+ /**
+  * raw_write_seqcount_end() - end a seqcount_t write section w/o lockdep
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the seqcount_LOCKNAME_t
++ *     variants
+  *
+  * Context: check write_seqcount_end()
+  */
+ #define raw_write_seqcount_end(s)					\
+ do {									\
+-	do_raw_write_seqcount_end(seqprop_ptr(s));			\
++	do_raw_write_seqcount_end(seqprop_raw_ptr(s));			\
+ 									\
+ 	if (seqprop_preemptible(s))					\
+ 		preempt_enable();					\
+ } while (0)
+ 
+-static inline void do_raw_write_seqcount_end(seqcount_t *s)
++static inline void do_raw_write_seqcount_end(raw_seqcount_t *s)
+ {
+ 	smp_wmb();
+-	s->sequence++;
++	(*s)++;
+ 	kcsan_nestable_atomic_end();
+ }
+ 
+@@ -516,7 +593,7 @@ do {									\
+ 
+ static inline void do_write_seqcount_begin_nested(seqcount_t *s, int subclass)
+ {
+-	do_raw_write_seqcount_begin(s);
++	do_raw_write_seqcount_begin(&s->sequence);
+ 	seqcount_acquire(&s->dep_map, subclass, 0, _RET_IP_);
+ }
+ 
+@@ -563,12 +640,13 @@ do {									\
+ static inline void do_write_seqcount_end(seqcount_t *s)
+ {
+ 	seqcount_release(&s->dep_map, _RET_IP_);
+-	do_raw_write_seqcount_end(s);
++	do_raw_write_seqcount_end(&s->sequence);
+ }
+ 
+ /**
+  * raw_write_seqcount_barrier() - do a seqcount_t write barrier
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the seqcount_LOCKNAME_t
++ *     variants
+  *
+  * This can be used to provide an ordering guarantee instead of the usual
+  * consistency guarantee. It is one wmb cheaper, because it can collapse
+@@ -608,33 +686,34 @@ static inline void do_write_seqcount_end(seqcount_t *s)
+  *      }
+  */
+ #define raw_write_seqcount_barrier(s)					\
+-	do_raw_write_seqcount_barrier(seqprop_ptr(s))
++	do_raw_write_seqcount_barrier(seqprop_raw_ptr(s))
+ 
+-static inline void do_raw_write_seqcount_barrier(seqcount_t *s)
++static inline void do_raw_write_seqcount_barrier(raw_seqcount_t *s)
+ {
+ 	kcsan_nestable_atomic_begin();
+-	s->sequence++;
++	(*s)++;
+ 	smp_wmb();
+-	s->sequence++;
++	(*s)++;
+ 	kcsan_nestable_atomic_end();
+ }
+ 
+ /**
+  * write_seqcount_invalidate() - invalidate in-progress seqcount_t read
+  *                               side operations
+- * @s: Pointer to seqcount_t or any of the seqcount_LOCKNAME_t variants
++ * @s: Pointer to seqcount_t, raw_seqcount_t or any of the seqcount_LOCKNAME_t
++ *     variants
+  *
+  * After write_seqcount_invalidate, no seqcount_t read side operations
+  * will complete successfully and see data older than this.
+  */
+ #define write_seqcount_invalidate(s)					\
+-	do_write_seqcount_invalidate(seqprop_ptr(s))
++	do_write_seqcount_invalidate(seqprop_raw_ptr(s))
+ 
+-static inline void do_write_seqcount_invalidate(seqcount_t *s)
++static inline void do_write_seqcount_invalidate(raw_seqcount_t *s)
+ {
+ 	smp_wmb();
+ 	kcsan_nestable_atomic_begin();
+-	s->sequence+=2;
++	(*s) += 2;
+ 	kcsan_nestable_atomic_end();
+ }
+ 
+diff --git a/mm/gup.c b/mm/gup.c
+index 886d6148d3d0..b67ded42761b 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -29,6 +29,52 @@ struct follow_page_context {
+ 	unsigned int page_mask;
+ };
+ 
++/*
++ * Indicates for which pages that are write-protected in the page table,
++ * whether GUP has to trigger unsharing via FAULT_FLAG_UNSHARE such that the
++ * GUP pin will remain consistent with the pages mapped into the page tables
++ * of the MM.
++ *
++ * This handling is required to guarantee that a child process that triggered
++ * a read-only GUP before unmapping the page of interest cannot observe
++ * modifications of shared anonymous pages with COW semantics in the parent
++ * after fork().
++ *
++ * TODO: although the security issue described does no longer apply in any case,
++ * the full consistency between the pinned pages and the pages mapped into the
++ * page tables of the MM only apply to short-term pinnings only. For
++ * FOLL_LONGTERM, FOLL_WRITE|FOLL_FORCE is required for now, which can be
++ * inefficient and still result in some consistency issues. Extend this
++ * mechanism to also provide full synchronicity to FOLL_LONGTERM, avoiding
++ * FOLL_WRITE|FOLL_FORCE.
++ *
++ * This function is safe to be called in IRQ context.
++ */
++bool gup_must_unshare(unsigned int flags, struct page *page, bool is_head)
++{
++	/* We only care about read faults where unsharing is desired. */
++	if (flags & (FOLL_WRITE | FOLL_NOUNSHARE))
++		return false;
++	/*
++	 * We only care when the reference count of the page is to get
++	 * increased. In particular, GUP users that rely on memory notifiers
++	 * instead don't have to trigger unsharing.
++	 */
++	if (!(flags & (FOLL_GET|FOLL_PIN)))
++		return false;
++	if (!PageAnon(page))
++		return false;
++	if (PageKsm(page))
++		return false;
++	if (PageHuge(page))
++		return __page_mapcount(page) > 1;
++	if (is_head) {
++		VM_BUG_ON(!PageTransHuge(page));
++		return page_trans_huge_anon_shared(page);
++	}
++	return page_mapcount(page) > 1;
++}
++
+ static void hpage_pincount_add(struct page *page, int refs)
+ {
+ 	VM_BUG_ON_PAGE(!hpage_pincount_available(page), page);
+@@ -543,6 +589,14 @@ static struct page *follow_page_pte(struct vm_area_struct *vma,
+ 		}
+ 	}
+ 
++	/*
++	 * If unsharing is required, keep retrying to unshare until the
++	 * page becomes exclusive.
++	 */
++	if (!pte_write(pte) && gup_must_unshare(flags, page, false)) {
++		page = ERR_PTR(-EMLINK);
++		goto out;
++	}
+ 	/* try_grab_page() does nothing unless FOLL_GET or FOLL_PIN is set. */
+ 	if (unlikely(!try_grab_page(page, flags))) {
+ 		page = ERR_PTR(-ENOMEM);
+@@ -790,6 +844,11 @@ static struct page *follow_p4d_mask(struct vm_area_struct *vma,
+  * When getting pages from ZONE_DEVICE memory, the @ctx->pgmap caches
+  * the device's dev_pagemap metadata to avoid repeating expensive lookups.
+  *
++ * When getting an anonymous page and the caller has to trigger unsharing
++ * of a shared anonymous page first, -EMLINK is returned. The caller should
++ * trigger a fault with FAULT_FLAG_UNSHARE set. With FOLL_NOUNSHARE set, will
++ * never require unsharing and consequently not return -EMLINK.
++ *
+  * On output, the @ctx->page_mask is set according to the size of the page.
+  *
+  * Return: the mapped (struct page *), %NULL if no mapping exists, or
+@@ -845,6 +904,12 @@ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
+ 	if (vma_is_secretmem(vma))
+ 		return NULL;
+ 
++	/*
++	 * Don't require unsharing in case we stumble over a read-only mapped,
++	 * shared anonymous page: this is an internal API only and callers don't
++	 * actually use it for exposing page content to user space.
++	 */
++	foll_flags |= FOLL_NOUNSHARE;
+ 	page = follow_page_mask(vma, address, foll_flags, &ctx);
+ 	if (ctx.pgmap)
+ 		put_dev_pagemap(ctx.pgmap);
+@@ -910,7 +975,8 @@ static int get_gate_page(struct mm_struct *mm, unsigned long address,
+  * is, *@locked will be set to 0 and -EBUSY returned.
+  */
+ static int faultin_page(struct vm_area_struct *vma,
+-		unsigned long address, unsigned int *flags, int *locked)
++		unsigned long address, unsigned int *flags, bool unshare,
++		int *locked)
+ {
+ 	unsigned int fault_flags = 0;
+ 	vm_fault_t ret;
+@@ -933,6 +999,12 @@ static int faultin_page(struct vm_area_struct *vma,
+ 		 */
+ 		fault_flags |= FAULT_FLAG_TRIED;
+ 	}
++	if (unshare) {
++		VM_BUG_ON(unshare && *flags & FOLL_NOUNSHARE);
++		fault_flags |= FAULT_FLAG_UNSHARE;
++		/* FAULT_FLAG_WRITE and FAULT_FLAG_UNSHARE are incompatible */
++		VM_BUG_ON(fault_flags & FAULT_FLAG_WRITE);
++	}
+ 
+ 	ret = handle_mm_fault(vma, address, fault_flags, NULL);
+ 	if (ret & VM_FAULT_ERROR) {
+@@ -1154,8 +1226,9 @@ static long __get_user_pages(struct mm_struct *mm,
+ 		cond_resched();
+ 
+ 		page = follow_page_mask(vma, start, foll_flags, &ctx);
+-		if (!page) {
+-			ret = faultin_page(vma, start, &foll_flags, locked);
++		if (!page || PTR_ERR(page) == -EMLINK) {
++			ret = faultin_page(vma, start, &foll_flags,
++					   PTR_ERR(page) == -EMLINK, locked);
+ 			switch (ret) {
+ 			case 0:
+ 				goto retry;
+@@ -2174,6 +2247,11 @@ static int gup_pte_range(pmd_t pmd, unsigned long addr, unsigned long end,
+ 			goto pte_unmap;
+ 		}
+ 
++		if (!pte_write(pte) && gup_must_unshare(flags, page, false)) {
++			put_compound_head(head, 1, flags);
++			goto pte_unmap;
++		}
++
+ 		VM_BUG_ON_PAGE(compound_head(page) != head, page);
+ 
+ 		/*
+@@ -2420,6 +2498,11 @@ static int gup_huge_pmd(pmd_t orig, pmd_t *pmdp, unsigned long addr,
+ 		return 0;
+ 	}
+ 
++	if (!pmd_write(orig) && gup_must_unshare(flags, head, true)) {
++		put_compound_head(head, refs, flags);
++		return 0;
++	}
++
+ 	*nr += refs;
+ 	SetPageReferenced(head);
+ 	return 1;
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index c5142d237e48..40cf1f52c551 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -527,6 +527,7 @@ void prep_transhuge_page(struct page *page)
+ 
+ 	INIT_LIST_HEAD(page_deferred_list(page));
+ 	set_compound_page_dtor(page, TRANSHUGE_PAGE_DTOR);
++	thp_mapcount_seqcount_init(page);
+ }
+ 
+ bool is_transparent_hugepage(struct page *page)
+@@ -1280,6 +1281,40 @@ void huge_pmd_set_accessed(struct vm_fault *vmf)
+ 	spin_unlock(vmf->ptl);
+ }
+ 
++
++static bool __page_trans_huge_anon_shared(struct page *page)
++{
++	int i, mapcount;
++
++	mapcount = head_compound_mapcount(page);
++	if (mapcount > 1)
++		return true;
++	if (PageDoubleMap(page))
++		mapcount -= 1;
++	for (i = 0; i < thp_nr_pages(page); i++) {
++		if (atomic_read(&page[i]._mapcount) + mapcount + 1 > 1)
++			return true;
++	}
++	return false;
++}
++
++/* A lightweight check corresponding to "page_trans_huge_mapcount() > 1". */
++bool page_trans_huge_anon_shared(struct page *page)
++{
++	unsigned int seqcount;
++	bool shared;
++
++	VM_BUG_ON_PAGE(PageHuge(page) || PageTail(page), page);
++	VM_BUG_ON_PAGE(!PageAnon(page) || !PageTransHuge(page), page);
++
++	do {
++		seqcount = thp_mapcount_read_begin(page);
++		shared = __page_trans_huge_anon_shared(page);
++	} while (thp_mapcount_read_retry(page, seqcount));
++
++	return shared;
++}
++
+ vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+@@ -1374,6 +1409,13 @@ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
+ 	page = pmd_page(*pmd);
+ 	VM_BUG_ON_PAGE(!PageHead(page) && !is_zone_device_page(page), page);
+ 
++	/*
++	 * If unsharing is required, keep retrying to unshare until the
++	 * page becomes exclusive.
++	 */
++	if (!pmd_write(*pmd) && gup_must_unshare(flags, page, true))
++		return ERR_PTR(-EMLINK);
++
+ 	if (!try_grab_page(page, flags))
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -1959,11 +2001,11 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long haddr, bool freeze)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
++	unsigned long addr, irq_flags;
+ 	struct page *page;
+ 	pgtable_t pgtable;
+ 	pmd_t old_pmd, _pmd;
+ 	bool young, write, soft_dirty, pmd_migration = false, uffd_wp = false;
+-	unsigned long addr;
+ 	int i;
+ 
+ 	VM_BUG_ON(haddr & ~HPAGE_PMD_MASK);
+@@ -2101,23 +2143,33 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 		pte = pte_offset_map(&_pmd, addr);
+ 		BUG_ON(!pte_none(*pte));
+ 		set_pte_at(mm, addr, pte, entry);
+-		if (!pmd_migration)
+-			atomic_inc(&page[i]._mapcount);
+ 		pte_unmap(pte);
+ 	}
+ 
+ 	if (!pmd_migration) {
++		/* Sub-page mapcount accounting for above small mappings. */
++		int val = 1;
++
++		/*
++		 * lock_page_memcg() is taken before thp_mapcount_lock() in
++		 * page_remove_anon_compound_rmap(), respect the same locking
++		 * order.
++		 */
++		lock_page_memcg(page);
++		thp_mapcount_lock(page, &irq_flags);
+ 		/*
+ 		 * Set PG_double_map before dropping compound_mapcount to avoid
+ 		 * false-negative page_mapped().
++		 *
++		 * The first to set PageDoubleMap() has to increment all
++		 * sub-page mapcounts by one.
+ 		 */
+-		if (compound_mapcount(page) > 1 &&
+-		    !TestSetPageDoubleMap(page)) {
+-			for (i = 0; i < HPAGE_PMD_NR; i++)
+-				atomic_inc(&page[i]._mapcount);
+-		}
++		if (compound_mapcount(page) > 1 && !TestSetPageDoubleMap(page))
++			val++;
++
++		for (i = 0; i < HPAGE_PMD_NR; i++)
++			atomic_add(val, &page[i]._mapcount);
+ 
+-		lock_page_memcg(page);
+ 		if (atomic_add_negative(-1, compound_mapcount_ptr(page))) {
+ 			/* Last compound_mapcount is gone. */
+ 			__mod_lruvec_page_state(page, NR_ANON_THPS,
+@@ -2128,6 +2180,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 					atomic_dec(&page[i]._mapcount);
+ 			}
+ 		}
++		thp_mapcount_unlock(page, irq_flags);
+ 		unlock_page_memcg(page);
+ 	}
+ 
+@@ -2496,23 +2549,30 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ int total_mapcount(struct page *page)
+ {
+ 	int i, compound, nr, ret;
++	unsigned int seqcount;
++	bool double_map;
+ 
+ 	VM_BUG_ON_PAGE(PageTail(page), page);
+ 
+ 	if (likely(!PageCompound(page)))
+ 		return atomic_read(&page->_mapcount) + 1;
++	if (PageHuge(page))
++		return head_compound_mapcount(page);
+ 
+-	compound = compound_mapcount(page);
+ 	nr = compound_nr(page);
+-	if (PageHuge(page))
+-		return compound;
+-	ret = compound;
+-	for (i = 0; i < nr; i++)
+-		ret += atomic_read(&page[i]._mapcount) + 1;
++
++	do {
++		seqcount = thp_mapcount_read_begin(page);
++		ret = compound = head_compound_mapcount(page);
++		for (i = 0; i < nr; i++)
++			ret += atomic_read(&page[i]._mapcount) + 1;
++		double_map = PageDoubleMap(page);
++	} while (thp_mapcount_read_retry(page, seqcount));
++
+ 	/* File pages has compound_mapcount included in _mapcount */
+ 	if (!PageAnon(page))
+ 		return ret - compound * nr;
+-	if (PageDoubleMap(page))
++	if (double_map)
+ 		ret -= nr;
+ 	return ret;
+ }
+@@ -2544,6 +2604,7 @@ int total_mapcount(struct page *page)
+ int page_trans_huge_mapcount(struct page *page, int *total_mapcount)
+ {
+ 	int i, ret, _total_mapcount, mapcount;
++	unsigned int seqcount;
+ 
+ 	/* hugetlbfs shouldn't call it */
+ 	VM_BUG_ON_PAGE(PageHuge(page), page);
+@@ -2557,17 +2618,22 @@ int page_trans_huge_mapcount(struct page *page, int *total_mapcount)
+ 
+ 	page = compound_head(page);
+ 
+-	_total_mapcount = ret = 0;
+-	for (i = 0; i < thp_nr_pages(page); i++) {
+-		mapcount = atomic_read(&page[i]._mapcount) + 1;
+-		ret = max(ret, mapcount);
+-		_total_mapcount += mapcount;
+-	}
+-	if (PageDoubleMap(page)) {
+-		ret -= 1;
+-		_total_mapcount -= thp_nr_pages(page);
+-	}
+-	mapcount = compound_mapcount(page);
++	do {
++		_total_mapcount = ret = 0;
++
++		seqcount = thp_mapcount_read_begin(page);
++		for (i = 0; i < thp_nr_pages(page); i++) {
++			mapcount = atomic_read(&page[i]._mapcount) + 1;
++			ret = max(ret, mapcount);
++			_total_mapcount += mapcount;
++		}
++		if (PageDoubleMap(page)) {
++			ret -= 1;
++			_total_mapcount -= thp_nr_pages(page);
++		}
++		mapcount = compound_mapcount(page);
++	} while (thp_mapcount_read_retry(page, seqcount));
++
+ 	ret += mapcount;
+ 	_total_mapcount += mapcount;
+ 	if (total_mapcount)
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index f5ed98843557..d1d25cccfd22 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -4630,14 +4630,15 @@ static void unmap_ref_private(struct mm_struct *mm, struct vm_area_struct *vma,
+ }
+ 
+ /*
+- * Hugetlb_cow() should be called with page lock of the original hugepage held.
++ * __wp_hugetlb() should be called with page lock of the original hugepage held.
+  * Called with hugetlb_instantiation_mutex held and pte_page locked so we
+  * cannot race with other handlers or page migration.
+  * Keep the pte_same checks anyway to make transition from the mutex easier.
+  */
+-static vm_fault_t hugetlb_cow(struct mm_struct *mm, struct vm_area_struct *vma,
+-		       unsigned long address, pte_t *ptep,
+-		       struct page *pagecache_page, spinlock_t *ptl)
++static __always_inline vm_fault_t
++__wp_hugetlb(struct mm_struct *mm, struct vm_area_struct *vma,
++	     unsigned long address, pte_t *ptep, struct page *pagecache_page,
++	     spinlock_t *ptl, bool unshare)
+ {
+ 	pte_t pte;
+ 	struct hstate *h = hstate_vma(vma);
+@@ -4651,11 +4652,21 @@ static vm_fault_t hugetlb_cow(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	old_page = pte_page(pte);
+ 
+ retry_avoidcopy:
+-	/* If no-one else is actually using this page, avoid the copy
+-	 * and just make the page writable */
+-	if (page_mapcount(old_page) == 1 && PageAnon(old_page)) {
+-		page_move_anon_rmap(old_page, vma);
+-		set_huge_ptep_writable(vma, haddr, ptep);
++	if (!unshare) {
++		/*
++		 * If no-one else is actually using this page, avoid the copy
++		 * and just make the page writable.
++		 */
++		if (page_mapcount(old_page) == 1 && PageAnon(old_page)) {
++			page_move_anon_rmap(old_page, vma);
++			set_huge_ptep_writable(vma, haddr, ptep);
++			return 0;
++		}
++	} else if (!PageAnon(old_page) || page_mapcount(old_page) == 1) {
++		/*
++		 * GUP-triggered unsharing only applies to shared anonymous
++		 * pages. If that does no longer apply, there is nothing to do.
++		 */
+ 		return 0;
+ 	}
+ 
+@@ -4756,11 +4767,11 @@ static vm_fault_t hugetlb_cow(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	if (likely(ptep && pte_same(huge_ptep_get(ptep), pte))) {
+ 		ClearHPageRestoreReserve(new_page);
+ 
+-		/* Break COW */
++		/* Break COW or unshare */
+ 		huge_ptep_clear_flush(vma, haddr, ptep);
+ 		mmu_notifier_invalidate_range(mm, range.start, range.end);
+ 		set_huge_pte_at(mm, haddr, ptep,
+-				make_huge_pte(vma, new_page, 1));
++				make_huge_pte(vma, new_page, !unshare));
+ 		page_remove_rmap(old_page, true);
+ 		hugepage_add_new_anon_rmap(new_page, vma, haddr);
+ 		SetHPageMigratable(new_page);
+@@ -4770,7 +4781,10 @@ static vm_fault_t hugetlb_cow(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	spin_unlock(ptl);
+ 	mmu_notifier_invalidate_range_end(&range);
+ out_release_all:
+-	/* No restore in case of successful pagetable update (Break COW) */
++	/*
++	 * No restore in case of successful pagetable update (Break COW or
++	 * unshare)
++	 */
+ 	if (new_page != old_page)
+ 		restore_reserve_on_error(h, vma, haddr, new_page);
+ 	put_page(new_page);
+@@ -4781,6 +4795,23 @@ static vm_fault_t hugetlb_cow(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	return ret;
+ }
+ 
++static vm_fault_t
++wp_hugetlb_cow(struct mm_struct *mm, struct vm_area_struct *vma,
++	       unsigned long address, pte_t *ptep, struct page *pagecache_page,
++	       spinlock_t *ptl)
++{
++	return __wp_hugetlb(mm, vma, address, ptep, pagecache_page, ptl,
++			    false);
++}
++
++static vm_fault_t
++wp_hugetlb_unshare(struct mm_struct *mm, struct vm_area_struct *vma,
++		   unsigned long address, pte_t *ptep,
++		   struct page *pagecache_page, spinlock_t *ptl)
++{
++	return __wp_hugetlb(mm, vma, address, ptep, pagecache_page, ptl, true);
++}
++
+ /* Return the pagecache page at a given address within a VMA */
+ static struct page *hugetlbfs_pagecache_page(struct hstate *h,
+ 			struct vm_area_struct *vma, unsigned long address)
+@@ -4893,7 +4924,8 @@ static vm_fault_t hugetlb_no_page(struct mm_struct *mm,
+ 	/*
+ 	 * Currently, we are forced to kill the process in the event the
+ 	 * original mapper has unmapped pages from the child due to a failed
+-	 * COW. Warn that such a situation has occurred as it may not be obvious
++	 * COW/unsharing. Warn that such a situation has occurred as it may not
++	 * be obvious.
+ 	 */
+ 	if (is_vma_resv_set(vma, HPAGE_RESV_UNMAPPED)) {
+ 		pr_warn_ratelimited("PID %d killed due to inadequate hugepage pool\n",
+@@ -5019,7 +5051,7 @@ static vm_fault_t hugetlb_no_page(struct mm_struct *mm,
+ 	hugetlb_count_add(pages_per_huge_page(h), mm);
+ 	if ((flags & FAULT_FLAG_WRITE) && !(vma->vm_flags & VM_SHARED)) {
+ 		/* Optimization, do the COW without a second fault */
+-		ret = hugetlb_cow(mm, vma, address, ptep, page, ptl);
++		ret = wp_hugetlb_cow(mm, vma, address, ptep, page, ptl);
+ 	}
+ 
+ 	spin_unlock(ptl);
+@@ -5149,14 +5181,15 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		goto out_mutex;
+ 
+ 	/*
+-	 * If we are going to COW the mapping later, we examine the pending
+-	 * reservations for this page now. This will ensure that any
++	 * If we are going to COW/unshare the mapping later, we examine the
++	 * pending reservations for this page now. This will ensure that any
+ 	 * allocations necessary to record that reservation occur outside the
+ 	 * spinlock. For private mappings, we also lookup the pagecache
+ 	 * page now as it is used to determine if a reservation has been
+ 	 * consumed.
+ 	 */
+-	if ((flags & FAULT_FLAG_WRITE) && !huge_pte_write(entry)) {
++	if ((flags & (FAULT_FLAG_WRITE|FAULT_FLAG_UNSHARE)) &&
++	    !huge_pte_write(entry)) {
+ 		if (vma_needs_reservation(h, vma, haddr) < 0) {
+ 			ret = VM_FAULT_OOM;
+ 			goto out_mutex;
+@@ -5171,14 +5204,17 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 
+ 	ptl = huge_pte_lock(h, mm, ptep);
+ 
+-	/* Check for a racing update before calling hugetlb_cow */
++	/*
++	 * Check for a racing update before calling wp_hugetlb_cow /
++	 * wp_hugetlb_unshare
++	 */
+ 	if (unlikely(!pte_same(entry, huge_ptep_get(ptep))))
+ 		goto out_ptl;
+ 
+ 	/*
+-	 * hugetlb_cow() requires page locks of pte_page(entry) and
+-	 * pagecache_page, so here we need take the former one
+-	 * when page != pagecache_page or !pagecache_page.
++	 * wp_hugetlb_cow()/wp_hugetlb_unshare() requires page locks of
++	 * pte_page(entry) and pagecache_page, so here we need take the former
++	 * one when page != pagecache_page or !pagecache_page.
+ 	 */
+ 	page = pte_page(entry);
+ 	if (page != pagecache_page)
+@@ -5191,11 +5227,15 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 
+ 	if (flags & FAULT_FLAG_WRITE) {
+ 		if (!huge_pte_write(entry)) {
+-			ret = hugetlb_cow(mm, vma, address, ptep,
+-					  pagecache_page, ptl);
++			ret = wp_hugetlb_cow(mm, vma, address, ptep,
++					     pagecache_page, ptl);
+ 			goto out_put_page;
+ 		}
+ 		entry = huge_pte_mkdirty(entry);
++	} else if (flags & FAULT_FLAG_UNSHARE && !huge_pte_write(entry)) {
++		ret = wp_hugetlb_unshare(mm, vma, address, ptep, pagecache_page,
++					 ptl);
++		goto out_put_page;
+ 	}
+ 	entry = pte_mkyoung(entry);
+ 	if (huge_ptep_set_access_flags(vma, haddr, ptep, entry,
+@@ -5431,6 +5471,25 @@ static void record_subpages_vmas(struct page *page, struct vm_area_struct *vma,
+ 	}
+ }
+ 
++static inline bool __follow_hugetlb_must_fault(unsigned int flags, pte_t *pte,
++					       bool *unshare)
++{
++	pte_t pteval = huge_ptep_get(pte);
++
++	*unshare = false;
++	if (is_swap_pte(pteval))
++		return true;
++	if (huge_pte_write(pteval))
++		return false;
++	if (flags & FOLL_WRITE)
++		return true;
++	if (gup_must_unshare(flags, pte_page(pteval), true)) {
++		*unshare = true;
++		return true;
++	}
++	return false;
++}
++
+ long follow_hugetlb_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 			 struct page **pages, struct vm_area_struct **vmas,
+ 			 unsigned long *position, unsigned long *nr_pages,
+@@ -5445,6 +5504,7 @@ long follow_hugetlb_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	while (vaddr < vma->vm_end && remainder) {
+ 		pte_t *pte;
+ 		spinlock_t *ptl = NULL;
++		bool unshare;
+ 		int absent;
+ 		struct page *page;
+ 
+@@ -5495,9 +5555,8 @@ long follow_hugetlb_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		 * both cases, and because we can't follow correct pages
+ 		 * directly from any kind of swap entries.
+ 		 */
+-		if (absent || is_swap_pte(huge_ptep_get(pte)) ||
+-		    ((flags & FOLL_WRITE) &&
+-		      !huge_pte_write(huge_ptep_get(pte)))) {
++		if (absent ||
++		    __follow_hugetlb_must_fault(flags, pte, &unshare)) {
+ 			vm_fault_t ret;
+ 			unsigned int fault_flags = 0;
+ 
+@@ -5505,6 +5564,8 @@ long follow_hugetlb_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 				spin_unlock(ptl);
+ 			if (flags & FOLL_WRITE)
+ 				fault_flags |= FAULT_FLAG_WRITE;
++			else if (unshare)
++				fault_flags |= FAULT_FLAG_UNSHARE;
+ 			if (locked)
+ 				fault_flags |= FAULT_FLAG_ALLOW_RETRY |
+ 					FAULT_FLAG_KILLABLE;
+@@ -6200,7 +6261,21 @@ follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+ 		goto out;
+ 	pte = huge_ptep_get((pte_t *)pmd);
+ 	if (pte_present(pte)) {
+-		page = pmd_page(*pmd) + ((address & ~PMD_MASK) >> PAGE_SHIFT);
++		struct page *head_page = pmd_page(*pmd);
++
++		/*
++		 * follow_huge_pmd() is only called when coming via
++		 * follow_page(), where we set FOLL_NOUNSHARE. Ordinary GUP
++		 * goes via follow_hugetlb_page(), where we can properly unshare
++		 * if required.
++		 */
++		if (WARN_ON_ONCE(!huge_pte_write(pte) &&
++				 gup_must_unshare(flags, head_page, true))) {
++			page = NULL;
++			goto out;
++		}
++
++		page = head_page + ((address & ~PMD_MASK) >> PAGE_SHIFT);
+ 		/*
+ 		 * try_grab_page() should always succeed here, because: a) we
+ 		 * hold the pmd (ptl) lock, and b) we've just checked that the
+diff --git a/mm/memory.c b/mm/memory.c
+index e2c623027e32..e843804f06a1 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2721,8 +2721,9 @@ EXPORT_SYMBOL_GPL(apply_to_existing_page_range);
+  * read non-atomically.  Before making any commitment, on those architectures
+  * or configurations (e.g. i386 with PAE) which might give a mix of unmatched
+  * parts, do_swap_page must check under lock before unmapping the pte and
+- * proceeding (but do_wp_page is only called after already making such a check;
+- * and do_anonymous_page can safely check later on).
++ * proceeding (but do_wp_page_cow/do_wp_page_unshare is only called after
++ * already making such a check; and do_anonymous_page can safely check later
++ * on).
+  */
+ static inline int pte_unmap_same(struct mm_struct *mm, pmd_t *pmd,
+ 				pte_t *page_table, pte_t orig_pte)
+@@ -2740,8 +2741,8 @@ static inline int pte_unmap_same(struct mm_struct *mm, pmd_t *pmd,
+ 	return same;
+ }
+ 
+-static inline bool cow_user_page(struct page *dst, struct page *src,
+-				 struct vm_fault *vmf)
++static inline bool __wp_page_copy_user(struct page *dst, struct page *src,
++				       struct vm_fault *vmf)
+ {
+ 	bool ret;
+ 	void *kaddr;
+@@ -2966,7 +2967,8 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
+ }
+ 
+ /*
+- * Handle the case of a page which we actually need to copy to a new page.
++ * Handle the case of a page which we actually need to copy to a new page,
++ * either due to COW or unsharing.
+  *
+  * Called with mmap_lock locked and the old page referenced, but
+  * without the ptl held.
+@@ -2981,7 +2983,7 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
+  *   held to the old page, as well as updating the rmap.
+  * - In any case, unlock the PTL and drop the reference we took to the old page.
+  */
+-static vm_fault_t wp_page_copy(struct vm_fault *vmf)
++static vm_fault_t wp_page_copy(struct vm_fault *vmf, bool unshare)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct mm_struct *mm = vma->vm_mm;
+@@ -3005,7 +3007,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 		if (!new_page)
+ 			goto oom;
+ 
+-		if (!cow_user_page(new_page, old_page, vmf)) {
++		if (!__wp_page_copy_user(new_page, old_page, vmf)) {
+ 			/*
+ 			 * COW failed, if the fault was solved by other,
+ 			 * it's fine. If not, userspace would re-fault on
+@@ -3047,7 +3049,14 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+ 		entry = mk_pte(new_page, vma->vm_page_prot);
+ 		entry = pte_sw_mkyoung(entry);
+-		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
++		if (unlikely(unshare)) {
++			if (pte_soft_dirty(vmf->orig_pte))
++				entry = pte_mksoft_dirty(entry);
++			if (pte_uffd_wp(vmf->orig_pte))
++				entry = pte_mkuffd_wp(entry);
++		} else {
++			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
++		}
+ 
+ 		/*
+ 		 * Clear the pte entry and flush it first, before updating the
+@@ -3064,6 +3073,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 		 * mmu page tables (such as kvm shadow page tables), we want the
+ 		 * new page to be mapped directly into the secondary page table.
+ 		 */
++		BUG_ON(unshare && pte_write(entry));
+ 		set_pte_at_notify(mm, vmf->address, vmf->pte, entry);
+ 		update_mmu_cache(vma, vmf->address, vmf->pte);
+ 		if (old_page) {
+@@ -3123,6 +3133,8 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 			free_swap_cache(old_page);
+ 		put_page(old_page);
+ 	}
++	if (unlikely(unshare))
++		return 0;
+ 	return page_copied ? VM_FAULT_WRITE : 0;
+ oom_free_new:
+ 	put_page(new_page);
+@@ -3132,6 +3144,70 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 	return VM_FAULT_OOM;
+ }
+ 
++static __always_inline vm_fault_t wp_page_cow(struct vm_fault *vmf)
++{
++	return wp_page_copy(vmf, false);
++}
++
++static __always_inline vm_fault_t wp_page_unshare(struct vm_fault *vmf)
++{
++	return wp_page_copy(vmf, true);
++}
++
++/*
++ * This routine handles present pages, when GUP tries to take a read-only
++ * pin on a shared anonymous page. It's similar to do_wp_page_cow(), except that
++ * it keeps the pages mapped read-only and doesn't apply to KSM pages.
++ *
++ * If a parent process forks a child process, we share anonymous pages between
++ * both processes with COW semantics. Both processes will map these now shared
++ * anonymous pages read-only, and any write access triggers unsharing via COW.
++ *
++ * If the child takes a read-only pin on such a page (i.e., FOLL_WRITE is not
++ * set) and then unmaps the target page, we have:
++ *
++ * * page has mapcount == 1 and refcount > 1
++ * * page is mapped read-only into the parent
++ * * page is pinned by the child and can still be read
++ *
++ * For now, we rely on refcount > 1 to perform the COW and trigger unsharing.
++ * However, that leads to other hard-to fix issues.
++ *
++ * GUP-triggered unsharing provides a parallel approach to trigger unsharing
++ * early, still allowing for relying on mapcount > 1 in COW code instead of on
++ * imprecise refcount > 1. Note that when we don't actually take a reference
++ * on the target page but instead use memory notifiers to synchronize to changes
++ * in the process page tables, unsharing is not required.
++ *
++ * Note that in the above scenario, it's impossible to distinguish during the
++ * write fault between:
++ *
++ * a) The parent process performed the pin and the child no longer has access
++ *    to the page.
++ *
++ * b) The child process performed the pin and the child still has access to the
++ *    page.
++ *
++ * In case of a), if we're dealing with a long-term read-only pin, the COW
++ * in the parent will result the pinned page differing from the page actually
++ * mapped into the process page tables in the parent: loss of synchronicity.
++ * Therefore, we really want to perform the copy when the read-only pin happens.
++ */
++static vm_fault_t do_wp_page_unshare(struct vm_fault *vmf)
++	__releases(vmf->ptl)
++{
++	vmf->page = vm_normal_page(vmf->vma, vmf->address, vmf->orig_pte);
++	if (vmf->page && PageAnon(vmf->page) && !PageKsm(vmf->page) &&
++	    page_mapcount(vmf->page) > 1) {
++		get_page(vmf->page);
++		pte_unmap_unlock(vmf->pte, vmf->ptl);
++		return wp_page_unshare(vmf);
++	}
++	vmf->page = NULL;
++	pte_unmap_unlock(vmf->pte, vmf->ptl);
++	return 0;
++}
++
+ /**
+  * finish_mkwrite_fault - finish page fault for a shared mapping, making PTE
+  *			  writeable once the page is prepared
+@@ -3240,7 +3316,7 @@ static vm_fault_t wp_page_shared(struct vm_fault *vmf)
+  * but allow concurrent faults), with pte both mapped and locked.
+  * We return with mmap_lock still held, but pte unmapped and unlocked.
+  */
+-static vm_fault_t do_wp_page(struct vm_fault *vmf)
++static vm_fault_t do_wp_page_cow(struct vm_fault *vmf)
+ 	__releases(vmf->ptl)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+@@ -3272,7 +3348,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
+ 			return wp_pfn_shared(vmf);
+ 
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
+-		return wp_page_copy(vmf);
++		return wp_page_cow(vmf);
+ 	}
+ 
+ 	/*
+@@ -3310,7 +3386,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
+ 	get_page(vmf->page);
+ 
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+-	return wp_page_copy(vmf);
++	return wp_page_cow(vmf);
+ }
+ 
+ static void unmap_mapping_range_vma(struct vm_area_struct *vma,
+@@ -3678,7 +3754,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	}
+ 
+ 	if (vmf->flags & FAULT_FLAG_WRITE) {
+-		ret |= do_wp_page(vmf);
++		ret |= do_wp_page_cow(vmf);
+ 		if (ret & VM_FAULT_ERROR)
+ 			ret &= VM_FAULT_ERROR;
+ 		goto out;
+@@ -4445,6 +4521,16 @@ static inline vm_fault_t create_huge_pmd(struct vm_fault *vmf)
+ /* `inline' is required to avoid gcc 4.1.2 build error */
+ static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf)
+ {
++	if (vmf->flags & FAULT_FLAG_UNSHARE) {
++		/*
++		 * We'll simply split the THP and handle unsharing on the
++		 * PTE level. Unsharing only applies to anon THPs and we
++		 * shouldn't ever find them inside shared mappings.
++		 */
++		if (WARN_ON_ONCE(vmf->vma->vm_flags & VM_SHARED))
++			return 0;
++		goto split_fallback;
++	}
+ 	if (vma_is_anonymous(vmf->vma)) {
+ 		if (userfaultfd_huge_pmd_wp(vmf->vma, vmf->orig_pmd))
+ 			return handle_userfault(vmf, VM_UFFD_WP);
+@@ -4457,7 +4543,8 @@ static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf)
+ 			return ret;
+ 	}
+ 
+-	/* COW or write-notify handled on pte level: split pmd. */
++split_fallback:
++	/* COW, unsharing or write-notify handled on pte level: split pmd. */
+ 	__split_huge_pmd(vmf->vma, vmf->pmd, vmf->address, false, NULL);
+ 
+ 	return VM_FAULT_FALLBACK;
+@@ -4568,8 +4655,11 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 			return do_fault(vmf);
+ 	}
+ 
+-	if (!pte_present(vmf->orig_pte))
+-		return do_swap_page(vmf);
++	if (!pte_present(vmf->orig_pte)) {
++		if (likely(!(vmf->flags & FAULT_FLAG_UNSHARE)))
++			return do_swap_page(vmf);
++		return 0;
++	}
+ 
+ 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
+ 		return do_numa_page(vmf);
+@@ -4581,9 +4671,13 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 		update_mmu_tlb(vmf->vma, vmf->address, vmf->pte);
+ 		goto unlock;
+ 	}
+-	if (vmf->flags & FAULT_FLAG_WRITE) {
+-		if (!pte_write(entry))
+-			return do_wp_page(vmf);
++	if (vmf->flags & (FAULT_FLAG_WRITE|FAULT_FLAG_UNSHARE)) {
++		if (!pte_write(entry)) {
++			if (vmf->flags & FAULT_FLAG_WRITE)
++				return do_wp_page_cow(vmf);
++			else
++				return do_wp_page_unshare(vmf);
++		}
+ 		entry = pte_mkdirty(entry);
+ 	}
+ 	entry = pte_mkyoung(entry);
+@@ -4624,7 +4718,6 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 		.pgoff = linear_page_index(vma, address),
+ 		.gfp_mask = __get_fault_gfp_mask(vma),
+ 	};
+-	unsigned int dirty = flags & FAULT_FLAG_WRITE;
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
+@@ -4651,7 +4744,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 
+ 			/* NUMA case for anonymous PUDs would go here */
+ 
+-			if (dirty && !pud_write(orig_pud)) {
++			if ((flags & FAULT_FLAG_WRITE) && !pud_write(orig_pud)) {
+ 				ret = wp_huge_pud(&vmf, orig_pud);
+ 				if (!(ret & VM_FAULT_FALLBACK))
+ 					return ret;
+@@ -4689,7 +4782,8 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 			if (pmd_protnone(vmf.orig_pmd) && vma_is_accessible(vma))
+ 				return do_huge_pmd_numa_page(&vmf);
+ 
+-			if (dirty && !pmd_write(vmf.orig_pmd)) {
++			if ((flags & (FAULT_FLAG_WRITE|FAULT_FLAG_UNSHARE)) &&
++			    !pmd_write(vmf.orig_pmd)) {
+ 				ret = wp_huge_pmd(&vmf);
+ 				if (!(ret & VM_FAULT_FALLBACK))
+ 					return ret;
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 6aebd1747251..e99924b132bb 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1294,6 +1294,7 @@ static void page_remove_file_rmap(struct page *page, bool compound)
+ 
+ static void page_remove_anon_compound_rmap(struct page *page)
+ {
++	unsigned long irq_flags;
+ 	int i, nr;
+ 
+ 	if (!atomic_add_negative(-1, compound_mapcount_ptr(page)))
+@@ -1308,23 +1309,30 @@ static void page_remove_anon_compound_rmap(struct page *page)
+ 
+ 	__mod_lruvec_page_state(page, NR_ANON_THPS, -thp_nr_pages(page));
+ 
+-	if (TestClearPageDoubleMap(page)) {
+-		/*
+-		 * Subpages can be mapped with PTEs too. Check how many of
+-		 * them are still mapped.
+-		 */
+-		for (i = 0, nr = 0; i < thp_nr_pages(page); i++) {
+-			if (atomic_add_negative(-1, &page[i]._mapcount))
+-				nr++;
+-		}
++	if (PageDoubleMap(page)) {
++		thp_mapcount_lock(page, &irq_flags);
++		if (TestClearPageDoubleMap(page)) {
++			/*
++			 * Subpages can be mapped with PTEs too. Check how many
++			 * of them are still mapped.
++			 */
++			for (i = 0, nr = 0; i < thp_nr_pages(page); i++) {
++				if (atomic_add_negative(-1, &page[i]._mapcount))
++					nr++;
++			}
++			thp_mapcount_unlock(page, irq_flags);
+ 
+-		/*
+-		 * Queue the page for deferred split if at least one small
+-		 * page of the compound page is unmapped, but at least one
+-		 * small page is still mapped.
+-		 */
+-		if (nr && nr < thp_nr_pages(page))
+-			deferred_split_huge_page(page);
++			/*
++			 * Queue the page for deferred split if at least one
++			 * small page of the compound page is unmapped, but at
++			 * least one small page is still mapped.
++			 */
++			if (nr && nr < thp_nr_pages(page))
++				deferred_split_huge_page(page);
++		} else {
++			thp_mapcount_unlock(page, irq_flags);
++			nr = thp_nr_pages(page);
++		}
+ 	} else {
+ 		nr = thp_nr_pages(page);
+ 	}
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 22d10f713848..f97b4f486b27 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -1610,6 +1610,7 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
+ 	struct swap_cluster_info *ci = NULL;
+ 	unsigned char *map = NULL;
+ 	int mapcount, swapcount = 0;
++	unsigned int seqcount;
+ 
+ 	/* hugetlbfs shouldn't call it */
+ 	VM_BUG_ON_PAGE(PageHuge(page), page);
+@@ -1625,7 +1626,6 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
+ 
+ 	page = compound_head(page);
+ 
+-	_total_mapcount = _total_swapcount = map_swapcount = 0;
+ 	if (PageSwapCache(page)) {
+ 		swp_entry_t entry;
+ 
+@@ -1638,21 +1638,28 @@ static int page_trans_huge_map_swapcount(struct page *page, int *total_mapcount,
+ 	}
+ 	if (map)
+ 		ci = lock_cluster(si, offset);
+-	for (i = 0; i < HPAGE_PMD_NR; i++) {
+-		mapcount = atomic_read(&page[i]._mapcount) + 1;
+-		_total_mapcount += mapcount;
+-		if (map) {
+-			swapcount = swap_count(map[offset + i]);
+-			_total_swapcount += swapcount;
++
++	do {
++		_total_mapcount = _total_swapcount = map_swapcount = 0;
++
++		seqcount = thp_mapcount_read_begin(page);
++		for (i = 0; i < HPAGE_PMD_NR; i++) {
++			mapcount = atomic_read(&page[i]._mapcount) + 1;
++			_total_mapcount += mapcount;
++			if (map) {
++				swapcount = swap_count(map[offset + i]);
++				_total_swapcount += swapcount;
++			}
++			map_swapcount = max(map_swapcount, mapcount + swapcount);
+ 		}
+-		map_swapcount = max(map_swapcount, mapcount + swapcount);
+-	}
++		if (PageDoubleMap(page)) {
++			map_swapcount -= 1;
++			_total_mapcount -= HPAGE_PMD_NR;
++		}
++		mapcount = compound_mapcount(page);
++	} while (thp_mapcount_read_retry(page, seqcount));
++
+ 	unlock_cluster(ci);
+-	if (PageDoubleMap(page)) {
+-		map_swapcount -= 1;
+-		_total_mapcount -= HPAGE_PMD_NR;
+-	}
+-	mapcount = compound_mapcount(page);
+ 	map_swapcount += mapcount;
+ 	_total_mapcount += mapcount;
+ 	if (total_mapcount)
+diff --git a/mm/util.c b/mm/util.c
+index bacabe446906..1ab714b46a10 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -733,19 +733,29 @@ EXPORT_SYMBOL(page_mapping);
+ /* Slow path of page_mapcount() for compound pages */
+ int __page_mapcount(struct page *page)
+ {
++	struct page *head_page;
++	unsigned int seqcount;
+ 	int ret;
+ 
+-	ret = atomic_read(&page->_mapcount) + 1;
++	if (PageHuge(page))
++		return compound_mapcount(page);
+ 	/*
+ 	 * For file THP page->_mapcount contains total number of mapping
+ 	 * of the page: no need to look into compound_mapcount.
+ 	 */
+-	if (!PageAnon(page) && !PageHuge(page))
+-		return ret;
+-	page = compound_head(page);
+-	ret += atomic_read(compound_mapcount_ptr(page)) + 1;
+-	if (PageDoubleMap(page))
+-		ret--;
++	if (!PageAnon(page))
++		return atomic_read(&page->_mapcount) + 1;
++
++	/* The mapcount_seqlock is so far only required for anonymous THP. */
++	head_page = compound_head(page);
++	do {
++		seqcount = thp_mapcount_read_begin(head_page);
++		ret = atomic_read(&page->_mapcount) + 1;
++		ret += head_compound_mapcount(head_page);
++		if (PageDoubleMap(head_page))
++			ret--;
++	} while (thp_mapcount_read_retry(head_page, seqcount));
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(__page_mapcount);
+diff --git a/tools/testing/selftests/vm/Makefile b/tools/testing/selftests/vm/Makefile
+index d9605bd10f2d..8522b5630656 100644
+--- a/tools/testing/selftests/vm/Makefile
++++ b/tools/testing/selftests/vm/Makefile
+@@ -27,6 +27,7 @@ CFLAGS = -Wall -I ../../../../usr/include $(EXTRA_CFLAGS)
+ LDLIBS = -lrt -lpthread
+ TEST_GEN_FILES = compaction_test
+ TEST_GEN_FILES += gup_test
++TEST_GEN_FILES += gup_cow
+ TEST_GEN_FILES += hmm-tests
+ TEST_GEN_FILES += hugepage-mmap
+ TEST_GEN_FILES += hugepage-shm
+diff --git a/tools/testing/selftests/vm/gup_cow.c b/tools/testing/selftests/vm/gup_cow.c
+new file mode 100644
+index 000000000000..9d44ed2ffdfc
+--- /dev/null
++++ b/tools/testing/selftests/vm/gup_cow.c
+@@ -0,0 +1,312 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * GUP (Get User Pages) interaction with COW (Copy On Write) tests.
++ *
++ * Copyright 2021, Red Hat, Inc.
++ *
++ * Author(s): David Hildenbrand <david@redhat.com>
++ */
++#define _GNU_SOURCE
++#include <stdlib.h>
++#include <string.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/wait.h>
++
++#include "../kselftest.h"
++
++#define barrier() asm volatile("" ::: "memory")
++
++static size_t pagesize;
++static size_t thpsize;
++static size_t hugetlbsize;
++
++struct shared_mem {
++	bool parent_ready;
++	bool child_ready;
++};
++struct shared_mem *shared;
++
++static size_t detect_thpsize(void)
++{
++	int fd = open("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size",
++		      O_RDONLY);
++	size_t size = 0;
++	char buf[15];
++	int ret;
++
++	if (fd < 0)
++		return 0;
++
++	ret = pread(fd, buf, sizeof(buf), 0);
++	if (ret < 0 || ret == sizeof(buf))
++		goto out;
++	buf[ret] = 0;
++
++	size = strtoul(buf, NULL, 10);
++out:
++	close(fd);
++	if (size < pagesize)
++		size = 0;
++	return size;
++}
++
++static uint64_t pagemap_get_entry(int fd, void *addr)
++{
++	const unsigned long pfn = (unsigned long)addr / pagesize;
++	uint64_t entry;
++	int ret;
++
++	ret = pread(fd, &entry, sizeof(entry), pfn * sizeof(entry));
++	if (ret != sizeof(entry))
++		ksft_exit_fail_msg("reading pagemap failed\n");
++	return entry;
++}
++
++static bool page_is_populated(void *addr)
++{
++	int fd = open("/proc/self/pagemap", O_RDONLY);
++	uint64_t entry;
++	bool ret;
++
++	if (fd < 0)
++		ksft_exit_fail_msg("opening pagemap failed\n");
++
++	/* Present or swapped. */
++	entry = pagemap_get_entry(fd, addr);
++	ret = !!(entry & 0xc000000000000000ull);
++	close(fd);
++	return ret;
++}
++
++static int child_vmsplice_fn(unsigned char *mem, size_t size)
++{
++	struct iovec iov = {
++		.iov_base = mem,
++		.iov_len = size,
++	};
++	size_t cur, total, transferred;
++	char *old, *new;
++	int fds[2];
++
++	old = malloc(size);
++	new = malloc(size);
++
++	/* Backup the original content. */
++	memcpy(old, mem, size);
++
++	if (pipe(fds) < 0)
++		return -errno;
++
++	/* Trigger a read-only pin. */
++	transferred = vmsplice(fds[1], &iov, 1, 0);
++	if (transferred < 0)
++		return -errno;
++	if (transferred == 0)
++		return -EINVAL;
++
++	/* Unmap it from our page tables. */
++	if (munmap(mem, size) < 0)
++		return -errno;
++
++	/* Wait until the parent modified it. */
++	barrier();
++	shared->child_ready = true;
++	barrier();
++	while (!shared->parent_ready)
++		barrier();
++	barrier();
++
++	/* See if we still read the old values. */
++	total = 0;
++	while (total < transferred) {
++		cur = read(fds[0], new + total, transferred - total);
++		if (cur < 0)
++			return -errno;
++		total += cur;
++	}
++
++	return memcmp(old, new, transferred);
++}
++
++static void test_child_ro_gup(unsigned char *mem, size_t size)
++{
++	int ret;
++
++	/* Populate the page. */
++	memset(mem, 0, size);
++
++	shared->parent_ready = false;
++	shared->child_ready = false;
++	barrier();
++
++	ret = fork();
++	if (ret < 0) {
++		ksft_exit_fail_msg("fork failed\n");
++	} else if (!ret) {
++		ret = child_vmsplice_fn(mem, size);
++		exit(ret);
++	}
++
++	barrier();
++	while (!shared->child_ready)
++		barrier();
++	/* Modify the page. */
++	barrier();
++	memset(mem, 0xff, size);
++	barrier();
++	shared->parent_ready = true;
++
++	wait(&ret);
++	if (WIFEXITED(ret))
++		ret = WEXITSTATUS(ret);
++	else
++		ret = -EINVAL;
++
++	ksft_test_result(!ret, "child has correct MAP_PRIVATE semantics\n");
++}
++
++static void test_anon_ro_gup_child(void)
++{
++	unsigned char *mem;
++	int ret;
++
++	ksft_print_msg("[RUN] %s\n", __func__);
++
++	mem = mmap(NULL, pagesize, PROT_READ | PROT_WRITE,
++		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (mem == MAP_FAILED) {
++		ksft_test_result_fail("mmap failed\n");
++		return;
++	}
++
++	ret = madvise(mem, pagesize, MADV_NOHUGEPAGE);
++	/* Ignore if not around on a kernel. */
++	if (ret && ret != -EINVAL) {
++		ksft_test_result_fail("madvise failed\n");
++		goto out;
++	}
++
++	test_child_ro_gup(mem, pagesize);
++out:
++	munmap(mem, pagesize);
++}
++
++static void test_anon_thp_ro_gup_child(void)
++{
++	unsigned char *mem, *mmap_mem;
++	size_t mmap_size;
++	int ret;
++
++	ksft_print_msg("[RUN] %s\n", __func__);
++
++	if (!thpsize)
++		ksft_test_result_skip("THP size not detected\n");
++
++	mmap_size = 2 * thpsize;
++	mmap_mem = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
++			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (mmap_mem == MAP_FAILED) {
++		ksft_test_result_fail("mmap failed\n");
++		return;
++	}
++
++	mem = (unsigned char *)(((uintptr_t)mmap_mem + thpsize) & ~(thpsize - 1));
++
++	ret = madvise(mem, thpsize, MADV_HUGEPAGE);
++	if (ret) {
++		ksft_test_result_fail("madvise(MADV_HUGEPAGE) failed\n");
++		goto out;
++	}
++
++	/*
++	 * Touch the first sub-page and test of we get another sub-page
++	 * populated.
++	 */
++	mem[0] = 0;
++	if (!page_is_populated(mem + pagesize)) {
++		ksft_test_result_skip("Did not get a THP populated\n");
++		goto out;
++	}
++
++	test_child_ro_gup(mem, thpsize);
++out:
++	munmap(mmap_mem, mmap_size);
++}
++
++static void test_anon_hugetlb_ro_gup_child(void)
++{
++	unsigned char *mem, *dummy;
++
++	ksft_print_msg("[RUN] %s\n", __func__);
++
++	if (!hugetlbsize)
++		ksft_test_result_skip("hugetlb size not detected\n");
++
++	ksft_print_msg("[INFO] Assuming hugetlb size of %zd bytes\n",
++			hugetlbsize);
++
++	mem = mmap(NULL, hugetlbsize, PROT_READ | PROT_WRITE,
++		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
++	if (mem == MAP_FAILED) {
++		ksft_test_result_skip("need more free huge pages\n");
++		return;
++	}
++
++	/*
++	 * We need a total of two hugetlb pages to handle COW/unsharing
++	 * properly.
++	 */
++	dummy = mmap(NULL, hugetlbsize, PROT_READ | PROT_WRITE,
++		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
++	if (dummy == MAP_FAILED) {
++		ksft_test_result_skip("need more free huge pages\n");
++		goto out;
++	}
++	munmap(dummy, hugetlbsize);
++
++	test_child_ro_gup(mem, hugetlbsize);
++out:
++	munmap(mem, hugetlbsize);
++}
++
++int main(int argc, char **argv)
++{
++	int err;
++
++	pagesize = getpagesize();
++	thpsize = detect_thpsize();
++	/* For simplicity, we'll rely on the thp size. */
++	hugetlbsize = thpsize;
++
++	ksft_print_header();
++	ksft_set_plan(3);
++
++	/* We need an easy way to talk to our child. */
++	shared = mmap(NULL, pagesize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	if (shared == MAP_FAILED)
++		ksft_exit_fail_msg("mmap(MAP_SHARED)\n");
++
++	/*
++	 * Tests for the security issue reported by Jann Horn that originally
++	 * resulted in CVE-2020-29374. More generally, it's a violation of
++	 * POSIX MAP_PRIVATE semantics, because some other process can modify
++	 * pages that are supposed to be private to one process.
++	 *
++	 * So let's test that process-private pages stay private using the
++	 * known vmsplice reproducer.
++	 */
++	test_anon_ro_gup_child();
++	test_anon_thp_ro_gup_child();
++	test_anon_hugetlb_ro_gup_child();
++
++	err = ksft_get_fail_cnt();
++	if (err)
++		ksft_exit_fail_msg("%d out of %d tests failed\n",
++				   err, ksft_test_num());
++	return ksft_exit_pass();
++}
+diff --git a/tools/testing/selftests/vm/run_vmtests.sh b/tools/testing/selftests/vm/run_vmtests.sh
+index 45e803af7c77..9cfdcbffa035 100755
+--- a/tools/testing/selftests/vm/run_vmtests.sh
++++ b/tools/testing/selftests/vm/run_vmtests.sh
+@@ -157,6 +157,22 @@ else
+ 	echo "[PASS]"
+ fi
+ 
++echo "--------------------------------------------------------"
++echo "running "GUP interaction with COW tests.
++echo "--------------------------------------------------------"
++./gup_cow
++ret_val=$?
++
++if [ $ret_val -eq 0 ]; then
++	echo "[PASS]"
++elif [ $ret_val -eq $ksft_skip ]; then
++	echo "[SKIP]"
++	exitcode=$ksft_skip
++else
++	echo "[FAIL]"
++	exitcode=1
++fi
++
+ echo "-------------------"
+ echo "running userfaultfd"
+ echo "-------------------"
+-- 
+2.34.1
+
