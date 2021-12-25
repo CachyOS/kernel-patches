@@ -950,3 +950,243 @@ index dea9fe8a56cc..8a9432fb3802 100644
  	if (IS_ENABLED(CONFIG_SMP)) {
  		return xchg(pmdp, pmd);
  	} else {
+oom-reaper and process_mrelease system call should protect against
+races with exit_mmap which can destroy page tables while they
+walk the VMA tree. oom-reaper protects from that race by setting
+MMF_OOM_VICTIM and by relying on exit_mmap to set MMF_OOM_SKIP
+before taking and releasing mmap_write_lock. process_mrelease has
+to elevate mm->mm_users to prevent such race. Both oom-reaper and
+process_mrelease hold mmap_read_lock when walking the VMA tree.
+The locking rules and mechanisms could be simpler if exit_mmap takes
+mmap_write_lock while executing destructive operations such as
+free_pgtables.
+Change exit_mmap to hold the mmap_write_lock when calling
+free_pgtables and remove_vma. Operations like unmap_vmas and
+unlock_range are not destructive and could run under mmap_read_lock
+but for simplicity we take one mmap_write_lock during almost the entire
+operation. Note also that because oom-reaper checks VM_LOCKED flag,
+unlock_range() should not be allowed to race with it.
+Before this patch, remove_vma used to be called with no locks held,
+however with fput being executed asynchronously and vm_ops->close
+not being allowed to hold mmap_lock (it is called from __split_vma
+with mmap_sem held for write), changing that should be fine.
+In most cases this lock should be uncontended. Previously, Kirill
+reported ~4% regression caused by a similar change [1]. We reran the
+same test and although the individual results are quite noisy, the
+percentiles show lower regression with 1.6% being the worst case [2].
+The change allows oom-reaper and process_mrelease to execute safely
+under mmap_read_lock without worries that exit_mmap might destroy page
+tables from under them.
+
+[1] https://lore.kernel.org/all/20170725141723.ivukwhddk2voyhuc@node.shutemov.name/
+[2] https://lore.kernel.org/all/CAJuCfpGC9-c9P40x7oy=jy5SphMcd0o0G_6U1-+JAziGKG6dGA@mail.gmail.com/
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+changes in v4
+- Separated comments describing vm_operations_struct::close locking
+requirements into a separate patch, per Matthew Wilcox
+
+ mm/mmap.c | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/mm/mmap.c b/mm/mmap.c
+index bfb0ea164a90..f4e09d390a07 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -3142,25 +3142,27 @@ void exit_mmap(struct mm_struct *mm)
+ 		 * to mmu_notifier_release(mm) ensures mmu notifier callbacks in
+ 		 * __oom_reap_task_mm() will not block.
+ 		 *
+-		 * This needs to be done before calling munlock_vma_pages_all(),
++		 * This needs to be done before calling unlock_range(),
+ 		 * which clears VM_LOCKED, otherwise the oom reaper cannot
+ 		 * reliably test it.
+ 		 */
+ 		(void)__oom_reap_task_mm(mm);
+
+ 		set_bit(MMF_OOM_SKIP, &mm->flags);
+-		mmap_write_lock(mm);
+-		mmap_write_unlock(mm);
+ 	}
+
++	mmap_write_lock(mm);
+ 	if (mm->locked_vm)
+ 		unlock_range(mm->mmap, ULONG_MAX);
+
+ 	arch_exit_mmap(mm);
+
+ 	vma = mm->mmap;
+-	if (!vma)	/* Can happen if dup_mmap() received an OOM */
++	if (!vma) {
++		/* Can happen if dup_mmap() received an OOM */
++		mmap_write_unlock(mm);
+ 		return;
++	}
+
+ 	lru_add_drain();
+ 	flush_cache_mm(mm);
+@@ -3171,16 +3173,14 @@ void exit_mmap(struct mm_struct *mm)
+ 	free_pgtables(&tlb, vma, FIRST_USER_ADDRESS, USER_PGTABLES_CEILING);
+ 	tlb_finish_mmu(&tlb);
+
+-	/*
+-	 * Walk the list again, actually closing and freeing it,
+-	 * with preemption enabled, without holding any MM locks.
+-	 */
++	/* Walk the list again, actually closing and freeing it. */
+ 	while (vma) {
+ 		if (vma->vm_flags & VM_ACCOUNT)
+ 			nr_accounted += vma_pages(vma);
+ 		vma = remove_vma(vma);
+ 		cond_resched();
+ 	}
++	mmap_write_unlock(mm);
+ 	vm_unacct_memory(nr_accounted);
+ }
+
+--
+2.34.1.400.ga245620fadb-goog
+Add comments for vm_operations_struct::close documenting locking
+requirements for this callback and its callers.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ include/linux/mm.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index a7e4a9e7d807..b9b88ba7564b 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -577,6 +577,10 @@ enum page_entry_size {
+  */
+ struct vm_operations_struct {
+ 	void (*open)(struct vm_area_struct * area);
++	/**
++	 * @close: Called when the VMA is being removed from the MM.
++	 * Context: User context.  May sleep.  Caller holds mmap_lock.
++	 */
+ 	void (*close)(struct vm_area_struct * area);
+ 	/* Called any time before splitting to check if it's allowed */
+ 	int (*may_split)(struct vm_area_struct *area, unsigned long addr);
+--
+2.34.1.400.ga245620fadb-goog
+With exit_mmap holding mmap_write_lock during free_pgtables call,
+process_mrelease does not need to elevate mm->mm_users in order to
+prevent exit_mmap from destrying pagetables while __oom_reap_task_mm
+is walking the VMA tree. The change prevents process_mrelease from
+calling the last mmput, which can lead to waiting for IO completion
+in exit_aio.
+
+Fixes: 337546e83fc7 ("mm/oom_kill.c: prevent a race between process_mrelease and exit_mmap")
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ mm/oom_kill.c | 27 +++++++++++++++------------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/mm/oom_kill.c b/mm/oom_kill.c
+index 1ddabefcfb5a..67780386f478 100644
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -1169,15 +1169,15 @@ SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
+ 		goto put_task;
+ 	}
+
+-	if (mmget_not_zero(p->mm)) {
+-		mm = p->mm;
+-		if (task_will_free_mem(p))
+-			reap = true;
+-		else {
+-			/* Error only if the work has not been done already */
+-			if (!test_bit(MMF_OOM_SKIP, &mm->flags))
+-				ret = -EINVAL;
+-		}
++	mm = p->mm;
++	mmgrab(mm);
++
++	if (task_will_free_mem(p))
++		reap = true;
++	else {
++		/* Error only if the work has not been done already */
++		if (!test_bit(MMF_OOM_SKIP, &mm->flags))
++			ret = -EINVAL;
+ 	}
+ 	task_unlock(p);
+
+@@ -1188,13 +1188,16 @@ SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
+ 		ret = -EINTR;
+ 		goto drop_mm;
+ 	}
+-	if (!__oom_reap_task_mm(mm))
++	/*
++	 * Check MMF_OOM_SKIP again under mmap_read_lock protection to ensure
++	 * possible change in exit_mmap is seen
++	 */
++	if (!test_bit(MMF_OOM_SKIP, &mm->flags) && !__oom_reap_task_mm(mm))
+ 		ret = -EAGAIN;
+ 	mmap_read_unlock(mm);
+
+ drop_mm:
+-	if (mm)
+-		mmput(mm);
++	mmdrop(mm);
+ put_task:
+ 	put_task_struct(task);
+ 	return ret;
+--
+2.34.1.400.ga245620fadb-goog
+MMF_OOM_SKIP used to play a synchronization role between exit_mmap and
+oom repear in the past. Since the exclusive mmap_sem is held in
+exit_mmap to cover all destructive operations the flag synchronization
+is not needed anymore and we can safely drop it. Just make sure that
+mm->mmap is set to NULL so that nobody will access the freed vma list.
+
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+---
+ mm/mmap.c | 23 +----------------------
+ 1 file changed, 1 insertion(+), 22 deletions(-)
+
+diff --git a/mm/mmap.c b/mm/mmap.c
+index f4e09d390a07..0d6af9d89aa8 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -3129,28 +3129,6 @@ void exit_mmap(struct mm_struct *mm)
+ 	/* mm's last user has gone, and its about to be pulled down */
+ 	mmu_notifier_release(mm);
+
+-	if (unlikely(mm_is_oom_victim(mm))) {
+-		/*
+-		 * Manually reap the mm to free as much memory as possible.
+-		 * Then, as the oom reaper does, set MMF_OOM_SKIP to disregard
+-		 * this mm from further consideration.  Taking mm->mmap_lock for
+-		 * write after setting MMF_OOM_SKIP will guarantee that the oom
+-		 * reaper will not run on this mm again after mmap_lock is
+-		 * dropped.
+-		 *
+-		 * Nothing can be holding mm->mmap_lock here and the above call
+-		 * to mmu_notifier_release(mm) ensures mmu notifier callbacks in
+-		 * __oom_reap_task_mm() will not block.
+-		 *
+-		 * This needs to be done before calling unlock_range(),
+-		 * which clears VM_LOCKED, otherwise the oom reaper cannot
+-		 * reliably test it.
+-		 */
+-		(void)__oom_reap_task_mm(mm);
+-
+-		set_bit(MMF_OOM_SKIP, &mm->flags);
+-	}
+-
+ 	mmap_write_lock(mm);
+ 	if (mm->locked_vm)
+ 		unlock_range(mm->mmap, ULONG_MAX);
+@@ -3180,6 +3158,7 @@ void exit_mmap(struct mm_struct *mm)
+ 		vma = remove_vma(vma);
+ 		cond_resched();
+ 	}
++	mm->mmap = NULL;
+ 	mmap_write_unlock(mm);
+ 	vm_unacct_memory(nr_accounted);
+ }
+--
+2.30.2
