@@ -1,9 +1,112 @@
+From 5f765954e64a57423da942406d03abca72094540 Mon Sep 17 00:00:00 2001
+From: "P. Jung" <ptr1337@cachyos.org>
+Date: Tue, 4 Jan 2022 22:48:32 +0000
+Subject: [PATCH] misc
+
+---
+ arch/x86/kernel/cpu/common.c       |  15 +++-
+ arch/x86/lib/copy_user_64.S        |  13 ++-
+ drivers/cpufreq/Kconfig            |   2 +-
+ drivers/cpufreq/cpufreq_ondemand.c |   6 +-
+ include/linux/pagemap.h            |   2 +-
+ kernel/Kconfig.hz                  |  16 ++++
+ kernel/notifier.c                  |  15 ++--
+ kernel/sched/core.c                |   2 +-
+ kernel/sched/fair.c                | 127 +++++++++++++++++++----------
+ mm/page-writeback.c                |   4 +-
+ mm/vmscan.c                        |   2 +-
+ 11 files changed, 139 insertions(+), 65 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 0083464de5e3..0663642d6199 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1787,6 +1787,17 @@ EXPORT_PER_CPU_SYMBOL(__preempt_count);
+ 
+ DEFINE_PER_CPU(unsigned long, cpu_current_top_of_stack) = TOP_OF_INIT_STACK;
+ 
++static void wrmsrl_cstar(unsigned long val)
++{
++	/*
++	 * Intel CPUs do not support 32-bit SYSCALL. Writing to MSR_CSTAR
++	 * is so far ignored by the CPU, but raises a #VE trap in a TDX
++	 * guest. Avoid the pointless write on all Intel CPUs.
++	 */
++	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
++		wrmsrl(MSR_CSTAR, val);
++}
++
+ /* May not be marked __init: used by software suspend */
+ void syscall_init(void)
+ {
+@@ -1794,7 +1805,7 @@ void syscall_init(void)
+ 	wrmsrl(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
+ 
+ #ifdef CONFIG_IA32_EMULATION
+-	wrmsrl(MSR_CSTAR, (unsigned long)entry_SYSCALL_compat);
++	wrmsrl_cstar((unsigned long)entry_SYSCALL_compat);
+ 	/*
+ 	 * This only works on Intel CPUs.
+ 	 * On AMD CPUs these MSRs are 32-bit, CPU truncates MSR_IA32_SYSENTER_EIP.
+@@ -1806,7 +1817,7 @@ void syscall_init(void)
+ 		    (unsigned long)(cpu_entry_stack(smp_processor_id()) + 1));
+ 	wrmsrl_safe(MSR_IA32_SYSENTER_EIP, (u64)entry_SYSENTER_compat);
+ #else
+-	wrmsrl(MSR_CSTAR, (unsigned long)ignore_sysret);
++	wrmsrl_cstar((unsigned long)ignore_sysret);
+ 	wrmsrl_safe(MSR_IA32_SYSENTER_CS, (u64)GDT_ENTRY_INVALID_SEG);
+ 	wrmsrl_safe(MSR_IA32_SYSENTER_ESP, 0ULL);
+ 	wrmsrl_safe(MSR_IA32_SYSENTER_EIP, 0ULL);
+diff --git a/arch/x86/lib/copy_user_64.S b/arch/x86/lib/copy_user_64.S
+index 2797e630b9b1..a2cbeae4b180 100644
+--- a/arch/x86/lib/copy_user_64.S
++++ b/arch/x86/lib/copy_user_64.S
+@@ -200,8 +200,8 @@ EXPORT_SYMBOL(copy_user_generic_string)
+  */
+ SYM_FUNC_START(copy_user_enhanced_fast_string)
+ 	ASM_STAC
+-	cmpl $64,%edx
+-	jb .L_copy_short_string	/* less then 64 bytes, avoid the costly 'rep' */
++	/* CPUs without FSRM should avoid rep movsb for short copies */
++	ALTERNATIVE "cmpl $64, %edx; jb .L_copy_short_string", "", X86_FEATURE_FSRM
+ 	movl %edx,%ecx
+ 1:	rep
+ 	movsb
+@@ -225,6 +225,7 @@ EXPORT_SYMBOL(copy_user_enhanced_fast_string)
+  * Don't try to copy the tail if machine check happened
+  *
+  * Input:
++ * eax trap number written by ex_handler_copy()
+  * rdi destination
+  * rsi source
+  * rdx count
+@@ -233,12 +234,20 @@ EXPORT_SYMBOL(copy_user_enhanced_fast_string)
+  * eax uncopied bytes or 0 if successful.
+  */
+ SYM_CODE_START_LOCAL(.Lcopy_user_handle_tail)
++	cmp $X86_TRAP_MC,%eax
++	je 3f
++
+ 	movl %edx,%ecx
+ 1:	rep movsb
+ 2:	mov %ecx,%eax
+ 	ASM_CLAC
+ 	ret
+ 
++3:
++	movl %edx,%eax
++	ASM_CLAC
++	RET
++
+ 	_ASM_EXTABLE_CPY(1b, 2b)
+ SYM_CODE_END(.Lcopy_user_handle_tail)
+ 
 diff --git a/drivers/cpufreq/Kconfig b/drivers/cpufreq/Kconfig
 index c3038cdc6865..25bf88b571ae 100644
 --- a/drivers/cpufreq/Kconfig
 +++ b/drivers/cpufreq/Kconfig
 @@ -72,7 +72,7 @@ config CPU_FREQ_DEFAULT_GOV_USERSPACE
-
+ 
  config CPU_FREQ_DEFAULT_GOV_ONDEMAND
  	bool "ondemand"
 -	depends on !(X86_INTEL_PSTATE && SMP)
@@ -11,14 +114,13 @@ index c3038cdc6865..25bf88b571ae 100644
  	select CPU_FREQ_GOV_ONDEMAND
  	select CPU_FREQ_GOV_PERFORMANCE
  	help
-
 diff --git a/drivers/cpufreq/cpufreq_ondemand.c b/drivers/cpufreq/cpufreq_ondemand.c
-index eb4320b619c9..71ec5040b29f 100644
+index 3b8f924771b4..e6a48c4cc524 100644
 --- a/drivers/cpufreq/cpufreq_ondemand.c
 +++ b/drivers/cpufreq/cpufreq_ondemand.c
 @@ -18,10 +18,10 @@
  #include "cpufreq_ondemand.h"
-
+ 
  /* On-demand governor macros */
 -#define DEF_FREQUENCY_UP_THRESHOLD		(80)
 -#define DEF_SAMPLING_DOWN_FACTOR		(1)
@@ -31,16 +133,16 @@ index eb4320b619c9..71ec5040b29f 100644
  #define MIN_FREQUENCY_UP_THRESHOLD		(1)
  #define MAX_FREQUENCY_UP_THRESHOLD		(100)
 diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
-index 62db6b0176b9..221331739fd1 100644
+index d150a9082b31..340fb5eb8418 100644
 --- a/include/linux/pagemap.h
 +++ b/include/linux/pagemap.h
-@@ -851,7 +851,7 @@ struct readahead_control {
+@@ -996,7 +996,7 @@ struct readahead_control {
  		._index = i,						\
  	}
-
+ 
 -#define VM_READAHEAD_PAGES	(SZ_128K / PAGE_SIZE)
 +#define VM_READAHEAD_PAGES	(SZ_8M / PAGE_SIZE)
-
+ 
  void page_cache_ra_unbounded(struct readahead_control *,
  		unsigned long nr_to_read, unsigned long lookahead_count);
 diff --git a/kernel/Kconfig.hz b/kernel/Kconfig.hz
@@ -50,7 +152,7 @@ index 38ef6d06888e..eb1ccd2481a9 100644
 @@ -40,6 +40,20 @@ choice
  	 on SMP and NUMA systems and exactly dividing by both PAL and
  	 NTSC frame rates for video and multimedia work.
-
+ 
 +	config HZ_600
 +		bool "600 HZ"
 +	help
@@ -75,21 +177,80 @@ index 38ef6d06888e..eb1ccd2481a9 100644
 +	default 600 if HZ_600
 +	default 750 if HZ_750
  	default 1000 if HZ_1000
-
+ 
  config SCHED_HRTICK
+diff --git a/kernel/notifier.c b/kernel/notifier.c
+index b8251dc0bc0f..ba005ebf4730 100644
+--- a/kernel/notifier.c
++++ b/kernel/notifier.c
+@@ -20,12 +20,13 @@ BLOCKING_NOTIFIER_HEAD(reboot_notifier_list);
+  */
+ 
+ static int notifier_chain_register(struct notifier_block **nl,
+-		struct notifier_block *n)
++				   struct notifier_block *n)
+ {
+ 	while ((*nl) != NULL) {
+ 		if (unlikely((*nl) == n)) {
+-			WARN(1, "double register detected");
+-			return 0;
++			WARN(1, "notifier callback %ps already registered",
++			     n->notifier_call);
++			return -EEXIST;
+ 		}
+ 		if (n->priority > (*nl)->priority)
+ 			break;
+@@ -134,7 +135,7 @@ static int notifier_call_chain_robust(struct notifier_block **nl,
+  *
+  *	Adds a notifier to an atomic notifier chain.
+  *
+- *	Currently always returns zero.
++ *	Returns 0 on success, %-EEXIST on error.
+  */
+ int atomic_notifier_chain_register(struct atomic_notifier_head *nh,
+ 		struct notifier_block *n)
+@@ -216,7 +217,7 @@ NOKPROBE_SYMBOL(atomic_notifier_call_chain);
+  *	Adds a notifier to a blocking notifier chain.
+  *	Must be called in process context.
+  *
+- *	Currently always returns zero.
++ *	Returns 0 on success, %-EEXIST on error.
+  */
+ int blocking_notifier_chain_register(struct blocking_notifier_head *nh,
+ 		struct notifier_block *n)
+@@ -335,7 +336,7 @@ EXPORT_SYMBOL_GPL(blocking_notifier_call_chain);
+  *	Adds a notifier to a raw notifier chain.
+  *	All locking must be provided by the caller.
+  *
+- *	Currently always returns zero.
++ *	Returns 0 on success, %-EEXIST on error.
+  */
+ int raw_notifier_chain_register(struct raw_notifier_head *nh,
+ 		struct notifier_block *n)
+@@ -406,7 +407,7 @@ EXPORT_SYMBOL_GPL(raw_notifier_call_chain);
+  *	Adds a notifier to an SRCU notifier chain.
+  *	Must be called in process context.
+  *
+- *	Currently always returns zero.
++ *	Returns 0 on success, %-EEXIST on error.
+  */
+ int srcu_notifier_chain_register(struct srcu_notifier_head *nh,
+ 		struct notifier_block *n)
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index f21714ea3db8..e3a184a75874 100644
-@@ -368,7 +368,7 @@ static inline void sched_core_dequeue(struct rq *rq, struct task_struct *p) { }
+index 77563109c0ea..f46ad068149e 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -372,7 +372,7 @@ static inline void sched_core_dequeue(struct rq *rq, struct task_struct *p) { }
   * part of the period that we allow rt tasks to run in us.
   * default: 0.95s
   */
 -int sysctl_sched_rt_runtime = 950000;
 +int sysctl_sched_rt_runtime = 980000;
-
-
+ 
+ 
  /*
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index f6a05d9b5443..aa4a2c980025 100644
+index 6e476f6d9435..64f2013ce0f5 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -35,8 +35,8 @@
@@ -100,7 +261,7 @@ index f6a05d9b5443..aa4a2c980025 100644
 -static unsigned int normalized_sysctl_sched_latency	= 6000000ULL;
 +unsigned int sysctl_sched_latency			= 4000000ULL;
 +static unsigned int normalized_sysctl_sched_latency	= 4000000ULL;
-
+ 
  /*
   * The initial- and re-scaling of tunables is configurable
 @@ -56,8 +56,8 @@ unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
@@ -111,10 +272,10 @@ index f6a05d9b5443..aa4a2c980025 100644
 -static unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
 +unsigned int sysctl_sched_min_granularity			= 500000ULL;
 +static unsigned int normalized_sysctl_sched_min_granularity	= 500000ULL;
-
+ 
  /*
-  * This value is kept at sysctl_sched_latency/sysctl_sched_min_granularity
-@@ -79,8 +79,8 @@ unsigned int sysctl_sched_child_runs_first __read_mostly;
+  * Minimal preemption granularity for CPU-bound SCHED_IDLE tasks.
+@@ -87,8 +87,8 @@ unsigned int sysctl_sched_child_runs_first __read_mostly;
   *
   * (default: 1 msec * (1 + ilog(ncpus)), units: nanoseconds)
   */
@@ -122,20 +283,238 @@ index f6a05d9b5443..aa4a2c980025 100644
 -static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
 +unsigned int sysctl_sched_wakeup_granularity			= 800000UL;
 +static unsigned int normalized_sysctl_sched_wakeup_granularity	= 800000UL;
-
+ 
  const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
-
-@@ -133,7 +133,7 @@ int __weak arch_asym_cpu_priority(int cpu)
+ 
+@@ -141,7 +141,7 @@ int __weak arch_asym_cpu_priority(int cpu)
   *
   * (default: 5 msec, units: microseconds)
   */
 -unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
 +unsigned int sysctl_sched_cfs_bandwidth_slice		= 4000UL;
  #endif
-
+ 
  static inline void update_load_add(struct load_weight *lw, unsigned long inc)
+@@ -3026,12 +3026,17 @@ enqueue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 	cfs_rq->avg.load_sum += se_weight(se) * se->avg.load_sum;
+ }
+ 
++#define MIN_DIVIDER (LOAD_AVG_MAX - 1024)
++
+ static inline void
+ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	u32 divider = get_pelt_divider(&se->avg);
+ 	sub_positive(&cfs_rq->avg.load_avg, se->avg.load_avg);
+-	cfs_rq->avg.load_sum = cfs_rq->avg.load_avg * divider;
++	sub_positive(&cfs_rq->avg.load_sum, se_weight(se) * se->avg.load_sum);
++	/* See update_tg_cfs_util() */
++	cfs_rq->avg.load_sum = max_t(u32, cfs_rq->avg.load_sum,
++					  cfs_rq->avg.load_avg * MIN_DIVIDER);
++
+ }
+ #else
+ static inline void
+@@ -3382,7 +3387,6 @@ void set_task_rq_fair(struct sched_entity *se,
+ 	se->avg.last_update_time = n_last_update_time;
+ }
+ 
+-
+ /*
+  * When on migration a sched_entity joins/leaves the PELT hierarchy, we need to
+  * propagate its contribution. The key to this propagation is the invariant
+@@ -3450,15 +3454,14 @@ void set_task_rq_fair(struct sched_entity *se,
+  * XXX: only do this for the part of runnable > running ?
+  *
+  */
+-
+ static inline void
+ update_tg_cfs_util(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
+ {
+-	long delta = gcfs_rq->avg.util_avg - se->avg.util_avg;
+-	u32 divider;
++	long delta_sum, delta_avg = gcfs_rq->avg.util_avg - se->avg.util_avg;
++	u32 new_sum, divider;
+ 
+ 	/* Nothing to update */
+-	if (!delta)
++	if (!delta_avg)
+ 		return;
+ 
+ 	/*
+@@ -3467,23 +3470,40 @@ update_tg_cfs_util(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq
+ 	 */
+ 	divider = get_pelt_divider(&cfs_rq->avg);
+ 
++
+ 	/* Set new sched_entity's utilization */
+ 	se->avg.util_avg = gcfs_rq->avg.util_avg;
+-	se->avg.util_sum = se->avg.util_avg * divider;
++	new_sum = se->avg.util_avg * divider;
++	delta_sum = (long)new_sum - (long)se->avg.util_sum;
++	se->avg.util_sum = new_sum;
+ 
+ 	/* Update parent cfs_rq utilization */
+-	add_positive(&cfs_rq->avg.util_avg, delta);
+-	cfs_rq->avg.util_sum = cfs_rq->avg.util_avg * divider;
++	add_positive(&cfs_rq->avg.util_avg, delta_avg);
++	add_positive(&cfs_rq->avg.util_sum, delta_sum);
++
++	/*
++	 * Because of rounding, se->util_sum might ends up being +1 more than
++	 * cfs->util_sum (XXX fix the rounding). Although this is not
++	 * a problem by itself, detaching a lot of tasks with the rounding
++	 * problem between 2 updates of util_avg (~1ms) can make cfs->util_sum
++	 * becoming null whereas cfs_util_avg is not.
++	 * Check that util_sum is still above its lower bound for the new
++	 * util_avg. Given that period_contrib might have moved since the last
++	 * sync, we are only sure that util_sum must be above or equal to
++	 *    util_avg * minimum possible divider
++	 */
++	cfs_rq->avg.util_sum = max_t(u32, cfs_rq->avg.util_sum,
++					  cfs_rq->avg.util_avg * MIN_DIVIDER);
+ }
+ 
+ static inline void
+ update_tg_cfs_runnable(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
+ {
+-	long delta = gcfs_rq->avg.runnable_avg - se->avg.runnable_avg;
+-	u32 divider;
++	long delta_sum, delta_avg = gcfs_rq->avg.runnable_avg - se->avg.runnable_avg;
++	u32 new_sum, divider;
+ 
+ 	/* Nothing to update */
+-	if (!delta)
++	if (!delta_avg)
+ 		return;
+ 
+ 	/*
+@@ -3494,19 +3514,25 @@ update_tg_cfs_runnable(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cf
+ 
+ 	/* Set new sched_entity's runnable */
+ 	se->avg.runnable_avg = gcfs_rq->avg.runnable_avg;
+-	se->avg.runnable_sum = se->avg.runnable_avg * divider;
++	new_sum = se->avg.runnable_avg * divider;
++	delta_sum = (long)new_sum - (long)se->avg.runnable_sum;
++	se->avg.runnable_sum = new_sum;
+ 
+ 	/* Update parent cfs_rq runnable */
+-	add_positive(&cfs_rq->avg.runnable_avg, delta);
+-	cfs_rq->avg.runnable_sum = cfs_rq->avg.runnable_avg * divider;
++	add_positive(&cfs_rq->avg.runnable_avg, delta_avg);
++	add_positive(&cfs_rq->avg.runnable_sum, delta_sum);
++	/* See update_tg_cfs_util() */
++	cfs_rq->avg.runnable_sum = max_t(u32, cfs_rq->avg.runnable_sum,
++					      cfs_rq->avg.runnable_avg * MIN_DIVIDER);
+ }
+ 
+ static inline void
+ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
+ {
+-	long delta, running_sum, runnable_sum = gcfs_rq->prop_runnable_sum;
++	long delta_avg, running_sum, runnable_sum = gcfs_rq->prop_runnable_sum;
+ 	unsigned long load_avg;
+ 	u64 load_sum = 0;
++	s64 delta_sum;
+ 	u32 divider;
+ 
+ 	if (!runnable_sum)
+@@ -3533,7 +3559,7 @@ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq
+ 		 * assuming all tasks are equally runnable.
+ 		 */
+ 		if (scale_load_down(gcfs_rq->load.weight)) {
+-			load_sum = div_s64(gcfs_rq->avg.load_sum,
++			load_sum = div_u64(gcfs_rq->avg.load_sum,
+ 				scale_load_down(gcfs_rq->load.weight));
+ 		}
+ 
+@@ -3550,19 +3576,22 @@ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq
+ 	running_sum = se->avg.util_sum >> SCHED_CAPACITY_SHIFT;
+ 	runnable_sum = max(runnable_sum, running_sum);
+ 
+-	load_sum = (s64)se_weight(se) * runnable_sum;
+-	load_avg = div_s64(load_sum, divider);
++	load_sum = se_weight(se) * runnable_sum;
++	load_avg = div_u64(load_sum, divider);
+ 
+-	se->avg.load_sum = runnable_sum;
+-
+-	delta = load_avg - se->avg.load_avg;
+-	if (!delta)
++	delta_avg = load_avg - se->avg.load_avg;
++	if (!delta_avg)
+ 		return;
+ 
+-	se->avg.load_avg = load_avg;
++	delta_sum = load_sum - (s64)se_weight(se) * se->avg.load_sum;
+ 
+-	add_positive(&cfs_rq->avg.load_avg, delta);
+-	cfs_rq->avg.load_sum = cfs_rq->avg.load_avg * divider;
++	se->avg.load_sum = runnable_sum;
++	se->avg.load_avg = load_avg;
++	add_positive(&cfs_rq->avg.load_avg, delta_avg);
++	add_positive(&cfs_rq->avg.load_sum, delta_sum);
++	/* See update_tg_cfs_util() */
++	cfs_rq->avg.load_sum = max_t(u32, cfs_rq->avg.load_sum,
++					  cfs_rq->avg.load_avg * MIN_DIVIDER);
+ }
+ 
+ static inline void add_tg_cfs_propagate(struct cfs_rq *cfs_rq, long runnable_sum)
+@@ -3678,15 +3707,22 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
+ 
+ 		r = removed_load;
+ 		sub_positive(&sa->load_avg, r);
+-		sa->load_sum = sa->load_avg * divider;
++		sub_positive(&sa->load_sum, r * divider);
++		/* See update_tg_cfs_util() */
++		sa->load_sum = max_t(u32, sa->load_sum, sa->load_avg * MIN_DIVIDER);
+ 
+ 		r = removed_util;
+ 		sub_positive(&sa->util_avg, r);
+-		sa->util_sum = sa->util_avg * divider;
++		sub_positive(&sa->util_sum, r * divider);
++		/* See update_tg_cfs_util() */
++		sa->util_sum = max_t(u32, sa->util_sum, sa->util_avg * MIN_DIVIDER);
+ 
+ 		r = removed_runnable;
+ 		sub_positive(&sa->runnable_avg, r);
+-		sa->runnable_sum = sa->runnable_avg * divider;
++		sub_positive(&sa->runnable_sum, r * divider);
++		/* See update_tg_cfs_util() */
++		sa->runnable_sum = max_t(u32, sa->runnable_sum,
++					      sa->runnable_avg * MIN_DIVIDER);
+ 
+ 		/*
+ 		 * removed_runnable is the unweighted version of removed_load so we
+@@ -3773,17 +3809,18 @@ static void attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
+  */
+ static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	/*
+-	 * cfs_rq->avg.period_contrib can be used for both cfs_rq and se.
+-	 * See ___update_load_avg() for details.
+-	 */
+-	u32 divider = get_pelt_divider(&cfs_rq->avg);
+-
+ 	dequeue_load_avg(cfs_rq, se);
+ 	sub_positive(&cfs_rq->avg.util_avg, se->avg.util_avg);
+-	cfs_rq->avg.util_sum = cfs_rq->avg.util_avg * divider;
++	sub_positive(&cfs_rq->avg.util_sum, se->avg.util_sum);
++	/* See update_tg_cfs_util() */
++	cfs_rq->avg.util_sum = max_t(u32, cfs_rq->avg.util_sum,
++					  cfs_rq->avg.util_avg * MIN_DIVIDER);
++
+ 	sub_positive(&cfs_rq->avg.runnable_avg, se->avg.runnable_avg);
+-	cfs_rq->avg.runnable_sum = cfs_rq->avg.runnable_avg * divider;
++	sub_positive(&cfs_rq->avg.runnable_sum, se->avg.runnable_sum);
++	/* See update_tg_cfs_util() */
++	cfs_rq->avg.runnable_sum = max_t(u32, cfs_rq->avg.runnable_sum,
++					      cfs_rq->avg.runnable_avg * MIN_DIVIDER);
+ 
+ 	add_tg_cfs_propagate(cfs_rq, -se->avg.load_sum);
+ 
 diff --git a/mm/page-writeback.c b/mm/page-writeback.c
-index 4812a17b288c..932f38ee246a 100644
+index a613f8ef6a02..58222ad1044d 100644
 --- a/mm/page-writeback.c
 +++ b/mm/page-writeback.c
 @@ -70,7 +70,7 @@ static long ratelimit_pages = 32;
@@ -144,7 +523,7 @@ index 4812a17b288c..932f38ee246a 100644
   */
 -int dirty_background_ratio = 10;
 +int dirty_background_ratio = 5;
-
+ 
  /*
   * dirty_background_bytes starts at 0 (disabled) so that it is a function of
 @@ -98,7 +98,7 @@ unsigned long vm_dirty_bytes;
@@ -153,11 +532,11 @@ index 4812a17b288c..932f38ee246a 100644
   */
 -unsigned int dirty_writeback_interval = 5 * 100; /* centiseconds */
 +unsigned int dirty_writeback_interval = 10 * 100; /* centiseconds */
-
+ 
  EXPORT_SYMBOL_GPL(dirty_writeback_interval);
-
+ 
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 74296c2d1fed..d08275fe7ebc 100644
+index 700434db5735..68fe2a5cbc0d 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -174,7 +174,7 @@ struct scan_control {
@@ -166,8 +545,9 @@ index 74296c2d1fed..d08275fe7ebc 100644
   */
 -int vm_swappiness = 60;
 +int vm_swappiness = 30;
-
+ 
  static void set_task_reclaim_state(struct task_struct *task,
  				   struct reclaim_state *rs)
---
-2.34.0.rc2.16.g5a73c6bdc7
+-- 
+2.34.1
+
