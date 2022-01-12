@@ -1,0 +1,193 @@
+From 03f265589fc4d75aa7d6441b08312ed2c6467943 Mon Sep 17 00:00:00 2001
+From: Torge Matthies <openglfreak@googlemail.com>
+Date: Sun, 21 Nov 2021 23:58:50 +0100
+Subject: [PATCH 1/2] sched/alt: Optimize loops in update_sched_rq_watermark.
+
+With the old code, gcc misses an optimization opportunity and compiles
+the loops to five instructions each:
+
+    0x0000000000000ed3 <+83>:	lock bts %rdi,(%rax)
+    0x0000000000000ed8 <+88>:	dec    %rdx
+    0x0000000000000edb <+91>:	add    $0x400,%rax
+    0x0000000000000ee1 <+97>:	cmp    %rdx,%rsi
+    0x0000000000000ee4 <+100>:	jne    0xed3 <update_sched_rq_watermark+83>
+    ...
+    0x0000000000000f13 <+147>:	lock btr %rdi,(%rax)
+    0x0000000000000f18 <+152>:	dec    %rdx
+    0x0000000000000f1b <+155>:	add    $0x400,%rax
+    0x0000000000000f21 <+161>:	cmp    %rcx,%rdx
+    0x0000000000000f24 <+164>:	jne    0xf13 <update_sched_rq_watermark+147>
+
+With this change, the loops get optimized to four instructions each:
+
+    0x0000000000000ed7 <+87>:	lock bts %rsi,(%rdx)
+    0x0000000000000edc <+92>:	add    $0x400,%rdx
+    0x0000000000000ee3 <+99>:	dec    %rcx
+    0x0000000000000ee6 <+102>:	jne    0xed7 <update_sched_rq_watermark+87>
+    ...
+    0x0000000000000f1a <+154>:	lock btr %rsi,(%rax)
+    0x0000000000000f1f <+159>:	add    $0x400,%rax
+    0x0000000000000f25 <+165>:	dec    %rdx
+    0x0000000000000f28 <+168>:	jne    0xf1a <update_sched_rq_watermark+154>
+
+Signed-off-by: Torge Matthies <openglfreak@googlemail.com>
+---
+ kernel/sched/alt_core.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/alt_core.c b/kernel/sched/alt_core.c
+index 8bc3320da..d0175368c 100644
+--- a/kernel/sched/alt_core.c
++++ b/kernel/sched/alt_core.c
+@@ -185,8 +185,8 @@ static inline void update_sched_rq_watermark(struct rq *rq)
+ 	rq->watermark = watermark;
+ 	cpu = cpu_of(rq);
+ 	if (watermark < last_wm) {
+-		for (i = last_wm; i > watermark; i--)
+-			cpumask_clear_cpu(cpu, sched_rq_watermark + SCHED_BITS - 1 - i);
++		for (i = last_wm - watermark; i > 0; i--)
++			cpumask_clear_cpu(cpu, sched_rq_watermark + SCHED_BITS - 1 - (i + watermark));
+ #ifdef CONFIG_SCHED_SMT
+ 		if (static_branch_likely(&sched_smt_present) &&
+ 		    IDLE_TASK_SCHED_PRIO == last_wm)
+@@ -196,8 +196,8 @@ static inline void update_sched_rq_watermark(struct rq *rq)
+ 		return;
+ 	}
+ 	/* last_wm < watermark */
+-	for (i = watermark; i > last_wm; i--)
+-		cpumask_set_cpu(cpu, sched_rq_watermark + SCHED_BITS - 1 - i);
++	for (i = watermark - last_wm; i > 0; i--)
++		cpumask_set_cpu(cpu, sched_rq_watermark + SCHED_BITS - 1 - (i + last_wm));
+ #ifdef CONFIG_SCHED_SMT
+ 	if (static_branch_likely(&sched_smt_present) &&
+ 	    IDLE_TASK_SCHED_PRIO == watermark) {
+-- 
+2.34.1.75.gabe6bb3905
+
+
+From 6e78e3c183b6c94739629094298e5dcfe94c5169 Mon Sep 17 00:00:00 2001
+From: Juuso Alasuutari <juuso.alasuutari@gmail.com>
+Date: Sat, 16 Oct 2021 17:01:28 +0300
+Subject: [PATCH 2/2] sched/alt: Alfred Chen's PoC sched_preferred_cpumask
+ patch
+
+The hard-coded cpumask value is based on torturing my R9 3950X and
+arbitrarily picking the top four cores. I have no idea if the same
+cores are supposed to have the highest boost in every specimen.
+
+Also fixed a typo in the cpumask variable.
+
+Signed-off-by: Juuso Alasuutari <juuso.alasuutari@gmail.com>
+---
+ arch/x86/kernel/itmt.c   |  1 +
+ kernel/sched/alt_core.c  | 29 ++++++++++++++++++-----------
+ kernel/sched/alt_sched.h |  4 +++-
+ 3 files changed, 22 insertions(+), 12 deletions(-)
+
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 9ff480e94..d1ea2d0c0 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -190,6 +190,7 @@ void sched_set_itmt_core_prio(int prio, int core_cpu)
+ {
+ 	int cpu, i = 1;
+ 
++	pr_info("sched_set_itmt_core_prio: %d -- %d\n", core_cpu, prio);
+ 	for_each_cpu(cpu, topology_sibling_cpumask(core_cpu)) {
+ 		int smt_prio;
+ 
+diff --git a/kernel/sched/alt_core.c b/kernel/sched/alt_core.c
+index d0175368c..01010babf 100644
+--- a/kernel/sched/alt_core.c
++++ b/kernel/sched/alt_core.c
+@@ -120,6 +120,8 @@ DEFINE_PER_CPU(cpumask_t [NR_CPU_AFFINITY_LEVELS], sched_cpu_topo_masks);
+ DEFINE_PER_CPU(cpumask_t *, sched_cpu_llc_mask);
+ DEFINE_PER_CPU(cpumask_t *, sched_cpu_topo_end_mask);
+ 
++static cpumask_t sched_preferred_cpumask ____cacheline_aligned_in_smp;
++
+ #ifdef CONFIG_SCHED_SMT
+ DEFINE_STATIC_KEY_FALSE(sched_smt_present);
+ EXPORT_SYMBOL_GPL(sched_smt_present);
+@@ -7082,11 +7084,14 @@ static void sched_init_topology_cpumask_early(void)
+ 	}
+ }
+ 
+-#define TOPOLOGY_CPUMASK(name, mask, last)\
++#define TOPOLOGY_CPUMASK(name, mask, itmt, last)\
+ 	if (cpumask_and(topo, topo, mask)) {					\
++		if (itmt && cpumask_and(topo, topo, &sched_preferred_cpumask))	\
++			pr_info("sched: cpu#%02d topo: 0x%016lx - "#name" itmt",\
++				cpu, (topo++)->bits[0]);			\
+ 		cpumask_copy(topo, mask);					\
+-		printk(KERN_INFO "sched: cpu#%02d topo: 0x%08lx - "#name,	\
+-		       cpu, (topo++)->bits[0]);					\
++		pr_info("sched: cpu#%02d topo: 0x%016lx - "#name,		\
++			cpu, (topo++)->bits[0]);				\
+ 	}									\
+ 	if (!last)								\
+ 		cpumask_complement(topo, mask)
+@@ -7096,6 +7101,8 @@ static void sched_init_topology_cpumask(void)
+ 	int cpu;
+ 	cpumask_t *topo;
+ 
++	sched_preferred_cpumask.bits[0] = 0x00600060;
++
+ 	for_each_online_cpu(cpu) {
+ 		/* take chance to reset time slice for idle tasks */
+ 		cpu_rq(cpu)->idle->time_slice = sched_timeslice_ns;
+@@ -7104,21 +7111,21 @@ static void sched_init_topology_cpumask(void)
+ 
+ 		cpumask_complement(topo, cpumask_of(cpu));
+ #ifdef CONFIG_SCHED_SMT
+-		TOPOLOGY_CPUMASK(smt, topology_sibling_cpumask(cpu), false);
++		TOPOLOGY_CPUMASK(smt, topology_sibling_cpumask(cpu), false, false);
+ #endif
+ 		per_cpu(sd_llc_id, cpu) = cpumask_first(cpu_coregroup_mask(cpu));
+ 		per_cpu(sched_cpu_llc_mask, cpu) = topo;
+-		TOPOLOGY_CPUMASK(coregroup, cpu_coregroup_mask(cpu), false);
++		TOPOLOGY_CPUMASK(coregroup, cpu_coregroup_mask(cpu), true, false);
+ 
+-		TOPOLOGY_CPUMASK(core, topology_core_cpumask(cpu), false);
++		TOPOLOGY_CPUMASK(core, topology_core_cpumask(cpu), true, false);
+ 
+-		TOPOLOGY_CPUMASK(others, cpu_online_mask, true);
++		TOPOLOGY_CPUMASK(others, cpu_online_mask, true, true);
+ 
+ 		per_cpu(sched_cpu_topo_end_mask, cpu) = topo;
+-		printk(KERN_INFO "sched: cpu#%02d llc_id = %d, llc_mask idx = %d\n",
+-		       cpu, per_cpu(sd_llc_id, cpu),
+-		       (int) (per_cpu(sched_cpu_llc_mask, cpu) -
+-			      per_cpu(sched_cpu_topo_masks, cpu)));
++		pr_info("sched: cpu#%02d llc_id = %d, llc_mask idx = %d\n",
++			cpu, per_cpu(sd_llc_id, cpu),
++			(int) (per_cpu(sched_cpu_llc_mask, cpu) -
++			       per_cpu(sched_cpu_topo_masks, cpu)));
+ 	}
+ }
+ #endif
+diff --git a/kernel/sched/alt_sched.h b/kernel/sched/alt_sched.h
+index e78324687..f87b798cd 100644
+--- a/kernel/sched/alt_sched.h
++++ b/kernel/sched/alt_sched.h
+@@ -301,14 +301,16 @@ enum {
+ #ifdef CONFIG_SCHED_SMT
+ 	SMT_LEVEL_SPACE_HOLDER,
+ #endif
++	COREGROUP_ITMT_LEVEL_SPACE_HOLDER,
+ 	COREGROUP_LEVEL_SPACE_HOLDER,
++	CORE_ITMT_LEVEL_SPACE_HOLDER,
+ 	CORE_LEVEL_SPACE_HOLDER,
++	OTHER_ITMT_LEVEL_SPACE_HOLDER,
+ 	OTHER_LEVEL_SPACE_HOLDER,
+ 	NR_CPU_AFFINITY_LEVELS
+ };
+ 
+ DECLARE_PER_CPU(cpumask_t [NR_CPU_AFFINITY_LEVELS], sched_cpu_topo_masks);
+-DECLARE_PER_CPU(cpumask_t *, sched_cpu_llc_mask);
+ 
+ static inline int
+ __best_mask_cpu(const cpumask_t *cpumask, const cpumask_t *mask)
+-- 
+2.34.1.75.gabe6bb3905
+
