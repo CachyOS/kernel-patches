@@ -1,0 +1,2575 @@
+From c7076f1d89aa0ca0dd0b8e2543a7445fa2783a94 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 30 Nov 2021 16:14:38 +0100
+Subject: [PATCH 01/15] x86/module: Fix the paravirt vs alternative order
+
+Ever since commit 4e6292114c741 ("x86/paravirt: Add new features for
+paravirt patching") there is an ordering dependency between patching
+paravirt ops and patching alternatives, the module loader still
+violates this.
+
+Fixes: 4e6292114c741 ("x86/paravirt: Add new features for paravirt patching")
+Cc: Juergen Gross <jgross@suse.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/kernel/module.c | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kernel/module.c b/arch/x86/kernel/module.c
+index 95fa745e310a..4edc9c87ad0b 100644
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@ -273,6 +273,10 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 			retpolines = s;
+ 	}
+ 
++	if (para) {
++		void *pseg = (void *)para->sh_addr;
++		apply_paravirt(pseg, pseg + para->sh_size);
++	}
+ 	if (retpolines) {
+ 		void *rseg = (void *)retpolines->sh_addr;
+ 		apply_retpolines(rseg, rseg + retpolines->sh_size);
+@@ -290,11 +294,6 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 					    tseg, tseg + text->sh_size);
+ 	}
+ 
+-	if (para) {
+-		void *pseg = (void *)para->sh_addr;
+-		apply_paravirt(pseg, pseg + para->sh_size);
+-	}
+-
+ 	/* make jump label nops */
+ 	jump_label_apply_nops(me);
+ 
+-- 
+2.35.0
+
+From 770bc72f11aae6a99e83146d2392dc0ef4c7fcab Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 22 Nov 2021 16:58:29 +0100
+Subject: [PATCH 02/15] x86: Annotate _THIS_IP_
+
+In order to find _THIS_IP_ code references in objtool, annotate them.
+
+These relocs are never used for control flow, only for
+unwind/backtrace like debug info, therefore it is safe to ignore them.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/linkage.h      | 11 +++++++++++
+ include/linux/instruction_pointer.h |  5 +++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/arch/x86/include/asm/linkage.h b/arch/x86/include/asm/linkage.h
+index 030907922bd0..be26d6394698 100644
+--- a/arch/x86/include/asm/linkage.h
++++ b/arch/x86/include/asm/linkage.h
+@@ -3,10 +3,21 @@
+ #define _ASM_X86_LINKAGE_H
+ 
+ #include <linux/stringify.h>
++#include <asm/asm.h>
+ 
+ #undef notrace
+ #define notrace __attribute__((no_instrument_function))
+ 
++#define _THIS_IP_						\
++	({	__label__ __here;				\
++		__here:						\
++		asm_volatile_goto (				\
++		    ".pushsection .discard.this_ip\n\t"		\
++		    _ASM_PTR " %l[__here]\n\t"			\
++		    ".popsection\n\t"				\
++		    : : : : __here);				\
++		(unsigned long)&&__here; })
++
+ #ifdef CONFIG_X86_32
+ #define asmlinkage CPP_ASMLINKAGE __attribute__((regparm(0)))
+ #endif /* CONFIG_X86_32 */
+diff --git a/include/linux/instruction_pointer.h b/include/linux/instruction_pointer.h
+index cda1f706eaeb..aa0b3ffea935 100644
+--- a/include/linux/instruction_pointer.h
++++ b/include/linux/instruction_pointer.h
+@@ -2,7 +2,12 @@
+ #ifndef _LINUX_INSTRUCTION_POINTER_H
+ #define _LINUX_INSTRUCTION_POINTER_H
+ 
++#include <asm/linkage.h>
++
+ #define _RET_IP_		(unsigned long)__builtin_return_address(0)
++
++#ifndef _THIS_IP_
+ #define _THIS_IP_  ({ __label__ __here; __here: (unsigned long)&&__here; })
++#endif
+ 
+ #endif /* _LINUX_INSTRUCTION_POINTER_H */
+-- 
+2.35.0
+
+From b06583cb6d2105c5f766f2be2b944fe9e0948a11 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 22 Nov 2021 16:50:52 +0100
+Subject: [PATCH 03/15] objtool: Read the _THIS_IP_ hints
+
+Read the new _THIS_IP_ annotation. While there, attempt to not bloat
+struct instruction.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ tools/objtool/check.c                 | 27 +++++++++++++++++++++++++++
+ tools/objtool/include/objtool/check.h | 13 ++++++++++---
+ 2 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index c2d2ab9a2861..9c32d4d0899b 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -1860,6 +1860,29 @@ static int read_unwind_hints(struct objtool_file *file)
+ 	return 0;
+ }
+ 
++static int read_this_ip_hints(struct objtool_file *file)
++{
++	struct section *sec;
++	struct instruction *insn;
++	struct reloc *reloc;
++
++	sec = find_section_by_name(file->elf, ".rela.discard.this_ip");
++	if (!sec)
++		return 0;
++
++	list_for_each_entry(reloc, &sec->reloc_list, list) {
++		insn = find_insn(file, reloc->sym->sec, reloc->sym->offset + reloc->addend);
++		if (!insn) {
++			WARN("bad .discard.this_ip entry");
++			return -1;
++		}
++
++		insn->this_ip = 1;
++	}
++
++	return 0;
++}
++
+ static int read_retpoline_hints(struct objtool_file *file)
+ {
+ 	struct section *sec;
+@@ -2097,6 +2120,10 @@ static int decode_sections(struct objtool_file *file)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = read_this_ip_hints(file);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Must be before add_{jump_call}_destination.
+ 	 */
+diff --git a/tools/objtool/include/objtool/check.h b/tools/objtool/include/objtool/check.h
+index 6cfff078897f..d3cf002e49ff 100644
+--- a/tools/objtool/include/objtool/check.h
++++ b/tools/objtool/include/objtool/check.h
+@@ -45,11 +45,18 @@ struct instruction {
+ 	unsigned int len;
+ 	enum insn_type type;
+ 	unsigned long immediate;
+-	bool dead_end, ignore, ignore_alts;
+-	bool hint;
+-	bool retpoline_safe;
++
++	u8 dead_end	: 1,
++	   ignore	: 1,
++	   ignore_alts	: 1,
++	   hint		: 1,
++	   retpoline_safe : 1,
++	   this_ip	: 1;
++		/* 2 bit hole */
+ 	s8 instr;
+ 	u8 visited;
++	/* u8 hole */
++
+ 	struct alt_group *alt_group;
+ 	struct symbol *call_dest;
+ 	struct instruction *jump_dest;
+-- 
+2.35.0
+
+From 0c4fa96edf3ba3ed07501a34b8ba60b7476732a6 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 22 Nov 2021 16:46:22 +0100
+Subject: [PATCH 04/15] x86: Base IBT bits
+
+Add Kconfig, Makefile and basic instruction support for x86 IBT.
+
+TODO: clang
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/Kconfig           | 15 ++++++++++++
+ arch/x86/Makefile          |  5 +++-
+ arch/x86/include/asm/ibt.h | 49 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 1 deletion(-)
+ create mode 100644 arch/x86/include/asm/ibt.h
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index ebe8fc76949a..d1f69b2a2423 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1860,6 +1860,21 @@ config X86_UMIP
+ 	  specific cases in protected and virtual-8086 modes. Emulated
+ 	  results are dummy.
+ 
++config CC_HAS_IBT
++	# GCC >= 9 and binutils >= 2.29
++	# Retpoline check to work around https://gcc.gnu.org/bugzilla/show_bug.cgi?id=93654
++	def_bool $(cc-option, -fcf-protection=branch -mindirect-branch-register) && $(as-instr,endbr64)
++
++config X86_IBT
++	prompt "Indirect Branch Tracking"
++	bool
++	depends on X86_64 && CC_HAS_IBT && STACK_VALIDATION
++	help
++	  Build the kernel with support for Indirect Branch Tracking, a
++	  hardware supported CFI scheme. Any indirect call must land on
++	  an ENDBR instruction, as such, the compiler will litter the
++	  code with them to make this happen.
++
+ config X86_INTEL_MEMORY_PROTECTION_KEYS
+ 	prompt "Memory Protection Keys"
+ 	def_bool y
+diff --git a/arch/x86/Makefile b/arch/x86/Makefile
+index e84cdd409b64..60730e66bfc2 100644
+--- a/arch/x86/Makefile
++++ b/arch/x86/Makefile
+@@ -62,8 +62,11 @@ export BITS
+ #
+ KBUILD_CFLAGS += -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx
+ 
+-# Intel CET isn't enabled in the kernel
++ifeq ($(CONFIG_X86_IBT),y)
++KBUILD_CFLAGS += $(call cc-option,-fcf-protection=branch)
++else
+ KBUILD_CFLAGS += $(call cc-option,-fcf-protection=none)
++endif
+ 
+ ifeq ($(CONFIG_X86_32),y)
+         BITS := 32
+diff --git a/arch/x86/include/asm/ibt.h b/arch/x86/include/asm/ibt.h
+new file mode 100644
+index 000000000000..0a9fbc4482c2
+--- /dev/null
++++ b/arch/x86/include/asm/ibt.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_X86_IBT_H
++#define _ASM_X86_IBT_H
++
++#ifdef CONFIG_X86_IBT
++
++#ifndef __ASSEMBLY__
++
++#ifdef CONFIG_X86_64
++#define ASM_ENDBR	"endbr64\n\t"
++#else
++#define ASM_ENDBR	"endbr32\n\t"
++#endif
++
++/*
++ * A bit convoluted, but matches both endbr32 and endbr64 without
++ * having either as literal in the text.
++ */
++static inline bool is_endbr(const void *addr)
++{
++	unsigned int val = ~*(unsigned int *)addr;
++	val |= 0x01000000U;
++	return val == ~0xfa1e0ff3;
++}
++
++#else /* __ASSEMBLY__ */
++
++#ifdef CONFIG_X86_64
++#define ENDBR	endbr64
++#else
++#define ENDBR	endbr32
++#endif
++
++#endif /* __ASSEMBLY__ */
++
++#else /* !IBT */
++
++#ifndef __ASSEMBLY__
++
++#define ASM_ENDBR
++
++#else /* __ASSEMBLY__ */
++
++#define ENDBR
++
++#endif /* __ASSEMBLY__ */
++
++#endif /* CONFIG_X86_IBT */
++#endif /* _ASM_X86_IBT_H */
+-- 
+2.35.0
+
+From 25a82d3aa9f971a8c33326ef37b4aaef140c98ee Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 23 Nov 2021 21:40:39 +0100
+Subject: [PATCH 05/15] x86/livepatch: Validate __fentry__ location
+
+Currently livepatch assumes __fentry__ lives at func+0, which is most
+likely untrue with IBT on. Override the weak klp_get_ftrace_location()
+function with an arch specific version that's IBT aware.
+
+Also make the weak fallback verify the location is an actual ftrace
+location as a sanity check.
+
+Suggested-by: Miroslav Benes <mbenes@suse.cz>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/livepatch.h | 9 +++++++++
+ kernel/livepatch/patch.c         | 2 +-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/livepatch.h b/arch/x86/include/asm/livepatch.h
+index 7c5cc6660e4b..e89567a539e7 100644
+--- a/arch/x86/include/asm/livepatch.h
++++ b/arch/x86/include/asm/livepatch.h
+@@ -17,4 +17,13 @@ static inline void klp_arch_set_pc(struct ftrace_regs *fregs, unsigned long ip)
+ 	ftrace_instruction_pointer_set(fregs, ip);
+ }
+ 
++#define klp_get_ftrace_location klp_get_ftrace_location
++static inline unsigned long klp_get_ftrace_location(unsigned long faddr)
++{
++	unsigned long addr = ftrace_location(faddr);
++	if (!addr && IS_ENABLED(CONFIG_X86_IBT))
++		addr = ftrace_location(faddr + 4);
++	return addr;
++}
++
+ #endif /* _ASM_X86_LIVEPATCH_H */
+diff --git a/kernel/livepatch/patch.c b/kernel/livepatch/patch.c
+index fe316c021d73..fd295bbbcbc7 100644
+--- a/kernel/livepatch/patch.c
++++ b/kernel/livepatch/patch.c
+@@ -133,7 +133,7 @@ static void notrace klp_ftrace_handler(unsigned long ip,
+ #ifndef klp_get_ftrace_location
+ static unsigned long klp_get_ftrace_location(unsigned long faddr)
+ {
+-	return faddr;
++	return ftrace_location(faddr);
+ }
+ #endif
+ 
+-- 
+2.35.0
+
+From 4d5216281e071cf268a0f23d7aa5c07849aab93e Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 1 Dec 2021 16:10:25 +0100
+Subject: [PATCH 06/15] x86/text-patching: Make text_gen_insn() IBT aware
+
+Make sure we don't generate direct JMP/CALL instructions to an ENDBR
+instruction (which might be poison).
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/text-patching.h | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/x86/include/asm/text-patching.h b/arch/x86/include/asm/text-patching.h
+index b7421780e4e9..8ee22adbfc3b 100644
+--- a/arch/x86/include/asm/text-patching.h
++++ b/arch/x86/include/asm/text-patching.h
+@@ -5,6 +5,7 @@
+ #include <linux/types.h>
+ #include <linux/stddef.h>
+ #include <asm/ptrace.h>
++#include <asm/ibt.h>
+ 
+ struct paravirt_patch_site;
+ #ifdef CONFIG_PARAVIRT
+@@ -101,6 +102,11 @@ void *text_gen_insn(u8 opcode, const void *addr, const void *dest)
+ 	static union text_poke_insn insn; /* per instance */
+ 	int size = text_opcode_size(opcode);
+ 
++#ifdef CONFIG_X86_IBT
++	if (is_endbr(dest))
++		dest += 4;
++#endif
++
+ 	insn.opcode = opcode;
+ 
+ 	if (size > 1) {
+-- 
+2.35.0
+
+From 7d3e112db70f61c7ae7adac4807fd5b457d48a00 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 1 Dec 2021 22:06:29 +0100
+Subject: [PATCH 07/15] x86: Don't generate ENDBR in .discard.text
+
+Having ENDBR in discarded sections can easily lead to relocations into
+discarded sections which the linkers aren't really fond of. Objtool
+also shouldn't generate them, but why tempt fate.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/setup.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/setup.h b/arch/x86/include/asm/setup.h
+index a12458a7a8d4..a0a88762d4de 100644
+--- a/arch/x86/include/asm/setup.h
++++ b/arch/x86/include/asm/setup.h
+@@ -119,7 +119,7 @@ void *extend_brk(size_t size, size_t align);
+  * executable.)
+  */
+ #define RESERVE_BRK(name,sz)						\
+-	static void __section(".discard.text") __used notrace		\
++	static void __section(".discard.text") __attribute__((nocf_check)) __used notrace		\
+ 	__brk_reservation_fn_##name##__(void) {				\
+ 		asm volatile (						\
+ 			".pushsection .brk_reservation,\"aw\",@nobits;" \
+-- 
+2.35.0
+
+From 2914816896b1cf81eaa084c1dff372328f5b91f3 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 22 Nov 2021 16:56:52 +0100
+Subject: [PATCH 08/15] x86/entry: Sprinkle ENDBR dust
+
+Kernel entry points should be having ENDBR on for IBT configs.
+
+The SYSCALL entry points are found through taking their respective
+address in order to program them in the MSRs, while the exception
+entry points are found through UNWIND_HINT_IRET_REGS.
+
+*Except* that latter hint is also used on exit code to denote when
+we're down to an IRET frame. As such add an additional 'entry'
+argument to the macro and have it default to '1' such that objtool
+will assume it's an entry and WARN about it.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/entry/entry_64.S           | 35 +++++++++++++++++------------
+ arch/x86/entry/entry_64_compat.S    |  2 ++
+ arch/x86/include/asm/idtentry.h     | 23 ++++++++++++-------
+ arch/x86/include/asm/segment.h      |  5 +++++
+ arch/x86/include/asm/unwind_hints.h | 18 ++++++++++-----
+ arch/x86/kernel/head_64.S           | 14 +++++++-----
+ arch/x86/kernel/idt.c               |  5 +++--
+ arch/x86/kernel/unwind_orc.c        |  3 ++-
+ include/linux/objtool.h             |  5 +++--
+ tools/include/linux/objtool.h       |  5 +++--
+ tools/objtool/check.c               |  3 ++-
+ tools/objtool/orc_dump.c            |  3 ++-
+ 12 files changed, 80 insertions(+), 41 deletions(-)
+
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index 466df3e50276..627177342dec 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -39,6 +39,7 @@
+ #include <asm/trapnr.h>
+ #include <asm/nospec-branch.h>
+ #include <asm/fsgsbase.h>
++#include <asm/ibt.h>
+ #include <linux/err.h>
+ 
+ #include "calling.h"
+@@ -87,6 +88,7 @@
+ SYM_CODE_START(entry_SYSCALL_64)
+ 	UNWIND_HINT_EMPTY
+ 
++	ENDBR
+ 	swapgs
+ 	/* tss.sp2 is scratch space. */
+ 	movq	%rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+@@ -349,7 +351,8 @@ SYM_CODE_END(ret_from_fork)
+  */
+ .macro idtentry vector asmsym cfunc has_error_code:req
+ SYM_CODE_START(\asmsym)
+-	UNWIND_HINT_IRET_REGS offset=\has_error_code*8
++	UNWIND_HINT_IRET_REGS offset=\has_error_code*8 entry=1
++	ENDBR
+ 	ASM_CLAC
+ 
+ 	.if \has_error_code == 0
+@@ -366,7 +369,7 @@ SYM_CODE_START(\asmsym)
+ 		.rept	6
+ 		pushq	5*8(%rsp)
+ 		.endr
+-		UNWIND_HINT_IRET_REGS offset=8
++		UNWIND_HINT_IRET_REGS offset=8 entry=0
+ .Lfrom_usermode_no_gap_\@:
+ 	.endif
+ 
+@@ -416,7 +419,8 @@ SYM_CODE_END(\asmsym)
+  */
+ .macro idtentry_mce_db vector asmsym cfunc
+ SYM_CODE_START(\asmsym)
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=1
++	ENDBR
+ 	ASM_CLAC
+ 
+ 	pushq	$-1			/* ORIG_RAX: no syscall to restart */
+@@ -471,7 +475,8 @@ SYM_CODE_END(\asmsym)
+  */
+ .macro idtentry_vc vector asmsym cfunc
+ SYM_CODE_START(\asmsym)
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=1
++	ENDBR
+ 	ASM_CLAC
+ 
+ 	/*
+@@ -532,7 +537,8 @@ SYM_CODE_END(\asmsym)
+  */
+ .macro idtentry_df vector asmsym cfunc
+ SYM_CODE_START(\asmsym)
+-	UNWIND_HINT_IRET_REGS offset=8
++	UNWIND_HINT_IRET_REGS offset=8 entry=1
++	ENDBR
+ 	ASM_CLAC
+ 
+ 	/* paranoid_entry returns GS information for paranoid_exit in EBX. */
+@@ -629,7 +635,7 @@ SYM_INNER_LABEL(restore_regs_and_return_to_kernel, SYM_L_GLOBAL)
+ 	INTERRUPT_RETURN
+ 
+ SYM_INNER_LABEL_ALIGN(native_iret, SYM_L_GLOBAL)
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=0
+ 	/*
+ 	 * Are we returning to a stack segment from the LDT?  Note: in
+ 	 * 64-bit mode SS:RSP on the exception stack is always valid.
+@@ -706,7 +712,7 @@ native_irq_return_ldt:
+ 	popq	%rdi				/* Restore user RDI */
+ 
+ 	movq	%rax, %rsp
+-	UNWIND_HINT_IRET_REGS offset=8
++	UNWIND_HINT_IRET_REGS offset=8 entry=0
+ 
+ 	/*
+ 	 * At this point, we cannot write to the stack any more, but we can
+@@ -821,13 +827,13 @@ SYM_CODE_START(xen_failsafe_callback)
+ 	movq	8(%rsp), %r11
+ 	addq	$0x30, %rsp
+ 	pushq	$0				/* RIP */
+-	UNWIND_HINT_IRET_REGS offset=8
++	UNWIND_HINT_IRET_REGS offset=8 entry=0
+ 	jmp	asm_exc_general_protection
+ 1:	/* Segment mismatch => Category 1 (Bad segment). Retry the IRET. */
+ 	movq	(%rsp), %rcx
+ 	movq	8(%rsp), %r11
+ 	addq	$0x30, %rsp
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=0
+ 	pushq	$-1 /* orig_ax = -1 => not a system call */
+ 	PUSH_AND_CLEAR_REGS
+ 	ENCODE_FRAME_POINTER
+@@ -1062,7 +1068,8 @@ SYM_CODE_END(error_return)
+  *	      when PAGE_TABLE_ISOLATION is in use.  Do not clobber.
+  */
+ SYM_CODE_START(asm_exc_nmi)
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=1
++	ENDBR
+ 
+ 	/*
+ 	 * We allow breakpoints in NMIs. If a breakpoint occurs, then
+@@ -1127,13 +1134,13 @@ SYM_CODE_START(asm_exc_nmi)
+ 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rdx
+ 	movq	%rsp, %rdx
+ 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+-	UNWIND_HINT_IRET_REGS base=%rdx offset=8
++	UNWIND_HINT_IRET_REGS base=%rdx offset=8 entry=0
+ 	pushq	5*8(%rdx)	/* pt_regs->ss */
+ 	pushq	4*8(%rdx)	/* pt_regs->rsp */
+ 	pushq	3*8(%rdx)	/* pt_regs->flags */
+ 	pushq	2*8(%rdx)	/* pt_regs->cs */
+ 	pushq	1*8(%rdx)	/* pt_regs->rip */
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=0
+ 	pushq   $-1		/* pt_regs->orig_ax */
+ 	PUSH_AND_CLEAR_REGS rdx=(%rdx)
+ 	ENCODE_FRAME_POINTER
+@@ -1289,7 +1296,7 @@ first_nmi:
+ 	.rept 5
+ 	pushq	11*8(%rsp)
+ 	.endr
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=0
+ 
+ 	/* Everything up to here is safe from nested NMIs */
+ 
+@@ -1305,7 +1312,7 @@ first_nmi:
+ 	pushq	$__KERNEL_CS	/* CS */
+ 	pushq	$1f		/* RIP */
+ 	iretq			/* continues at repeat_nmi below */
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=0
+ 1:
+ #endif
+ 
+diff --git a/arch/x86/entry/entry_64_compat.S b/arch/x86/entry/entry_64_compat.S
+index 0051cf5c792d..a7f470dacd7b 100644
+--- a/arch/x86/entry/entry_64_compat.S
++++ b/arch/x86/entry/entry_64_compat.S
+@@ -49,6 +49,7 @@
+ SYM_CODE_START(entry_SYSENTER_compat)
+ 	UNWIND_HINT_EMPTY
+ 	/* Interrupts are off on entry. */
++	ENDBR
+ 	SWAPGS
+ 
+ 	pushq	%rax
+@@ -198,6 +199,7 @@ SYM_CODE_END(entry_SYSENTER_compat)
+  */
+ SYM_CODE_START(entry_SYSCALL_compat)
+ 	UNWIND_HINT_EMPTY
++	ENDBR
+ 	/* Interrupts are off on entry. */
+ 	swapgs
+ 
+diff --git a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
+index 1345088e9902..e215438a99db 100644
+--- a/arch/x86/include/asm/idtentry.h
++++ b/arch/x86/include/asm/idtentry.h
+@@ -5,6 +5,12 @@
+ /* Interrupts/Exceptions */
+ #include <asm/trapnr.h>
+ 
++#ifdef CONFIG_X86_IBT
++#define IDT_ALIGN	16
++#else
++#define IDT_ALIGN	8
++#endif
++
+ #ifndef __ASSEMBLY__
+ #include <linux/entry-common.h>
+ #include <linux/hardirq.h>
+@@ -492,33 +498,34 @@ __visible noinstr void func(struct pt_regs *regs,			\
+  * point is to mask off the bits above bit 7 because the push is sign
+  * extending.
+  */
+-	.align 8
++
++	.align IDT_ALIGN
+ SYM_CODE_START(irq_entries_start)
+     vector=FIRST_EXTERNAL_VECTOR
+     .rept NR_EXTERNAL_VECTORS
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=1
+ 0 :
++	ENDBR
+ 	.byte	0x6a, vector
+ 	jmp	asm_common_interrupt
+-	nop
+ 	/* Ensure that the above is 8 bytes max */
+-	. = 0b + 8
++	.fill 0b + IDT_ALIGN - ., 1, 0x90
+ 	vector = vector+1
+     .endr
+ SYM_CODE_END(irq_entries_start)
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+-	.align 8
++	.align IDT_ALIGN
+ SYM_CODE_START(spurious_entries_start)
+     vector=FIRST_SYSTEM_VECTOR
+     .rept NR_SYSTEM_VECTORS
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=1
+ 0 :
++	ENDBR
+ 	.byte	0x6a, vector
+ 	jmp	asm_spurious_interrupt
+-	nop
+ 	/* Ensure that the above is 8 bytes max */
+-	. = 0b + 8
++	.fill 0b + IDT_ALIGN - ., 1, 0x90
+ 	vector = vector+1
+     .endr
+ SYM_CODE_END(spurious_entries_start)
+diff --git a/arch/x86/include/asm/segment.h b/arch/x86/include/asm/segment.h
+index b228c9d44ee7..6a8a5bcbf14d 100644
+--- a/arch/x86/include/asm/segment.h
++++ b/arch/x86/include/asm/segment.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/const.h>
+ #include <asm/alternative.h>
++#include <asm/ibt.h>
+ 
+ /*
+  * Constructor for a conventional segment GDT (or LDT) entry.
+@@ -275,7 +276,11 @@ static inline void vdso_read_cpunode(unsigned *cpu, unsigned *node)
+  * vector has no error code (two bytes), a 'push $vector_number' (two
+  * bytes), and a jump to the common entry code (up to five bytes).
+  */
++#ifdef CONFIG_X86_IBT
++#define EARLY_IDT_HANDLER_SIZE 13
++#else
+ #define EARLY_IDT_HANDLER_SIZE 9
++#endif
+ 
+ /*
+  * xen_early_idt_handler_array is for Xen pv guests: for each entry in
+diff --git a/arch/x86/include/asm/unwind_hints.h b/arch/x86/include/asm/unwind_hints.h
+index 8b33674288ea..d5b401c2f9e9 100644
+--- a/arch/x86/include/asm/unwind_hints.h
++++ b/arch/x86/include/asm/unwind_hints.h
+@@ -11,7 +11,7 @@
+ 	UNWIND_HINT sp_reg=ORC_REG_UNDEFINED type=UNWIND_HINT_TYPE_CALL end=1
+ .endm
+ 
+-.macro UNWIND_HINT_REGS base=%rsp offset=0 indirect=0 extra=1 partial=0
++.macro UNWIND_HINT_REGS base=%rsp offset=0 indirect=0 extra=1 partial=0 entry=1
+ 	.if \base == %rsp
+ 		.if \indirect
+ 			.set sp_reg, ORC_REG_SP_INDIRECT
+@@ -33,9 +33,17 @@
+ 	.set sp_offset, \offset
+ 
+ 	.if \partial
+-		.set type, UNWIND_HINT_TYPE_REGS_PARTIAL
++		.if \entry
++		.set type, UNWIND_HINT_TYPE_REGS_ENTRY
++		.else
++		.set type, UNWIND_HINT_TYPE_REGS_EXIT
++		.endif
+ 	.elseif \extra == 0
+-		.set type, UNWIND_HINT_TYPE_REGS_PARTIAL
++		.if \entry
++		.set type, UNWIND_HINT_TYPE_REGS_ENTRY
++		.else
++		.set type, UNWIND_HINT_TYPE_REGS_EXIT
++		.endif
+ 		.set sp_offset, \offset + (16*8)
+ 	.else
+ 		.set type, UNWIND_HINT_TYPE_REGS
+@@ -44,8 +52,8 @@
+ 	UNWIND_HINT sp_reg=sp_reg sp_offset=sp_offset type=type
+ .endm
+ 
+-.macro UNWIND_HINT_IRET_REGS base=%rsp offset=0
+-	UNWIND_HINT_REGS base=\base offset=\offset partial=1
++.macro UNWIND_HINT_IRET_REGS base=%rsp offset=0 entry=1
++	UNWIND_HINT_REGS base=\base offset=\offset partial=1 entry=\entry
+ .endm
+ 
+ .macro UNWIND_HINT_FUNC
+diff --git a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+index 9c63fc5988cd..534281870ca3 100644
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -25,6 +25,7 @@
+ #include <asm/export.h>
+ #include <asm/nospec-branch.h>
+ #include <asm/fixmap.h>
++#include <asm/ibt.h>
+ 
+ /*
+  * We are not able to switch in one step to the final KERNEL ADDRESS SPACE
+@@ -327,7 +328,8 @@ SYM_CODE_END(start_cpu0)
+  * when .init.text is freed.
+  */
+ SYM_CODE_START_NOALIGN(vc_boot_ghcb)
+-	UNWIND_HINT_IRET_REGS offset=8
++	UNWIND_HINT_IRET_REGS offset=8 entry=1
++	ENDBR
+ 
+ 	/* Build pt_regs */
+ 	PUSH_AND_CLEAR_REGS
+@@ -371,18 +373,20 @@ SYM_CODE_START(early_idt_handler_array)
+ 	i = 0
+ 	.rept NUM_EXCEPTION_VECTORS
+ 	.if ((EXCEPTION_ERRCODE_MASK >> i) & 1) == 0
+-		UNWIND_HINT_IRET_REGS
++		UNWIND_HINT_IRET_REGS entry=1
++		ENDBR
+ 		pushq $0	# Dummy error code, to make stack frame uniform
+ 	.else
+-		UNWIND_HINT_IRET_REGS offset=8
++		UNWIND_HINT_IRET_REGS offset=8 entry=1
++		ENDBR
+ 	.endif
+ 	pushq $i		# 72(%rsp) Vector number
+ 	jmp early_idt_handler_common
+-	UNWIND_HINT_IRET_REGS
++	UNWIND_HINT_IRET_REGS entry=0
+ 	i = i + 1
+ 	.fill early_idt_handler_array + i*EARLY_IDT_HANDLER_SIZE - ., 1, 0xcc
+ 	.endr
+-	UNWIND_HINT_IRET_REGS offset=16
++	UNWIND_HINT_IRET_REGS offset=16 entry=0
+ SYM_CODE_END(early_idt_handler_array)
+ 
+ SYM_CODE_START_LOCAL(early_idt_handler_common)
+diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+index df0fa695bb09..7676e3444c83 100644
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -10,6 +10,7 @@
+ #include <asm/proto.h>
+ #include <asm/desc.h>
+ #include <asm/hw_irq.h>
++#include <asm/idtentry.h>
+ 
+ #define DPL0		0x0
+ #define DPL3		0x3
+@@ -272,7 +273,7 @@ void __init idt_setup_apic_and_irq_gates(void)
+ 	idt_setup_from_table(idt_table, apic_idts, ARRAY_SIZE(apic_idts), true);
+ 
+ 	for_each_clear_bit_from(i, system_vectors, FIRST_SYSTEM_VECTOR) {
+-		entry = irq_entries_start + 8 * (i - FIRST_EXTERNAL_VECTOR);
++		entry = irq_entries_start + IDT_ALIGN * (i - FIRST_EXTERNAL_VECTOR);
+ 		set_intr_gate(i, entry);
+ 	}
+ 
+@@ -283,7 +284,7 @@ void __init idt_setup_apic_and_irq_gates(void)
+ 		 * system_vectors bitmap. Otherwise they show up in
+ 		 * /proc/interrupts.
+ 		 */
+-		entry = spurious_entries_start + 8 * (i - FIRST_SYSTEM_VECTOR);
++		entry = spurious_entries_start + IDT_ALIGN * (i - FIRST_SYSTEM_VECTOR);
+ 		set_intr_gate(i, entry);
+ 	}
+ #endif
+diff --git a/arch/x86/kernel/unwind_orc.c b/arch/x86/kernel/unwind_orc.c
+index 2de3c8c5eba9..fbf112c5485c 100644
+--- a/arch/x86/kernel/unwind_orc.c
++++ b/arch/x86/kernel/unwind_orc.c
+@@ -566,7 +566,8 @@ bool unwind_next_frame(struct unwind_state *state)
+ 		state->signal = true;
+ 		break;
+ 
+-	case UNWIND_HINT_TYPE_REGS_PARTIAL:
++	case UNWIND_HINT_TYPE_REGS_ENTRY:
++	case UNWIND_HINT_TYPE_REGS_EXIT:
+ 		if (!deref_stack_iret_regs(state, sp, &state->ip, &state->sp)) {
+ 			orc_warn_current("can't access iret registers at %pB\n",
+ 					 (void *)orig_ip);
+diff --git a/include/linux/objtool.h b/include/linux/objtool.h
+index aca52db2f3f3..c48d45733071 100644
+--- a/include/linux/objtool.h
++++ b/include/linux/objtool.h
+@@ -35,8 +35,9 @@ struct unwind_hint {
+  */
+ #define UNWIND_HINT_TYPE_CALL		0
+ #define UNWIND_HINT_TYPE_REGS		1
+-#define UNWIND_HINT_TYPE_REGS_PARTIAL	2
+-#define UNWIND_HINT_TYPE_FUNC		3
++#define UNWIND_HINT_TYPE_REGS_ENTRY	2
++#define UNWIND_HINT_TYPE_REGS_EXIT	3
++#define UNWIND_HINT_TYPE_FUNC		4
+ 
+ #ifdef CONFIG_STACK_VALIDATION
+ 
+diff --git a/tools/include/linux/objtool.h b/tools/include/linux/objtool.h
+index aca52db2f3f3..c48d45733071 100644
+--- a/tools/include/linux/objtool.h
++++ b/tools/include/linux/objtool.h
+@@ -35,8 +35,9 @@ struct unwind_hint {
+  */
+ #define UNWIND_HINT_TYPE_CALL		0
+ #define UNWIND_HINT_TYPE_REGS		1
+-#define UNWIND_HINT_TYPE_REGS_PARTIAL	2
+-#define UNWIND_HINT_TYPE_FUNC		3
++#define UNWIND_HINT_TYPE_REGS_ENTRY	2
++#define UNWIND_HINT_TYPE_REGS_EXIT	3
++#define UNWIND_HINT_TYPE_FUNC		4
+ 
+ #ifdef CONFIG_STACK_VALIDATION
+ 
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 9c32d4d0899b..74b057953a5e 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -2339,7 +2339,8 @@ static int update_cfi_state(struct instruction *insn,
+ 	}
+ 
+ 	if (cfi->type == UNWIND_HINT_TYPE_REGS ||
+-	    cfi->type == UNWIND_HINT_TYPE_REGS_PARTIAL)
++	    cfi->type == UNWIND_HINT_TYPE_REGS_ENTRY ||
++	    cfi->type == UNWIND_HINT_TYPE_REGS_EXIT)
+ 		return update_cfi_state_regs(insn, cfi, op);
+ 
+ 	switch (op->dest.type) {
+diff --git a/tools/objtool/orc_dump.c b/tools/objtool/orc_dump.c
+index f5a8508c42d6..145cef3535c2 100644
+--- a/tools/objtool/orc_dump.c
++++ b/tools/objtool/orc_dump.c
+@@ -43,7 +43,8 @@ static const char *orc_type_name(unsigned int type)
+ 		return "call";
+ 	case UNWIND_HINT_TYPE_REGS:
+ 		return "regs";
+-	case UNWIND_HINT_TYPE_REGS_PARTIAL:
++	case UNWIND_HINT_TYPE_REGS_ENTRY:
++	case UNWIND_HINT_TYPE_REGS_EXIT:
+ 		return "regs (partial)";
+ 	default:
+ 		return "?";
+-- 
+2.35.0
+
+From f1668c2ce94fb7c6f0f765185c0496e96c4aa7ab Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 30 Nov 2021 12:51:55 +0100
+Subject: [PATCH 09/15] x86/linkage: Add ENDBR to SYM_FUNC_START*()
+
+Ensure the ASM functions have ENDBR on for IBT builds, this follows
+the ARM64 example. Unlike ARM64, we'll likely end up overwriting them
+with poison.
+
+XXX can we drop ENDBR for local symbols?
+
+Suggested-by: Mark Rutland <mark.rutland@arm.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/linkage.h | 43 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/arch/x86/include/asm/linkage.h b/arch/x86/include/asm/linkage.h
+index be26d6394698..9117a07dd2bd 100644
+--- a/arch/x86/include/asm/linkage.h
++++ b/arch/x86/include/asm/linkage.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/stringify.h>
+ #include <asm/asm.h>
++#include <asm/ibt.h>
+ 
+ #undef notrace
+ #define notrace __attribute__((no_instrument_function))
+@@ -43,6 +44,48 @@
+ #define ASM_RET	"ret\n\t"
+ #endif
+ 
++/*
++ * compressed and purgatory define this to disable EXPORT,
++ * hijack this same to also not emit ENDBR.
++ */
++#ifndef __DISABLE_EXPORTS
++
++/*
++ * The same as SYM_FUNC_START_ALIAS, but we will need to distinguish these two
++ * later.
++ */
++#define SYM_FUNC_START(name)				\
++	SYM_START(name, SYM_L_GLOBAL, SYM_A_ALIGN)	\
++	ENDBR
++
++/* SYM_FUNC_START_NOALIGN -- use for global functions, w/o alignment */
++#define SYM_FUNC_START_NOALIGN(name)			\
++	SYM_START(name, SYM_L_GLOBAL, SYM_A_NONE)	\
++	ENDBR
++
++/* SYM_FUNC_START_LOCAL -- use for local functions */
++/* the same as SYM_FUNC_START_LOCAL_ALIAS, see comment near SYM_FUNC_START */
++#define SYM_FUNC_START_LOCAL(name)			\
++	SYM_START(name, SYM_L_LOCAL, SYM_A_ALIGN)	\
++	ENDBR
++
++/* SYM_FUNC_START_LOCAL_NOALIGN -- use for local functions, w/o alignment */
++#define SYM_FUNC_START_LOCAL_NOALIGN(name)		\
++	SYM_START(name, SYM_L_LOCAL, SYM_A_NONE)	\
++	ENDBR
++
++/* SYM_FUNC_START_WEAK -- use for weak functions */
++#define SYM_FUNC_START_WEAK(name)			\
++	SYM_START(name, SYM_L_WEAK, SYM_A_ALIGN)	\
++	ENDBR
++
++/* SYM_FUNC_START_WEAK_NOALIGN -- use for weak functions, w/o alignment */
++#define SYM_FUNC_START_WEAK_NOALIGN(name)		\
++	SYM_START(name, SYM_L_WEAK, SYM_A_NONE)		\
++	ENDBR
++
++#endif /* __DISABLE_EXPORTS */
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _ASM_X86_LINKAGE_H */
+-- 
+2.35.0
+
+From d0c9fa649de8b709c5efea200bd00b646be0e7b5 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 2 Dec 2021 00:31:21 +0100
+Subject: [PATCH 10/15] x86/bpf: Add ENDBR instructions to prologue
+
+With IBT enabled builds we need ENDBR instructions at indirect jump
+target sites, since we start execution of the JIT'ed code through an
+indirect jump, the very first instruction needs to be ENDBR.
+
+Similarly, since eBPF tail-calls use indirect branches, their landing
+site needs to be an ENDBR too.
+
+Note: this shifts the trampoline patch site by 5 bytes but I've not
+yet figured out where this is used.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/net/bpf_jit_comp.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 2b1e266ff95c..c954ae423e2b 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -46,6 +46,12 @@ static u8 *emit_code(u8 *ptr, u32 bytes, unsigned int len)
+ #define EMIT4_off32(b1, b2, b3, b4, off) \
+ 	do { EMIT4(b1, b2, b3, b4); EMIT(off, 4); } while (0)
+ 
++#ifdef CONFIG_X86_IBT
++#define EMIT_ENDBR() EMIT4(0xf3, 0x0f, 0x1e, 0xfa)
++#else
++#define EMIT_ENDBR()
++#endif
++
+ static bool is_imm8(int value)
+ {
+ 	return value <= 127 && value >= -128;
+@@ -241,7 +247,7 @@ struct jit_context {
+ /* Number of bytes emit_patch() needs to generate instructions */
+ #define X86_PATCH_SIZE		5
+ /* Number of bytes that will be skipped on tailcall */
+-#define X86_TAIL_CALL_OFFSET	11
++#define X86_TAIL_CALL_OFFSET	(11 + 4*IS_ENABLED(CONFIG_X86_IBT))
+ 
+ static void push_callee_regs(u8 **pprog, bool *callee_regs_used)
+ {
+@@ -286,6 +292,7 @@ static void emit_prologue(u8 **pprog, u32 stack_depth, bool ebpf_from_cbpf,
+ 	/* BPF trampoline can be made to work without these nops,
+ 	 * but let's waste 5 bytes for now and optimize later
+ 	 */
++	EMIT_ENDBR();
+ 	memcpy(prog, x86_nops[5], X86_PATCH_SIZE);
+ 	prog += X86_PATCH_SIZE;
+ 	if (!ebpf_from_cbpf) {
+@@ -296,6 +303,10 @@ static void emit_prologue(u8 **pprog, u32 stack_depth, bool ebpf_from_cbpf,
+ 	}
+ 	EMIT1(0x55);             /* push rbp */
+ 	EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
++
++	/* X86_TAIL_CALL_OFFSET is here */
++	EMIT_ENDBR();
++
+ 	/* sub rsp, rounded_stack_depth */
+ 	if (stack_depth)
+ 		EMIT3_off32(0x48, 0x81, 0xEC, round_up(stack_depth, 8));
+-- 
+2.35.0
+
+From fc9e165c4ee9eab470f10844fb136c63102b0de9 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 30 Nov 2021 16:28:41 +0100
+Subject: [PATCH 11/15] x86: Add IBT feature, MSR and #CP handling
+
+The bits required to make the hardware go.. Of note is that, provided
+the syscall entry points are covered with ENDBR, #CP doesn't need to
+be an IST because we'll never hit the syscall gap.
+
+If we grow kernel shadow-stack support this needs to change.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/cpufeatures.h          |  1 +
+ arch/x86/include/asm/idtentry.h             |  5 +++++
+ arch/x86/include/asm/msr-index.h            | 20 +++++++++++++++++++-
+ arch/x86/include/uapi/asm/processor-flags.h |  2 ++
+ arch/x86/kernel/cpu/common.c                | 18 ++++++++++++++++++
+ arch/x86/kernel/idt.c                       |  4 ++++
+ arch/x86/kernel/traps.c                     | 16 ++++++++++++++++
+ 7 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index 6db4e2932b3d..35b96290b1c9 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -390,6 +390,7 @@
+ #define X86_FEATURE_TSXLDTRK		(18*32+16) /* TSX Suspend Load Address Tracking */
+ #define X86_FEATURE_PCONFIG		(18*32+18) /* Intel PCONFIG */
+ #define X86_FEATURE_ARCH_LBR		(18*32+19) /* Intel ARCH LBR */
++#define X86_FEATURE_IBT			(18*32+20) /* Indirect Branch Tracking */
+ #define X86_FEATURE_AVX512_FP16		(18*32+23) /* AVX512 FP16 */
+ #define X86_FEATURE_SPEC_CTRL		(18*32+26) /* "" Speculation Control (IBRS + IBPB) */
+ #define X86_FEATURE_INTEL_STIBP		(18*32+27) /* "" Single Thread Indirect Branch Predictors */
+diff --git a/arch/x86/include/asm/idtentry.h b/arch/x86/include/asm/idtentry.h
+index e215438a99db..9127e1e3c439 100644
+--- a/arch/x86/include/asm/idtentry.h
++++ b/arch/x86/include/asm/idtentry.h
+@@ -622,6 +622,11 @@ DECLARE_IDTENTRY_DF(X86_TRAP_DF,	exc_double_fault);
+ DECLARE_IDTENTRY_RAW_ERRORCODE(X86_TRAP_DF,	xenpv_exc_double_fault);
+ #endif
+ 
++/* #CP */
++#ifdef CONFIG_X86_IBT
++DECLARE_IDTENTRY_ERRORCODE(X86_TRAP_CP,	exc_control_protection);
++#endif
++
+ /* #VC */
+ #ifdef CONFIG_AMD_MEM_ENCRYPT
+ DECLARE_IDTENTRY_VC(X86_TRAP_VC,	exc_vmm_communication);
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 3faf0f97edb1..81b2dd135847 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -360,11 +360,29 @@
+ #define MSR_ATOM_CORE_TURBO_RATIOS	0x0000066c
+ #define MSR_ATOM_CORE_TURBO_VIDS	0x0000066d
+ 
+-
+ #define MSR_CORE_PERF_LIMIT_REASONS	0x00000690
+ #define MSR_GFX_PERF_LIMIT_REASONS	0x000006B0
+ #define MSR_RING_PERF_LIMIT_REASONS	0x000006B1
+ 
++/* Control-flow Enforcement Technology MSRs */
++#define MSR_IA32_U_CET			0x000006a0 /* user mode cet */
++#define MSR_IA32_S_CET			0x000006a2 /* kernel mode cet */
++#define CET_SHSTK_EN			BIT_ULL(0)
++#define CET_WRSS_EN			BIT_ULL(1)
++#define CET_ENDBR_EN			BIT_ULL(2)
++#define CET_LEG_IW_EN			BIT_ULL(3)
++#define CET_NO_TRACK_EN			BIT_ULL(4)
++#define CET_SUPPRESS_DISABLE		BIT_ULL(5)
++#define CET_RESERVED			(BIT_ULL(6) | BIT_ULL(7) | BIT_ULL(8) | BIT_ULL(9))
++#define CET_SUPPRESS			BIT_ULL(10)
++#define CET_WAIT_ENDBR			BIT_ULL(11)
++
++#define MSR_IA32_PL0_SSP		0x000006a4 /* ring-0 shadow stack pointer */
++#define MSR_IA32_PL1_SSP		0x000006a5 /* ring-1 shadow stack pointer */
++#define MSR_IA32_PL2_SSP		0x000006a6 /* ring-2 shadow stack pointer */
++#define MSR_IA32_PL3_SSP		0x000006a7 /* ring-3 shadow stack pointer */
++#define MSR_IA32_INT_SSP_TAB		0x000006a8 /* exception shadow stack table */
++
+ /* Hardware P state interface */
+ #define MSR_PPERF			0x0000064e
+ #define MSR_PERF_LIMIT_REASONS		0x0000064f
+diff --git a/arch/x86/include/uapi/asm/processor-flags.h b/arch/x86/include/uapi/asm/processor-flags.h
+index bcba3c643e63..c47cc7f2feeb 100644
+--- a/arch/x86/include/uapi/asm/processor-flags.h
++++ b/arch/x86/include/uapi/asm/processor-flags.h
+@@ -130,6 +130,8 @@
+ #define X86_CR4_SMAP		_BITUL(X86_CR4_SMAP_BIT)
+ #define X86_CR4_PKE_BIT		22 /* enable Protection Keys support */
+ #define X86_CR4_PKE		_BITUL(X86_CR4_PKE_BIT)
++#define X86_CR4_CET_BIT		23 /* enable Control-flow Enforcement Technology */
++#define X86_CR4_CET		_BITUL(X86_CR4_CET_BIT)
+ 
+ /*
+  * x86-64 Task Priority Register, CR8
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 7b8382c11788..0d0069adf402 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -515,6 +515,23 @@ static __init int setup_disable_pku(char *arg)
+ __setup("nopku", setup_disable_pku);
+ #endif /* CONFIG_X86_64 */
+ 
++static __always_inline void setup_cet(struct cpuinfo_x86 *c)
++{
++	u64 msr;
++
++	if (!cpu_feature_enabled(X86_FEATURE_IBT))
++		return;
++
++	cr4_set_bits(X86_CR4_CET);
++
++	rdmsrl(MSR_IA32_S_CET, msr);
++#ifdef CONFIG_X86_IBT
++	if (cpu_feature_enabled(X86_FEATURE_IBT))
++		msr |= CET_ENDBR_EN | CET_NO_TRACK_EN;
++#endif
++	wrmsrl(MSR_IA32_S_CET, msr);
++}
++
+ /*
+  * Some CPU features depend on higher CPUID levels, which may not always
+  * be available due to CPUID level capping or broken virtualization
+@@ -1632,6 +1649,7 @@ static void identify_cpu(struct cpuinfo_x86 *c)
+ 
+ 	x86_init_rdrand(c);
+ 	setup_pku(c);
++	setup_cet(c);
+ 
+ 	/*
+ 	 * Clear/Set all flags overridden by options, need do it
+diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+index 7676e3444c83..1c581e781609 100644
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -104,6 +104,10 @@ static const __initconst struct idt_data def_idts[] = {
+ 	ISTG(X86_TRAP_MC,		asm_exc_machine_check, IST_INDEX_MCE),
+ #endif
+ 
++#ifdef CONFIG_X86_IBT
++	INTG(X86_TRAP_CP,		asm_exc_control_protection),
++#endif
++
+ #ifdef CONFIG_AMD_MEM_ENCRYPT
+ 	ISTG(X86_TRAP_VC,		asm_exc_vmm_communication, IST_INDEX_VC),
+ #endif
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index c9d566dcf89a..26ebe27d2ff3 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -641,6 +641,22 @@ DEFINE_IDTENTRY_ERRORCODE(exc_general_protection)
+ 	cond_local_irq_disable(regs);
+ }
+ 
++#ifdef CONFIG_X86_IBT
++DEFINE_IDTENTRY_ERRORCODE(exc_control_protection)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_IBT)) {
++		pr_err("Whaaa?!?!\n");
++		return;
++	}
++
++	if (WARN_ON_ONCE(user_mode(regs) || error_code != 3))
++		return;
++
++	pr_err("Missing ENDBR: %pS\n", instruction_pointer(regs));
++	return;
++}
++#endif
++
+ static bool do_int3(struct pt_regs *regs)
+ {
+ 	int res;
+-- 
+2.35.0
+
+From d5a2c3913b5f7131be12171c07731c412f8df14e Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 1 Dec 2021 23:07:59 +0100
+Subject: [PATCH 12/15] x86: Disable IBT around firmware
+
+Assume firmware isn't IBT clean and disable it across calls.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/include/asm/efi.h   |  9 +++++++--
+ arch/x86/include/asm/ibt.h   | 10 ++++++++++
+ arch/x86/kernel/apm_32.c     |  7 +++++++
+ arch/x86/kernel/cpu/common.c | 32 +++++++++++++++++++++++++++++++-
+ 4 files changed, 55 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/include/asm/efi.h b/arch/x86/include/asm/efi.h
+index 03cb12775043..98938a68251c 100644
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@ -7,6 +7,7 @@
+ #include <asm/tlb.h>
+ #include <asm/nospec-branch.h>
+ #include <asm/mmu_context.h>
++#include <asm/ibt.h>
+ #include <linux/build_bug.h>
+ #include <linux/kernel.h>
+ #include <linux/pgtable.h>
+@@ -120,8 +121,12 @@ extern asmlinkage u64 __efi_call(void *fp, ...);
+ 	efi_enter_mm();							\
+ })
+ 
+-#define arch_efi_call_virt(p, f, args...)				\
+-	efi_call((void *)p->f, args)					\
++#define arch_efi_call_virt(p, f, args...) ({				\
++	u64 ret, ibt = ibt_save();					\
++	ret = efi_call((void *)p->f, args);				\
++	ibt_restore(ibt);						\
++	ret;								\
++})
+ 
+ #define arch_efi_call_virt_teardown()					\
+ ({									\
+diff --git a/arch/x86/include/asm/ibt.h b/arch/x86/include/asm/ibt.h
+index 0a9fbc4482c2..054cc4da1d4c 100644
+--- a/arch/x86/include/asm/ibt.h
++++ b/arch/x86/include/asm/ibt.h
+@@ -6,6 +6,8 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#include <linux/types.h>
++
+ #ifdef CONFIG_X86_64
+ #define ASM_ENDBR	"endbr64\n\t"
+ #else
+@@ -23,6 +25,9 @@ static inline bool is_endbr(const void *addr)
+ 	return val == ~0xfa1e0ff3;
+ }
+ 
++extern u64 ibt_save(void);
++extern void ibt_restore(u64 save);
++
+ #else /* __ASSEMBLY__ */
+ 
+ #ifdef CONFIG_X86_64
+@@ -37,8 +42,13 @@ static inline bool is_endbr(const void *addr)
+ 
+ #ifndef __ASSEMBLY__
+ 
++#include <linux/types.h>
++
+ #define ASM_ENDBR
+ 
++static inline u64 ibt_save(void) { return 0; }
++static inline void ibt_restore(u64 save) { }
++
+ #else /* __ASSEMBLY__ */
+ 
+ #define ENDBR
+diff --git a/arch/x86/kernel/apm_32.c b/arch/x86/kernel/apm_32.c
+index 241dda687eb9..60e330cdbd17 100644
+--- a/arch/x86/kernel/apm_32.c
++++ b/arch/x86/kernel/apm_32.c
+@@ -232,6 +232,7 @@
+ #include <asm/paravirt.h>
+ #include <asm/reboot.h>
+ #include <asm/nospec-branch.h>
++#include <asm/ibt.h>
+ 
+ #if defined(CONFIG_APM_DISPLAY_BLANK) && defined(CONFIG_VT)
+ extern int (*console_blank_hook)(int);
+@@ -598,6 +599,7 @@ static long __apm_bios_call(void *_call)
+ 	struct desc_struct	save_desc_40;
+ 	struct desc_struct	*gdt;
+ 	struct apm_bios_call	*call = _call;
++	u64			ibt;
+ 
+ 	cpu = get_cpu();
+ 	BUG_ON(cpu != 0);
+@@ -607,11 +609,13 @@ static long __apm_bios_call(void *_call)
+ 
+ 	apm_irq_save(flags);
+ 	firmware_restrict_branch_speculation_start();
++	ibt = ibt_save();
+ 	APM_DO_SAVE_SEGS;
+ 	apm_bios_call_asm(call->func, call->ebx, call->ecx,
+ 			  &call->eax, &call->ebx, &call->ecx, &call->edx,
+ 			  &call->esi);
+ 	APM_DO_RESTORE_SEGS;
++	ibt_restore(ibt);
+ 	firmware_restrict_branch_speculation_end();
+ 	apm_irq_restore(flags);
+ 	gdt[0x40 / 8] = save_desc_40;
+@@ -676,6 +680,7 @@ static long __apm_bios_call_simple(void *_call)
+ 	struct desc_struct	save_desc_40;
+ 	struct desc_struct	*gdt;
+ 	struct apm_bios_call	*call = _call;
++	u64			ibt;
+ 
+ 	cpu = get_cpu();
+ 	BUG_ON(cpu != 0);
+@@ -685,10 +690,12 @@ static long __apm_bios_call_simple(void *_call)
+ 
+ 	apm_irq_save(flags);
+ 	firmware_restrict_branch_speculation_start();
++	ibt = ibt_save();
+ 	APM_DO_SAVE_SEGS;
+ 	error = apm_bios_call_simple_asm(call->func, call->ebx, call->ecx,
+ 					 &call->eax);
+ 	APM_DO_RESTORE_SEGS;
++	ibt_restore(ibt);
+ 	firmware_restrict_branch_speculation_end();
+ 	apm_irq_restore(flags);
+ 	gdt[0x40 / 8] = save_desc_40;
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 0d0069adf402..ff6e0237da2d 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -515,6 +515,36 @@ static __init int setup_disable_pku(char *arg)
+ __setup("nopku", setup_disable_pku);
+ #endif /* CONFIG_X86_64 */
+ 
++#ifdef CONFIG_X86_IBT
++
++#define CET_IBT_EN	(CET_ENDBR_EN | CET_NO_TRACK_EN)
++
++u64 ibt_save(void)
++{
++	u64 msr = 0;
++
++	if (cpu_feature_enabled(X86_FEATURE_IBT)) {
++		rdmsrl(MSR_IA32_S_CET, msr);
++		wrmsrl(MSR_IA32_S_CET, msr & ~CET_IBT_EN);
++	}
++
++	return msr;
++}
++
++void ibt_restore(u64 save)
++{
++	u64 msr;
++
++	if (cpu_feature_enabled(X86_FEATURE_IBT)) {
++		rdmsrl(MSR_IA32_S_CET, msr);
++		msr &= ~CET_IBT_EN;
++		msr |= (save & CET_IBT_EN);
++		wrmsrl(MSR_IA32_S_CET, msr);
++	}
++}
++
++#endif
++
+ static __always_inline void setup_cet(struct cpuinfo_x86 *c)
+ {
+ 	u64 msr;
+@@ -527,7 +557,7 @@ static __always_inline void setup_cet(struct cpuinfo_x86 *c)
+ 	rdmsrl(MSR_IA32_S_CET, msr);
+ #ifdef CONFIG_X86_IBT
+ 	if (cpu_feature_enabled(X86_FEATURE_IBT))
+-		msr |= CET_ENDBR_EN | CET_NO_TRACK_EN;
++		msr |= CET_IBT_EN;
+ #endif
+ 	wrmsrl(MSR_IA32_S_CET, msr);
+ }
+-- 
+2.35.0
+
+From 9d7a08a58dd3654d96cd9b3b7b25607202765959 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 22 Nov 2021 16:58:05 +0100
+Subject: [PATCH 13/15] objtool: Add IBT validation / fixups
+
+Objtool based IBT validation in 3 passes:
+
+ --ibt-fix-direct:
+
+    Detect and rewrite any code/reloc from a JMP/CALL instruction
+    to an ENDBR instruction. This is basically a compiler bug since
+    neither needs the ENDBR and decoding it is a pure waste of time.
+
+ --ibt:
+
+    Report code relocs that are not JMP/CALL and don't point to ENDBR
+
+    There's a bunch of false positives, for eg. static_call_update()
+    and copy_thread() and kprobes. But most of them were due to
+    _THIS_IP_ which has been taken care of with the prior annotation.
+
+ --ibt-seal:
+
+    Find superfluous ENDBR instructions. Any function that
+    doesn't have it's address taken should not have an ENDBR
+    instruction. This removes about 1-in-4 ENDBR instructions.
+
+All these flags are LTO like and require '--vmlinux --duplicate' to
+run. As is, the output on x86_64-defconfig looks like:
+
+  vmlinux.o: warning: objtool: apply_retpolines()+0x9b: relocation to !ENDBR: .text.__x86.indirect_thunk+0x0
+  vmlinux.o: warning: objtool: copy_thread()+0x3c: relocation to !ENDBR: .text+0x1440
+  vmlinux.o: warning: objtool: machine_kexec_prepare()+0x189: relocation to !ENDBR: .text+0x52000
+  vmlinux.o: warning: objtool: machine_kexec()+0x44: relocation to !ENDBR: .text+0x52000
+  vmlinux.o: warning: objtool: __kretprobe_trampoline()+0x0: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: arch_prepare_kretprobe()+0x16: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: trampoline_handler()+0x1b: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: paravirt_patch()+0x15: relocation to !ENDBR: _paravirt_nop+0x0
+  vmlinux.o: warning: objtool: unwind_next_frame()+0x53d: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: unwind_next_frame()+0x3d0: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: unwind_next_frame()+0x232: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: __unwind_start()+0x11a: relocation to !ENDBR: .text+0x1440
+  vmlinux.o: warning: objtool: filter_irq_stacks()+0x1f: relocation to !ENDBR: .entry.text+0x1550
+  vmlinux.o: warning: objtool: __kretprobe_find_ret_addr()+0xe: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: kretprobe_find_ret_addr()+0x13: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: __kretprobe_trampoline_handler()+0x43: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: trace_seq_print_sym()+0x8e: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: trace_seq_print_sym()+0x39: relocation to !ENDBR: __kretprobe_trampoline+0x0
+  vmlinux.o: warning: objtool: override_function_with_return()+0x4: relocation to !ENDBR: just_return_func+0x0
+  vmlinux.o: warning: objtool: rpm_suspend()+0x409: relocation to !ENDBR: rpm_suspend+0x56b
+  vmlinux.o: warning: objtool: rpm_idle()+0x192: relocation to !ENDBR: rpm_idle+0x215
+  vmlinux.o: warning: objtool: init_real_mode()+0xf1: relocation to !ENDBR: .head.text+0x40
+  vmlinux.o: warning: objtool: int3_exception_notify()+0x52: relocation to !ENDBR: int3_magic+0x0
+  vmlinux.o: warning: objtool: vmware_platform_setup()+0x10c: relocation to !ENDBR: _paravirt_nop+0x0
+  vmlinux.o: warning: objtool: exc_double_fault()+0x55: relocation to !ENDBR: .entry.text+0x15f7
+  vmlinux.o: warning: objtool: exc_debug()+0xa3: relocation to !ENDBR: .entry.text+0x1b0d
+  vmlinux.o: warning: objtool: .text+0x5211c: relocation to !ENDBR: .text+0x52125
+  vmlinux.o: warning: objtool: .head.text+0x80: relocation to !ENDBR: .head.text+0x89
+  vmlinux.o: warning: objtool: .head.text+0xf4: relocation to !ENDBR: .head.text+0x107
+  vmlinux.o: warning: objtool: .entry.text+0x1856: relocation to !ENDBR: asm_load_gs_index+0x7
+  vmlinux.o: warning: objtool: .entry.text+0x1957: relocation to !ENDBR: .entry.text+0x19d4
+  vmlinux.o: warning: objtool: .entry.text+0x19aa: relocation to !ENDBR: .entry.text+0x19d4
+  vmlinux.o: warning: objtool: .entry.text+0x1965: relocation to !ENDBR: .entry.text+0x19f9
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/x86/kernel/vmlinux.lds.S           |   9 +
+ tools/objtool/arch/x86/decode.c         |  81 +++++-
+ tools/objtool/builtin-check.c           |  21 +-
+ tools/objtool/check.c                   | 322 ++++++++++++++++++++++--
+ tools/objtool/include/objtool/arch.h    |   3 +
+ tools/objtool/include/objtool/builtin.h |   3 +-
+ tools/objtool/include/objtool/objtool.h |   4 +
+ tools/objtool/objtool.c                 |   1 +
+ 8 files changed, 421 insertions(+), 23 deletions(-)
+
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index 27f830345b6f..321fdc258d73 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -285,6 +285,15 @@ SECTIONS
+ 	}
+ #endif
+ 
++#ifdef CONFIG_X86_IBT
++	. = ALIGN(8);
++	.ibt_endbr_sites : AT(ADDR(.ibt_endbr_sites) - LOAD_OFFSET) {
++		__ibt_endbr_sites = .;
++		*(.ibt_endbr_sites)
++		__ibt_endbr_sites_end = .;
++	}
++#endif
++
+ 	/*
+ 	 * struct alt_inst entries. From the header (alternative.h):
+ 	 * "Alternative instructions for different CPU types or capabilities"
+diff --git a/tools/objtool/arch/x86/decode.c b/tools/objtool/arch/x86/decode.c
+index c10ef78df050..820311f715a9 100644
+--- a/tools/objtool/arch/x86/decode.c
++++ b/tools/objtool/arch/x86/decode.c
+@@ -112,7 +112,7 @@ int arch_decode_instruction(struct objtool_file *file, const struct section *sec
+ 	const struct elf *elf = file->elf;
+ 	struct insn insn;
+ 	int x86_64, ret;
+-	unsigned char op1, op2,
++	unsigned char op1, op2, prefix,
+ 		      rex = 0, rex_b = 0, rex_r = 0, rex_w = 0, rex_x = 0,
+ 		      modrm = 0, modrm_mod = 0, modrm_rm = 0, modrm_reg = 0,
+ 		      sib = 0, /* sib_scale = 0, */ sib_index = 0, sib_base = 0;
+@@ -137,6 +137,8 @@ int arch_decode_instruction(struct objtool_file *file, const struct section *sec
+ 	if (insn.vex_prefix.nbytes)
+ 		return 0;
+ 
++	prefix = insn.prefixes.bytes[0];
++
+ 	op1 = insn.opcode.bytes[0];
+ 	op2 = insn.opcode.bytes[1];
+ 
+@@ -491,6 +493,11 @@ int arch_decode_instruction(struct objtool_file *file, const struct section *sec
+ 			/* nopl/nopw */
+ 			*type = INSN_NOP;
+ 
++		} else if (op2 == 0x1e) {
++
++			if (prefix == 0xf3 && (modrm == 0xfa || modrm == 0xfb))
++				*type = INSN_ENDBR;
++
+ 		} else if (op2 == 0xa0 || op2 == 0xa8) {
+ 
+ 			/* push fs/gs */
+@@ -596,6 +603,7 @@ int arch_decode_instruction(struct objtool_file *file, const struct section *sec
+ 				op->dest.type = OP_DEST_REG;
+ 				op->dest.reg = CFI_SP;
+ 			}
++			*type = INSN_IRET;
+ 			break;
+ 		}
+ 
+@@ -696,6 +704,77 @@ const char *arch_nop_insn(int len)
+ 	return nops[len-1];
+ }
+ 
++const char *arch_mod_immediate(struct instruction *insn, unsigned long target)
++{
++	struct section *sec = insn->sec;
++	Elf_Data *data = sec->data;
++	unsigned char op1, op2;
++	static char bytes[16];
++	struct insn x86_insn;
++	int ret, disp;
++
++	disp = (long)(target - (insn->offset + insn->len));
++
++	if (data->d_type != ELF_T_BYTE || data->d_off) {
++		WARN("unexpected data for section: %s", sec->name);
++		return NULL;
++	}
++
++	ret = insn_decode(&x86_insn, data->d_buf + insn->offset, insn->len,
++			  INSN_MODE_64);
++	if (ret < 0) {
++		WARN("can't decode instruction at %s:0x%lx", sec->name, insn->offset);
++		return NULL;
++	}
++
++	op1 = x86_insn.opcode.bytes[0];
++	op2 = x86_insn.opcode.bytes[1];
++
++	switch (op1) {
++	case 0x0f: /* escape */
++		switch (op2) {
++		case 0x80 ... 0x8f: /* jcc.d32 */
++			if (insn->len != 6)
++				return NULL;
++			bytes[0] = op1;
++			bytes[1] = op2;
++			*(int *)&bytes[2] = disp;
++			break;
++
++		default:
++			return NULL;
++		}
++		break;
++
++	case 0x70 ... 0x7f: /* jcc.d8 */
++	case 0xeb: /* jmp.d8 */
++		if (insn->len != 2)
++			return NULL;
++
++		if (disp >> 7 != disp >> 31) {
++			WARN("displacement doesn't fit\n");
++			return NULL;
++		}
++
++		bytes[0] = op1;
++		bytes[1] = disp & 0xff;
++		break;
++
++	case 0xe8: /* call */
++	case 0xe9: /* jmp.d32 */
++		if (insn->len != 5)
++			return NULL;
++		bytes[0] = op1;
++		*(int *)&bytes[1] = disp;
++		break;
++
++	default:
++		return NULL;
++	}
++
++	return bytes;
++}
++
+ #define BYTE_RET	0xC3
+ 
+ const char *arch_ret_insn(int len)
+diff --git a/tools/objtool/builtin-check.c b/tools/objtool/builtin-check.c
+index 38070f26105b..858012d26b21 100644
+--- a/tools/objtool/builtin-check.c
++++ b/tools/objtool/builtin-check.c
+@@ -20,7 +20,8 @@
+ #include <objtool/objtool.h>
+ 
+ bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats,
+-     validate_dup, vmlinux, mcount, noinstr, backup, sls;
++     validate_dup, vmlinux, mcount, noinstr, backup, sls,
++     ibt, ibt_fix_direct, ibt_seal;
+ 
+ static const char * const check_usage[] = {
+ 	"objtool check [<options>] file.o",
+@@ -46,6 +47,9 @@ const struct option check_options[] = {
+ 	OPT_BOOLEAN('M', "mcount", &mcount, "generate __mcount_loc"),
+ 	OPT_BOOLEAN('B', "backup", &backup, "create .orig files before modification"),
+ 	OPT_BOOLEAN('S', "sls", &sls, "validate straight-line-speculation"),
++	OPT_BOOLEAN(0, "ibt", &ibt, "validate ENDBR placement"),
++	OPT_BOOLEAN(0, "ibt-fix-direct", &ibt_fix_direct, "fixup direct jmp/call to ENDBR"),
++	OPT_BOOLEAN(0, "ibt-seal", &ibt_seal, "list superfluous ENDBR instructions"),
+ 	OPT_END(),
+ };
+ 
+@@ -85,6 +89,21 @@ int cmd_check(int argc, const char **argv)
+ 	argc = cmd_parse_options(argc, argv, check_usage);
+ 	objname = argv[0];
+ 
++	if (ibt && !(vmlinux && validate_dup)) {
++		fprintf(stderr, "--ibt requires: --vmlinux --duplicate\n");
++		exit(129);
++	}
++
++	if (ibt_fix_direct && !ibt) {
++		fprintf(stderr, "--ibt-fix-direct requires --ibt\n");
++		exit(129);
++	}
++
++	if (ibt_seal && !(ibt && ibt_fix_direct)) {
++		fprintf(stderr, "--ibt-seal requires: --ibt --ibt-fix-direct\n");
++		exit(129);
++	}
++
+ 	file = objtool_open_read(objname);
+ 	if (!file)
+ 		return 1;
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 74b057953a5e..c5351dd676aa 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -380,6 +380,7 @@ static int decode_instructions(struct objtool_file *file)
+ 			memset(insn, 0, sizeof(*insn));
+ 			INIT_LIST_HEAD(&insn->alts);
+ 			INIT_LIST_HEAD(&insn->stack_ops);
++			INIT_LIST_HEAD(&insn->call_node);
+ 
+ 			insn->sec = sec;
+ 			insn->offset = offset;
+@@ -731,6 +732,58 @@ static int create_retpoline_sites_sections(struct objtool_file *file)
+ 	return 0;
+ }
+ 
++static int create_ibt_endbr_sites_sections(struct objtool_file *file)
++{
++	struct instruction *insn;
++	struct section *sec;
++	int idx;
++
++	sec = find_section_by_name(file->elf, ".ibt_endbr_sites");
++	if (sec) {
++		WARN("file already has .ibt_endbr_sites, skipping");
++		return 0;
++	}
++
++	idx = 0;
++	list_for_each_entry(insn, &file->endbr_list, call_node)
++		idx++;
++
++	if (stats) {
++		printf("ibt: ENDBR at function start: %d\n", file->nr_endbr);
++		printf("ibt: ENDBR inside functions:  %d\n", file->nr_endbr_int);
++		printf("ibt: superfluous ENDBR:       %d\n", idx);
++	}
++
++	if (!idx)
++		return 0;
++
++	sec = elf_create_section(file->elf, ".ibt_endbr_sites", 0,
++				 sizeof(int), idx);
++	if (!sec) {
++		WARN("elf_create_section: .ibt_endbr_sites");
++		return -1;
++	}
++
++	idx = 0;
++	list_for_each_entry(insn, &file->endbr_list, call_node) {
++
++		int *site = (int *)sec->data->d_buf + idx;
++		*site = 0;
++
++		if (elf_add_reloc_to_insn(file->elf, sec,
++					  idx * sizeof(int),
++					  R_X86_64_PC32,
++					  insn->sec, insn->offset)) {
++			WARN("elf_add_reloc_to_insn: .ibt_endbr_sites");
++			return -1;
++		}
++
++		idx++;
++	}
++
++	return 0;
++}
++
+ static int create_mcount_loc_sections(struct objtool_file *file)
+ {
+ 	struct section *sec;
+@@ -1176,6 +1229,15 @@ static int add_jump_destinations(struct objtool_file *file)
+ 	unsigned long dest_off;
+ 
+ 	for_each_insn(file, insn) {
++		if (insn->type == INSN_ENDBR && insn->func) {
++			if (insn->offset == insn->func->offset) {
++				list_add_tail(&insn->call_node, &file->endbr_list);
++				file->nr_endbr++;
++			} else {
++				file->nr_endbr_int++;
++			}
++		}
++
+ 		if (!is_static_jump(insn))
+ 			continue;
+ 
+@@ -1192,10 +1254,14 @@ static int add_jump_destinations(struct objtool_file *file)
+ 		} else if (insn->func) {
+ 			/* internal or external sibling call (with reloc) */
+ 			add_call_dest(file, insn, reloc->sym, true);
+-			continue;
++
++			dest_sec = reloc->sym->sec;
++			dest_off = reloc->sym->offset +
++				   arch_dest_reloc_offset(reloc->addend);
++
+ 		} else if (reloc->sym->sec->idx) {
+ 			dest_sec = reloc->sym->sec;
+-			dest_off = reloc->sym->sym.st_value +
++			dest_off = reloc->sym->offset +
+ 				   arch_dest_reloc_offset(reloc->addend);
+ 		} else {
+ 			/* non-func asm code jumping to another file */
+@@ -1205,6 +1271,10 @@ static int add_jump_destinations(struct objtool_file *file)
+ 		insn->jump_dest = find_insn(file, dest_sec, dest_off);
+ 		if (!insn->jump_dest) {
+ 
++			/* external symbol */
++			if (!vmlinux && insn->func)
++				continue;
++
+ 			/*
+ 			 * This is a special case where an alt instruction
+ 			 * jumps past the end of the section.  These are
+@@ -1219,6 +1289,32 @@ static int add_jump_destinations(struct objtool_file *file)
+ 			return -1;
+ 		}
+ 
++		if (ibt && insn->jump_dest->type == INSN_ENDBR &&
++		    insn->jump_dest->func &&
++		    insn->jump_dest->offset == insn->jump_dest->func->offset) {
++			if (reloc) {
++				if (ibt_fix_direct) {
++					reloc->addend += 4;
++					elf_write_reloc(file->elf, reloc);
++				} else {
++					WARN_FUNC("Direct RELOC jump to ENDBR", insn->sec, insn->offset);
++				}
++			} else {
++				if (ibt_fix_direct) {
++					const char *bytes = arch_mod_immediate(insn, dest_off + 4);
++					if (bytes) {
++						elf_write_insn(file->elf, insn->sec,
++							       insn->offset, insn->len,
++							       bytes);
++					} else {
++						WARN_FUNC("Direct IMM jump to ENDBR; cannot fix", insn->sec, insn->offset);
++					}
++				} else {
++					WARN_FUNC("Direct IMM jump to ENDBR", insn->sec, insn->offset);
++				}
++			}
++		}
++
+ 		/*
+ 		 * Cross-function jump.
+ 		 */
+@@ -1246,7 +1342,8 @@ static int add_jump_destinations(struct objtool_file *file)
+ 				insn->jump_dest->func->pfunc = insn->func;
+ 
+ 			} else if (insn->jump_dest->func->pfunc != insn->func->pfunc &&
+-				   insn->jump_dest->offset == insn->jump_dest->func->offset) {
++				   ((insn->jump_dest->offset == insn->jump_dest->func->offset) ||
++				    (insn->jump_dest->offset == insn->jump_dest->func->offset + 4))) {
+ 				/* internal sibling call (without reloc) */
+ 				add_call_dest(file, insn, insn->jump_dest->func, true);
+ 			}
+@@ -1256,23 +1353,12 @@ static int add_jump_destinations(struct objtool_file *file)
+ 	return 0;
+ }
+ 
+-static struct symbol *find_call_destination(struct section *sec, unsigned long offset)
+-{
+-	struct symbol *call_dest;
+-
+-	call_dest = find_func_by_offset(sec, offset);
+-	if (!call_dest)
+-		call_dest = find_symbol_by_offset(sec, offset);
+-
+-	return call_dest;
+-}
+-
+ /*
+  * Find the destination instructions for all calls.
+  */
+ static int add_call_destinations(struct objtool_file *file)
+ {
+-	struct instruction *insn;
++	struct instruction *insn, *target = NULL;
+ 	unsigned long dest_off;
+ 	struct symbol *dest;
+ 	struct reloc *reloc;
+@@ -1284,7 +1370,21 @@ static int add_call_destinations(struct objtool_file *file)
+ 		reloc = insn_reloc(file, insn);
+ 		if (!reloc) {
+ 			dest_off = arch_jump_destination(insn);
+-			dest = find_call_destination(insn->sec, dest_off);
++
++			target = find_insn(file, insn->sec, dest_off);
++			if (!target) {
++				WARN_FUNC("direct call to nowhere", insn->sec, insn->offset);
++				return -1;
++			}
++			dest = target->func;
++			if (!dest)
++				dest = find_symbol_containing(insn->sec, dest_off);
++			if (!dest) {
++				WARN_FUNC("IMM can't find call dest symbol at %s+0x%lx",
++					  insn->sec, insn->offset,
++					  insn->sec->name, dest_off);
++				return -1;
++			}
+ 
+ 			add_call_dest(file, insn, dest, false);
+ 
+@@ -1303,10 +1403,25 @@ static int add_call_destinations(struct objtool_file *file)
+ 			}
+ 
+ 		} else if (reloc->sym->type == STT_SECTION) {
+-			dest_off = arch_dest_reloc_offset(reloc->addend);
+-			dest = find_call_destination(reloc->sym->sec, dest_off);
++			struct section *dest_sec;
++
++			dest_sec = reloc->sym->sec;
++			dest_off = reloc->sym->offset +
++				   arch_dest_reloc_offset(reloc->addend);
++
++			target = find_insn(file, dest_sec, dest_off);
++			if (target) {
++				dest = target->func;
++				if (!dest)
++					dest = find_symbol_containing(dest_sec, dest_off);
++			} else {
++				WARN("foo");
++				dest = find_func_by_offset(dest_sec, dest_off);
++				if (!dest)
++					dest = find_symbol_by_offset(dest_sec, dest_off);
++			}
+ 			if (!dest) {
+-				WARN_FUNC("can't find call dest symbol at %s+0x%lx",
++				WARN_FUNC("RELOC can't find call dest symbol at %s+0x%lx",
+ 					  insn->sec, insn->offset,
+ 					  reloc->sym->sec->name,
+ 					  dest_off);
+@@ -1317,9 +1432,43 @@ static int add_call_destinations(struct objtool_file *file)
+ 
+ 		} else if (reloc->sym->retpoline_thunk) {
+ 			add_retpoline_call(file, insn);
++			continue;
++
++		} else {
++			struct section *dest_sec;
++
++			dest_sec = reloc->sym->sec;
++			dest_off = reloc->sym->offset +
++				   arch_dest_reloc_offset(reloc->addend);
++
++			target = find_insn(file, dest_sec, dest_off);
+ 
+-		} else
+ 			add_call_dest(file, insn, reloc->sym, false);
++		}
++
++		if (ibt && target && target->type == INSN_ENDBR) {
++			if (reloc) {
++				if (ibt_fix_direct) {
++					reloc->addend += 4;
++					elf_write_reloc(file->elf, reloc);
++				} else {
++					WARN_FUNC("Direct RELOC call to ENDBR", insn->sec, insn->offset);
++				}
++			} else {
++				if (ibt_fix_direct) {
++					const char *bytes = arch_mod_immediate(insn, dest_off + 4);
++					if (bytes) {
++						elf_write_insn(file->elf, insn->sec,
++							       insn->offset, insn->len,
++							       bytes);
++					} else {
++						WARN_FUNC("Direct IMM call to ENDBR; cannot fix", insn->sec, insn->offset);
++					}
++				} else {
++					WARN_FUNC("Direct IMM call to ENDBR", insn->sec, insn->offset);
++				}
++			}
++		}
+ 	}
+ 
+ 	return 0;
+@@ -3054,6 +3203,8 @@ static struct instruction *next_insn_to_validate(struct objtool_file *file,
+ 	return next_insn_same_sec(file, insn);
+ }
+ 
++static void validate_ibt_insn(struct objtool_file *file, struct instruction *insn);
++
+ /*
+  * Follow the branch starting at the given instruction, and recursively follow
+  * any other branches (jumps).  Meanwhile, track the frame pointer state at
+@@ -3102,6 +3253,12 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 
+ 		if (insn->hint) {
+ 			state.cfi = *insn->cfi;
++			if (ibt) {
++				if (insn->cfi->type == UNWIND_HINT_TYPE_REGS_ENTRY &&
++				    insn->type != INSN_ENDBR) {
++					WARN_FUNC("IRET_ENTRY hint without ENDBR", insn->sec, insn->offset);
++				}
++			}
+ 		} else {
+ 			/* XXX track if we actually changed state.cfi */
+ 
+@@ -3261,7 +3418,12 @@ static int validate_branch(struct objtool_file *file, struct symbol *func,
+ 			state.df = false;
+ 			break;
+ 
++		case INSN_NOP:
++			break;
++
+ 		default:
++			if (ibt)
++				validate_ibt_insn(file, insn);
+ 			break;
+ 		}
+ 
+@@ -3507,6 +3669,112 @@ static int validate_functions(struct objtool_file *file)
+ 	return warnings;
+ }
+ 
++static struct instruction *
++validate_ibt_reloc(struct objtool_file *file, struct reloc *reloc)
++{
++	struct instruction *dest;
++	struct section *sec;
++	unsigned long off;
++
++	sec = reloc->sym->sec;
++	off = reloc->sym->offset + reloc->addend;
++
++	dest = find_insn(file, sec, off);
++	if (!dest)
++		return NULL;
++
++	if (dest->type == INSN_ENDBR) {
++		if (!list_empty(&dest->call_node))
++			list_del_init(&dest->call_node);
++
++		return NULL;
++	}
++
++	if (reloc->sym->static_call_tramp)
++		return NULL;
++
++	return dest;
++}
++
++static void validate_ibt_target(struct objtool_file *file, struct instruction *insn,
++				struct instruction *target)
++{
++	struct instruction *n;
++
++	if (target->func && target->func == insn->func) {
++		/*
++		 * _THIS_IP_ code references aren't used for control flow,
++		 * ignore them.
++		 */
++		if (target->this_ip)
++			return;
++
++		/*
++		 * IRET-to-self, IRET doesn't require ENDBR.
++		 */
++		for (n = insn; n->offset <= target->offset;
++		     n = next_insn_same_func(file, n)) {
++			if (n->type == INSN_IRET)
++				return;
++		}
++	}
++
++	WARN_FUNC("relocation to !ENDBR: %s+0x%lx",
++		  insn->sec, insn->offset,
++		  target && target->func ? target->func->name : target->sec->name,
++		  target && target->func ? target->offset - target->func->offset : target->offset);
++}
++
++static void validate_ibt_insn(struct objtool_file *file, struct instruction *insn)
++{
++	struct reloc *reloc = insn_reloc(file, insn);
++	struct instruction *target;
++
++	for (;;) {
++		if (!reloc)
++			return;
++
++		target = validate_ibt_reloc(file, reloc);
++		if (target)
++			validate_ibt_target(file, insn, target);
++
++		reloc = find_reloc_by_dest_range(file->elf, insn->sec, reloc->offset + 1,
++						 (insn->offset + insn->len) - (reloc->offset + 1));
++	}
++}
++
++static int validate_ibt(struct objtool_file *file)
++{
++	struct section *sec;
++	struct reloc *reloc;
++
++	for_each_sec(file, sec) {
++		/* already done in validate_branch() */
++		if (sec->sh.sh_flags & SHF_EXECINSTR)
++			continue;
++
++		if (!sec->reloc)
++			continue;
++
++		if (!strncmp(sec->name, ".orc", 4))
++			continue;
++
++		if (!strncmp(sec->name, ".discard", 8))
++			continue;
++
++		if (!strcmp(sec->name, "_error_injection_whitelist"))
++			continue;
++
++		if (!strcmp(sec->name, "_kprobe_blacklist"))
++			continue;
++
++		list_for_each_entry(reloc, &sec->reloc->reloc_list, list)
++			validate_ibt_reloc(file, reloc);
++	}
++
++	return 0;
++}
++
+ static int validate_reachable_instructions(struct objtool_file *file)
+ {
+ 	struct instruction *insn;
+@@ -3575,6 +3843,13 @@ int check(struct objtool_file *file)
+ 		goto out;
+ 	warnings += ret;
+ 
++	if (vmlinux && ibt) {
++		ret = validate_ibt(file);
++		if (ret < 0)
++			goto out;
++		warnings += ret;
++	}
++
+ 	if (!warnings) {
+ 		ret = validate_reachable_instructions(file);
+ 		if (ret < 0)
+@@ -3601,6 +3876,13 @@ int check(struct objtool_file *file)
+ 		warnings += ret;
+ 	}
+ 
++	if (ibt_seal) {
++		ret = create_ibt_endbr_sites_sections(file);
++		if (ret < 0)
++			goto out;
++		warnings += ret;
++	}
++
+ 	if (stats) {
+ 		printf("nr_insns_visited: %ld\n", nr_insns_visited);
+ 		printf("nr_cfi: %ld\n", nr_cfi);
+diff --git a/tools/objtool/include/objtool/arch.h b/tools/objtool/include/objtool/arch.h
+index 76bae3078286..4bdad19a00ba 100644
+--- a/tools/objtool/include/objtool/arch.h
++++ b/tools/objtool/include/objtool/arch.h
+@@ -27,6 +27,8 @@ enum insn_type {
+ 	INSN_STD,
+ 	INSN_CLD,
+ 	INSN_TRAP,
++	INSN_ENDBR,
++	INSN_IRET,
+ 	INSN_OTHER,
+ };
+ 
+@@ -84,6 +86,7 @@ unsigned long arch_dest_reloc_offset(int addend);
+ 
+ const char *arch_nop_insn(int len);
+ const char *arch_ret_insn(int len);
++const char *arch_mod_immediate(struct instruction *insn, unsigned long target);
+ 
+ int arch_decode_hint_reg(u8 sp_reg, int *base);
+ 
+diff --git a/tools/objtool/include/objtool/builtin.h b/tools/objtool/include/objtool/builtin.h
+index 89ba869ed08f..7ddc90ff19de 100644
+--- a/tools/objtool/include/objtool/builtin.h
++++ b/tools/objtool/include/objtool/builtin.h
+@@ -9,7 +9,8 @@
+ 
+ extern const struct option check_options[];
+ extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats,
+-            validate_dup, vmlinux, mcount, noinstr, backup, sls;
++            validate_dup, vmlinux, mcount, noinstr, backup, sls,
++	    ibt, ibt_fix_direct, ibt_seal;
+ 
+ extern int cmd_parse_options(int argc, const char **argv, const char * const usage[]);
+ 
+diff --git a/tools/objtool/include/objtool/objtool.h b/tools/objtool/include/objtool/objtool.h
+index f99fbc6078d5..7a5c13a78f87 100644
+--- a/tools/objtool/include/objtool/objtool.h
++++ b/tools/objtool/include/objtool/objtool.h
+@@ -26,8 +26,12 @@ struct objtool_file {
+ 	struct list_head retpoline_call_list;
+ 	struct list_head static_call_list;
+ 	struct list_head mcount_loc_list;
++	struct list_head endbr_list;
+ 	bool ignore_unreachables, c_file, hints, rodata;
+ 
++	unsigned int nr_endbr;
++	unsigned int nr_endbr_int;
++
+ 	unsigned long jl_short, jl_long;
+ 	unsigned long jl_nop_short, jl_nop_long;
+ 
+diff --git a/tools/objtool/objtool.c b/tools/objtool/objtool.c
+index bdf699f6552b..b09946f4e1d6 100644
+--- a/tools/objtool/objtool.c
++++ b/tools/objtool/objtool.c
+@@ -128,6 +128,7 @@ struct objtool_file *objtool_open_read(const char *_objname)
+ 	INIT_LIST_HEAD(&file.retpoline_call_list);
+ 	INIT_LIST_HEAD(&file.static_call_list);
+ 	INIT_LIST_HEAD(&file.mcount_loc_list);
++	INIT_LIST_HEAD(&file.endbr_list);
+ 	file.c_file = !vmlinux && find_section_by_name(file.elf, ".comment");
+ 	file.ignore_unreachables = no_unreachable;
+ 	file.hints = false;
+-- 
+2.35.0
+
+From 623b0b299ecce8d2a172633450173cd853eb9a9f Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 30 Nov 2021 16:13:36 +0100
+Subject: [PATCH 14/15] x86/alternative: Use .ibt_endbr_sites to seal indirect
+ calls
+
+Objtool's --ibt-seal option generates .ibt_endbr_sites which lists
+'superfluous' ENDBR instructions. That is those instructions for which
+the function is never indirectly called.
+
+Additionally, objtool's --ibt-fix-direct ensures direct calls never
+target an ENDBR instruction.
+
+Combined this yields that these instructions should never be executed.
+
+Poison them using a 4 byte UD1 instruction; for IBT hardware this will
+raise an #CP exception due to WAIT_FOR_ENDBR not getting what it
+wants. For !IBT hardware it'll trigger #UD.
+
+In either case, it will be 'impossible' to indirectly call these
+functions thereafter.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ arch/um/kernel/um_arch.c           |  4 ++
+ arch/x86/include/asm/alternative.h |  1 +
+ arch/x86/include/asm/ibt.h         |  4 +-
+ arch/x86/kernel/alternative.c      | 63 +++++++++++++++++++++++++++++
+ arch/x86/kernel/module.c           |  8 +++-
+ arch/x86/kernel/traps.c            | 64 ++++++++++++++++++++++--------
+ 6 files changed, 126 insertions(+), 18 deletions(-)
+
+diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
+index abceeabe29b9..0760e24f2eba 100644
+--- a/arch/um/kernel/um_arch.c
++++ b/arch/um/kernel/um_arch.c
+@@ -424,6 +424,10 @@ void __init check_bugs(void)
+ 	os_check_bugs();
+ }
+ 
++void apply_ibt_endbr(s32 *start, s32 *end)
++{
++}
++
+ void apply_retpolines(s32 *start, s32 *end)
+ {
+ }
+diff --git a/arch/x86/include/asm/alternative.h b/arch/x86/include/asm/alternative.h
+index 58eee6402832..9b10c8c76087 100644
+--- a/arch/x86/include/asm/alternative.h
++++ b/arch/x86/include/asm/alternative.h
+@@ -76,6 +76,7 @@ extern int alternatives_patched;
+ extern void alternative_instructions(void);
+ extern void apply_alternatives(struct alt_instr *start, struct alt_instr *end);
+ extern void apply_retpolines(s32 *start, s32 *end);
++extern void apply_ibt_endbr(s32 *start, s32 *end);
+ 
+ struct module;
+ 
+diff --git a/arch/x86/include/asm/ibt.h b/arch/x86/include/asm/ibt.h
+index 054cc4da1d4c..735415510095 100644
+--- a/arch/x86/include/asm/ibt.h
++++ b/arch/x86/include/asm/ibt.h
+@@ -21,8 +21,10 @@
+ static inline bool is_endbr(const void *addr)
+ {
+ 	unsigned int val = ~*(unsigned int *)addr;
++	if (val == ~0x0040b90f) /* ud1_endbr */
++		return true;
+ 	val |= 0x01000000U;
+-	return val == ~0xfa1e0ff3;
++	return val == ~0xfa1e0ff3; /* endbr */
+ }
+ 
+ extern u64 ibt_save(void);
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 5007c3ffe96f..3da0e08c08db 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -115,6 +115,7 @@ static void __init_or_module add_nops(void *insns, unsigned int len)
+ }
+ 
+ extern s32 __retpoline_sites[], __retpoline_sites_end[];
++extern s32 __ibt_endbr_sites[], __ibt_endbr_sites_end[];
+ extern struct alt_instr __alt_instructions[], __alt_instructions_end[];
+ extern s32 __smp_locks[], __smp_locks_end[];
+ void text_poke_early(void *addr, const void *opcode, size_t len);
+@@ -512,6 +513,66 @@ void __init_or_module noinline apply_retpolines(s32 *start, s32 *end) { }
+ 
+ #endif /* CONFIG_RETPOLINE && CONFIG_STACK_VALIDATION */
+ 
++#if defined(CONFIG_X86_IBT) && defined(CONFIG_STACK_VALIDATION)
++
++/*
++ * ud1    0x0(%rax),%eax -- a 4 byte #UD instruction for when we don't have
++ *                          IBT and still want to trigger fail.
++ */
++static const u8 ud1_endbr[4] = { 0x0f, 0xb9, 0x40, 0x00 };
++
++/*
++ * Generated by: objtool --ibt-seal
++ */
++void __init_or_module noinline apply_ibt_endbr(s32 *start, s32 *end)
++{
++	s32 *s;
++
++	pr_err("XXX IBT: %d\n", end-start);
++
++	for (s = start; s < end; s++) {
++		void *addr = (void *)s + *s;
++		struct insn insn;
++		const u8 *bytes;
++		int len, ret;
++
++		ret = insn_decode_kernel(&insn, addr);
++		if (WARN_ON_ONCE(ret < 0))
++			continue;
++
++		len = insn.length;
++		if (len != 4)
++			continue;
++
++		if (insn.prefixes.bytes[0] != 0xf3)
++			continue;
++
++		if (insn.opcode.bytes[0] != 0x0f || insn.opcode.bytes[1] != 0x1e)
++			continue;
++
++		if (insn.modrm.bytes[0] != 0xfa && insn.modrm.bytes[0] != 0xfb)
++			continue;
++
++		DPRINTK("ENDBR at: %pS (%px)", addr, addr);
++
++		/*
++		 * When we have IBT, the lack of ENDBR will trigger #CP
++		 * When we don't have IBT, explicitly trigger #UD
++		 */
++		bytes = ud1_endbr;
++
++		DUMP_BYTES(((u8*)addr),  len, "%px: orig: ", addr);
++		DUMP_BYTES(((u8*)bytes), len, "%px: repl: ", addr);
++		text_poke_early(addr, bytes, len);
++	}
++}
++
++#else
++
++void __init_or_module noinline apply_ibt_endbr(s32 *start, s32 *end) { }
++
++#endif /* !X86_IBT || !CONFIG_STACK_VALIDATION */
++
+ #ifdef CONFIG_SMP
+ static void alternatives_smp_lock(const s32 *start, const s32 *end,
+ 				  u8 *text, u8 *text_end)
+@@ -831,6 +892,8 @@ void __init alternative_instructions(void)
+ 	 */
+ 	apply_alternatives(__alt_instructions, __alt_instructions_end);
+ 
++	apply_ibt_endbr(__ibt_endbr_sites, __ibt_endbr_sites_end);
++
+ #ifdef CONFIG_SMP
+ 	/* Patch to UP if other cpus not imminent. */
+ 	if (!noreplace_smp && (num_present_cpus() == 1 || setup_max_cpus <= 1)) {
+diff --git a/arch/x86/kernel/module.c b/arch/x86/kernel/module.c
+index 4edc9c87ad0b..c03545306132 100644
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@ -253,7 +253,7 @@ int module_finalize(const Elf_Ehdr *hdr,
+ {
+ 	const Elf_Shdr *s, *text = NULL, *alt = NULL, *locks = NULL,
+ 		*para = NULL, *orc = NULL, *orc_ip = NULL,
+-		*retpolines = NULL;
++		*retpolines = NULL, *ibt_endbr = NULL;
+ 	char *secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+ 
+ 	for (s = sechdrs; s < sechdrs + hdr->e_shnum; s++) {
+@@ -271,6 +271,8 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 			orc_ip = s;
+ 		if (!strcmp(".retpoline_sites", secstrings + s->sh_name))
+ 			retpolines = s;
++		if (!strcmp(".ibt_endbr_sites", secstrings + s->sh_name))
++			ibt_endbr = s;
+ 	}
+ 
+ 	if (para) {
+@@ -286,6 +288,10 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 		void *aseg = (void *)alt->sh_addr;
+ 		apply_alternatives(aseg, aseg + alt->sh_size);
+ 	}
++	if (ibt_endbr) {
++		void *iseg = (void *)ibt_endbr->sh_addr;
++		apply_ibt_endbr(iseg, iseg + alt->sh_size);
++	}
+ 	if (locks && text) {
+ 		void *lseg = (void *)locks->sh_addr;
+ 		void *tseg = (void *)text->sh_addr;
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 26ebe27d2ff3..7b1f9ce9d2a9 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -209,12 +209,60 @@ DEFINE_IDTENTRY(exc_overflow)
+ 	do_error_trap(regs, 0, "overflow", X86_TRAP_OF, SIGSEGV, 0, NULL);
+ }
+ 
++#ifdef CONFIG_X86_IBT
++
++static void handle_endbr(struct pt_regs *regs)
++{
++	pr_err("Missing ENDBR: %pS\n", (void *)instruction_pointer(regs));
++	regs->ip += 4;
++}
++
++DEFINE_IDTENTRY_ERRORCODE(exc_control_protection)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_IBT)) {
++		pr_err("Whaaa?!?!\n");
++		return;
++	}
++
++	if (WARN_ON_ONCE(user_mode(regs) || error_code != 3))
++		return;
++
++	handle_endbr(regs);
++}
++
++static bool handle_ud1_endbr(struct pt_regs *regs)
++{
++	u32 ud1;
++
++	if (get_kernel_nofault(ud1, (u32 *)regs->ip))
++		return false;
++
++	if (ud1 == 0x0040b90f) {
++		handle_endbr(regs);
++		return true;
++	}
++
++	return false;
++}
++
++#else /* CONFIG_X86_IBT */
++
++static bool handle_ud1_endbr(struct pt_regs *regs)
++{
++	return false;
++}
++
++#endif /* CONFIG_X86_IBT */
++
+ #ifdef CONFIG_X86_F00F_BUG
+ void handle_invalid_op(struct pt_regs *regs)
+ #else
+ static inline void handle_invalid_op(struct pt_regs *regs)
+ #endif
+ {
++	if (!user_mode(regs) && handle_ud1_endbr(regs))
++		return;
++
+ 	do_error_trap(regs, 0, "invalid opcode", X86_TRAP_UD, SIGILL,
+ 		      ILL_ILLOPN, error_get_trap_addr(regs));
+ }
+@@ -641,22 +689,6 @@ DEFINE_IDTENTRY_ERRORCODE(exc_general_protection)
+ 	cond_local_irq_disable(regs);
+ }
+ 
+-#ifdef CONFIG_X86_IBT
+-DEFINE_IDTENTRY_ERRORCODE(exc_control_protection)
+-{
+-	if (!cpu_feature_enabled(X86_FEATURE_IBT)) {
+-		pr_err("Whaaa?!?!\n");
+-		return;
+-	}
+-
+-	if (WARN_ON_ONCE(user_mode(regs) || error_code != 3))
+-		return;
+-
+-	pr_err("Missing ENDBR: %pS\n", instruction_pointer(regs));
+-	return;
+-}
+-#endif
+-
+ static bool do_int3(struct pt_regs *regs)
+ {
+ 	int res;
+-- 
+2.35.0
+
+From 39225ffbf0bf9b246f6e9d01c3ec2aca64eec290 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 30 Nov 2021 16:54:19 +0100
+Subject: [PATCH 15/15] x86/Makefile: Frob IBT objtool pass
+
+XXX figure out modules
+XXX backmerge
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+---
+ scripts/Makefile.build  |  5 +++--
+ scripts/link-vmlinux.sh | 10 ++++++++--
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/scripts/Makefile.build b/scripts/Makefile.build
+index a4b89b757287..b3950046bd22 100644
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -242,9 +242,10 @@ cmd_gen_objtooldep = $(if $(objtool-enabled), { echo ; echo '$@: $$(wildcard $(o
+ 
+ endif # CONFIG_STACK_VALIDATION
+ 
+-ifdef CONFIG_LTO_CLANG
++ifneq "$(or $(CONFIG_LTO_CLANG),$(CONFIG_X86_IBT))" ""
+ 
+-# Skip objtool for LLVM bitcode
++# Skip objtool for individual translation units in favour of
++# a link time run
+ $(obj)/%.o: objtool-enabled :=
+ 
+ else
+diff --git a/scripts/link-vmlinux.sh b/scripts/link-vmlinux.sh
+index 666f7bbc13eb..99599ba167c7 100755
+--- a/scripts/link-vmlinux.sh
++++ b/scripts/link-vmlinux.sh
+@@ -108,7 +108,8 @@ objtool_link()
+ 	local objtoolcmd;
+ 	local objtoolopt;
+ 
+-	if is_enabled CONFIG_LTO_CLANG && is_enabled CONFIG_STACK_VALIDATION; then
++	if ( is_enabled CONFIG_LTO_CLANG && is_enabled CONFIG_STACK_VALIDATION ) ||
++	   is_enabled CONFIG_X86_IBT; then
+ 		# Don't perform vmlinux validation unless explicitly requested,
+ 		# but run objtool on vmlinux.o now that we have an object file.
+ 		if is_enabled CONFIG_UNWINDER_ORC; then
+@@ -126,6 +127,11 @@ objtool_link()
+ 		objtoolopt="${objtoolopt} --noinstr"
+ 	fi
+ 
++	if [ -n "${CONFIG_X86_IBT}" ]; then
++		# IBT requires LTO like objtool run
++		objtoolopt="${objtoolopt} --ibt --ibt-fix-direct --ibt-seal"
++	fi
++
+ 	if [ -n "${objtoolopt}" ]; then
+ 		if [ -z "${objtoolcmd}" ]; then
+ 			objtoolcmd="check"
+@@ -168,7 +174,7 @@ vmlinux_link()
+ 	# skip output file argument
+ 	shift
+ 
+-	if is_enabled CONFIG_LTO_CLANG; then
++	if is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_IBT; then
+ 		# Use vmlinux.o instead of performing the slow LTO link again.
+ 		objs=vmlinux.o
+ 		libs=
+-- 
+2.35.0
+
