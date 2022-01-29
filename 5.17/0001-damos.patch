@@ -1,0 +1,249 @@
+From dfb053e0f89ec330656c0f552a6ba0fbc8566507 Mon Sep 17 00:00:00 2001
+From: "P. Jung" <ptr1337@cachyos.org>
+Date: Sat, 29 Jan 2022 08:13:31 +0000
+Subject: [PATCH] damos
+
+---
+ include/linux/damon.h |   3 +
+ mm/damon/dbgfs.c      |   1 +
+ mm/damon/vaddr.c      | 147 ++++++++++++++++++++++++++++++++++++++++++
+ mm/internal.h         |   2 +
+ mm/vmscan.c           |   4 +-
+ 5 files changed, 155 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/damon.h b/include/linux/damon.h
+index 5e1e3a128b77..0093cf1079d6 100644
+--- a/include/linux/damon.h
++++ b/include/linux/damon.h
+@@ -87,6 +87,8 @@ struct damon_target {
+  * @DAMOS_PAGEOUT:	Call ``madvise()`` for the region with MADV_PAGEOUT.
+  * @DAMOS_HUGEPAGE:	Call ``madvise()`` for the region with MADV_HUGEPAGE.
+  * @DAMOS_NOHUGEPAGE:	Call ``madvise()`` for the region with MADV_NOHUGEPAGE.
++ * @DAMOS_DEMOTE:	Migrate cold pages from fast memory node (DRAM) to slow
++ *			memory node (persistent memory).
+  * @DAMOS_STAT:		Do nothing but count the stat.
+  */
+ enum damos_action {
+@@ -96,6 +98,7 @@ enum damos_action {
+ 	DAMOS_HUGEPAGE,
+ 	DAMOS_NOHUGEPAGE,
+ 	DAMOS_STAT,		/* Do nothing but only record the stat */
++	DAMOS_DEMOTE,
+ };
+ 
+ /**
+diff --git a/mm/damon/dbgfs.c b/mm/damon/dbgfs.c
+index 5b899601e56c..94d84d1182ab 100644
+--- a/mm/damon/dbgfs.c
++++ b/mm/damon/dbgfs.c
+@@ -169,6 +169,7 @@ static bool damos_action_valid(int action)
+ 	case DAMOS_HUGEPAGE:
+ 	case DAMOS_NOHUGEPAGE:
+ 	case DAMOS_STAT:
++	case DAMOS_DEMOTE:
+ 		return true;
+ 	default:
+ 		return false;
+diff --git a/mm/damon/vaddr.c b/mm/damon/vaddr.c
+index 89b6468da2b9..15cf70c6626e 100644
+--- a/mm/damon/vaddr.c
++++ b/mm/damon/vaddr.c
+@@ -14,6 +14,10 @@
+ #include <linux/page_idle.h>
+ #include <linux/pagewalk.h>
+ #include <linux/sched/mm.h>
++#include <linux/migrate.h>
++#include <linux/mm_inline.h>
++#include <linux/swapops.h>
++#include "../internal.h"
+ 
+ #include "prmtv-common.h"
+ 
+@@ -699,6 +703,147 @@ static unsigned long damos_madvise(struct damon_target *target,
+ }
+ #endif	/* CONFIG_ADVISE_SYSCALLS */
+ 
++static void damos_isolate_page(struct page *page, struct list_head *demote_list)
++{
++	struct page *head = compound_head(page);
++
++	/* Do not interfere with other mappings of this page */
++	if (page_mapcount(head) != 1)
++		return;
++
++	/* No need migration if the target demotion node is empty. */
++	if (next_demotion_node(page_to_nid(head)) == NUMA_NO_NODE)
++		return;
++
++	if (isolate_lru_page(head))
++		return;
++
++	list_add_tail(&head->lru, demote_list);
++	mod_node_page_state(page_pgdat(head),
++			    NR_ISOLATED_ANON + page_is_file_lru(head),
++			    thp_nr_pages(head));
++}
++
++static int damos_isolate_pmd_entry(pmd_t *pmd, unsigned long addr,
++				   unsigned long end, struct mm_walk *walk)
++{
++	struct vm_area_struct *vma = walk->vma;
++	struct list_head *demote_list = walk->private;
++	spinlock_t *ptl;
++	struct page *page;
++	pte_t *pte, *mapped_pte;
++
++	if (!vma_migratable(vma))
++		return -EFAULT;
++
++	ptl = pmd_trans_huge_lock(pmd, vma);
++	if (ptl) {
++		/* Bail out if THP migration is not supported. */
++		if (!thp_migration_supported())
++			goto thp_out;
++
++		/* If the THP pte is under migration, do not bother it. */
++		if (unlikely(is_pmd_migration_entry(*pmd)))
++			goto thp_out;
++
++		page = damon_get_page(pmd_pfn(*pmd));
++		if (!page)
++			goto thp_out;
++
++		damos_isolate_page(page, demote_list);
++
++		put_page(page);
++thp_out:
++		spin_unlock(ptl);
++		return 0;
++	}
++
++	/* regular page handling */
++	if (pmd_none(*pmd) || unlikely(pmd_bad(*pmd)))
++		return -EINVAL;
++
++	mapped_pte = pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
++	for (; addr != end; pte++, addr += PAGE_SIZE) {
++		if (pte_none(*pte) || !pte_present(*pte))
++			continue;
++
++		page = damon_get_page(pte_pfn(*pte));
++		if (!page)
++			continue;
++
++		damos_isolate_page(page, demote_list);
++		put_page(page);
++	}
++	pte_unmap_unlock(mapped_pte, ptl);
++	cond_resched();
++
++	return 0;
++}
++
++static const struct mm_walk_ops damos_isolate_pages_walk_ops = {
++	.pmd_entry              = damos_isolate_pmd_entry,
++};
++
++/*
++ * damos_demote() - demote cold pages from fast memory to slow memory
++ * @target:    the given target
++ * @r:         region of the target
++ *
++ * On tiered memory system, if DAMON monitored cold pages on fast memory
++ * node (DRAM), we can demote them to slow memory node proactively in case
++ * accumulating much more cold memory on fast memory node (DRAM) to reclaim.
++ *
++ * Return the bytes of the region that the DAMOS_DEMOTE action is successfully
++ * applied.
++ */
++static unsigned long damos_demote(struct damon_target *target,
++				  struct damon_region *r)
++{
++	struct mm_struct *mm;
++	LIST_HEAD(demote_pages);
++	LIST_HEAD(pagelist);
++	unsigned int nr_succeeded, demoted_pages = 0;
++	struct page *page, *next;
++
++	/* Validate if allowing to do page demotion */
++	if (!numa_demotion_enabled)
++		return 0;
++
++	mm = damon_get_mm(target);
++	if (!mm)
++		return 0;
++
++	mmap_read_lock(mm);
++	walk_page_range(mm, r->ar.start, r->ar.end,
++			&damos_isolate_pages_walk_ops, &demote_pages);
++	mmap_read_unlock(mm);
++
++	mmput(mm);
++	if (list_empty(&demote_pages))
++		return 0;
++
++	list_for_each_entry_safe(page, next, &demote_pages, lru) {
++		list_add(&page->lru, &pagelist);
++
++		nr_succeeded = demote_page_list(&pagelist, page_pgdat(page));
++		if (!nr_succeeded) {
++			if (!list_empty(&pagelist)) {
++				list_del(&page->lru);
++				mod_node_page_state(page_pgdat(page),
++						    NR_ISOLATED_ANON + page_is_file_lru(page),
++						    -thp_nr_pages(page));
++				putback_lru_page(page);
++			}
++		} else {
++			demoted_pages += nr_succeeded;
++		}
++
++		cond_resched();
++	}
++
++	return demoted_pages * PAGE_SIZE;
++}
++
+ static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
+ 		struct damon_target *t, struct damon_region *r,
+ 		struct damos *scheme)
+@@ -723,6 +868,8 @@ static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
+ 		break;
+ 	case DAMOS_STAT:
+ 		return 0;
++	case DAMOS_DEMOTE:
++		return damos_demote(t, r);
+ 	default:
+ 		return 0;
+ 	}
+diff --git a/mm/internal.h b/mm/internal.h
+index 96aa50e46119..f1efd9dcab92 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -160,6 +160,8 @@ extern unsigned long highest_memmap_pfn;
+ extern int isolate_lru_page(struct page *page);
+ extern void putback_lru_page(struct page *page);
+ extern void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason);
++extern unsigned int demote_page_list(struct list_head *demote_pages,
++				     struct pglist_data *pgdat);
+ 
+ /*
+  * in mm/rmap.c:
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 534035f99c05..0b1fec1ebd9d 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1480,8 +1480,8 @@ static struct page *alloc_demote_page(struct page *page, unsigned long node)
+  * another node.  Pages which are not demoted are left on
+  * @demote_pages.
+  */
+-static unsigned int demote_page_list(struct list_head *demote_pages,
+-				     struct pglist_data *pgdat)
++unsigned int demote_page_list(struct list_head *demote_pages,
++			      struct pglist_data *pgdat)
+ {
+ 	int target_nid = next_demotion_node(pgdat->node_id);
+ 	unsigned int nr_succeeded;
+-- 
+2.35.0
+
