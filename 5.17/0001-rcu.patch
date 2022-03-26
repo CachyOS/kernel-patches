@@ -1,0 +1,361 @@
+From d142c90bdb69e7c556482565d155a60f686cae8f Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Sat, 26 Mar 2022 17:41:16 +0100
+Subject: [PATCH] rcu-5.17: port changes from zenkernel
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ .../admin-guide/kernel-parameters.txt         |  2 +
+ kernel/rcu/rcutorture.c                       |  7 +--
+ kernel/rcu/tree.c                             | 46 +++++++++++--------
+ kernel/rcu/tree.h                             |  8 ++--
+ kernel/rcu/tree_nocb.h                        | 14 +++++-
+ kernel/rcu/tree_plugin.h                      | 13 +++---
+ kernel/rcu/tree_stall.h                       | 35 ++++++++++++++
+ 7 files changed, 94 insertions(+), 31 deletions(-)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 7123524a8..98fa63d93 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4504,6 +4504,8 @@
+ 			(the least-favored priority).  Otherwise, when
+ 			RCU_BOOST is not set, valid values are 0-99 and
+ 			the default is zero (non-realtime operation).
++			When RCU_NOCB_CPU is set, also adjust the
++			priority of NOCB callback kthreads.
+ 
+ 	rcutree.rcu_nocb_gp_stride= [KNL]
+ 			Set the number of NOCB callback kthreads in
+diff --git a/kernel/rcu/rcutorture.c b/kernel/rcu/rcutorture.c
+index 422f7e4cc..829ae0b7d 100644
+--- a/kernel/rcu/rcutorture.c
++++ b/kernel/rcu/rcutorture.c
+@@ -997,7 +997,7 @@ static int rcu_torture_boost(void *arg)
+ 			goto checkwait;
+ 
+ 		/* Wait for the next test interval. */
+-		oldstarttime = boost_starttime;
++		oldstarttime = READ_ONCE(boost_starttime);
+ 		while (time_before(jiffies, oldstarttime)) {
+ 			schedule_timeout_interruptible(oldstarttime - jiffies);
+ 			if (stutter_wait("rcu_torture_boost"))
+@@ -1041,10 +1041,11 @@ static int rcu_torture_boost(void *arg)
+ 		 * interval.  Besides, we are running at RT priority,
+ 		 * so delays should be relatively rare.
+ 		 */
+-		while (oldstarttime == boost_starttime && !kthread_should_stop()) {
++		while (oldstarttime == READ_ONCE(boost_starttime) && !kthread_should_stop()) {
+ 			if (mutex_trylock(&boost_mutex)) {
+ 				if (oldstarttime == boost_starttime) {
+-					boost_starttime = jiffies + test_boost_interval * HZ;
++					WRITE_ONCE(boost_starttime,
++						   jiffies + test_boost_interval * HZ);
+ 					n_rcu_torture_boosts++;
+ 				}
+ 				mutex_unlock(&boost_mutex);
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index a4c25a628..bd9b2af24 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -153,7 +153,7 @@ static void sync_sched_exp_online_cleanup(int cpu);
+ static void check_cb_ovld_locked(struct rcu_data *rdp, struct rcu_node *rnp);
+ static bool rcu_rdp_is_offloaded(struct rcu_data *rdp);
+ 
+-/* rcuc/rcub kthread realtime priority */
++/* rcuc/rcub/rcuop kthread realtime priority */
+ static int kthread_prio = IS_ENABLED(CONFIG_RCU_BOOST) ? 1 : 0;
+ module_param(kthread_prio, int, 0444);
+ 
+@@ -2850,10 +2850,12 @@ static void rcu_cpu_kthread(unsigned int cpu)
+ {
+ 	unsigned int *statusp = this_cpu_ptr(&rcu_data.rcu_cpu_kthread_status);
+ 	char work, *workp = this_cpu_ptr(&rcu_data.rcu_cpu_has_work);
++	unsigned long *j = this_cpu_ptr(&rcu_data.rcuc_activity);
+ 	int spincnt;
+ 
+ 	trace_rcu_utilization(TPS("Start CPU kthread@rcu_run"));
+ 	for (spincnt = 0; spincnt < 10; spincnt++) {
++		WRITE_ONCE(*j, jiffies);
+ 		local_bh_disable();
+ 		*statusp = RCU_KTHREAD_RUNNING;
+ 		local_irq_disable();
+@@ -2874,6 +2876,7 @@ static void rcu_cpu_kthread(unsigned int cpu)
+ 	schedule_timeout_idle(2);
+ 	trace_rcu_utilization(TPS("End CPU kthread@rcu_yield"));
+ 	*statusp = RCU_KTHREAD_WAITING;
++	WRITE_ONCE(*j, jiffies);
+ }
+ 
+ static struct smp_hotplug_thread rcu_cpu_thread_spec = {
+@@ -2894,7 +2897,7 @@ static int __init rcu_spawn_core_kthreads(void)
+ 
+ 	for_each_possible_cpu(cpu)
+ 		per_cpu(rcu_data.rcu_cpu_has_work, cpu) = 0;
+-	if (!IS_ENABLED(CONFIG_RCU_BOOST) && use_softirq)
++	if (use_softirq)
+ 		return 0;
+ 	WARN_ONCE(smpboot_register_percpu_thread(&rcu_cpu_thread_spec),
+ 		  "%s: Could not start rcuc kthread, OOM is now expected behavior\n", __func__);
+@@ -4440,26 +4443,10 @@ static int rcu_pm_notify(struct notifier_block *self,
+ static int __init rcu_spawn_gp_kthread(void)
+ {
+ 	unsigned long flags;
+-	int kthread_prio_in = kthread_prio;
+ 	struct rcu_node *rnp;
+ 	struct sched_param sp;
+ 	struct task_struct *t;
+ 
+-	/* Force priority into range. */
+-	if (IS_ENABLED(CONFIG_RCU_BOOST) && kthread_prio < 2
+-	    && IS_BUILTIN(CONFIG_RCU_TORTURE_TEST))
+-		kthread_prio = 2;
+-	else if (IS_ENABLED(CONFIG_RCU_BOOST) && kthread_prio < 1)
+-		kthread_prio = 1;
+-	else if (kthread_prio < 0)
+-		kthread_prio = 0;
+-	else if (kthread_prio > 99)
+-		kthread_prio = 99;
+-
+-	if (kthread_prio != kthread_prio_in)
+-		pr_alert("rcu_spawn_gp_kthread(): Limited prio to %d from %d\n",
+-			 kthread_prio, kthread_prio_in);
+-
+ 	rcu_scheduler_fully_active = 1;
+ 	t = kthread_create(rcu_gp_kthread, NULL, "%s", rcu_state.name);
+ 	if (WARN_ONCE(IS_ERR(t), "%s: Could not start grace-period kthread, OOM is now expected behavior\n", __func__))
+@@ -4584,6 +4571,28 @@ static void __init rcu_init_one(void)
+ 	}
+ }
+ 
++/*
++ * Force priority from the kernel command-line into range.
++ */
++static void __init sanitize_kthread_prio(void)
++{
++	int kthread_prio_in = kthread_prio;
++
++	if (IS_ENABLED(CONFIG_RCU_BOOST) && kthread_prio < 2
++	    && IS_BUILTIN(CONFIG_RCU_TORTURE_TEST))
++		kthread_prio = 2;
++	else if (IS_ENABLED(CONFIG_RCU_BOOST) && kthread_prio < 1)
++		kthread_prio = 1;
++	else if (kthread_prio < 0)
++		kthread_prio = 0;
++	else if (kthread_prio > 99)
++		kthread_prio = 99;
++
++	if (kthread_prio != kthread_prio_in)
++		pr_alert("%s: Limited prio to %d from %d\n",
++			 __func__, kthread_prio, kthread_prio_in);
++}
++
+ /*
+  * Compute the rcu_node tree geometry from kernel parameters.  This cannot
+  * replace the definitions in tree.h because those are needed to size
+@@ -4744,6 +4753,7 @@ void __init rcu_init(void)
+ 
+ 	kfree_rcu_batch_init();
+ 	rcu_bootup_announce();
++	sanitize_kthread_prio();
+ 	rcu_init_geometry();
+ 	rcu_init_one();
+ 	if (dump_tree)
+diff --git a/kernel/rcu/tree.h b/kernel/rcu/tree.h
+index 486fc901b..b84cc5742 100644
+--- a/kernel/rcu/tree.h
++++ b/kernel/rcu/tree.h
+@@ -203,6 +203,8 @@ struct rcu_data {
+ 	int nocb_defer_wakeup;		/* Defer wakeup of nocb_kthread. */
+ 	struct timer_list nocb_timer;	/* Enforce finite deferral. */
+ 	unsigned long nocb_gp_adv_time;	/* Last call_rcu() CB adv (jiffies). */
++	struct mutex nocb_gp_kthread_mutex; /* Exclusion for nocb gp kthread */
++					    /* spawning */
+ 
+ 	/* The following fields are used by call_rcu, hence own cacheline. */
+ 	raw_spinlock_t nocb_bypass_lock ____cacheline_internodealigned_in_smp;
+@@ -237,6 +239,7 @@ struct rcu_data {
+ 					/* rcuc per-CPU kthread or NULL. */
+ 	unsigned int rcu_cpu_kthread_status;
+ 	char rcu_cpu_has_work;
++	unsigned long rcuc_activity;
+ 
+ 	/* 7) Diagnostic data, including RCU CPU stall warnings. */
+ 	unsigned int softirq_snap;	/* Snapshot of softirq activity. */
+@@ -302,9 +305,8 @@ struct rcu_state {
+ 
+ 	/* The following fields are guarded by the root rcu_node's lock. */
+ 
+-	u8	boost ____cacheline_internodealigned_in_smp;
+-						/* Subject to priority boost. */
+-	unsigned long gp_seq;			/* Grace-period sequence #. */
++	unsigned long gp_seq ____cacheline_internodealigned_in_smp;
++						/* Grace-period sequence #. */
+ 	unsigned long gp_max;			/* Maximum GP duration in */
+ 						/*  jiffies. */
+ 	struct task_struct *gp_kthread;		/* Task for grace periods. */
+diff --git a/kernel/rcu/tree_nocb.h b/kernel/rcu/tree_nocb.h
+index eeafb546a..547c41437 100644
+--- a/kernel/rcu/tree_nocb.h
++++ b/kernel/rcu/tree_nocb.h
+@@ -1226,6 +1226,7 @@ static void __init rcu_boot_init_nocb_percpu_data(struct rcu_data *rdp)
+ 	raw_spin_lock_init(&rdp->nocb_gp_lock);
+ 	timer_setup(&rdp->nocb_timer, do_nocb_deferred_wakeup_timer, 0);
+ 	rcu_cblist_init(&rdp->nocb_bypass);
++	mutex_init(&rdp->nocb_gp_kthread_mutex);
+ }
+ 
+ /*
+@@ -1238,6 +1239,7 @@ static void rcu_spawn_cpu_nocb_kthread(int cpu)
+ 	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
+ 	struct rcu_data *rdp_gp;
+ 	struct task_struct *t;
++	struct sched_param sp;
+ 
+ 	if (!rcu_scheduler_fully_active || !rcu_nocb_is_setup)
+ 		return;
+@@ -1247,20 +1249,30 @@ static void rcu_spawn_cpu_nocb_kthread(int cpu)
+ 		return;
+ 
+ 	/* If we didn't spawn the GP kthread first, reorganize! */
++	sp.sched_priority = kthread_prio;
+ 	rdp_gp = rdp->nocb_gp_rdp;
++	mutex_lock(&rdp_gp->nocb_gp_kthread_mutex);
+ 	if (!rdp_gp->nocb_gp_kthread) {
+ 		t = kthread_run(rcu_nocb_gp_kthread, rdp_gp,
+ 				"rcuog/%d", rdp_gp->cpu);
+-		if (WARN_ONCE(IS_ERR(t), "%s: Could not start rcuo GP kthread, OOM is now expected behavior\n", __func__))
++		if (WARN_ONCE(IS_ERR(t), "%s: Could not start rcuo GP kthread, OOM is now expected behavior\n", __func__)) {
++			mutex_unlock(&rdp_gp->nocb_gp_kthread_mutex);
+ 			return;
++		}
+ 		WRITE_ONCE(rdp_gp->nocb_gp_kthread, t);
++		if (kthread_prio)
++			sched_setscheduler_nocheck(t, SCHED_FIFO, &sp);
+ 	}
++	mutex_unlock(&rdp_gp->nocb_gp_kthread_mutex);
+ 
+ 	/* Spawn the kthread for this CPU. */
+ 	t = kthread_run(rcu_nocb_cb_kthread, rdp,
+ 			"rcuo%c/%d", rcu_state.abbr, cpu);
+ 	if (WARN_ONCE(IS_ERR(t), "%s: Could not start rcuo CB kthread, OOM is now expected behavior\n", __func__))
+ 		return;
++
++	if (kthread_prio)
++		sched_setscheduler_nocheck(t, SCHED_FIFO, &sp);
+ 	WRITE_ONCE(rdp->nocb_cb_kthread, t);
+ 	WRITE_ONCE(rdp->nocb_gp_kthread, rdp_gp->nocb_gp_kthread);
+ }
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index c5b45c2f6..8167cab1b 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -556,16 +556,16 @@ rcu_preempt_deferred_qs_irqrestore(struct task_struct *t, unsigned long flags)
+ 			raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+ 		}
+ 
+-		/* Unboost if we were boosted. */
+-		if (IS_ENABLED(CONFIG_RCU_BOOST) && drop_boost_mutex)
+-			rt_mutex_futex_unlock(&rnp->boost_mtx.rtmutex);
+-
+ 		/*
+ 		 * If this was the last task on the expedited lists,
+ 		 * then we need to report up the rcu_node hierarchy.
+ 		 */
+ 		if (!empty_exp && empty_exp_now)
+ 			rcu_report_exp_rnp(rnp, true);
++
++		/* Unboost if we were boosted. */
++		if (IS_ENABLED(CONFIG_RCU_BOOST) && drop_boost_mutex)
++			rt_mutex_futex_unlock(&rnp->boost_mtx.rtmutex);
+ 	} else {
+ 		local_irq_restore(flags);
+ 	}
+@@ -996,12 +996,15 @@ dump_blkd_tasks(struct rcu_node *rnp, int ncheck)
+  */
+ static void rcu_cpu_kthread_setup(unsigned int cpu)
+ {
++	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
+ #ifdef CONFIG_RCU_BOOST
+ 	struct sched_param sp;
+ 
+ 	sp.sched_priority = kthread_prio;
+ 	sched_setscheduler_nocheck(current, SCHED_FIFO, &sp);
+ #endif /* #ifdef CONFIG_RCU_BOOST */
++
++	WRITE_ONCE(rdp->rcuc_activity, jiffies);
+ }
+ 
+ #ifdef CONFIG_RCU_BOOST
+@@ -1175,8 +1178,6 @@ static void rcu_spawn_one_boost_kthread(struct rcu_node *rnp)
+ 	if (rnp->boost_kthread_task || !rcu_scheduler_fully_active)
+ 		return;
+ 
+-	rcu_state.boost = 1;
+-
+ 	t = kthread_create(rcu_boost_kthread, (void *)rnp,
+ 			   "rcub/%d", rnp_index);
+ 	if (WARN_ON_ONCE(IS_ERR(t)))
+diff --git a/kernel/rcu/tree_stall.h b/kernel/rcu/tree_stall.h
+index 21bebf7c9..0c5d85165 100644
+--- a/kernel/rcu/tree_stall.h
++++ b/kernel/rcu/tree_stall.h
+@@ -379,6 +379,15 @@ static bool rcu_is_gp_kthread_starving(unsigned long *jp)
+ 	return j > 2 * HZ;
+ }
+ 
++static bool rcu_is_rcuc_kthread_starving(struct rcu_data *rdp, unsigned long *jp)
++{
++	unsigned long j = jiffies - READ_ONCE(rdp->rcuc_activity);
++
++	if (jp)
++		*jp = j;
++	return j > 2 * HZ;
++}
++
+ /*
+  * Print out diagnostic information for the specified stalled CPU.
+  *
+@@ -430,6 +439,29 @@ static void print_cpu_stall_info(int cpu)
+ 	       falsepositive ? " (false positive?)" : "");
+ }
+ 
++static void rcuc_kthread_dump(struct rcu_data *rdp)
++{
++	int cpu;
++	unsigned long j;
++	struct task_struct *rcuc;
++
++	rcuc = rdp->rcu_cpu_kthread_task;
++	if (!rcuc)
++		return;
++
++	cpu = task_cpu(rcuc);
++	if (cpu_is_offline(cpu) || idle_cpu(cpu))
++		return;
++
++	if (!rcu_is_rcuc_kthread_starving(rdp, &j))
++		return;
++
++	pr_err("%s kthread starved for %ld jiffies\n", rcuc->comm, j);
++	sched_show_task(rcuc);
++	if (!trigger_single_cpu_backtrace(cpu))
++		dump_cpu_task(cpu);
++}
++
+ /* Complain about starvation of grace-period kthread.  */
+ static void rcu_check_gp_kthread_starvation(void)
+ {
+@@ -601,6 +633,9 @@ static void print_cpu_stall(unsigned long gps)
+ 	rcu_check_gp_kthread_expired_fqs_timer();
+ 	rcu_check_gp_kthread_starvation();
+ 
++	if (!use_softirq)
++		rcuc_kthread_dump(rdp);
++
+ 	rcu_dump_cpu_stacks();
+ 
+ 	raw_spin_lock_irqsave_rcu_node(rnp, flags);
+-- 
+2.35.1.354.g715d08a9e5
+
