@@ -1,0 +1,2086 @@
+From 1b3561b0c51624e9230dc59add6d3c86da0c52e8 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 18 Apr 2022 18:07:43 +0000
+Subject: [PATCH 12/17] spf-lru
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/arm64/Kconfig                    |   1 +
+ arch/arm64/mm/fault.c                 |  62 ++++
+ arch/powerpc/Kconfig                  |   1 +
+ arch/powerpc/mm/fault.c               |  64 ++++
+ arch/x86/Kconfig                      |   1 +
+ arch/x86/mm/fault.c                   |  63 ++++
+ drivers/gpu/drm/i915/i915_gpu_error.c |   4 +-
+ include/linux/mm.h                    |  68 +++-
+ include/linux/mm_types.h              |  33 +-
+ include/linux/mmap_lock.h             | 109 ++++--
+ include/linux/mmu_notifier.h          |  52 ++-
+ include/linux/percpu-rwsem.h          |  13 +-
+ include/linux/vm_event.h              | 111 ++++++
+ include/linux/vm_event_item.h         |  25 ++
+ include/linux/vmstat.h                |  95 +-----
+ kernel/fork.c                         |  18 +-
+ kernel/locking/percpu-rwsem.c         |  32 ++
+ mm/Kconfig                            |  22 ++
+ mm/Kconfig.debug                      |   7 +
+ mm/debug.c                            |   1 +
+ mm/memory.c                           | 470 +++++++++++++++++++-------
+ mm/mmap.c                             |  13 +-
+ mm/vmstat.c                           |  25 ++
+ 23 files changed, 1038 insertions(+), 252 deletions(-)
+ create mode 100644 include/linux/vm_event.h
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index baa0e9bbe754..a795fbcbd0db 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -222,6 +222,7 @@ config ARM64
+ 	select THREAD_INFO_IN_TASK
+ 	select HAVE_ARCH_USERFAULTFD_MINOR if USERFAULTFD
+ 	select TRACE_IRQFLAGS_SUPPORT
++	select ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT
+ 	help
+ 	  ARM 64-bit (AArch64) Linux support.
+ 
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 77341b160aca..2598795f4e70 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -25,6 +25,7 @@
+ #include <linux/perf_event.h>
+ #include <linux/preempt.h>
+ #include <linux/hugetlb.h>
++#include <linux/vm_event_item.h>
+ 
+ #include <asm/acpi.h>
+ #include <asm/bug.h>
+@@ -524,6 +525,11 @@ static int __kprobes do_page_fault(unsigned long far, unsigned int esr,
+ 	unsigned long vm_flags;
+ 	unsigned int mm_flags = FAULT_FLAG_DEFAULT;
+ 	unsigned long addr = untagged_addr(far);
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	struct vm_area_struct *vma;
++	struct vm_area_struct pvma;
++	unsigned long seq;
++#endif
+ 
+ 	if (kprobe_page_fault(regs, esr))
+ 		return 0;
+@@ -574,6 +580,59 @@ static int __kprobes do_page_fault(unsigned long far, unsigned int esr,
+ 
+ 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
+ 
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	/*
++	 * No need to try speculative faults for kernel or
++	 * single threaded user space.
++	 */
++	if (!(mm_flags & FAULT_FLAG_USER) || atomic_read(&mm->mm_users) == 1)
++		goto no_spf;
++
++	count_vm_event(SPF_ATTEMPT);
++	seq = mmap_seq_read_start(mm);
++	if (seq & 1) {
++		count_vm_spf_event(SPF_ABORT_ODD);
++		goto spf_abort;
++	}
++	rcu_read_lock();
++	vma = __find_vma(mm, addr);
++	if (!vma || vma->vm_start > addr) {
++		rcu_read_unlock();
++		count_vm_spf_event(SPF_ABORT_UNMAPPED);
++		goto spf_abort;
++	}
++	if (!vma_is_anonymous(vma)) {
++		rcu_read_unlock();
++		count_vm_spf_event(SPF_ABORT_NO_SPECULATE);
++		goto spf_abort;
++	}
++	pvma = *vma;
++	rcu_read_unlock();
++	if (!mmap_seq_read_check(mm, seq, SPF_ABORT_VMA_COPY))
++		goto spf_abort;
++	vma = &pvma;
++	if (!(vma->vm_flags & vm_flags)) {
++		count_vm_spf_event(SPF_ABORT_ACCESS_ERROR);
++		goto spf_abort;
++	}
++	fault = do_handle_mm_fault(vma, addr & PAGE_MASK,
++			mm_flags | FAULT_FLAG_SPECULATIVE, seq, regs);
++
++	/* Quick path to respond to signals */
++	if (fault_signal_pending(fault, regs)) {
++		if (!user_mode(regs))
++			goto no_context;
++		return 0;
++	}
++	if (!(fault & VM_FAULT_RETRY))
++		goto done;
++
++spf_abort:
++	count_vm_event(SPF_ABORT);
++no_spf:
++
++#endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
++
+ 	/*
+ 	 * As per x86, we may deadlock here. However, since the kernel only
+ 	 * validly references user space from well defined areas of the code,
+@@ -612,6 +671,9 @@ static int __kprobes do_page_fault(unsigned long far, unsigned int esr,
+ 		goto retry;
+ 	}
+ 	mmap_read_unlock(mm);
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++done:
++#endif
+ 
+ 	/*
+ 	 * Handle the "normal" (no error) case first.
+diff --git a/arch/powerpc/Kconfig b/arch/powerpc/Kconfig
+index b779603978e1..5f82bc7eee0b 100644
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -144,6 +144,7 @@ config PPC
+ 	select ARCH_STACKWALK
+ 	select ARCH_SUPPORTS_ATOMIC_RMW
+ 	select ARCH_SUPPORTS_DEBUG_PAGEALLOC	if PPC_BOOK3S || PPC_8xx || 40x
++	select ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT if PPC_BOOK3S_64
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF		if PPC64
+ 	select ARCH_USE_MEMTEST
+diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
+index 7ba6d3eff636..ed89d05de4f0 100644
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -395,6 +395,10 @@ static int ___do_page_fault(struct pt_regs *regs, unsigned long address,
+ 	int is_write = page_fault_is_write(error_code);
+ 	vm_fault_t fault, major = 0;
+ 	bool kprobe_fault = kprobe_page_fault(regs, 11);
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	struct vm_area_struct pvma;
++	unsigned long seq;
++#endif
+ 
+ 	if (unlikely(debugger_fault_handler(regs) || kprobe_fault))
+ 		return 0;
+@@ -451,6 +455,63 @@ static int ___do_page_fault(struct pt_regs *regs, unsigned long address,
+ 	if (is_exec)
+ 		flags |= FAULT_FLAG_INSTRUCTION;
+ 
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	/*
++	 * No need to try speculative faults for kernel or
++	 * single threaded user space.
++	 */
++	if (!(flags & FAULT_FLAG_USER) || atomic_read(&mm->mm_users) == 1)
++		goto no_spf;
++
++	count_vm_event(SPF_ATTEMPT);
++	seq = mmap_seq_read_start(mm);
++	if (seq & 1) {
++		count_vm_spf_event(SPF_ABORT_ODD);
++		goto spf_abort;
++	}
++	rcu_read_lock();
++	vma = __find_vma(mm, address);
++	if (!vma || vma->vm_start > address) {
++		rcu_read_unlock();
++		count_vm_spf_event(SPF_ABORT_UNMAPPED);
++		goto spf_abort;
++	}
++	if (!vma_is_anonymous(vma)) {
++		rcu_read_unlock();
++		count_vm_spf_event(SPF_ABORT_NO_SPECULATE);
++		goto spf_abort;
++	}
++	pvma = *vma;
++	rcu_read_unlock();
++	if (!mmap_seq_read_check(mm, seq, SPF_ABORT_VMA_COPY))
++		goto spf_abort;
++	vma = &pvma;
++#ifdef CONFIG_PPC_MEM_KEYS
++	if (unlikely(access_pkey_error(is_write, is_exec,
++				       (error_code & DSISR_KEYFAULT), vma))) {
++		count_vm_spf_event(SPF_ABORT_ACCESS_ERROR);
++		goto spf_abort;
++	}
++#endif /* CONFIG_PPC_MEM_KEYS */
++	if (unlikely(access_error(is_write, is_exec, vma))) {
++		count_vm_spf_event(SPF_ABORT_ACCESS_ERROR);
++		goto spf_abort;
++	}
++	fault = do_handle_mm_fault(vma, address,
++				   flags | FAULT_FLAG_SPECULATIVE, seq, regs);
++	major |= fault & VM_FAULT_MAJOR;
++
++	if (fault_signal_pending(fault, regs))
++		return user_mode(regs) ? 0 : SIGBUS;
++	if (!(fault & VM_FAULT_RETRY))
++		goto done;
++
++spf_abort:
++	count_vm_event(SPF_ABORT);
++no_spf:
++
++#endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
++
+ 	/* When running in the kernel we expect faults to occur only to
+ 	 * addresses in user space.  All other faults represent errors in the
+ 	 * kernel and should generate an OOPS.  Unfortunately, in the case of an
+@@ -522,6 +583,9 @@ static int ___do_page_fault(struct pt_regs *regs, unsigned long address,
+ 	}
+ 
+ 	mmap_read_unlock(current->mm);
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++done:
++#endif
+ 
+ 	if (unlikely(fault & VM_FAULT_ERROR))
+ 		return mm_fault_error(regs, address, fault);
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 54a8e93d6855..49de24edc8e2 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -34,6 +34,7 @@ config X86_64
+ 	select SWIOTLB
+ 	select ARCH_HAS_ELFCORE_COMPAT
+ 	select ZONE_DMA32
++	select ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT
+ 
+ config FORCE_DYNAMIC_FTRACE
+ 	def_bool y
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index aeeae77fe5dd..04413984c208 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1226,6 +1226,10 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	struct mm_struct *mm;
+ 	vm_fault_t fault;
+ 	unsigned int flags = FAULT_FLAG_DEFAULT;
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	struct vm_area_struct pvma;
++	unsigned long seq;
++#endif
+ 
+ 	tsk = current;
+ 	mm = tsk->mm;
+@@ -1323,6 +1327,62 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	}
+ #endif
+ 
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	/*
++	 * No need to try speculative faults for kernel or
++	 * single threaded user space.
++	 */
++	if (!(flags & FAULT_FLAG_USER) || atomic_read(&mm->mm_users) == 1)
++		goto no_spf;
++
++	count_vm_event(SPF_ATTEMPT);
++	seq = mmap_seq_read_start(mm);
++	if (seq & 1) {
++		count_vm_spf_event(SPF_ABORT_ODD);
++		goto spf_abort;
++	}
++	rcu_read_lock();
++	vma = __find_vma(mm, address);
++	if (!vma || vma->vm_start > address) {
++		rcu_read_unlock();
++		count_vm_spf_event(SPF_ABORT_UNMAPPED);
++		goto spf_abort;
++	}
++	if (!vma_is_anonymous(vma)) {
++		rcu_read_unlock();
++		count_vm_spf_event(SPF_ABORT_NO_SPECULATE);
++		goto spf_abort;
++	}
++	pvma = *vma;
++	rcu_read_unlock();
++	if (!mmap_seq_read_check(mm, seq, SPF_ABORT_VMA_COPY))
++		goto spf_abort;
++	vma = &pvma;
++	if (unlikely(access_error(error_code, vma))) {
++		count_vm_spf_event(SPF_ABORT_ACCESS_ERROR);
++		goto spf_abort;
++	}
++	fault = do_handle_mm_fault(vma, address,
++				   flags | FAULT_FLAG_SPECULATIVE, seq, regs);
++
++	if (!(fault & VM_FAULT_RETRY))
++		goto done;
++
++	/* Quick path to respond to signals */
++	if (fault_signal_pending(fault, regs)) {
++		if (!user_mode(regs))
++			kernelmode_fixup_or_oops(regs, error_code, address,
++						 SIGBUS, BUS_ADRERR,
++						 ARCH_DEFAULT_PKEY);
++		return;
++	}
++
++spf_abort:
++	count_vm_event(SPF_ABORT);
++no_spf:
++
++#endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
++
+ 	/*
+ 	 * Kernel-mode access to the user address space should only occur
+ 	 * on well-defined single instructions listed in the exception
+@@ -1419,6 +1479,9 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	}
+ 
+ 	mmap_read_unlock(mm);
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++done:
++#endif
+ 	if (likely(!(fault & VM_FAULT_ERROR)))
+ 		return;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 0633888a411e..0e1ddc5911a5 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -515,7 +515,7 @@ static void error_print_context(struct drm_i915_error_state_buf *m,
+ }
+ 
+ static struct i915_vma_coredump *
+-__find_vma(struct i915_vma_coredump *vma, const char *name)
++__i915_find_vma(struct i915_vma_coredump *vma, const char *name)
+ {
+ 	while (vma) {
+ 		if (strcmp(vma->name, name) == 0)
+@@ -529,7 +529,7 @@ __find_vma(struct i915_vma_coredump *vma, const char *name)
+ static struct i915_vma_coredump *
+ find_batch(const struct intel_engine_coredump *ee)
+ {
+-	return __find_vma(ee->vma, "batch");
++	return __i915_find_vma(ee->vma, "batch");
+ }
+ 
+ static void error_print_engine(struct drm_i915_error_state_buf *m,
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 1f3695e95942..d8e75ea2a6f3 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -462,7 +462,8 @@ static inline bool fault_flag_allow_retry_first(enum fault_flag flags)
+ 	{ FAULT_FLAG_USER,		"USER" }, \
+ 	{ FAULT_FLAG_REMOTE,		"REMOTE" }, \
+ 	{ FAULT_FLAG_INSTRUCTION,	"INSTRUCTION" }, \
+-	{ FAULT_FLAG_INTERRUPTIBLE,	"INTERRUPTIBLE" }
++	{ FAULT_FLAG_INTERRUPTIBLE,	"INTERRUPTIBLE" }, \
++	{ FAULT_FLAG_SPECULATIVE,	"SPECULATIVE" }
+ 
+ /*
+  * vm_fault is filled by the pagefault handler and passed to the vma's
+@@ -483,6 +484,10 @@ struct vm_fault {
+ 	};
+ 	enum fault_flag flags;		/* FAULT_FLAG_xxx flags
+ 					 * XXX: should really be 'const' */
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	unsigned long seq;
++	pmd_t orig_pmd;
++#endif
+ 	pmd_t *pmd;			/* Pointer to pmd entry matching
+ 					 * the 'address' */
+ 	pud_t *pud;			/* Pointer to pud entry matching
+@@ -490,9 +495,11 @@ struct vm_fault {
+ 					 */
+ 	union {
+ 		pte_t orig_pte;		/* Value of PTE at the time of fault */
++#ifndef CONFIG_SPECULATIVE_PAGE_FAULT
+ 		pmd_t orig_pmd;		/* Value of PMD at the time of fault,
+ 					 * used by PMD fault only.
+ 					 */
++#endif
+ 	};
+ 
+ 	struct page *cow_page;		/* Page handler may use for COW fault */
+@@ -1865,9 +1872,15 @@ int generic_error_remove_page(struct address_space *mapping, struct page *page);
+ int invalidate_inode_page(struct page *page);
+ 
+ #ifdef CONFIG_MMU
+-extern vm_fault_t handle_mm_fault(struct vm_area_struct *vma,
+-				  unsigned long address, unsigned int flags,
+-				  struct pt_regs *regs);
++extern vm_fault_t do_handle_mm_fault(struct vm_area_struct *vma,
++		unsigned long address, unsigned int flags,
++		unsigned long seq, struct pt_regs *regs);
++static inline vm_fault_t handle_mm_fault(struct vm_area_struct *vma,
++		unsigned long address, unsigned int flags,
++		struct pt_regs *regs)
++{
++	return do_handle_mm_fault(vma, address, flags, 0, regs);
++}
+ extern int fixup_user_fault(struct mm_struct *mm,
+ 			    unsigned long address, unsigned int fault_flags,
+ 			    bool *unlocked);
+@@ -2759,10 +2772,17 @@ extern int expand_upwards(struct vm_area_struct *vma, unsigned long address);
+ #endif
+ 
+ /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+-extern struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr);
++extern struct vm_area_struct * __find_vma(struct mm_struct * mm, unsigned long addr);
+ extern struct vm_area_struct * find_vma_prev(struct mm_struct * mm, unsigned long addr,
+ 					     struct vm_area_struct **pprev);
+ 
++static inline
++struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
++{
++	mmap_assert_locked(mm);
++	return __find_vma(mm, addr);
++}
++
+ /**
+  * find_vma_intersection() - Look up the first VMA which intersects the interval
+  * @mm: The process address space.
+@@ -3390,5 +3410,43 @@ madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
+ }
+ #endif
+ 
++#ifdef CONFIG_MMU
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++
++bool __pte_map_lock(struct vm_fault *vmf);
++
++static inline bool pte_map_lock(struct vm_fault *vmf)
++{
++	VM_BUG_ON(vmf->pte);
++	return __pte_map_lock(vmf);
++}
++
++static inline bool pte_spinlock(struct vm_fault *vmf)
++{
++	VM_BUG_ON(!vmf->pte);
++	return __pte_map_lock(vmf);
++}
++
++#else	/* !CONFIG_SPECULATIVE_PAGE_FAULT */
++
++#define pte_map_lock(__vmf)						\
++({									\
++	struct vm_fault *vmf = __vmf;					\
++	vmf->pte = pte_offset_map_lock(vmf->vma->vm_mm, vmf->pmd,	\
++				       vmf->address, &vmf->ptl);	\
++	true;								\
++})
++
++#define pte_spinlock(__vmf)						\
++({									\
++	struct vm_fault *vmf = __vmf;					\
++	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);		\
++	spin_lock(vmf->ptl);						\
++	true;								\
++})
++
++#endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
++#endif	/* CONFIG_MMU */
++
+ #endif /* __KERNEL__ */
+ #endif /* _LINUX_MM_H */
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index cbc7fa381ac6..c0d360f22a12 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -374,16 +374,27 @@ struct anon_vma_name {
+  * per VM-area/task. A VM area is any part of the process virtual memory
+  * space that has a special rule for the page-fault handlers (ie a shared
+  * library, the executable area etc).
++ *
++ * Note that speculative page faults make an on-stack copy of the VMA,
++ * so the structure size matters.
++ * (TODO - it would be preferable to copy only the required vma attributes
++ *  rather than the entire vma).
+  */
+ struct vm_area_struct {
+ 	/* The first cache line has the info for VMA tree walking. */
+ 
+-	unsigned long vm_start;		/* Our start address within vm_mm. */
+-	unsigned long vm_end;		/* The first byte after our end address
+-					   within vm_mm. */
++	union {
++		struct {
++			/* VMA covers [vm_start; vm_end) addresses within mm */
++			unsigned long vm_start, vm_end;
+ 
+-	/* linked list of VM areas per task, sorted by address */
+-	struct vm_area_struct *vm_next, *vm_prev;
++			/* linked list of VMAs per task, sorted by address */
++			struct vm_area_struct *vm_next, *vm_prev;
++		};
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++		struct rcu_head vm_rcu;	/* Used for deferred freeing. */
++#endif
++	};
+ 
+ 	struct rb_node vm_rb;
+ 
+@@ -458,6 +469,7 @@ struct vm_area_struct {
+ } __randomize_layout;
+ 
+ struct kioctx_table;
++struct percpu_rw_semaphore;
+ struct mm_struct {
+ 	struct {
+ 		struct vm_area_struct *mmap;		/* list of VMAs */
+@@ -530,6 +542,10 @@ struct mm_struct {
+ 		 * cacheline.
+ 		 */
+ 		struct rw_semaphore mmap_lock;
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++		unsigned long mmap_seq;
++#endif
++
+ 
+ 		struct list_head mmlist; /* List of maybe swapped mm's.	These
+ 					  * are globally strung together off
+@@ -600,7 +616,10 @@ struct mm_struct {
+ 		struct file __rcu *exe_file;
+ #ifdef CONFIG_MMU_NOTIFIER
+ 		struct mmu_notifier_subscriptions *notifier_subscriptions;
+-#endif
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++		struct percpu_rw_semaphore *mmu_notifier_lock;
++#endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
++#endif	/* CONFIG_MMU_NOTIFIER */
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
+ 		pgtable_t pmd_huge_pte; /* protected by page_table_lock */
+ #endif
+@@ -872,6 +891,7 @@ typedef struct {
+  * @FAULT_FLAG_REMOTE: The fault is not for current task/mm.
+  * @FAULT_FLAG_INSTRUCTION: The fault was during an instruction fetch.
+  * @FAULT_FLAG_INTERRUPTIBLE: The fault can be interrupted by non-fatal signals.
++ * @FAULT_FLAG_SPECULATIVE: The fault is handled without holding the mmap lock.
+  *
+  * About @FAULT_FLAG_ALLOW_RETRY and @FAULT_FLAG_TRIED: we can specify
+  * whether we would allow page faults to retry by specifying these two
+@@ -903,6 +923,7 @@ enum fault_flag {
+ 	FAULT_FLAG_REMOTE =		1 << 7,
+ 	FAULT_FLAG_INSTRUCTION =	1 << 8,
+ 	FAULT_FLAG_INTERRUPTIBLE =	1 << 9,
++	FAULT_FLAG_SPECULATIVE =	1 << 10,
+ };
+ 
+ #endif /* _LINUX_MM_TYPES_H */
+diff --git a/include/linux/mmap_lock.h b/include/linux/mmap_lock.h
+index 96e113e23d04..747805ce07b8 100644
+--- a/include/linux/mmap_lock.h
++++ b/include/linux/mmap_lock.h
+@@ -7,9 +7,18 @@
+ #include <linux/rwsem.h>
+ #include <linux/tracepoint-defs.h>
+ #include <linux/types.h>
++#include <linux/vm_event.h>
+ 
+-#define MMAP_LOCK_INITIALIZER(name) \
+-	.mmap_lock = __RWSEM_INITIALIZER((name).mmap_lock),
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++#define MMAP_LOCK_SEQ_INITIALIZER(name) \
++	.mmap_seq = 0,
++#else
++#define MMAP_LOCK_SEQ_INITIALIZER(name)
++#endif
++
++#define MMAP_LOCK_INITIALIZER(name)				\
++	.mmap_lock = __RWSEM_INITIALIZER((name).mmap_lock),	\
++	MMAP_LOCK_SEQ_INITIALIZER(name)
+ 
+ DECLARE_TRACEPOINT(mmap_lock_start_locking);
+ DECLARE_TRACEPOINT(mmap_lock_acquire_returned);
+@@ -63,13 +72,66 @@ static inline void __mmap_lock_trace_released(struct mm_struct *mm, bool write)
+ static inline void mmap_init_lock(struct mm_struct *mm)
+ {
+ 	init_rwsem(&mm->mmap_lock);
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	mm->mmap_seq = 0;
++#endif
++}
++
++static inline void __mmap_seq_write_lock(struct mm_struct *mm)
++{
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	VM_BUG_ON_MM(mm->mmap_seq & 1, mm);
++	mm->mmap_seq++;
++	smp_wmb();
++#endif
++}
++
++static inline void __mmap_seq_write_unlock(struct mm_struct *mm)
++{
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	smp_wmb();
++	mm->mmap_seq++;
++	VM_BUG_ON_MM(mm->mmap_seq & 1, mm);
++#endif
++}
++
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++static inline unsigned long mmap_seq_read_start(struct mm_struct *mm)
++{
++	unsigned long seq;
++
++	seq = READ_ONCE(mm->mmap_seq);
++	smp_rmb();
++	return seq;
++}
++
++static inline bool __mmap_seq_read_check(struct mm_struct *mm,
++					 unsigned long seq)
++{
++	smp_rmb();
++	return seq == READ_ONCE(mm->mmap_seq);
++}
++
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT_STATS
++static inline bool mmap_seq_read_check(struct mm_struct *mm, unsigned long seq,
++	enum vm_event_item fail_event)
++{
++	if (__mmap_seq_read_check(mm, seq))
++		return true;
++	count_vm_event(fail_event);
++	return false;
+ }
++#else
++#define mmap_seq_read_check(mm, seq, fail) __mmap_seq_read_check(mm, seq)
++#endif /* CONFIG_SPECULATIVE_PAGE_FAULT_STATS */
++#endif /* CONFIG_SPECULATIVE_PAGE_FAULT */
+ 
+ static inline void mmap_write_lock(struct mm_struct *mm)
+ {
+ 	__mmap_lock_trace_start_locking(mm, true);
+ 	down_write(&mm->mmap_lock);
+ 	__mmap_lock_trace_acquire_returned(mm, true, true);
++	__mmap_seq_write_lock(mm);
+ }
+ 
+ static inline void mmap_write_lock_nested(struct mm_struct *mm, int subclass)
+@@ -77,37 +139,44 @@ static inline void mmap_write_lock_nested(struct mm_struct *mm, int subclass)
+ 	__mmap_lock_trace_start_locking(mm, true);
+ 	down_write_nested(&mm->mmap_lock, subclass);
+ 	__mmap_lock_trace_acquire_returned(mm, true, true);
++	__mmap_seq_write_lock(mm);
+ }
+ 
+ static inline int mmap_write_lock_killable(struct mm_struct *mm)
+ {
+-	int ret;
++	int error;
+ 
+ 	__mmap_lock_trace_start_locking(mm, true);
+-	ret = down_write_killable(&mm->mmap_lock);
+-	__mmap_lock_trace_acquire_returned(mm, true, ret == 0);
+-	return ret;
++	error = down_write_killable(&mm->mmap_lock);
++	__mmap_lock_trace_acquire_returned(mm, true, !error);
++	if (likely(!error))
++		__mmap_seq_write_lock(mm);
++	return error;
+ }
+ 
+ static inline bool mmap_write_trylock(struct mm_struct *mm)
+ {
+-	bool ret;
++	bool ok;
+ 
+ 	__mmap_lock_trace_start_locking(mm, true);
+-	ret = down_write_trylock(&mm->mmap_lock) != 0;
+-	__mmap_lock_trace_acquire_returned(mm, true, ret);
+-	return ret;
++	ok = down_write_trylock(&mm->mmap_lock) != 0;
++	__mmap_lock_trace_acquire_returned(mm, true, ok);
++	if (likely(ok))
++		__mmap_seq_write_lock(mm);
++	return ok;
+ }
+ 
+ static inline void mmap_write_unlock(struct mm_struct *mm)
+ {
+ 	__mmap_lock_trace_released(mm, true);
++	__mmap_seq_write_unlock(mm);
+ 	up_write(&mm->mmap_lock);
+ }
+ 
+ static inline void mmap_write_downgrade(struct mm_struct *mm)
+ {
+ 	__mmap_lock_trace_acquire_returned(mm, false, true);
++	__mmap_seq_write_unlock(mm);
+ 	downgrade_write(&mm->mmap_lock);
+ }
+ 
+@@ -120,22 +189,22 @@ static inline void mmap_read_lock(struct mm_struct *mm)
+ 
+ static inline int mmap_read_lock_killable(struct mm_struct *mm)
+ {
+-	int ret;
++	int error;
+ 
+ 	__mmap_lock_trace_start_locking(mm, false);
+-	ret = down_read_killable(&mm->mmap_lock);
+-	__mmap_lock_trace_acquire_returned(mm, false, ret == 0);
+-	return ret;
++	error = down_read_killable(&mm->mmap_lock);
++	__mmap_lock_trace_acquire_returned(mm, false, !error);
++	return error;
+ }
+ 
+ static inline bool mmap_read_trylock(struct mm_struct *mm)
+ {
+-	bool ret;
++	bool ok;
+ 
+ 	__mmap_lock_trace_start_locking(mm, false);
+-	ret = down_read_trylock(&mm->mmap_lock) != 0;
+-	__mmap_lock_trace_acquire_returned(mm, false, ret);
+-	return ret;
++	ok = down_read_trylock(&mm->mmap_lock) != 0;
++	__mmap_lock_trace_acquire_returned(mm, false, ok);
++	return ok;
+ }
+ 
+ static inline void mmap_read_unlock(struct mm_struct *mm)
+@@ -162,9 +231,9 @@ static inline void mmap_assert_write_locked(struct mm_struct *mm)
+ 	VM_BUG_ON_MM(!rwsem_is_locked(&mm->mmap_lock), mm);
+ }
+ 
+-static inline int mmap_lock_is_contended(struct mm_struct *mm)
++static inline bool mmap_lock_is_contended(struct mm_struct *mm)
+ {
+-	return rwsem_is_contended(&mm->mmap_lock);
++	return rwsem_is_contended(&mm->mmap_lock) != 0;
+ }
+ 
+ #endif /* _LINUX_MMAP_LOCK_H */
+diff --git a/include/linux/mmu_notifier.h b/include/linux/mmu_notifier.h
+index 45fc2c81e370..d0430410fdd8 100644
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@ -6,6 +6,8 @@
+ #include <linux/spinlock.h>
+ #include <linux/mm_types.h>
+ #include <linux/mmap_lock.h>
++#include <linux/percpu-rwsem.h>
++#include <linux/slab.h>
+ #include <linux/srcu.h>
+ #include <linux/interval_tree.h>
+ 
+@@ -499,15 +501,35 @@ static inline void mmu_notifier_invalidate_range(struct mm_struct *mm,
+ 		__mmu_notifier_invalidate_range(mm, start, end);
+ }
+ 
+-static inline void mmu_notifier_subscriptions_init(struct mm_struct *mm)
++static inline bool mmu_notifier_subscriptions_init(struct mm_struct *mm)
+ {
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	mm->mmu_notifier_lock = kzalloc(sizeof(struct percpu_rw_semaphore), GFP_KERNEL);
++	if (!mm->mmu_notifier_lock)
++		return false;
++	if (percpu_init_rwsem(mm->mmu_notifier_lock)) {
++		kfree(mm->mmu_notifier_lock);
++		return false;
++	}
++#endif
++
+ 	mm->notifier_subscriptions = NULL;
++	return true;
+ }
+ 
+ static inline void mmu_notifier_subscriptions_destroy(struct mm_struct *mm)
+ {
+ 	if (mm_has_notifiers(mm))
+ 		__mmu_notifier_subscriptions_destroy(mm);
++
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	if (!in_atomic()) {
++		percpu_free_rwsem(mm->mmu_notifier_lock);
++		kfree(mm->mmu_notifier_lock);
++	} else {
++		percpu_rwsem_async_destroy(mm->mmu_notifier_lock);
++	}
++#endif
+ }
+ 
+ 
+@@ -724,8 +746,9 @@ static inline void mmu_notifier_invalidate_range(struct mm_struct *mm,
+ {
+ }
+ 
+-static inline void mmu_notifier_subscriptions_init(struct mm_struct *mm)
++static inline bool mmu_notifier_subscriptions_init(struct mm_struct *mm)
+ {
++	return true;
+ }
+ 
+ static inline void mmu_notifier_subscriptions_destroy(struct mm_struct *mm)
+@@ -749,4 +772,29 @@ static inline void mmu_notifier_synchronize(void)
+ 
+ #endif /* CONFIG_MMU_NOTIFIER */
+ 
++#if defined(CONFIG_MMU_NOTIFIER) && defined(CONFIG_SPECULATIVE_PAGE_FAULT)
++
++static inline bool mmu_notifier_trylock(struct mm_struct *mm)
++{
++	return percpu_down_read_trylock(mm->mmu_notifier_lock);
++}
++
++static inline void mmu_notifier_unlock(struct mm_struct *mm)
++{
++	percpu_up_read(mm->mmu_notifier_lock);
++}
++
++#else
++
++static inline bool mmu_notifier_trylock(struct mm_struct *mm)
++{
++	return true;
++}
++
++static inline void mmu_notifier_unlock(struct mm_struct *mm)
++{
++}
++
++#endif
++
+ #endif /* _LINUX_MMU_NOTIFIER_H */
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 5fda40f97fe9..bf1668fc9c5e 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -13,7 +13,14 @@ struct percpu_rw_semaphore {
+ 	struct rcu_sync		rss;
+ 	unsigned int __percpu	*read_count;
+ 	struct rcuwait		writer;
+-	wait_queue_head_t	waiters;
++	/*
++	 * destroy_list_entry is used during object destruction when waiters
++	 * can't be used, therefore reusing the same space.
++	 */
++	union {
++		wait_queue_head_t	waiters;
++		struct list_head	destroy_list_entry;
++	};
+ 	atomic_t		block;
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 	struct lockdep_map	dep_map;
+@@ -127,8 +134,12 @@ extern void percpu_up_write(struct percpu_rw_semaphore *);
+ extern int __percpu_init_rwsem(struct percpu_rw_semaphore *,
+ 				const char *, struct lock_class_key *);
+ 
++/* Can't be called in atomic context. */
+ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
+ 
++/* Invokes percpu_free_rwsem and frees the semaphore from a worker thread. */
++extern void percpu_rwsem_async_destroy(struct percpu_rw_semaphore *sem);
++
+ #define percpu_init_rwsem(sem)					\
+ ({								\
+ 	static struct lock_class_key rwsem_key;			\
+diff --git a/include/linux/vm_event.h b/include/linux/vm_event.h
+new file mode 100644
+index 000000000000..689a21387dad
+--- /dev/null
++++ b/include/linux/vm_event.h
+@@ -0,0 +1,111 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_VM_EVENT_H
++#define _LINUX_VM_EVENT_H
++
++#include <linux/types.h>
++#include <linux/percpu.h>
++#include <linux/mmzone.h>
++#include <linux/vm_event_item.h>
++#include <linux/atomic.h>
++
++#ifdef CONFIG_VM_EVENT_COUNTERS
++/*
++ * Light weight per cpu counter implementation.
++ *
++ * Counters should only be incremented and no critical kernel component
++ * should rely on the counter values.
++ *
++ * Counters are handled completely inline. On many platforms the code
++ * generated will simply be the increment of a global address.
++ */
++
++struct vm_event_state {
++	unsigned long event[NR_VM_EVENT_ITEMS];
++};
++
++DECLARE_PER_CPU(struct vm_event_state, vm_event_states);
++
++/*
++ * vm counters are allowed to be racy. Use raw_cpu_ops to avoid the
++ * local_irq_disable overhead.
++ */
++static inline void __count_vm_event(enum vm_event_item item)
++{
++	raw_cpu_inc(vm_event_states.event[item]);
++}
++
++static inline void count_vm_event(enum vm_event_item item)
++{
++	this_cpu_inc(vm_event_states.event[item]);
++}
++
++static inline void __count_vm_events(enum vm_event_item item, long delta)
++{
++	raw_cpu_add(vm_event_states.event[item], delta);
++}
++
++static inline void count_vm_events(enum vm_event_item item, long delta)
++{
++	this_cpu_add(vm_event_states.event[item], delta);
++}
++
++extern void all_vm_events(unsigned long *);
++
++extern void vm_events_fold_cpu(int cpu);
++
++#else
++
++/* Disable counters */
++static inline void count_vm_event(enum vm_event_item item)
++{
++}
++static inline void count_vm_events(enum vm_event_item item, long delta)
++{
++}
++static inline void __count_vm_event(enum vm_event_item item)
++{
++}
++static inline void __count_vm_events(enum vm_event_item item, long delta)
++{
++}
++static inline void all_vm_events(unsigned long *ret)
++{
++}
++static inline void vm_events_fold_cpu(int cpu)
++{
++}
++
++#endif /* CONFIG_VM_EVENT_COUNTERS */
++
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT_STATS
++#define count_vm_spf_event(x) count_vm_event(x)
++#else
++#define count_vm_spf_event(x) do {} while (0)
++#endif
++
++#ifdef CONFIG_NUMA_BALANCING
++#define count_vm_numa_event(x)     count_vm_event(x)
++#define count_vm_numa_events(x, y) count_vm_events(x, y)
++#else
++#define count_vm_numa_event(x) do {} while (0)
++#define count_vm_numa_events(x, y) do { (void)(y); } while (0)
++#endif /* CONFIG_NUMA_BALANCING */
++
++#ifdef CONFIG_DEBUG_TLBFLUSH
++#define count_vm_tlb_event(x)	   count_vm_event(x)
++#define count_vm_tlb_events(x, y)  count_vm_events(x, y)
++#else
++#define count_vm_tlb_event(x)     do {} while (0)
++#define count_vm_tlb_events(x, y) do { (void)(y); } while (0)
++#endif
++
++#ifdef CONFIG_DEBUG_VM_VMACACHE
++#define count_vm_vmacache_event(x) count_vm_event(x)
++#else
++#define count_vm_vmacache_event(x) do {} while (0)
++#endif
++
++#define __count_zid_vm_events(item, zid, delta) \
++	__count_vm_events(item##_NORMAL - ZONE_NORMAL + zid, delta)
++
++#endif /* _LINUX_VM_EVENT_H */
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index 7b2363388bfa..0390b81b1e71 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -133,6 +133,31 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ #ifdef CONFIG_X86
+ 		DIRECT_MAP_LEVEL2_SPLIT,
+ 		DIRECT_MAP_LEVEL3_SPLIT,
++#endif
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++		SPF_ATTEMPT,
++		SPF_ABORT,
++#endif
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT_STATS
++		SPF_ABORT_ODD,
++		SPF_ABORT_UNMAPPED,
++		SPF_ABORT_NO_SPECULATE,
++		SPF_ABORT_VMA_COPY,
++		SPF_ABORT_ACCESS_ERROR,
++		SPF_ABORT_PUD,
++		SPF_ABORT_PMD,
++		SPF_ABORT_ANON_VMA,
++		SPF_ABORT_PTE_MAP_LOCK_SEQ1,
++		SPF_ABORT_PTE_MAP_LOCK_PMD,
++		SPF_ABORT_PTE_MAP_LOCK_PTL,
++		SPF_ABORT_PTE_MAP_LOCK_SEQ2,
++		SPF_ABORT_USERFAULTFD,
++		SPF_ABORT_FAULT,
++		SPF_ABORT_SWAP,
++		SPF_ATTEMPT_ANON,
++		SPF_ATTEMPT_NUMA,
++		SPF_ATTEMPT_PTE,
++		SPF_ATTEMPT_WP,
+ #endif
+ 		NR_VM_EVENT_ITEMS
+ };
+diff --git a/include/linux/vmstat.h b/include/linux/vmstat.h
+index bfe38869498d..7c3c892ce89a 100644
+--- a/include/linux/vmstat.h
++++ b/include/linux/vmstat.h
+@@ -6,6 +6,7 @@
+ #include <linux/percpu.h>
+ #include <linux/mmzone.h>
+ #include <linux/vm_event_item.h>
++#include <linux/vm_event.h>
+ #include <linux/atomic.h>
+ #include <linux/static_key.h>
+ #include <linux/mmdebug.h>
+@@ -40,100 +41,6 @@ enum writeback_stat_item {
+ 	NR_VM_WRITEBACK_STAT_ITEMS,
+ };
+ 
+-#ifdef CONFIG_VM_EVENT_COUNTERS
+-/*
+- * Light weight per cpu counter implementation.
+- *
+- * Counters should only be incremented and no critical kernel component
+- * should rely on the counter values.
+- *
+- * Counters are handled completely inline. On many platforms the code
+- * generated will simply be the increment of a global address.
+- */
+-
+-struct vm_event_state {
+-	unsigned long event[NR_VM_EVENT_ITEMS];
+-};
+-
+-DECLARE_PER_CPU(struct vm_event_state, vm_event_states);
+-
+-/*
+- * vm counters are allowed to be racy. Use raw_cpu_ops to avoid the
+- * local_irq_disable overhead.
+- */
+-static inline void __count_vm_event(enum vm_event_item item)
+-{
+-	raw_cpu_inc(vm_event_states.event[item]);
+-}
+-
+-static inline void count_vm_event(enum vm_event_item item)
+-{
+-	this_cpu_inc(vm_event_states.event[item]);
+-}
+-
+-static inline void __count_vm_events(enum vm_event_item item, long delta)
+-{
+-	raw_cpu_add(vm_event_states.event[item], delta);
+-}
+-
+-static inline void count_vm_events(enum vm_event_item item, long delta)
+-{
+-	this_cpu_add(vm_event_states.event[item], delta);
+-}
+-
+-extern void all_vm_events(unsigned long *);
+-
+-extern void vm_events_fold_cpu(int cpu);
+-
+-#else
+-
+-/* Disable counters */
+-static inline void count_vm_event(enum vm_event_item item)
+-{
+-}
+-static inline void count_vm_events(enum vm_event_item item, long delta)
+-{
+-}
+-static inline void __count_vm_event(enum vm_event_item item)
+-{
+-}
+-static inline void __count_vm_events(enum vm_event_item item, long delta)
+-{
+-}
+-static inline void all_vm_events(unsigned long *ret)
+-{
+-}
+-static inline void vm_events_fold_cpu(int cpu)
+-{
+-}
+-
+-#endif /* CONFIG_VM_EVENT_COUNTERS */
+-
+-#ifdef CONFIG_NUMA_BALANCING
+-#define count_vm_numa_event(x)     count_vm_event(x)
+-#define count_vm_numa_events(x, y) count_vm_events(x, y)
+-#else
+-#define count_vm_numa_event(x) do {} while (0)
+-#define count_vm_numa_events(x, y) do { (void)(y); } while (0)
+-#endif /* CONFIG_NUMA_BALANCING */
+-
+-#ifdef CONFIG_DEBUG_TLBFLUSH
+-#define count_vm_tlb_event(x)	   count_vm_event(x)
+-#define count_vm_tlb_events(x, y)  count_vm_events(x, y)
+-#else
+-#define count_vm_tlb_event(x)     do {} while (0)
+-#define count_vm_tlb_events(x, y) do { (void)(y); } while (0)
+-#endif
+-
+-#ifdef CONFIG_DEBUG_VM_VMACACHE
+-#define count_vm_vmacache_event(x) count_vm_event(x)
+-#else
+-#define count_vm_vmacache_event(x) do {} while (0)
+-#endif
+-
+-#define __count_zid_vm_events(item, zid, delta) \
+-	__count_vm_events(item##_NORMAL - ZONE_NORMAL + zid, delta)
+-
+ /*
+  * Zone and node-based page accounting with per cpu differentials.
+  */
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 78aa4cb06a4c..2b4f224d060e 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -375,9 +375,24 @@ struct vm_area_struct *vm_area_dup(struct vm_area_struct *orig)
+ 	return new;
+ }
+ 
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++static void __vm_area_free(struct rcu_head *head)
++{
++	struct vm_area_struct *vma = container_of(head, struct vm_area_struct,
++						  vm_rcu);
++	kmem_cache_free(vm_area_cachep, vma);
++}
++#endif
++
+ void vm_area_free(struct vm_area_struct *vma)
+ {
+ 	free_anon_vma_name(vma);
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	if (atomic_read(&vma->vm_mm->mm_users) > 1) {
++		call_rcu(&vma->vm_rcu, __vm_area_free);
++		return;
++	}
++#endif
+ 	kmem_cache_free(vm_area_cachep, vma);
+ }
+ 
+@@ -1060,7 +1075,8 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 	mm_init_owner(mm, p);
+ 	mm_init_pasid(mm);
+ 	RCU_INIT_POINTER(mm->exe_file, NULL);
+-	mmu_notifier_subscriptions_init(mm);
++	if (!mmu_notifier_subscriptions_init(mm))
++		goto fail_nopgd;
+ 	init_tlb_flush_pending(mm);
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
+ 	mm->pmd_huge_pte = NULL;
+diff --git a/kernel/locking/percpu-rwsem.c b/kernel/locking/percpu-rwsem.c
+index 70a32a576f3f..a3d37bf83c60 100644
+--- a/kernel/locking/percpu-rwsem.c
++++ b/kernel/locking/percpu-rwsem.c
+@@ -7,6 +7,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/sched.h>
+ #include <linux/sched/task.h>
++#include <linux/slab.h>
+ #include <linux/errno.h>
+ 
+ int __percpu_init_rwsem(struct percpu_rw_semaphore *sem,
+@@ -268,3 +269,34 @@ void percpu_up_write(struct percpu_rw_semaphore *sem)
+ 	rcu_sync_exit(&sem->rss);
+ }
+ EXPORT_SYMBOL_GPL(percpu_up_write);
++
++static LIST_HEAD(destroy_list);
++static DEFINE_SPINLOCK(destroy_list_lock);
++
++static void destroy_list_workfn(struct work_struct *work)
++{
++	struct percpu_rw_semaphore *sem, *sem2;
++	LIST_HEAD(to_destroy);
++
++	spin_lock(&destroy_list_lock);
++	list_splice_init(&destroy_list, &to_destroy);
++	spin_unlock(&destroy_list_lock);
++
++	if (list_empty(&to_destroy))
++		return;
++
++	list_for_each_entry_safe(sem, sem2, &to_destroy, destroy_list_entry) {
++		percpu_free_rwsem(sem);
++		kfree(sem);
++	}
++}
++
++static DECLARE_WORK(destroy_list_work, destroy_list_workfn);
++
++void percpu_rwsem_async_destroy(struct percpu_rw_semaphore *sem)
++{
++	spin_lock(&destroy_list_lock);
++	list_add_tail(&sem->destroy_list_entry, &destroy_list);
++	spin_unlock(&destroy_list_lock);
++	schedule_work(&destroy_list_work);
++}
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 7fd84e0384dc..fc9cf671d769 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -920,4 +920,26 @@ config LRU_GEN_STATS
+ 
+ source "mm/damon/Kconfig"
+ 
++config ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT
++       def_bool n
++
++config SPECULATIVE_PAGE_FAULT
++	bool "Speculative page faults"
++	default y
++	depends on ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT && MMU && SMP
++	help
++	  Try to handle user space page faults without holding the mmap lock.
++
++	  Instead of blocking writers through the use of mmap lock,
++	  the page fault handler merely verifies, at the end of the page
++	  fault, that no writers have been running concurrently with it.
++
++	  In high concurrency situations, the speculative fault handler
++	  gains a throughput advantage by avoiding having to update the
++	  mmap lock reader count.
++
++	  If the check fails due to a concurrent writer, or due to hitting
++	  an unsupported case, the fault handler falls back to classical
++	  processing using the mmap read lock.
++
+ endmenu
+diff --git a/mm/Kconfig.debug b/mm/Kconfig.debug
+index 5bd5bb097252..73b61cc95562 100644
+--- a/mm/Kconfig.debug
++++ b/mm/Kconfig.debug
+@@ -174,3 +174,10 @@ config PTDUMP_DEBUGFS
+ 	  kernel.
+ 
+ 	  If in doubt, say N.
++
++config SPECULATIVE_PAGE_FAULT_STATS
++	bool "Additional statistics for speculative page faults"
++	depends on SPECULATIVE_PAGE_FAULT
++	help
++	  Additional statistics for speculative page faults.
++	  If in doubt, say N.
+diff --git a/mm/debug.c b/mm/debug.c
+index bc9ac87f0e08..40d3f358b75c 100644
+--- a/mm/debug.c
++++ b/mm/debug.c
+@@ -220,6 +220,7 @@ void dump_mm(const struct mm_struct *mm)
+ 		mm->def_flags, &mm->def_flags
+ 	);
+ }
++EXPORT_SYMBOL(dump_mm);
+ 
+ static bool page_init_poisoning __read_mostly = true;
+ 
+diff --git a/mm/memory.c b/mm/memory.c
+index 0774b939c7da..a222bc5709ae 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2736,6 +2736,100 @@ int apply_to_existing_page_range(struct mm_struct *mm, unsigned long addr,
+ }
+ EXPORT_SYMBOL_GPL(apply_to_existing_page_range);
+ 
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++
++/*
++ * speculative_page_walk_begin() ... speculative_page_walk_end() protects
++ * against races with page table reclamation.
++ *
++ * This is similar to what fast GUP does, but fast GUP also needs to
++ * protect against races with THP page splitting, so it always needs
++ * to disable interrupts.
++ * Speculative page faults only need to protect against page table reclamation,
++ * so rcu_read_lock() is sufficient in the MMU_GATHER_RCU_TABLE_FREE case.
++ */
++#ifdef CONFIG_MMU_GATHER_RCU_TABLE_FREE
++#define speculative_page_walk_begin() rcu_read_lock()
++#define speculative_page_walk_end()   rcu_read_unlock()
++#else
++#define speculative_page_walk_begin() local_irq_disable()
++#define speculative_page_walk_end()   local_irq_enable()
++#endif
++
++bool __pte_map_lock(struct vm_fault *vmf)
++{
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	pmd_t pmdval;
++#endif
++	pte_t *pte = vmf->pte;
++	spinlock_t *ptl;
++
++	if (!(vmf->flags & FAULT_FLAG_SPECULATIVE)) {
++		vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
++		if (!pte)
++			vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
++		spin_lock(vmf->ptl);
++		return true;
++	}
++
++	speculative_page_walk_begin();
++	if (!mmap_seq_read_check(vmf->vma->vm_mm, vmf->seq,
++				 SPF_ABORT_PTE_MAP_LOCK_SEQ1))
++		goto fail;
++	/*
++	 * The mmap sequence count check guarantees that the page
++	 * tables are still valid at that point, and
++	 * speculative_page_walk_begin() ensures that they stay around.
++	 */
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	/*
++	 * We check if the pmd value is still the same to ensure that there
++	 * is not a huge collapse operation in progress in our back.
++	 */
++	pmdval = READ_ONCE(*vmf->pmd);
++	if (!pmd_same(pmdval, vmf->orig_pmd)) {
++		count_vm_spf_event(SPF_ABORT_PTE_MAP_LOCK_PMD);
++		goto fail;
++	}
++#endif
++	ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
++	if (!pte)
++		pte = pte_offset_map(vmf->pmd, vmf->address);
++	/*
++	 * Try locking the page table.
++	 *
++	 * Note that we might race against zap_pte_range() which
++	 * invalidates TLBs while holding the page table lock.
++	 * We are still under the speculative_page_walk_begin() section,
++	 * and zap_pte_range() could thus deadlock with us if we tried
++	 * using spin_lock() here.
++	 *
++	 * We also don't want to retry until spin_trylock() succeeds,
++	 * because of the starvation potential against a stream of lockers.
++	 */
++	if (unlikely(!spin_trylock(ptl))) {
++		count_vm_spf_event(SPF_ABORT_PTE_MAP_LOCK_PTL);
++		goto fail;
++	}
++	if (!mmap_seq_read_check(vmf->vma->vm_mm, vmf->seq,
++				 SPF_ABORT_PTE_MAP_LOCK_SEQ2))
++		goto unlock_fail;
++	speculative_page_walk_end();
++	vmf->pte = pte;
++	vmf->ptl = ptl;
++	return true;
++
++unlock_fail:
++	spin_unlock(ptl);
++fail:
++	if (pte)
++		pte_unmap(pte);
++	speculative_page_walk_end();
++	return false;
++}
++
++#endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
++
+ /*
+  * handle_pte_fault chooses page fault handler according to an entry which was
+  * read non-atomically.  Before making any commitment, on those architectures
+@@ -3010,20 +3104,28 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 	pte_t entry;
+ 	int page_copied = 0;
+ 	struct mmu_notifier_range range;
++	vm_fault_t ret = VM_FAULT_OOM;
+ 
+-	if (unlikely(anon_vma_prepare(vma)))
+-		goto oom;
++	if (unlikely(!vma->anon_vma)) {
++		if (vmf->flags & FAULT_FLAG_SPECULATIVE) {
++			count_vm_spf_event(SPF_ABORT_ANON_VMA);
++			ret = VM_FAULT_RETRY;
++			goto out;
++		}
++		if (__anon_vma_prepare(vma))
++			goto out;
++	}
+ 
+ 	if (is_zero_pfn(pte_pfn(vmf->orig_pte))) {
+ 		new_page = alloc_zeroed_user_highpage_movable(vma,
+ 							      vmf->address);
+ 		if (!new_page)
+-			goto oom;
++			goto out;
+ 	} else {
+ 		new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
+ 				vmf->address);
+ 		if (!new_page)
+-			goto oom;
++			goto out;
+ 
+ 		if (!cow_user_page(new_page, old_page, vmf)) {
+ 			/*
+@@ -3040,11 +3142,16 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 	}
+ 
+ 	if (mem_cgroup_charge(page_folio(new_page), mm, GFP_KERNEL))
+-		goto oom_free_new;
++		goto out_free_new;
+ 	cgroup_throttle_swaprate(new_page, GFP_KERNEL);
+ 
+ 	__SetPageUptodate(new_page);
+ 
++	if ((vmf->flags & FAULT_FLAG_SPECULATIVE) &&
++	    !mmu_notifier_trylock(mm)) {
++		ret = VM_FAULT_RETRY;
++		goto out_free_new;
++	}
+ 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, mm,
+ 				vmf->address & PAGE_MASK,
+ 				(vmf->address & PAGE_MASK) + PAGE_SIZE);
+@@ -3053,7 +3160,11 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 	/*
+ 	 * Re-check the pte - we dropped the lock
+ 	 */
+-	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
++	if (!pte_map_lock(vmf)) {
++		ret = VM_FAULT_RETRY;
++		/* put_page() will uncharge the page */
++		goto out_notify;
++	}
+ 	if (likely(pte_same(*vmf->pte, vmf->orig_pte))) {
+ 		if (old_page) {
+ 			if (!PageAnon(old_page)) {
+@@ -3128,6 +3239,8 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 	 * the above ptep_clear_flush_notify() did already call it.
+ 	 */
+ 	mmu_notifier_invalidate_range_only_end(&range);
++	if (vmf->flags & FAULT_FLAG_SPECULATIVE)
++		mmu_notifier_unlock(mm);
+ 	if (old_page) {
+ 		/*
+ 		 * Don't let another task, with possibly unlocked vma,
+@@ -3144,12 +3257,16 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 		put_page(old_page);
+ 	}
+ 	return page_copied ? VM_FAULT_WRITE : 0;
+-oom_free_new:
++out_notify:
++	mmu_notifier_invalidate_range_only_end(&range);
++	if (vmf->flags & FAULT_FLAG_SPECULATIVE)
++		mmu_notifier_unlock(mm);
++out_free_new:
+ 	put_page(new_page);
+-oom:
++out:
+ 	if (old_page)
+ 		put_page(old_page);
+-	return VM_FAULT_OOM;
++	return ret;
+ }
+ 
+ /**
+@@ -3194,6 +3311,7 @@ static vm_fault_t wp_pfn_shared(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 
++	VM_BUG_ON(vmf->flags & FAULT_FLAG_SPECULATIVE);
+ 	if (vma->vm_ops && vma->vm_ops->pfn_mkwrite) {
+ 		vm_fault_t ret;
+ 
+@@ -3214,6 +3332,8 @@ static vm_fault_t wp_page_shared(struct vm_fault *vmf)
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	vm_fault_t ret = VM_FAULT_WRITE;
+ 
++	VM_BUG_ON(vmf->flags & FAULT_FLAG_SPECULATIVE);
++
+ 	get_page(vmf->page);
+ 
+ 	if (vma->vm_ops && vma->vm_ops->page_mkwrite) {
+@@ -3265,8 +3385,15 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 
++	if (vmf->flags & FAULT_FLAG_SPECULATIVE)
++		count_vm_spf_event(SPF_ATTEMPT_WP);
++
+ 	if (userfaultfd_pte_wp(vma, *vmf->pte)) {
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
++		if (vmf->flags & FAULT_FLAG_SPECULATIVE) {
++			count_vm_spf_event(SPF_ABORT_USERFAULTFD);
++			return VM_FAULT_RETRY;
++		}
+ 		return handle_userfault(vmf, VM_UFFD_WP);
+ 	}
+ 
+@@ -3292,6 +3419,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
+ 			return wp_pfn_shared(vmf);
+ 
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
++		vmf->pte = NULL;
+ 		return wp_page_copy(vmf);
+ 	}
+ 
+@@ -3330,6 +3458,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
+ 	get_page(vmf->page);
+ 
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
++	vmf->pte = NULL;
+ 	return wp_page_copy(vmf);
+ }
+ 
+@@ -3512,6 +3641,12 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	vm_fault_t ret = 0;
+ 	void *shadow = NULL;
+ 
++	if (vmf->flags & FAULT_FLAG_SPECULATIVE) {
++		pte_unmap(vmf->pte);
++		count_vm_spf_event(SPF_ABORT_SWAP);
++		return VM_FAULT_RETRY;
++	}
++
+ 	if (!pte_unmap_same(vmf))
+ 		goto out;
+ 
+@@ -3737,10 +3872,13 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+-	struct page *page;
++	struct page *page = NULL;
+ 	vm_fault_t ret = 0;
+ 	pte_t entry;
+ 
++	if (vmf->flags & FAULT_FLAG_SPECULATIVE)
++		count_vm_spf_event(SPF_ATTEMPT_ANON);
++
+ 	/* File mapping without ->vm_ops ? */
+ 	if (vma->vm_flags & VM_SHARED)
+ 		return VM_FAULT_SIGBUS;
+@@ -3758,7 +3896,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	if (pte_alloc(vma->vm_mm, vmf->pmd))
+ 		return VM_FAULT_OOM;
+ 
+-	/* See comment in handle_pte_fault() */
++	/* See comment in __handle_mm_fault() */
+ 	if (unlikely(pmd_trans_unstable(vmf->pmd)))
+ 		return 0;
+ 
+@@ -3767,78 +3905,80 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 			!mm_forbids_zeropage(vma->vm_mm)) {
+ 		entry = pte_mkspecial(pfn_pte(my_zero_pfn(vmf->address),
+ 						vma->vm_page_prot));
+-		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+-				vmf->address, &vmf->ptl);
+-		if (!pte_none(*vmf->pte)) {
+-			update_mmu_tlb(vma, vmf->address, vmf->pte);
+-			goto unlock;
+-		}
+-		ret = check_stable_address_space(vma->vm_mm);
+-		if (ret)
+-			goto unlock;
+-		/* Deliver the page fault to userland, check inside PT lock */
+-		if (userfaultfd_missing(vma)) {
+-			pte_unmap_unlock(vmf->pte, vmf->ptl);
+-			return handle_userfault(vmf, VM_UFFD_MISSING);
++	} else {
++		/* Allocate our own private page. */
++		if (unlikely(!vma->anon_vma)) {
++			if (vmf->flags & FAULT_FLAG_SPECULATIVE) {
++				count_vm_spf_event(SPF_ABORT_ANON_VMA);
++				return VM_FAULT_RETRY;
++			}
++			if (__anon_vma_prepare(vma))
++				goto oom;
+ 		}
+-		goto setpte;
+-	}
+-
+-	/* Allocate our own private page. */
+-	if (unlikely(anon_vma_prepare(vma)))
+-		goto oom;
+-	page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
+-	if (!page)
+-		goto oom;
++		page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
++		if (!page)
++			goto oom;
+ 
+-	if (mem_cgroup_charge(page_folio(page), vma->vm_mm, GFP_KERNEL))
+-		goto oom_free_page;
+-	cgroup_throttle_swaprate(page, GFP_KERNEL);
++		if (mem_cgroup_charge(page_folio(page), vma->vm_mm, GFP_KERNEL))
++			goto oom_free_page;
++		cgroup_throttle_swaprate(page, GFP_KERNEL);
+ 
+-	/*
+-	 * The memory barrier inside __SetPageUptodate makes sure that
+-	 * preceding stores to the page contents become visible before
+-	 * the set_pte_at() write.
+-	 */
+-	__SetPageUptodate(page);
++		/*
++		 * The memory barrier inside __SetPageUptodate makes sure that
++		 * preceding stores to the page contents become visible before
++		 * the set_pte_at() write.
++		 */
++		__SetPageUptodate(page);
+ 
+-	entry = mk_pte(page, vma->vm_page_prot);
+-	entry = pte_sw_mkyoung(entry);
+-	if (vma->vm_flags & VM_WRITE)
+-		entry = pte_mkwrite(pte_mkdirty(entry));
++		entry = mk_pte(page, vma->vm_page_prot);
++		entry = pte_sw_mkyoung(entry);
++		if (vma->vm_flags & VM_WRITE)
++			entry = pte_mkwrite(pte_mkdirty(entry));
++	}
+ 
+-	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+-			&vmf->ptl);
+-	if (!pte_none(*vmf->pte)) {
+-		update_mmu_cache(vma, vmf->address, vmf->pte);
++	if (!pte_map_lock(vmf)) {
++		ret = VM_FAULT_RETRY;
+ 		goto release;
+ 	}
++	if (!pte_none(*vmf->pte)) {
++		update_mmu_tlb(vma, vmf->address, vmf->pte);
++		goto unlock;
++	}
+ 
+ 	ret = check_stable_address_space(vma->vm_mm);
+ 	if (ret)
+-		goto release;
++		goto unlock;
+ 
+ 	/* Deliver the page fault to userland, check inside PT lock */
+ 	if (userfaultfd_missing(vma)) {
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
+-		put_page(page);
++		if (page)
++			put_page(page);
++		if (vmf->flags & FAULT_FLAG_SPECULATIVE) {
++			count_vm_spf_event(SPF_ABORT_USERFAULTFD);
++			return VM_FAULT_RETRY;
++		}
+ 		return handle_userfault(vmf, VM_UFFD_MISSING);
+ 	}
+ 
+-	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+-	page_add_new_anon_rmap(page, vma, vmf->address, false);
+-	lru_cache_add_inactive_or_unevictable(page, vma);
+-setpte:
++	if (page) {
++		inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
++		page_add_new_anon_rmap(page, vma, vmf->address, false);
++		lru_cache_add_inactive_or_unevictable(page, vma);
++	}
++
+ 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+ 
+ 	/* No need to invalidate - it was non-present before */
+ 	update_mmu_cache(vma, vmf->address, vmf->pte);
++	pte_unmap_unlock(vmf->pte, vmf->ptl);
++	return 0;
+ unlock:
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+-	return ret;
+ release:
+-	put_page(page);
+-	goto unlock;
++	if (page)
++		put_page(page);
++	return ret;
+ oom_free_page:
+ 	put_page(page);
+ oom:
+@@ -4071,7 +4211,7 @@ vm_fault_t finish_fault(struct vm_fault *vmf)
+ 			return VM_FAULT_OOM;
+ 	}
+ 
+-	/* See comment in handle_pte_fault() */
++	/* See comment in __handle_mm_fault() */
+ 	if (pmd_devmap_trans_unstable(vmf->pmd))
+ 		return 0;
+ 
+@@ -4299,6 +4439,8 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
+ 	struct mm_struct *vm_mm = vma->vm_mm;
+ 	vm_fault_t ret;
+ 
++	VM_BUG_ON(vmf->flags & FAULT_FLAG_SPECULATIVE);
++
+ 	/*
+ 	 * The VMA was not fully populated on mmap() or missing VM_DONTEXPAND
+ 	 */
+@@ -4368,13 +4510,16 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
+ 	bool was_writable = pte_savedwrite(vmf->orig_pte);
+ 	int flags = 0;
+ 
++	if (vmf->flags & FAULT_FLAG_SPECULATIVE)
++		count_vm_spf_event(SPF_ATTEMPT_NUMA);
++
+ 	/*
+ 	 * The "pte" at this point cannot be used safely without
+ 	 * validation through pte_unmap_same(). It's of NUMA type but
+ 	 * the pfn may be screwed if the read is non atomic.
+ 	 */
+-	vmf->ptl = pte_lockptr(vma->vm_mm, vmf->pmd);
+-	spin_lock(vmf->ptl);
++	if (!pte_spinlock(vmf))
++		return VM_FAULT_RETRY;
+ 	if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
+ 		goto out;
+@@ -4536,53 +4681,6 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ {
+ 	pte_t entry;
+ 
+-	if (unlikely(pmd_none(*vmf->pmd))) {
+-		/*
+-		 * Leave __pte_alloc() until later: because vm_ops->fault may
+-		 * want to allocate huge page, and if we expose page table
+-		 * for an instant, it will be difficult to retract from
+-		 * concurrent faults and from rmap lookups.
+-		 */
+-		vmf->pte = NULL;
+-	} else {
+-		/*
+-		 * If a huge pmd materialized under us just retry later.  Use
+-		 * pmd_trans_unstable() via pmd_devmap_trans_unstable() instead
+-		 * of pmd_trans_huge() to ensure the pmd didn't become
+-		 * pmd_trans_huge under us and then back to pmd_none, as a
+-		 * result of MADV_DONTNEED running immediately after a huge pmd
+-		 * fault in a different thread of this mm, in turn leading to a
+-		 * misleading pmd_trans_huge() retval. All we have to ensure is
+-		 * that it is a regular pmd that we can walk with
+-		 * pte_offset_map() and we can do that through an atomic read
+-		 * in C, which is what pmd_trans_unstable() provides.
+-		 */
+-		if (pmd_devmap_trans_unstable(vmf->pmd))
+-			return 0;
+-		/*
+-		 * A regular pmd is established and it can't morph into a huge
+-		 * pmd from under us anymore at this point because we hold the
+-		 * mmap_lock read mode and khugepaged takes it in write mode.
+-		 * So now it's safe to run pte_offset_map().
+-		 */
+-		vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
+-		vmf->orig_pte = *vmf->pte;
+-
+-		/*
+-		 * some architectures can have larger ptes than wordsize,
+-		 * e.g.ppc44x-defconfig has CONFIG_PTE_64BIT=y and
+-		 * CONFIG_32BIT=y, so READ_ONCE cannot guarantee atomic
+-		 * accesses.  The code below just needs a consistent view
+-		 * for the ifs and we later double check anyway with the
+-		 * ptl lock held. So here a barrier will do.
+-		 */
+-		barrier();
+-		if (pte_none(vmf->orig_pte)) {
+-			pte_unmap(vmf->pte);
+-			vmf->pte = NULL;
+-		}
+-	}
+-
+ 	if (!vmf->pte) {
+ 		if (vma_is_anonymous(vmf->vma))
+ 			return do_anonymous_page(vmf);
+@@ -4596,8 +4694,11 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
+ 		return do_numa_page(vmf);
+ 
+-	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
+-	spin_lock(vmf->ptl);
++	if (vmf->flags & FAULT_FLAG_SPECULATIVE)
++		count_vm_spf_event(SPF_ATTEMPT_PTE);
++
++	if (!pte_spinlock(vmf))
++		return VM_FAULT_RETRY;
+ 	entry = vmf->orig_pte;
+ 	if (unlikely(!pte_same(*vmf->pte, entry))) {
+ 		update_mmu_tlb(vmf->vma, vmf->address, vmf->pte);
+@@ -4637,7 +4738,7 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+  * return value.  See filemap_fault() and __folio_lock_or_retry().
+  */
+ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+-		unsigned long address, unsigned int flags)
++		unsigned long address, unsigned int flags, unsigned long seq)
+ {
+ 	struct vm_fault vmf = {
+ 		.vma = vma,
+@@ -4652,6 +4753,87 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 	p4d_t *p4d;
+ 	vm_fault_t ret;
+ 
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	if (flags & FAULT_FLAG_SPECULATIVE) {
++		pgd_t pgdval;
++		p4d_t p4dval;
++		pud_t pudval;
++
++		vmf.seq = seq;
++
++		speculative_page_walk_begin();
++		pgd = pgd_offset(mm, address);
++		pgdval = READ_ONCE(*pgd);
++		if (pgd_none(pgdval) || unlikely(pgd_bad(pgdval))) {
++			count_vm_spf_event(SPF_ABORT_PUD);
++			goto spf_fail;
++		}
++
++		p4d = p4d_offset(pgd, address);
++		p4dval = READ_ONCE(*p4d);
++		if (p4d_none(p4dval) || unlikely(p4d_bad(p4dval))) {
++			count_vm_spf_event(SPF_ABORT_PUD);
++			goto spf_fail;
++		}
++
++		vmf.pud = pud_offset(p4d, address);
++		pudval = READ_ONCE(*vmf.pud);
++		if (pud_none(pudval) || unlikely(pud_bad(pudval)) ||
++		    unlikely(pud_trans_huge(pudval)) ||
++		    unlikely(pud_devmap(pudval))) {
++			count_vm_spf_event(SPF_ABORT_PUD);
++			goto spf_fail;
++		}
++
++		vmf.pmd = pmd_offset(vmf.pud, address);
++		vmf.orig_pmd = READ_ONCE(*vmf.pmd);
++
++		/*
++		 * pmd_none could mean that a hugepage collapse is in
++		 * progress in our back as collapse_huge_page() mark
++		 * it before invalidating the pte (which is done once
++		 * the IPI is catched by all CPU and we have interrupt
++		 * disabled).  For this reason we cannot handle THP in
++		 * a speculative way since we can't safely identify an
++		 * in progress collapse operation done in our back on
++		 * that PMD.
++		 */
++		if (unlikely(pmd_none(vmf.orig_pmd) ||
++			     is_swap_pmd(vmf.orig_pmd) ||
++			     pmd_trans_huge(vmf.orig_pmd) ||
++			     pmd_devmap(vmf.orig_pmd))) {
++			count_vm_spf_event(SPF_ABORT_PMD);
++			goto spf_fail;
++		}
++
++		/*
++		 * The above does not allocate/instantiate page-tables because
++		 * doing so would lead to the possibility of instantiating
++		 * page-tables after free_pgtables() -- and consequently
++		 * leaking them.
++		 *
++		 * The result is that we take at least one non-speculative
++		 * fault per PMD in order to instantiate it.
++		 */
++
++		vmf.pte = pte_offset_map(vmf.pmd, address);
++		vmf.orig_pte = READ_ONCE(*vmf.pte);
++		barrier();
++		if (pte_none(vmf.orig_pte)) {
++			pte_unmap(vmf.pte);
++			vmf.pte = NULL;
++		}
++
++		speculative_page_walk_end();
++
++		return handle_pte_fault(&vmf);
++
++	spf_fail:
++		speculative_page_walk_end();
++		return VM_FAULT_RETRY;
++	}
++#endif	/* CONFIG_SPECULATIVE_PAGE_FAULT */
++
+ 	pgd = pgd_offset(mm, address);
+ 	p4d = p4d_alloc(mm, pgd, address);
+ 	if (!p4d)
+@@ -4722,6 +4904,53 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 		}
+ 	}
+ 
++	if (unlikely(pmd_none(*vmf.pmd))) {
++		/*
++		 * Leave __pte_alloc() until later: because vm_ops->fault may
++		 * want to allocate huge page, and if we expose page table
++		 * for an instant, it will be difficult to retract from
++		 * concurrent faults and from rmap lookups.
++		 */
++		vmf.pte = NULL;
++	} else {
++		/*
++		 * If a huge pmd materialized under us just retry later.  Use
++		 * pmd_trans_unstable() via pmd_devmap_trans_unstable() instead
++		 * of pmd_trans_huge() to ensure the pmd didn't become
++		 * pmd_trans_huge under us and then back to pmd_none, as a
++		 * result of MADV_DONTNEED running immediately after a huge pmd
++		 * fault in a different thread of this mm, in turn leading to a
++		 * misleading pmd_trans_huge() retval. All we have to ensure is
++		 * that it is a regular pmd that we can walk with
++		 * pte_offset_map() and we can do that through an atomic read
++		 * in C, which is what pmd_trans_unstable() provides.
++		 */
++		if (pmd_devmap_trans_unstable(vmf.pmd))
++			return 0;
++		/*
++		 * A regular pmd is established and it can't morph into a huge
++		 * pmd from under us anymore at this point because we hold the
++		 * mmap_lock read mode and khugepaged takes it in write mode.
++		 * So now it's safe to run pte_offset_map().
++		 */
++		vmf.pte = pte_offset_map(vmf.pmd, vmf.address);
++		vmf.orig_pte = *vmf.pte;
++
++		/*
++		 * some architectures can have larger ptes than wordsize,
++		 * e.g.ppc44x-defconfig has CONFIG_PTE_64BIT=y and
++		 * CONFIG_32BIT=y, so READ_ONCE cannot guarantee atomic
++		 * accesses.  The code below just needs a consistent view
++		 * for the ifs and we later double check anyway with the
++		 * ptl lock held. So here a barrier will do.
++		 */
++		barrier();
++		if (pte_none(vmf.orig_pte)) {
++			pte_unmap(vmf.pte);
++			vmf.pte = NULL;
++		}
++	}
++
+ 	return handle_pte_fault(&vmf);
+ }
+ 
+@@ -4813,11 +5042,14 @@ static void lru_gen_exit_fault(void)
+  * The mmap_lock may have been released depending on flags and our
+  * return value.  See filemap_fault() and __folio_lock_or_retry().
+  */
+-vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+-			   unsigned int flags, struct pt_regs *regs)
++vm_fault_t do_handle_mm_fault(struct vm_area_struct *vma,
++		unsigned long address, unsigned int flags,
++		unsigned long seq, struct pt_regs *regs)
+ {
+ 	vm_fault_t ret;
+ 
++	VM_BUG_ON((flags & FAULT_FLAG_SPECULATIVE) && !vma_is_anonymous(vma));
++
+ 	__set_current_state(TASK_RUNNING);
+ 
+ 	count_vm_event(PGFAULT);
+@@ -4840,10 +5072,12 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 
+ 	lru_gen_enter_fault(vma);
+ 
+-	if (unlikely(is_vm_hugetlb_page(vma)))
++	if (unlikely(is_vm_hugetlb_page(vma))) {
++		VM_BUG_ON(flags & FAULT_FLAG_SPECULATIVE);
+ 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
+-	else
+-		ret = __handle_mm_fault(vma, address, flags);
++	} else {
++		ret = __handle_mm_fault(vma, address, flags, seq);
++	}
+ 
+ 	lru_gen_exit_fault();
+ 
+@@ -4863,7 +5097,7 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(handle_mm_fault);
++EXPORT_SYMBOL_GPL(do_handle_mm_fault);
+ 
+ #ifndef __PAGETABLE_P4D_FOLDED
+ /*
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 18875c216f8d..afcf8f939e6d 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2276,12 +2276,11 @@ get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
+ EXPORT_SYMBOL(get_unmapped_area);
+ 
+ /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+-struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
++struct vm_area_struct *__find_vma(struct mm_struct *mm, unsigned long addr)
+ {
+ 	struct rb_node *rb_node;
+ 	struct vm_area_struct *vma;
+ 
+-	mmap_assert_locked(mm);
+ 	/* Check the cache first. */
+ 	vma = vmacache_find(mm, addr);
+ 	if (likely(vma))
+@@ -2308,7 +2307,7 @@ struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+ 	return vma;
+ }
+ 
+-EXPORT_SYMBOL(find_vma);
++EXPORT_SYMBOL(__find_vma);
+ 
+ /*
+  * Same as find_vma, but also return a pointer to the previous VMA in *pprev.
+@@ -3594,6 +3593,10 @@ int mm_take_all_locks(struct mm_struct *mm)
+ 
+ 	mutex_lock(&mm_all_locks_mutex);
+ 
++#if defined(CONFIG_MMU_NOTIFIER) && defined(CONFIG_SPECULATIVE_PAGE_FAULT)
++	percpu_down_write(mm->mmu_notifier_lock);
++#endif
++
+ 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+ 		if (signal_pending(current))
+ 			goto out_unlock;
+@@ -3681,6 +3684,10 @@ void mm_drop_all_locks(struct mm_struct *mm)
+ 			vm_unlock_mapping(vma->vm_file->f_mapping);
+ 	}
+ 
++#if defined(CONFIG_MMU_NOTIFIER) && defined(CONFIG_SPECULATIVE_PAGE_FAULT)
++	percpu_up_write(mm->mmu_notifier_lock);
++#endif
++
+ 	mutex_unlock(&mm_all_locks_mutex);
+ }
+ 
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 9e9536df51b5..dca9109aa710 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1391,6 +1391,31 @@ const char * const vmstat_text[] = {
+ 	"direct_map_level2_splits",
+ 	"direct_map_level3_splits",
+ #endif
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
++	"spf_attempt",
++	"spf_abort",
++#endif
++#ifdef CONFIG_SPECULATIVE_PAGE_FAULT_STATS
++	"SPF_ABORT_ODD",
++	"SPF_ABORT_UNMAPPED",
++	"SPF_ABORT_NO_SPECULATE",
++	"SPF_ABORT_VMA_COPY",
++	"SPF_ABORT_ACCESS_ERROR",
++	"SPF_ABORT_PUD",
++	"SPF_ABORT_PMD",
++	"SPF_ABORT_ANON_VMA",
++	"SPF_ABORT_PTE_MAP_LOCK_SEQ1",
++	"SPF_ABORT_PTE_MAP_LOCK_PMD",
++	"SPF_ABORT_PTE_MAP_LOCK_PTL",
++	"SPF_ABORT_PTE_MAP_LOCK_SEQ2",
++	"SPF_ABORT_USERFAULTFD",
++	"SPF_ABORT_FAULT",
++	"SPF_ABORT_SWAP",
++	"SPF_ATTEMPT_ANON",
++	"SPF_ATTEMPT_NUMA",
++	"SPF_ATTEMPT_PTE",
++	"SPF_ATTEMPT_WP",
++#endif
+ #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
+ };
+ #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA || CONFIG_MEMCG */
+-- 
+2.36.0.rc2.10.g1ac7422e39
+
