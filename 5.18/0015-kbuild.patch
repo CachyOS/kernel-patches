@@ -1,0 +1,2380 @@
+From 3d85e7a7affb2c01b8ee084ca91c0933f2e33745 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Fri, 29 Apr 2022 22:54:47 +0200
+Subject: [PATCH] kbuild
+
+---
+ .gitignore                                |   2 +
+ Documentation/kbuild/kconfig-language.rst |   6 +
+ Makefile                                  |  10 +-
+ certs/Makefile                            |   4 +-
+ kernel/gen_kheaders.sh                    |   2 +-
+ scripts/Kbuild.include                    |   4 +
+ scripts/Makefile                          |   4 +-
+ scripts/Makefile.build                    | 183 ++-----
+ scripts/Makefile.extrawarn                |  13 +-
+ scripts/Makefile.lib                      |  13 +-
+ scripts/Makefile.modfinal                 |   6 +-
+ scripts/Makefile.modpost                  |   9 +-
+ scripts/adjust_autoksyms.sh               |   2 +-
+ scripts/dummy-tools/pahole                |   4 +
+ scripts/gen_autoksyms.sh                  |  18 +-
+ scripts/kconfig/gconf-cfg.sh              |  12 +-
+ scripts/kconfig/mconf-cfg.sh              |  16 +-
+ scripts/kconfig/nconf-cfg.sh              |  16 +-
+ scripts/kconfig/qconf-cfg.sh              |  14 +-
+ scripts/link-vmlinux.sh                   |  38 +-
+ scripts/mod/file2alias.c                  |   2 -
+ scripts/mod/list.h                        | 336 +++++++++++++
+ scripts/mod/modpost.c                     | 570 +++++++++++++---------
+ scripts/mod/modpost.h                     |  31 +-
+ scripts/mod/sumversion.c                  |  11 +-
+ tools/objtool/Makefile                    |   4 +-
+ usr/include/Makefile                      |   2 +-
+ 27 files changed, 849 insertions(+), 483 deletions(-)
+ create mode 100755 scripts/dummy-tools/pahole
+ create mode 100644 scripts/mod/list.h
+
+diff --git a/.gitignore b/.gitignore
+index 7afd412dadd2..f9dad6b917e6 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -42,9 +42,11 @@
+ *.so.dbg
+ *.su
+ *.symtypes
++*.symver.lds
+ *.symversions
+ *.tab.[ch]
+ *.tar
++*.usyms
+ *.xz
+ *.zst
+ Module.symvers
+diff --git a/Documentation/kbuild/kconfig-language.rst b/Documentation/kbuild/kconfig-language.rst
+index 93a5b6e1fabd..a7173843a294 100644
+--- a/Documentation/kbuild/kconfig-language.rst
++++ b/Documentation/kbuild/kconfig-language.rst
+@@ -693,6 +693,8 @@ in documenting basic Kconfig syntax a more precise definition of Kconfig
+ semantics is welcomed. One project deduced Kconfig semantics through
+ the use of the xconfig configurator [1]_. Work should be done to confirm if
+ the deduced semantics matches our intended Kconfig design goals.
++Another project formalized a denotational semantics of a core subset of
++the Kconfig language [10]_.
+ 
+ Having well defined semantics can be useful for tools for practical
+ evaluation of dependencies, for instance one such case was work to
+@@ -700,6 +702,8 @@ express in boolean abstraction of the inferred semantics of Kconfig to
+ translate Kconfig logic into boolean formulas and run a SAT solver on this to
+ find dead code / features (always inactive), 114 dead features were found in
+ Linux using this methodology [1]_ (Section 8: Threats to validity).
++The kismet tool, based on the semantics in [10]_, finds abuses of reverse
++dependencies and has led to dozens of committed fixes to Linux Kconfig files [11]_.
+ 
+ Confirming this could prove useful as Kconfig stands as one of the leading
+ industrial variability modeling languages [1]_ [2]_. Its study would help
+@@ -738,3 +742,5 @@ https://kernelnewbies.org/KernelProjects/kconfig-sat
+ .. [7] https://vamos.cs.fau.de
+ .. [8] https://undertaker.cs.fau.de
+ .. [9] https://www4.cs.fau.de/Publications/2011/tartler_11_eurosys.pdf
++.. [10] https://paulgazzillo.com/papers/esecfse21.pdf
++.. [11] https://github.com/paulgazz/kmax
+diff --git a/Makefile b/Makefile
+index 8c7de9a72ea2..0779db3d1c0c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -436,6 +436,7 @@ else
+ HOSTCC	= gcc
+ HOSTCXX	= g++
+ endif
++HOSTPKG_CONFIG	= pkg-config
+ 
+ KBUILD_USERHOSTCFLAGS := -Wall -Wmissing-prototypes -Wstrict-prototypes \
+ 			 -O2 -fomit-frame-pointer -std=gnu11 \
+@@ -533,7 +534,7 @@ KBUILD_LDFLAGS_MODULE :=
+ KBUILD_LDFLAGS :=
+ CLANG_FLAGS :=
+ 
+-export ARCH SRCARCH CONFIG_SHELL BASH HOSTCC KBUILD_HOSTCFLAGS CROSS_COMPILE LD CC
++export ARCH SRCARCH CONFIG_SHELL BASH HOSTCC KBUILD_HOSTCFLAGS CROSS_COMPILE LD CC HOSTPKG_CONFIG
+ export CPP AR NM STRIP OBJCOPY OBJDUMP READELF PAHOLE RESOLVE_BTFIDS LEX YACC AWK INSTALLKERNEL
+ export PERL PYTHON3 CHECK CHECKFLAGS MAKE UTS_MACHINE HOSTCXX
+ export KGZIP KBZIP2 KLZOP LZMA LZ4 XZ ZSTD
+@@ -1649,6 +1650,7 @@ help:
+ 	@echo  '		1: warnings which may be relevant and do not occur too often'
+ 	@echo  '		2: warnings which occur quite often but may still be relevant'
+ 	@echo  '		3: more obscure warnings, can most likely be ignored'
++	@echo  '		e: warnings are being treated as errors'
+ 	@echo  '		Multiple levels can be combined with W=12 or W=123'
+ 	@echo  ''
+ 	@echo  'Execute "make" or "make all" to build all targets marked with [*] '
+@@ -1791,7 +1793,8 @@ ifdef single-build
+ 
+ # .ko is special because modpost is needed
+ single-ko := $(sort $(filter %.ko, $(MAKECMDGOALS)))
+-single-no-ko := $(sort $(patsubst %.ko,%.mod, $(MAKECMDGOALS)))
++single-no-ko := $(filter-out $(single-ko), $(MAKECMDGOALS)) \
++		$(foreach x, o mod, $(patsubst %.ko, %.$x, $(single-ko)))
+ 
+ $(single-ko): single_modpost
+ 	@:
+@@ -1847,7 +1850,7 @@ clean: $(clean-dirs)
+ 		-o -name '*.ko.*' \
+ 		-o -name '*.dtb' -o -name '*.dtbo' -o -name '*.dtb.S' -o -name '*.dt.yaml' \
+ 		-o -name '*.dwo' -o -name '*.lst' \
+-		-o -name '*.su' -o -name '*.mod' \
++		-o -name '*.su' -o -name '*.mod' -o -name '*.usyms' \
+ 		-o -name '.*.d' -o -name '.*.tmp' -o -name '*.mod.c' \
+ 		-o -name '*.lex.c' -o -name '*.tab.[ch]' \
+ 		-o -name '*.asn1.[ch]' \
+@@ -1856,6 +1859,7 @@ clean: $(clean-dirs)
+ 		-o -name '*.c.[012]*.*' \
+ 		-o -name '*.ll' \
+ 		-o -name '*.gcno' \
++		-o -name '*.symver.lds' \
+ 		-o -name '*.*.symversions' \) -type f -print | xargs rm -f
+ 
+ # Generate tags for editors
+diff --git a/certs/Makefile b/certs/Makefile
+index d8443cfb1c40..e4a0488133f0 100644
+--- a/certs/Makefile
++++ b/certs/Makefile
+@@ -74,5 +74,5 @@ targets += x509_revocation_list
+ 
+ hostprogs := extract-cert
+ 
+-HOSTCFLAGS_extract-cert.o = $(shell pkg-config --cflags libcrypto 2> /dev/null)
+-HOSTLDLIBS_extract-cert = $(shell pkg-config --libs libcrypto 2> /dev/null || echo -lcrypto)
++HOSTCFLAGS_extract-cert.o = $(shell $(HOSTPKG_CONFIG) --cflags libcrypto 2> /dev/null)
++HOSTLDLIBS_extract-cert = $(shell $(HOSTPKG_CONFIG) --libs libcrypto 2> /dev/null || echo -lcrypto)
+diff --git a/kernel/gen_kheaders.sh b/kernel/gen_kheaders.sh
+index 1966a749e0d9..0c78e64f747d 100755
+--- a/kernel/gen_kheaders.sh
++++ b/kernel/gen_kheaders.sh
+@@ -74,7 +74,7 @@ fi
+ # of tree builds having stale headers in srctree. Just silence CPIO for now.
+ for f in $dir_list;
+ 	do find "$f" -name "*.h";
+-done | cpio --quiet -pd $cpio_dir >/dev/null 2>&1
++done | cpio --quiet -pdu $cpio_dir >/dev/null 2>&1
+ 
+ # Remove comments except SDPX lines
+ find $cpio_dir -type f -print0 |
+diff --git a/scripts/Kbuild.include b/scripts/Kbuild.include
+index 3514c2149e9d..455a0a6ce12d 100644
+--- a/scripts/Kbuild.include
++++ b/scripts/Kbuild.include
+@@ -15,6 +15,10 @@ pound := \#
+ # Name of target with a '.' as filename prefix. foo/bar.o => foo/.bar.o
+ dot-target = $(dir $@).$(notdir $@)
+ 
++###
++# Name of target with a '.tmp_' as filename prefix. foo/bar.o => foo/.tmp_bar.o
++tmp-target = $(dir $@).tmp_$(notdir $@)
++
+ ###
+ # The temporary file to save gcc -MMD generated dependencies must not
+ # contain a comma
+diff --git a/scripts/Makefile b/scripts/Makefile
+index ce5aa9030b74..f084f08ed176 100644
+--- a/scripts/Makefile
++++ b/scripts/Makefile
+@@ -14,8 +14,8 @@ hostprogs-always-$(CONFIG_SYSTEM_EXTRA_CERTIFICATE)	+= insert-sys-cert
+ HOSTCFLAGS_sorttable.o = -I$(srctree)/tools/include
+ HOSTLDLIBS_sorttable = -lpthread
+ HOSTCFLAGS_asn1_compiler.o = -I$(srctree)/include
+-HOSTCFLAGS_sign-file.o = $(shell pkg-config --cflags libcrypto 2> /dev/null)
+-HOSTLDLIBS_sign-file = $(shell pkg-config --libs libcrypto 2> /dev/null || echo -lcrypto)
++HOSTCFLAGS_sign-file.o = $(shell $(HOSTPKG_CONFIG) --cflags libcrypto 2> /dev/null)
++HOSTLDLIBS_sign-file = $(shell $(HOSTPKG_CONFIG) --libs libcrypto 2> /dev/null || echo -lcrypto)
+ 
+ ifdef CONFIG_UNWINDER_ORC
+ ifeq ($(ARCH),x86_64)
+diff --git a/scripts/Makefile.build b/scripts/Makefile.build
+index 9717e6f6fb31..fe4d3a908dd0 100644
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -85,11 +85,8 @@ ifdef need-builtin
+ targets-for-builtin += $(obj)/built-in.a
+ endif
+ 
+-targets-for-modules := $(patsubst %.o, %.mod, $(filter %.o, $(obj-m)))
+-
+-ifneq ($(CONFIG_LTO_CLANG)$(CONFIG_X86_KERNEL_IBT),)
+-targets-for-modules += $(patsubst %.o, %.prelink.o, $(filter %.o, $(obj-m)))
+-endif
++targets-for-modules := $(foreach x, o mod $(if $(CONFIG_TRIM_UNUSED_KSYMS), usyms), \
++				$(patsubst %.o, %.$x, $(filter %.o, $(obj-m))))
+ 
+ ifdef need-modorder
+ targets-for-modules += $(obj)/modules.order
+@@ -125,18 +122,17 @@ cmd_cpp_i_c       = $(CPP) $(c_flags) -o $@ $<
+ $(obj)/%.i: $(src)/%.c FORCE
+ 	$(call if_changed_dep,cpp_i_c)
+ 
++genksyms = scripts/genksyms/genksyms		\
++	$(if $(1), -T $(2))			\
++	$(if $(CONFIG_MODULE_REL_CRCS), -R)	\
++	$(if $(KBUILD_PRESERVE), -p)		\
++	-r $(or $(wildcard $(2:.symtypes=.symref)), /dev/null)
++
+ # These mirror gensymtypes_S and co below, keep them in synch.
+-cmd_gensymtypes_c =                                                         \
+-    $(CPP) -D__GENKSYMS__ $(c_flags) $< |                                   \
+-    scripts/genksyms/genksyms $(if $(1), -T $(2))                           \
+-     $(patsubst y,-R,$(CONFIG_MODULE_REL_CRCS))                             \
+-     $(if $(KBUILD_PRESERVE),-p)                                            \
+-     -r $(firstword $(wildcard $(2:.symtypes=.symref) /dev/null))
++cmd_gensymtypes_c = $(CPP) -D__GENKSYMS__ $(c_flags) $< | $(genksyms)
+ 
+ quiet_cmd_cc_symtypes_c = SYM $(quiet_modtag) $@
+-cmd_cc_symtypes_c =                                                         \
+-    $(call cmd_gensymtypes_c,true,$@) >/dev/null;                           \
+-    test -s $@ || rm -f $@
++      cmd_cc_symtypes_c = $(call cmd_gensymtypes_c,true,$@) >/dev/null
+ 
+ $(obj)/%.symtypes : $(src)/%.c FORCE
+ 	$(call cmd,cc_symtypes_c)
+@@ -153,8 +149,16 @@ $(obj)/%.ll: $(src)/%.c FORCE
+ # The C file is compiled and updated dependency information is generated.
+ # (See cmd_cc_o_c + relevant part of rule_cc_o_c)
+ 
++is-single-obj-m = $(if $(part-of-module),$(if $(filter $@, $(obj-m)),y))
++
++ifdef CONFIG_LTO_CLANG
++cmd_ld_single = $(if $(is-single-obj-m), ; $(LD) $(ld_flags) -r -o $(tmp-target) $@; mv $(tmp-target) $@)
++endif
++
+ quiet_cmd_cc_o_c = CC $(quiet_modtag)  $@
+-      cmd_cc_o_c = $(CC) $(c_flags) -c -o $@ $< $(cmd_objtool)
++      cmd_cc_o_c = $(CC) $(c_flags) -c -o $@ $< \
++		$(cmd_ld_single) \
++		$(cmd_objtool)
+ 
+ ifdef CONFIG_MODVERSIONS
+ # When module versioning is enabled the following steps are executed:
+@@ -162,35 +166,21 @@ ifdef CONFIG_MODVERSIONS
+ # o if <file>.o doesn't contain a __ksymtab version, i.e. does
+ #   not export symbols, it's done.
+ # o otherwise, we calculate symbol versions using the good old
+-#   genksyms on the preprocessed source and postprocess them in a way
+-#   that they are usable as a linker script
+-# o generate .tmp_<file>.o from <file>.o using the linker to
+-#   replace the unresolved symbols __crc_exported_symbol with
+-#   the actual value of the checksum generated by genksyms
+-# o remove .tmp_<file>.o to <file>.o
++#   genksyms on the preprocessed source and dump them into .cmd file.
++#   modpost will parse .cmd files to retrieve versions to create linker
++#   scripts that are fed to the final linking of vmlinux or modules.
+ 
+-ifdef CONFIG_LTO_CLANG
+ # Generate .o.symversions files for each .o with exported symbols, and link these
+ # to the kernel and/or modules at the end.
+-cmd_modversions_c =								\
++gen_symversions =								\
+ 	if $(NM) $@ 2>/dev/null | grep -q __ksymtab; then			\
+-		$(call cmd_gensymtypes_c,$(KBUILD_SYMTYPES),$(@:.o=.symtypes))	\
+-		    > $@.symversions;						\
+-	else									\
+-		rm -f $@.symversions;						\
+-	fi;
+-else
+-cmd_modversions_c =								\
+-	if $(OBJDUMP) -h $@ | grep -q __ksymtab; then				\
+-		$(call cmd_gensymtypes_c,$(KBUILD_SYMTYPES),$(@:.o=.symtypes))	\
+-		    > $(@D)/.tmp_$(@F:.o=.ver);					\
+-										\
+-		$(LD) $(KBUILD_LDFLAGS) -r -o $(@D)/.tmp_$(@F) $@ 		\
+-			-T $(@D)/.tmp_$(@F:.o=.ver);				\
+-		mv -f $(@D)/.tmp_$(@F) $@;					\
+-		rm -f $(@D)/.tmp_$(@F:.o=.ver);					\
++		echo >> $(dot-target).cmd ;					\
++		$(call cmd_gensymtypes_$(1),$(KBUILD_SYMTYPES),$(@:.o=.symtypes)) | \
++		sed 's/\(.*\) = \(.*\);/$(pound)\1=\2/' >> $(dot-target).cmd ; \
+ 	fi
+-endif
++
++cmd_gen_symversions_c =	$(call gen_symversions,c)
++
+ endif
+ 
+ ifdef CONFIG_FTRACE_MCOUNT_USE_RECORDMCOUNT
+@@ -242,28 +232,20 @@ cmd_gen_objtooldep = $(if $(objtool-enabled), { echo ; echo '$@: $$(wildcard $(o
+ 
+ endif # CONFIG_STACK_VALIDATION
+ 
+-ifneq ($(CONFIG_LTO_CLANG)$(CONFIG_X86_KERNEL_IBT),)
+-
+-# Skip objtool for LLVM bitcode
+-$(obj)/%.o: objtool-enabled :=
+-
+-else
+ 
+ # 'OBJECT_FILES_NON_STANDARD := y': skip objtool checking for a directory
+ # 'OBJECT_FILES_NON_STANDARD_foo.o := 'y': skip objtool checking for a file
+ # 'OBJECT_FILES_NON_STANDARD_foo.o := 'n': override directory skip for a file
+ 
+-$(obj)/%.o: objtool-enabled = $(if $(filter-out y%, \
+-	$(OBJECT_FILES_NON_STANDARD_$(basetarget).o)$(OBJECT_FILES_NON_STANDARD)n),y)
++is-standard-object = $(if $(filter-out y%, $(OBJECT_FILES_NON_STANDARD_$(basetarget).o)$(OBJECT_FILES_NON_STANDARD)n),y)
+ 
+-endif
++delay-objtool := $(or $(CONFIG_LTO_CLANG),$(CONFIG_X86_KERNEL_IBT))
++
++$(obj)/%.o: objtool-enabled = $(if $(is-standard-object),$(if $(delay-objtool),$(is-single-obj-m),y))
+ 
+ ifdef CONFIG_TRIM_UNUSED_KSYMS
+ cmd_gen_ksymdeps = \
+ 	$(CONFIG_SHELL) $(srctree)/scripts/gen_ksymdeps.sh $@ >> $(dot-target).cmd
+-
+-# List module undefined symbols
+-undefined_syms = $(NM) $< | $(AWK) '$$1 == "U" { printf("%s%s", x++ ? " " : "", $$2) }';
+ endif
+ 
+ define rule_cc_o_c
+@@ -272,7 +254,7 @@ define rule_cc_o_c
+ 	$(call cmd,checksrc)
+ 	$(call cmd,checkdoc)
+ 	$(call cmd,gen_objtooldep)
+-	$(call cmd,modversions_c)
++	$(call cmd,gen_symversions_c)
+ 	$(call cmd,record_mcount)
+ endef
+ 
+@@ -280,7 +262,7 @@ define rule_as_o_S
+ 	$(call cmd_and_fixdep,as_o_S)
+ 	$(call cmd,gen_ksymdeps)
+ 	$(call cmd,gen_objtooldep)
+-	$(call cmd,modversions_S)
++	$(call cmd,gen_symversions_S)
+ endef
+ 
+ # Built-in and composite module parts
+@@ -288,33 +270,17 @@ $(obj)/%.o: $(src)/%.c $(recordmcount_source) FORCE
+ 	$(call if_changed_rule,cc_o_c)
+ 	$(call cmd,force_checksrc)
+ 
+-ifneq ($(CONFIG_LTO_CLANG)$(CONFIG_X86_KERNEL_IBT),)
+-# Module .o files may contain LLVM bitcode, compile them into native code
+-# before ELF processing
+-quiet_cmd_cc_prelink_modules = LD [M]  $@
+-      cmd_cc_prelink_modules =						\
+-	$(LD) $(ld_flags) -r -o $@					\
+-               $(shell [ -s $(@:.prelink.o=.o.symversions) ] &&		\
+-                       echo -T $(@:.prelink.o=.o.symversions))		\
+-		--whole-archive $(filter-out FORCE,$^)			\
+-		$(cmd_objtool)
+-
+-# objtool was skipped for LLVM bitcode, run it now that we have compiled
+-# modules into native code
+-$(obj)/%.prelink.o: objtool-enabled = y
+-$(obj)/%.prelink.o: part-of-module := y
++cmd_mod = echo $(addprefix $(obj)/, $(call real-search, $*.o, .o, -objs -y -m)) | \
++	$(AWK) -v RS='( |\n)' '!x[$$0]++' > $@
+ 
+-$(obj)/%.prelink.o: $(obj)/%.o FORCE
+-	$(call if_changed,cc_prelink_modules)
+-endif
++$(obj)/%.mod: FORCE
++	$(call if_changed,mod)
+ 
+-cmd_mod = { \
+-	echo $(if $($*-objs)$($*-y)$($*-m), $(addprefix $(obj)/, $($*-objs) $($*-y) $($*-m)), $(@:.mod=.o)); \
+-	$(undefined_syms) echo; \
+-	} > $@
++# List module undefined symbols
++cmd_undefined_syms = $(NM) $< | sed -n 's/^  *U //p' > $@
+ 
+-$(obj)/%.mod: $(obj)/%$(mod-prelink-ext).o FORCE
+-	$(call if_changed,mod)
++$(obj)/%.usyms: $(obj)/%.o FORCE
++	$(call if_changed,undefined_syms)
+ 
+ quiet_cmd_cc_lst_c = MKLST   $@
+       cmd_cc_lst_c = $(CC) $(c_flags) -g -c -o $*.o $< && \
+@@ -344,16 +310,10 @@ cmd_gensymtypes_S =                                                         \
+     $(CPP) $(a_flags) $< |                                                  \
+      grep "\<___EXPORT_SYMBOL\>" |                                          \
+      sed 's/.*___EXPORT_SYMBOL[[:space:]]*\([a-zA-Z0-9_]*\)[[:space:]]*,.*/EXPORT_SYMBOL(\1);/' ; } | \
+-    $(CPP) -D__GENKSYMS__ $(c_flags) -xc - |                                \
+-    scripts/genksyms/genksyms $(if $(1), -T $(2))                           \
+-     $(patsubst y,-R,$(CONFIG_MODULE_REL_CRCS))                             \
+-     $(if $(KBUILD_PRESERVE),-p)                                            \
+-     -r $(firstword $(wildcard $(2:.symtypes=.symref) /dev/null))
++    $(CPP) -D__GENKSYMS__ $(c_flags) -xc - | $(genksyms)
+ 
+ quiet_cmd_cc_symtypes_S = SYM $(quiet_modtag) $@
+-cmd_cc_symtypes_S =                                                         \
+-    $(call cmd_gensymtypes_S,true,$@) >/dev/null;                           \
+-    test -s $@ || rm -f $@
++      cmd_cc_symtypes_S = $(call cmd_gensymtypes_S,true,$@) >/dev/null
+ 
+ $(obj)/%.symtypes : $(src)/%.S FORCE
+ 	$(call cmd,cc_symtypes_S)
+@@ -373,16 +333,8 @@ ifdef CONFIG_ASM_MODVERSIONS
+ # versioning matches the C process described above, with difference that
+ # we parse asm-prototypes.h C header to get function definitions.
+ 
+-cmd_modversions_S =								\
+-	if $(OBJDUMP) -h $@ | grep -q __ksymtab; then				\
+-		$(call cmd_gensymtypes_S,$(KBUILD_SYMTYPES),$(@:.o=.symtypes))	\
+-		    > $(@D)/.tmp_$(@F:.o=.ver);					\
+-										\
+-		$(LD) $(KBUILD_LDFLAGS) -r -o $(@D)/.tmp_$(@F) $@ 		\
+-			-T $(@D)/.tmp_$(@F:.o=.ver);				\
+-		mv -f $(@D)/.tmp_$(@F) $@;					\
+-		rm -f $(@D)/.tmp_$(@F:.o=.ver);					\
+-	fi
++cmd_gen_symversions_S = $(call gen_symversions,S)
++
+ endif
+ 
+ $(obj)/%.o: $(src)/%.S FORCE
+@@ -417,17 +369,6 @@ $(obj)/%.asn1.c $(obj)/%.asn1.h: $(src)/%.asn1 $(objtree)/scripts/asn1_compiler
+ $(subdir-builtin): $(obj)/%/built-in.a: $(obj)/% ;
+ $(subdir-modorder): $(obj)/%/modules.order: $(obj)/% ;
+ 
+-# combine symversions for later processing
+-ifeq ($(CONFIG_LTO_CLANG) $(CONFIG_MODVERSIONS),y y)
+-      cmd_update_lto_symversions =					\
+-	rm -f $@.symversions						\
+-	$(foreach n, $(filter-out FORCE,$^),				\
+-		$(if $(shell test -s $(n).symversions && echo y),	\
+-			; cat $(n).symversions >> $@.symversions))
+-else
+-      cmd_update_lto_symversions = echo >/dev/null
+-endif
+-
+ #
+ # Rule to compile a set of .o files into one .a file (without symbol table)
+ #
+@@ -435,11 +376,8 @@ endif
+ quiet_cmd_ar_builtin = AR      $@
+       cmd_ar_builtin = rm -f $@; $(AR) cDPrST $@ $(real-prereqs)
+ 
+-quiet_cmd_ar_and_symver = AR      $@
+-      cmd_ar_and_symver = $(cmd_update_lto_symversions); $(cmd_ar_builtin)
+-
+ $(obj)/built-in.a: $(real-obj-y) FORCE
+-	$(call if_changed,ar_and_symver)
++	$(call if_changed,ar_builtin)
+ 
+ #
+ # Rule to create modules.order file
+@@ -459,32 +397,19 @@ $(obj)/modules.order: $(obj-m) FORCE
+ #
+ # Rule to compile a set of .o files into one .a file (with symbol table)
+ #
+-quiet_cmd_ar_lib = AR      $@
+-      cmd_ar_lib = $(cmd_update_lto_symversions); $(cmd_ar)
+ 
+ $(obj)/lib.a: $(lib-y) FORCE
+-	$(call if_changed,ar_lib)
+-
+-# NOTE:
+-# Do not replace $(filter %.o,^) with $(real-prereqs). When a single object
+-# module is turned into a multi object module, $^ will contain header file
+-# dependencies recorded in the .*.cmd file.
+-ifneq ($(CONFIG_LTO_CLANG)$(CONFIG_X86_KERNEL_IBT),)
+-quiet_cmd_link_multi-m = AR [M]  $@
+-cmd_link_multi-m =						\
+-	$(cmd_update_lto_symversions);				\
+-	rm -f $@; 						\
+-	$(AR) cDPrsT $@ $(filter %.o,$^)
+-else
++	$(call if_changed,ar)
++
+ quiet_cmd_link_multi-m = LD [M]  $@
+-      cmd_link_multi-m = $(LD) $(ld_flags) -r -o $@ $(filter %.o,$^)
+-endif
++      cmd_link_multi-m = $(LD) $(ld_flags) -r -o $@ @$(patsubst %.o,%.mod,$@) $(cmd_objtool)
+ 
+-$(multi-obj-m): FORCE
++$(multi-obj-m): objtool-enabled := $(delay-objtool)
++$(multi-obj-m): part-of-module := y
++$(multi-obj-m): %.o: %.mod FORCE
+ 	$(call if_changed,link_multi-m)
+ $(call multi_depend, $(multi-obj-m), .o, -objs -y -m)
+ 
+-targets += $(multi-obj-m)
+ targets := $(filter-out $(PHONY), $(targets))
+ 
+ # Add intermediate targets:
+diff --git a/scripts/Makefile.extrawarn b/scripts/Makefile.extrawarn
+index 650d0b8ceec3..f5f0d6f09053 100644
+--- a/scripts/Makefile.extrawarn
++++ b/scripts/Makefile.extrawarn
+@@ -2,8 +2,8 @@
+ # ==========================================================================
+ # make W=... settings
+ #
+-# There are three warning groups enabled by W=1, W=2, W=3.
+-# They are independent, and can be combined like W=12 or W=123.
++# There are four warning groups enabled by W=1, W=2, W=3, and W=e
++# They are independent, and can be combined like W=12 or W=123e.
+ # ==========================================================================
+ 
+ KBUILD_CFLAGS += $(call cc-disable-warning, packed-not-aligned)
+@@ -94,3 +94,12 @@ KBUILD_CFLAGS += $(call cc-option, -Wpacked-bitfield-compat)
+ KBUILD_CPPFLAGS += -DKBUILD_EXTRA_WARN3
+ 
+ endif
++
++#
++# W=e - error out on warnings
++#
++ifneq ($(findstring e, $(KBUILD_EXTRA_WARN)),)
++
++KBUILD_CFLAGS += -Werror
++
++endif
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index 9f69ecdd7977..f75138385449 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -225,20 +225,13 @@ dtc_cpp_flags  = -Wp,-MMD,$(depfile).pre.tmp -nostdinc                    \
+ 		 $(addprefix -I,$(DTC_INCLUDE))                          \
+ 		 -undef -D__DTS__
+ 
+-ifneq ($(CONFIG_LTO_CLANG)$(CONFIG_X86_KERNEL_IBT),)
+-# With CONFIG_LTO_CLANG, .o files in modules might be LLVM bitcode, so we
+-# need to run LTO to compile them into native code (.lto.o) before further
+-# processing.
+-mod-prelink-ext := .prelink
+-endif
+-
+ # Useful for describing the dependency of composite objects
+ # Usage:
+ #   $(call multi_depend, multi_used_targets, suffix_to_remove, suffix_to_add)
+ define multi_depend
+-$(foreach m, $(notdir $1), \
+-	$(eval $(obj)/$m: \
+-	$(addprefix $(obj)/, $(foreach s, $3, $($(m:%$(strip $2)=%$(s)))))))
++$(foreach m, $1, \
++	$(eval $m: \
++	$(addprefix $(obj)/, $(call suffix-search, $(patsubst $(obj)/%,%,$m), $2, $3))))
+ endef
+ 
+ # Copy a file
+diff --git a/scripts/Makefile.modfinal b/scripts/Makefile.modfinal
+index 7f39599e9fae..51d384a0e4f9 100644
+--- a/scripts/Makefile.modfinal
++++ b/scripts/Makefile.modfinal
+@@ -9,7 +9,7 @@ __modfinal:
+ include include/config/auto.conf
+ include $(srctree)/scripts/Kbuild.include
+ 
+-# for c_flags and mod-prelink-ext
++# for c_flags
+ include $(srctree)/scripts/Makefile.lib
+ 
+ # find all modules listed in modules.order
+@@ -34,6 +34,7 @@ quiet_cmd_ld_ko_o = LD [M]  $@
+       cmd_ld_ko_o +=							\
+ 	$(LD) -r $(KBUILD_LDFLAGS)					\
+ 		$(KBUILD_LDFLAGS_MODULE) $(LDFLAGS_MODULE)		\
++		$(addprefix -T, $(filter %.symver.lds, $(real-prereqs)))\
+ 		-T scripts/module.lds -o $@ $(filter %.o, $^);		\
+ 	$(if $(ARCH_POSTLINK), $(MAKE) -f $(ARCH_POSTLINK) $@, true)
+ 
+@@ -54,9 +55,8 @@ if_changed_except = $(if $(call newer_prereqs_except,$(2))$(cmd-check),      \
+ 	$(cmd);                                                              \
+ 	printf '%s\n' 'cmd_$@ := $(make-cmd)' > $(dot-target).cmd, @:)
+ 
+-
+ # Re-generate module BTFs if either module's .ko or vmlinux changed
+-$(modules): %.ko: %$(mod-prelink-ext).o %.mod.o scripts/module.lds $(if $(KBUILD_BUILTIN),vmlinux) FORCE
++$(modules): %.ko: %.o %.mod.o $(if $(CONFIG_MODVERSIONS), %.symver.lds) scripts/module.lds $(if $(KBUILD_BUILTIN),vmlinux) FORCE
+ 	+$(call if_changed_except,ld_ko_o,vmlinux)
+ ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+ 	+$(if $(newer-prereqs),$(call cmd,btf_ko))
+diff --git a/scripts/Makefile.modpost b/scripts/Makefile.modpost
+index 48585c4d04ad..f2ce411acd59 100644
+--- a/scripts/Makefile.modpost
++++ b/scripts/Makefile.modpost
+@@ -41,9 +41,6 @@ __modpost:
+ include include/config/auto.conf
+ include $(srctree)/scripts/Kbuild.include
+ 
+-# for mod-prelink-ext
+-include $(srctree)/scripts/Makefile.lib
+-
+ MODPOST = scripts/mod/modpost								\
+ 	$(if $(CONFIG_MODVERSIONS),-m)							\
+ 	$(if $(CONFIG_MODULE_SRCVERSION_ALL),-a)					\
+@@ -118,8 +115,6 @@ $(input-symdump):
+ 	@echo >&2 '         Modules may not have dependencies or modversions.'
+ 	@echo >&2 '         You may get many unresolved symbol warnings.'
+ 
+-modules := $(sort $(shell cat $(MODORDER)))
+-
+ # KBUILD_MODPOST_WARN can be set to avoid error out in case of undefined symbols
+ ifneq ($(KBUILD_MODPOST_WARN)$(filter-out $(existing-input-symdump), $(input-symdump)),)
+ MODPOST += -w
+@@ -128,9 +123,9 @@ endif
+ # Read out modules.order to pass in modpost.
+ # Otherwise, allmodconfig would fail with "Argument list too long".
+ quiet_cmd_modpost = MODPOST $@
+-      cmd_modpost = sed 's/\.ko$$/$(mod-prelink-ext)\.o/' $< | $(MODPOST) -T -
++      cmd_modpost = sed 's/ko$$/o/' $< | $(MODPOST) -T -
+ 
+-$(output-symdump): $(MODORDER) $(input-symdump) $(modules:.ko=$(mod-prelink-ext).o) FORCE
++$(output-symdump): $(MODORDER) $(input-symdump) FORCE
+ 	$(call if_changed,modpost)
+ 
+ targets += $(output-symdump)
+diff --git a/scripts/adjust_autoksyms.sh b/scripts/adjust_autoksyms.sh
+index 59fdb875e818..f1b5ac818411 100755
+--- a/scripts/adjust_autoksyms.sh
++++ b/scripts/adjust_autoksyms.sh
+@@ -35,7 +35,7 @@ case "$KBUILD_VERBOSE" in
+ esac
+ 
+ # Generate a new symbol list file
+-$CONFIG_SHELL $srctree/scripts/gen_autoksyms.sh "$new_ksyms_file"
++$CONFIG_SHELL $srctree/scripts/gen_autoksyms.sh --modorder "$new_ksyms_file"
+ 
+ # Extract changes between old and new list and touch corresponding
+ # dependency files.
+diff --git a/scripts/dummy-tools/pahole b/scripts/dummy-tools/pahole
+new file mode 100755
+index 000000000000..53501a36fa71
+--- /dev/null
++++ b/scripts/dummy-tools/pahole
+@@ -0,0 +1,4 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0-only
++
++echo v99.99
+diff --git a/scripts/gen_autoksyms.sh b/scripts/gen_autoksyms.sh
+index 120225c541c5..faacf7062122 100755
+--- a/scripts/gen_autoksyms.sh
++++ b/scripts/gen_autoksyms.sh
+@@ -2,13 +2,10 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
+ # Create an autoksyms.h header file from the list of all module's needed symbols
+-# as recorded on the second line of *.mod files and the user-provided symbol
+-# whitelist.
++# as recorded in *.usyms files and the user-provided symbol whitelist.
+ 
+ set -e
+ 
+-output_file="$1"
+-
+ # Use "make V=1" to debug this script.
+ case "$KBUILD_VERBOSE" in
+ *1*)
+@@ -16,6 +13,15 @@ case "$KBUILD_VERBOSE" in
+ 	;;
+ esac
+ 
++read_modorder=
++
++if [ "$1" = --modorder ]; then
++	shift
++	read_modorder=1
++fi
++
++output_file="$1"
++
+ needed_symbols=
+ 
+ # Special case for modversions (see modpost.c)
+@@ -41,10 +47,8 @@ cat > "$output_file" << EOT
+ 
+ EOT
+ 
+-[ -f modules.order ] && modlist=modules.order || modlist=/dev/null
+-
+ {
+-	sed 's/ko$/mod/' $modlist | xargs -n1 sed -n -e '2p'
++	[ -n "${read_modorder}" ] && sed 's/ko$/usyms/' modules.order | xargs cat
+ 	echo "$needed_symbols"
+ 	[ -n "$ksym_wl" ] && cat "$ksym_wl"
+ } | sed -e 's/ /\n/g' | sed -n -e '/^$/!p' |
+diff --git a/scripts/kconfig/gconf-cfg.sh b/scripts/kconfig/gconf-cfg.sh
+index 480ecd8b9f41..cbd90c28c05f 100755
+--- a/scripts/kconfig/gconf-cfg.sh
++++ b/scripts/kconfig/gconf-cfg.sh
+@@ -3,14 +3,14 @@
+ 
+ PKG="gtk+-2.0 gmodule-2.0 libglade-2.0"
+ 
+-if [ -z "$(command -v pkg-config)" ]; then
++if [ -z "$(command -v ${HOSTPKG_CONFIG})" ]; then
+ 	echo >&2 "*"
+-	echo >&2 "* 'make gconfig' requires 'pkg-config'. Please install it."
++	echo >&2 "* 'make gconfig' requires '${HOSTPKG_CONFIG}'. Please install it."
+ 	echo >&2 "*"
+ 	exit 1
+ fi
+ 
+-if ! pkg-config --exists $PKG; then
++if ! ${HOSTPKG_CONFIG} --exists $PKG; then
+ 	echo >&2 "*"
+ 	echo >&2 "* Unable to find the GTK+ installation. Please make sure that"
+ 	echo >&2 "* the GTK+ 2.0 development package is correctly installed."
+@@ -19,12 +19,12 @@ if ! pkg-config --exists $PKG; then
+ 	exit 1
+ fi
+ 
+-if ! pkg-config --atleast-version=2.0.0 gtk+-2.0; then
++if ! ${HOSTPKG_CONFIG} --atleast-version=2.0.0 gtk+-2.0; then
+ 	echo >&2 "*"
+ 	echo >&2 "* GTK+ is present but version >= 2.0.0 is required."
+ 	echo >&2 "*"
+ 	exit 1
+ fi
+ 
+-echo cflags=\"$(pkg-config --cflags $PKG)\"
+-echo libs=\"$(pkg-config --libs $PKG)\"
++echo cflags=\"$(${HOSTPKG_CONFIG} --cflags $PKG)\"
++echo libs=\"$(${HOSTPKG_CONFIG} --libs $PKG)\"
+diff --git a/scripts/kconfig/mconf-cfg.sh b/scripts/kconfig/mconf-cfg.sh
+index b520e407a8eb..025b565e0b7c 100755
+--- a/scripts/kconfig/mconf-cfg.sh
++++ b/scripts/kconfig/mconf-cfg.sh
+@@ -4,16 +4,16 @@
+ PKG="ncursesw"
+ PKG2="ncurses"
+ 
+-if [ -n "$(command -v pkg-config)" ]; then
+-	if pkg-config --exists $PKG; then
+-		echo cflags=\"$(pkg-config --cflags $PKG)\"
+-		echo libs=\"$(pkg-config --libs $PKG)\"
++if [ -n "$(command -v ${HOSTPKG_CONFIG})" ]; then
++	if ${HOSTPKG_CONFIG} --exists $PKG; then
++		echo cflags=\"$(${HOSTPKG_CONFIG} --cflags $PKG)\"
++		echo libs=\"$(${HOSTPKG_CONFIG} --libs $PKG)\"
+ 		exit 0
+ 	fi
+ 
+-	if pkg-config --exists $PKG2; then
+-		echo cflags=\"$(pkg-config --cflags $PKG2)\"
+-		echo libs=\"$(pkg-config --libs $PKG2)\"
++	if ${HOSTPKG_CONFIG} --exists $PKG2; then
++		echo cflags=\"$(${HOSTPKG_CONFIG} --cflags $PKG2)\"
++		echo libs=\"$(${HOSTPKG_CONFIG} --libs $PKG2)\"
+ 		exit 0
+ 	fi
+ fi
+@@ -46,7 +46,7 @@ echo >&2 "* Unable to find the ncurses package."
+ echo >&2 "* Install ncurses (ncurses-devel or libncurses-dev"
+ echo >&2 "* depending on your distribution)."
+ echo >&2 "*"
+-echo >&2 "* You may also need to install pkg-config to find the"
++echo >&2 "* You may also need to install ${HOSTPKG_CONFIG} to find the"
+ echo >&2 "* ncurses installed in a non-default location."
+ echo >&2 "*"
+ exit 1
+diff --git a/scripts/kconfig/nconf-cfg.sh b/scripts/kconfig/nconf-cfg.sh
+index c212255070c0..3a10bac2adb3 100755
+--- a/scripts/kconfig/nconf-cfg.sh
++++ b/scripts/kconfig/nconf-cfg.sh
+@@ -4,16 +4,16 @@
+ PKG="ncursesw menuw panelw"
+ PKG2="ncurses menu panel"
+ 
+-if [ -n "$(command -v pkg-config)" ]; then
+-	if pkg-config --exists $PKG; then
+-		echo cflags=\"$(pkg-config --cflags $PKG)\"
+-		echo libs=\"$(pkg-config --libs $PKG)\"
++if [ -n "$(command -v ${HOSTPKG_CONFIG})" ]; then
++	if ${HOSTPKG_CONFIG} --exists $PKG; then
++		echo cflags=\"$(${HOSTPKG_CONFIG} --cflags $PKG)\"
++		echo libs=\"$(${HOSTPKG_CONFIG} --libs $PKG)\"
+ 		exit 0
+ 	fi
+ 
+-	if pkg-config --exists $PKG2; then
+-		echo cflags=\"$(pkg-config --cflags $PKG2)\"
+-		echo libs=\"$(pkg-config --libs $PKG2)\"
++	if ${HOSTPKG_CONFIG} --exists $PKG2; then
++		echo cflags=\"$(${HOSTPKG_CONFIG} --cflags $PKG2)\"
++		echo libs=\"$(${HOSTPKG_CONFIG} --libs $PKG2)\"
+ 		exit 0
+ 	fi
+ fi
+@@ -44,7 +44,7 @@ echo >&2 "* Unable to find the ncurses package."
+ echo >&2 "* Install ncurses (ncurses-devel or libncurses-dev"
+ echo >&2 "* depending on your distribution)."
+ echo >&2 "*"
+-echo >&2 "* You may also need to install pkg-config to find the"
++echo >&2 "* You may also need to install ${HOSTPKG_CONFIG} to find the"
+ echo >&2 "* ncurses installed in a non-default location."
+ echo >&2 "*"
+ exit 1
+diff --git a/scripts/kconfig/qconf-cfg.sh b/scripts/kconfig/qconf-cfg.sh
+index fa564cd795b7..9b695e5cd9b3 100755
+--- a/scripts/kconfig/qconf-cfg.sh
++++ b/scripts/kconfig/qconf-cfg.sh
+@@ -3,22 +3,22 @@
+ 
+ PKG="Qt5Core Qt5Gui Qt5Widgets"
+ 
+-if [ -z "$(command -v pkg-config)" ]; then
++if [ -z "$(command -v ${HOSTPKG_CONFIG})" ]; then
+ 	echo >&2 "*"
+-	echo >&2 "* 'make xconfig' requires 'pkg-config'. Please install it."
++	echo >&2 "* 'make xconfig' requires '${HOSTPKG_CONFIG}'. Please install it."
+ 	echo >&2 "*"
+ 	exit 1
+ fi
+ 
+-if pkg-config --exists $PKG; then
+-	echo cflags=\"-std=c++11 -fPIC $(pkg-config --cflags $PKG)\"
+-	echo libs=\"$(pkg-config --libs $PKG)\"
+-	echo moc=\"$(pkg-config --variable=host_bins Qt5Core)/moc\"
++if ${HOSTPKG_CONFIG} --exists $PKG; then
++	echo cflags=\"-std=c++11 -fPIC $(${HOSTPKG_CONFIG} --cflags $PKG)\"
++	echo libs=\"$(${HOSTPKG_CONFIG} --libs $PKG)\"
++	echo moc=\"$(${HOSTPKG_CONFIG} --variable=host_bins Qt5Core)/moc\"
+ 	exit 0
+ fi
+ 
+ echo >&2 "*"
+-echo >&2 "* Could not find Qt5 via pkg-config."
++echo >&2 "* Could not find Qt5 via ${HOSTPKG_CONFIG}."
+ echo >&2 "* Please install Qt5 and make sure it's in PKG_CONFIG_PATH"
+ echo >&2 "*"
+ exit 1
+diff --git a/scripts/link-vmlinux.sh b/scripts/link-vmlinux.sh
+index 20f44504a644..e2900d3bd215 100755
+--- a/scripts/link-vmlinux.sh
++++ b/scripts/link-vmlinux.sh
+@@ -56,20 +56,6 @@ gen_initcalls()
+ 		> .tmp_initcalls.lds
+ }
+ 
+-# If CONFIG_LTO_CLANG is selected, collect generated symbol versions into
+-# .tmp_symversions.lds
+-gen_symversions()
+-{
+-	info GEN .tmp_symversions.lds
+-	rm -f .tmp_symversions.lds
+-
+-	for o in ${KBUILD_VMLINUX_OBJS} ${KBUILD_VMLINUX_LIBS}; do
+-		if [ -f ${o}.symversions ]; then
+-			cat ${o}.symversions >> .tmp_symversions.lds
+-		fi
+-	done
+-}
+-
+ # Link of vmlinux.o used for section mismatch analysis
+ # ${1} output file
+ modpost_link()
+@@ -88,11 +74,6 @@ modpost_link()
+ 		gen_initcalls
+ 		lds="-T .tmp_initcalls.lds"
+ 
+-		if is_enabled CONFIG_MODVERSIONS; then
+-			gen_symversions
+-			lds="${lds} -T .tmp_symversions.lds"
+-		fi
+-
+ 		# This might take a while, so indicate that we're doing
+ 		# an LTO link
+ 		info LTO ${1}
+@@ -196,6 +177,9 @@ vmlinux_link()
+ 	fi
+ 
+ 	ldflags="${ldflags} ${wl}--script=${objtree}/${KBUILD_LDS}"
++	if is_enabled CONFIG_MODVERSIONS; then
++		ldflags="${ldflags} ${wl}--script=vmlinux.symver.lds"
++	fi
+ 
+ 	# The kallsyms linking does not need debug symbols included.
+ 	if [ "$output" != "${output#.tmp_vmlinux.kallsyms}" ] ; then
+@@ -304,13 +288,12 @@ cleanup()
+ 	rm -f .btf.*
+ 	rm -f .tmp_System.map
+ 	rm -f .tmp_initcalls.lds
+-	rm -f .tmp_symversions.lds
+ 	rm -f .tmp_vmlinux*
+ 	rm -f System.map
+ 	rm -f vmlinux
+ 	rm -f vmlinux.map
+ 	rm -f vmlinux.o
+-	rm -f .vmlinux.d
++	rm -f .vmlinux*
+ }
+ 
+ # Use "make V=1" to debug this script
+@@ -342,6 +325,19 @@ ${MAKE} -f "${srctree}/scripts/Makefile.build" obj=init need-builtin=1
+ modpost_link vmlinux.o
+ objtool_link vmlinux.o
+ 
++# Generate the list of objects in vmlinux
++rm -f .vmlinux.objs
++for f in ${KBUILD_VMLINUX_OBJS} ${KBUILD_VMLINUX_LIBS}; do
++	case ${f} in
++	*.a)
++		${AR} t ${f} >> .vmlinux.objs
++		;;
++	*)
++		echo ${f} >> .vmlinux.objs
++		;;
++	esac
++done
++
+ # modpost vmlinux.o to check for section mismatches
+ ${MAKE} -f "${srctree}/scripts/Makefile.modpost" MODPOST_VMLINUX=1
+ 
+diff --git a/scripts/mod/file2alias.c b/scripts/mod/file2alias.c
+index 5258247d78ac..e8a9c6816fec 100644
+--- a/scripts/mod/file2alias.c
++++ b/scripts/mod/file2alias.c
+@@ -734,8 +734,6 @@ static int do_vio_entry(const char *filename, void *symval,
+ 	return 1;
+ }
+ 
+-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+-
+ static void do_input(char *alias,
+ 		     kernel_ulong_t *arr, unsigned int min, unsigned int max)
+ {
+diff --git a/scripts/mod/list.h b/scripts/mod/list.h
+new file mode 100644
+index 000000000000..c87583a71714
+--- /dev/null
++++ b/scripts/mod/list.h
+@@ -0,0 +1,336 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef LIST_H
++#define LIST_H
++
++#include <stdbool.h>
++#include <stddef.h>
++
++/* Are two types/vars the same type (ignoring qualifiers)? */
++#define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
++
++/**
++ * container_of - cast a member of a structure out to the containing structure
++ * @ptr:	the pointer to the member.
++ * @type:	the type of the container struct this is embedded in.
++ * @member:	the name of the member within the struct.
++ *
++ */
++#define container_of(ptr, type, member) ({				\
++	void *__mptr = (void *)(ptr);					\
++	_Static_assert(__same_type(*(ptr), ((type *)0)->member) ||	\
++		      __same_type(*(ptr), void),			\
++		      "pointer type mismatch in container_of()");	\
++	((type *)(__mptr - offsetof(type, member))); })
++
++#define LIST_POISON1  ((void *) 0x100)
++#define LIST_POISON2  ((void *) 0x122)
++
++/*
++ * Circular doubly linked list implementation.
++ *
++ * Some of the internal functions ("__xxx") are useful when
++ * manipulating whole lists rather than single entries, as
++ * sometimes we already know the next/prev entries and we can
++ * generate better code by using them directly rather than
++ * using the generic single-entry routines.
++ */
++
++struct list_head {
++	struct list_head *next, *prev;
++};
++
++#define LIST_HEAD_INIT(name) { &(name), &(name) }
++
++#define LIST_HEAD(name) \
++	struct list_head name = LIST_HEAD_INIT(name)
++
++/**
++ * INIT_LIST_HEAD - Initialize a list_head structure
++ * @list: list_head structure to be initialized.
++ *
++ * Initializes the list_head to point to itself.  If it is a list header,
++ * the result is an empty list.
++ */
++static inline void INIT_LIST_HEAD(struct list_head *list)
++{
++	list->next = list;
++	list->prev = list;
++}
++
++/*
++ * Insert a new entry between two known consecutive entries.
++ *
++ * This is only for internal list manipulation where we know
++ * the prev/next entries already!
++ */
++static inline void __list_add(struct list_head *new,
++			      struct list_head *prev,
++			      struct list_head *next)
++{
++	next->prev = new;
++	new->next = next;
++	new->prev = prev;
++	prev->next = new;
++}
++
++/**
++ * list_add - add a new entry
++ * @new: new entry to be added
++ * @head: list head to add it after
++ *
++ * Insert a new entry after the specified head.
++ * This is good for implementing stacks.
++ */
++static inline void list_add(struct list_head *new, struct list_head *head)
++{
++	__list_add(new, head, head->next);
++}
++
++/**
++ * list_add_tail - add a new entry
++ * @new: new entry to be added
++ * @head: list head to add it before
++ *
++ * Insert a new entry before the specified head.
++ * This is useful for implementing queues.
++ */
++static inline void list_add_tail(struct list_head *new, struct list_head *head)
++{
++	__list_add(new, head->prev, head);
++}
++
++/*
++ * Delete a list entry by making the prev/next entries
++ * point to each other.
++ *
++ * This is only for internal list manipulation where we know
++ * the prev/next entries already!
++ */
++static inline void __list_del(struct list_head *prev, struct list_head *next)
++{
++	next->prev = prev;
++	prev->next = next;
++}
++
++static inline void __list_del_entry(struct list_head *entry)
++{
++	__list_del(entry->prev, entry->next);
++}
++
++/**
++ * list_del - deletes entry from list.
++ * @entry: the element to delete from the list.
++ * Note: list_empty() on entry does not return true after this, the entry is
++ * in an undefined state.
++ */
++static inline void list_del(struct list_head *entry)
++{
++	__list_del_entry(entry);
++	entry->next = LIST_POISON1;
++	entry->prev = LIST_POISON2;
++}
++
++/**
++ * list_is_head - tests whether @list is the list @head
++ * @list: the entry to test
++ * @head: the head of the list
++ */
++static inline int list_is_head(const struct list_head *list, const struct list_head *head)
++{
++	return list == head;
++}
++
++/**
++ * list_empty - tests whether a list is empty
++ * @head: the list to test.
++ */
++static inline int list_empty(const struct list_head *head)
++{
++	return head->next == head;
++}
++
++/**
++ * list_entry - get the struct for this entry
++ * @ptr:	the &struct list_head pointer.
++ * @type:	the type of the struct this is embedded in.
++ * @member:	the name of the list_head within the struct.
++ */
++#define list_entry(ptr, type, member) \
++	container_of(ptr, type, member)
++
++/**
++ * list_first_entry - get the first element from a list
++ * @ptr:	the list head to take the element from.
++ * @type:	the type of the struct this is embedded in.
++ * @member:	the name of the list_head within the struct.
++ *
++ * Note, that list is expected to be not empty.
++ */
++#define list_first_entry(ptr, type, member) \
++	list_entry((ptr)->next, type, member)
++
++/**
++ * list_next_entry - get the next element in list
++ * @pos:	the type * to cursor
++ * @member:	the name of the list_head within the struct.
++ */
++#define list_next_entry(pos, member) \
++	list_entry((pos)->member.next, typeof(*(pos)), member)
++
++/**
++ * list_entry_is_head - test if the entry points to the head of the list
++ * @pos:	the type * to cursor
++ * @head:	the head for your list.
++ * @member:	the name of the list_head within the struct.
++ */
++#define list_entry_is_head(pos, head, member)				\
++	(&pos->member == (head))
++
++/**
++ * list_for_each_entry	-	iterate over list of given type
++ * @pos:	the type * to use as a loop cursor.
++ * @head:	the head for your list.
++ * @member:	the name of the list_head within the struct.
++ */
++#define list_for_each_entry(pos, head, member)				\
++	for (pos = list_first_entry(head, typeof(*pos), member);	\
++	     !list_entry_is_head(pos, head, member);			\
++	     pos = list_next_entry(pos, member))
++
++/**
++ * list_for_each_entry_safe - iterate over list of given type safe against removal of list entry
++ * @pos:	the type * to use as a loop cursor.
++ * @n:		another type * to use as temporary storage
++ * @head:	the head for your list.
++ * @member:	the name of the list_head within the struct.
++ */
++#define list_for_each_entry_safe(pos, n, head, member)			\
++	for (pos = list_first_entry(head, typeof(*pos), member),	\
++		n = list_next_entry(pos, member);			\
++	     !list_entry_is_head(pos, head, member);			\
++	     pos = n, n = list_next_entry(n, member))
++
++/*
++ * Double linked lists with a single pointer list head.
++ * Mostly useful for hash tables where the two pointer list head is
++ * too wasteful.
++ * You lose the ability to access the tail in O(1).
++ */
++
++struct hlist_head {
++	struct hlist_node *first;
++};
++
++struct hlist_node {
++	struct hlist_node *next, **pprev;
++};
++
++#define HLIST_HEAD_INIT { .first = NULL }
++#define HLIST_HEAD(name) struct hlist_head name = {  .first = NULL }
++#define INIT_HLIST_HEAD(ptr) ((ptr)->first = NULL)
++static inline void INIT_HLIST_NODE(struct hlist_node *h)
++{
++	h->next = NULL;
++	h->pprev = NULL;
++}
++
++/**
++ * hlist_unhashed - Has node been removed from list and reinitialized?
++ * @h: Node to be checked
++ *
++ * Not that not all removal functions will leave a node in unhashed
++ * state.  For example, hlist_nulls_del_init_rcu() does leave the
++ * node in unhashed state, but hlist_nulls_del() does not.
++ */
++static inline int hlist_unhashed(const struct hlist_node *h)
++{
++	return !h->pprev;
++}
++
++static inline void __hlist_del(struct hlist_node *n)
++{
++	struct hlist_node *next = n->next;
++	struct hlist_node **pprev = n->pprev;
++
++	*pprev = next;
++	if (next)
++		next->pprev = pprev;
++}
++
++/**
++ * hlist_del - Delete the specified hlist_node from its list
++ * @n: Node to delete.
++ *
++ * Note that this function leaves the node in hashed state.  Use
++ * hlist_del_init() or similar instead to unhash @n.
++ */
++static inline void hlist_del(struct hlist_node *n)
++{
++	__hlist_del(n);
++	n->next = LIST_POISON1;
++	n->pprev = LIST_POISON2;
++}
++
++/**
++ * hlist_del_init - Delete the specified hlist_node from its list and initialize
++ * @n: Node to delete.
++ *
++ * Note that this function leaves the node in unhashed state.
++ */
++static inline void hlist_del_init(struct hlist_node *n)
++{
++	if (!hlist_unhashed(n)) {
++		__hlist_del(n);
++		INIT_HLIST_NODE(n);
++	}
++}
++
++/**
++ * hlist_add_head - add a new entry at the beginning of the hlist
++ * @n: new entry to be added
++ * @h: hlist head to add it after
++ *
++ * Insert a new entry after the specified head.
++ * This is good for implementing stacks.
++ */
++static inline void hlist_add_head(struct hlist_node *n, struct hlist_head *h)
++{
++	struct hlist_node *first = h->first;
++	n->next = first;
++	if (first)
++		first->pprev = &n->next;
++	h->first = n;
++	n->pprev = &h->first;
++}
++
++#define hlist_entry(ptr, type, member) container_of(ptr, type, member)
++
++#define hlist_entry_safe(ptr, type, member) \
++	({ typeof(ptr) ____ptr = (ptr); \
++	   ____ptr ? hlist_entry(____ptr, type, member) : NULL; \
++	})
++
++/**
++ * hlist_for_each_entry	- iterate over list of given type
++ * @pos:	the type * to use as a loop cursor.
++ * @head:	the head for your list.
++ * @member:	the name of the hlist_node within the struct.
++ */
++#define hlist_for_each_entry(pos, head, member)				\
++	for (pos = hlist_entry_safe((head)->first, typeof(*(pos)), member);\
++	     pos;							\
++	     pos = hlist_entry_safe((pos)->member.next, typeof(*(pos)), member))
++
++/**
++ * hlist_for_each_entry_safe - iterate over list of given type safe against removal of list entry
++ * @pos:	the type * to use as a loop cursor.
++ * @n:		a &struct hlist_node to use as temporary storage
++ * @head:	the head for your list.
++ * @member:	the name of the hlist_node within the struct.
++ */
++#define hlist_for_each_entry_safe(pos, n, head, member)			\
++	for (pos = hlist_entry_safe((head)->first, typeof(*pos), member);\
++	     pos && ({ n = pos->member.next; 1; });			\
++	     pos = hlist_entry_safe(n, typeof(*pos), member))
++
++#endif /* LIST_H */
+diff --git a/scripts/mod/modpost.c b/scripts/mod/modpost.c
+index ed9d056d2108..d8de62506939 100644
+--- a/scripts/mod/modpost.c
++++ b/scripts/mod/modpost.c
+@@ -23,20 +23,20 @@
+ #include "../../include/linux/license.h"
+ 
+ /* Are we using CONFIG_MODVERSIONS? */
+-static int modversions = 0;
++static bool modversions;
+ /* Is CONFIG_MODULE_SRCVERSION_ALL set? */
+-static int all_versions = 0;
++static bool all_versions;
+ /* If we are modposting external module set to 1 */
+-static int external_module = 0;
++static bool external_module;
+ /* Only warn about unresolved symbols */
+-static int warn_unresolved = 0;
++static bool warn_unresolved;
+ /* How a symbol is exported */
+-static int sec_mismatch_count = 0;
+-static int sec_mismatch_warn_only = true;
++static int sec_mismatch_count;
++static bool sec_mismatch_warn_only = true;
+ /* ignore missing files */
+-static int ignore_missing_files;
++static bool ignore_missing_files;
+ /* If set to 1, only warn (instead of error) about missing ns imports */
+-static int allow_missing_ns_imports;
++static bool allow_missing_ns_imports;
+ 
+ static bool error_occurred;
+ 
+@@ -165,16 +165,17 @@ char *get_line(char **stringp)
+ }
+ 
+ /* A list of all modules we processed */
+-static struct module *modules;
++LIST_HEAD(modules);
+ 
+ static struct module *find_module(const char *modname)
+ {
+ 	struct module *mod;
+ 
+-	for (mod = modules; mod; mod = mod->next)
++	list_for_each_entry(mod, &modules, list) {
+ 		if (strcmp(mod->name, modname) == 0)
+-			break;
+-	return mod;
++			return mod;
++	}
++	return NULL;
+ }
+ 
+ static struct module *new_module(const char *modname)
+@@ -184,35 +185,33 @@ static struct module *new_module(const char *modname)
+ 	mod = NOFAIL(malloc(sizeof(*mod) + strlen(modname) + 1));
+ 	memset(mod, 0, sizeof(*mod));
+ 
+-	/* add to list */
++	INIT_LIST_HEAD(&mod->exported_symbols);
++	INIT_LIST_HEAD(&mod->unresolved_symbols);
++	INIT_LIST_HEAD(&mod->missing_namespaces);
++	INIT_LIST_HEAD(&mod->imported_namespaces);
++
+ 	strcpy(mod->name, modname);
+ 	mod->is_vmlinux = (strcmp(modname, "vmlinux") == 0);
+-	mod->gpl_compatible = -1;
+-	mod->next = modules;
+-	modules = mod;
++	mod->gpl_compatible = true;
++
++	list_add_tail(&mod->list, &modules);
+ 
+ 	return mod;
+ }
+ 
+-/* A hash of all exported symbols,
+- * struct symbol is also used for lists of unresolved symbols */
+-
+-#define SYMBOL_HASH_SIZE 1024
+-
+ struct symbol {
+-	struct symbol *next;
++	struct hlist_node hash_node;
++	struct list_head list;
+ 	struct module *module;
+ 	unsigned int crc;
+-	int crc_valid;
++	bool crc_valid;
+ 	char *namespace;
+-	unsigned int weak:1;
+-	unsigned int is_static:1;  /* 1 if symbol is not global */
++	bool weak;
++	bool is_static;		/* true if symbol is not global */
+ 	enum export  export;       /* Type of export */
+ 	char name[];
+ };
+ 
+-static struct symbol *symbolhash[SYMBOL_HASH_SIZE];
+-
+ /* This is based on the hash algorithm from gdbm, via tdb */
+ static inline unsigned int tdb_hash(const char *name)
+ {
+@@ -226,36 +225,57 @@ static inline unsigned int tdb_hash(const char *name)
+ 	return (1103515243 * value + 12345);
+ }
+ 
++/* useful hash macros */
++#define hash_head(table, key)		(&(table)[tdb_hash(key) % ARRAY_SIZE(table)])
++
++#define hash_add_symbol(sym, table)	hlist_add_head(&(sym)->hash_node, \
++						       hash_head(table, (sym)->name))
++
++#define hash_del_symbol(sym)		hlist_del_init(&(sym)->hash_node)
++
++#define hash_for_matched_symbol(sym, table, key) \
++	hlist_for_each_entry(sym, hash_head(table, key), hash_node) \
++		if (!strcmp(sym->name, key))
++
++#define hash_for_matched_symbol_safe(sym, n, table, key) \
++	hlist_for_each_entry_safe(sym, n, hash_head(table, key), hash_node) \
++		if (!strcmp(sym->name, key))
++
++#define HASHTABLE_DECLARE(name, size)	struct hlist_head name[size];
++
++/* hash table of all exported symbols */
++HASHTABLE_DECLARE(exported_symbols, 8192);
++
++/* hash table of CRCs */
++HASHTABLE_DECLARE(crc_symbols, 1024);
++
+ /**
+  * Allocate a new symbols for use in the hash of exported symbols or
+  * the list of unresolved symbols per module
+  **/
+-static struct symbol *alloc_symbol(const char *name, unsigned int weak,
+-				   struct symbol *next)
++static struct symbol *alloc_symbol(const char *name)
+ {
+ 	struct symbol *s = NOFAIL(malloc(sizeof(*s) + strlen(name) + 1));
+ 
+ 	memset(s, 0, sizeof(*s));
+ 	strcpy(s->name, name);
+-	s->weak = weak;
+-	s->next = next;
+-	s->is_static = 1;
++
+ 	return s;
+ }
+ 
+-/* For the hash of exported symbols */
+-static struct symbol *new_symbol(const char *name, struct module *module,
+-				 enum export export)
++
++static void sym_add_unresolved(const char *name, struct module *mod, bool weak)
+ {
+-	unsigned int hash;
++	struct symbol *sym;
+ 
+-	hash = tdb_hash(name) % SYMBOL_HASH_SIZE;
+-	symbolhash[hash] = alloc_symbol(name, 0, symbolhash[hash]);
++	sym = alloc_symbol(name);
++	sym->weak = weak;
+ 
+-	return symbolhash[hash];
++	list_add_tail(&sym->list, &mod->unresolved_symbols);
+ }
+ 
+-static struct symbol *find_symbol(const char *name)
++static struct symbol *find_symbol_in_module(const char *name,
++					    struct module *mod)
+ {
+ 	struct symbol *s;
+ 
+@@ -263,42 +283,47 @@ static struct symbol *find_symbol(const char *name)
+ 	if (name[0] == '.')
+ 		name++;
+ 
+-	for (s = symbolhash[tdb_hash(name) % SYMBOL_HASH_SIZE]; s; s = s->next) {
+-		if (strcmp(s->name, name) == 0)
++	hash_for_matched_symbol(s, exported_symbols, name) {
++		if (!mod || s->module == mod)
+ 			return s;
+ 	}
+ 	return NULL;
+ }
+ 
+-static bool contains_namespace(struct namespace_list *list,
+-			       const char *namespace)
++static struct symbol *find_symbol(const char *name)
++{
++	return find_symbol_in_module(name, NULL);
++}
++
++struct namespace_list {
++	struct list_head list;
++	char namespace[];
++};
++
++static bool contains_namespace(struct list_head *head, const char *namespace)
+ {
+-	for (; list; list = list->next)
++	struct namespace_list *list;
++
++	list_for_each_entry(list, head, list) {
+ 		if (!strcmp(list->namespace, namespace))
+ 			return true;
++	}
+ 
+ 	return false;
+ }
+ 
+-static void add_namespace(struct namespace_list **list, const char *namespace)
++static void add_namespace(struct list_head *head, const char *namespace)
+ {
+ 	struct namespace_list *ns_entry;
+ 
+-	if (!contains_namespace(*list, namespace)) {
+-		ns_entry = NOFAIL(malloc(sizeof(struct namespace_list) +
++	if (!contains_namespace(head, namespace)) {
++		ns_entry = NOFAIL(malloc(sizeof(*ns_entry) +
+ 					 strlen(namespace) + 1));
+ 		strcpy(ns_entry->namespace, namespace);
+-		ns_entry->next = *list;
+-		*list = ns_entry;
++		list_add_tail(&ns_entry->list, head);
+ 	}
+ }
+ 
+-static bool module_imports_namespace(struct module *module,
+-				     const char *namespace)
+-{
+-	return contains_namespace(module->imported_namespaces, namespace);
+-}
+-
+ static const struct {
+ 	const char *str;
+ 	enum export export;
+@@ -369,23 +394,6 @@ static enum export export_from_secname(struct elf_info *elf, unsigned int sec)
+ 		return export_unknown;
+ }
+ 
+-static enum export export_from_sec(struct elf_info *elf, unsigned int sec)
+-{
+-	if (sec == elf->export_sec)
+-		return export_plain;
+-	else if (sec == elf->export_gpl_sec)
+-		return export_gpl;
+-	else
+-		return export_unknown;
+-}
+-
+-static const char *namespace_from_kstrtabns(const struct elf_info *info,
+-					    const Elf_Sym *sym)
+-{
+-	const char *value = sym_get_data(info, sym);
+-	return value[0] ? value : NULL;
+-}
+-
+ static void sym_update_namespace(const char *symname, const char *namespace)
+ {
+ 	struct symbol *s = find_symbol(symname);
+@@ -401,47 +409,158 @@ static void sym_update_namespace(const char *symname, const char *namespace)
+ 	}
+ 
+ 	free(s->namespace);
+-	s->namespace =
+-		namespace && namespace[0] ? NOFAIL(strdup(namespace)) : NULL;
++	s->namespace = namespace[0] ? NOFAIL(strdup(namespace)) : NULL;
+ }
+ 
+-/**
+- * Add an exported symbol - it may have already been added without a
+- * CRC, in this case just update the CRC
+- **/
+-static struct symbol *sym_add_exported(const char *name, struct module *mod,
+-				       enum export export)
++static void sym_add_exported(const char *name, struct module *mod,
++			     enum export export)
+ {
+ 	struct symbol *s = find_symbol(name);
+ 
+-	if (!s) {
+-		s = new_symbol(name, mod, export);
+-	} else if (!external_module || s->module->is_vmlinux ||
+-		   s->module == mod) {
+-		warn("%s: '%s' exported twice. Previous export was in %s%s\n",
+-		     mod->name, name, s->module->name,
+-		     s->module->is_vmlinux ? "" : ".ko");
+-		return s;
++	if (s && (!external_module || s->module->is_vmlinux || s->module == mod)) {
++		error("%s: '%s' exported twice. Previous export was in %s%s\n",
++		      mod->name, name, s->module->name,
++		      s->module->is_vmlinux ? "" : ".ko");
+ 	}
+ 
++	s = NULL;
++
++	if (modversions) {
++		struct hlist_node *n;
++
++		hash_for_matched_symbol_safe(s, n, crc_symbols, name) {
++			if (s->module == mod)
++				hash_del_symbol(s);
++			break;
++		}
++
++		if (!s)
++			warn("EXPORT symbol \"%s\" [%s%s] version generation failed, symbol will not be versioned.\n"
++			     "Is \"%s\" prototyped in <asm/asm-prototypes.h>?\n",
++			     name, mod->name, mod->is_vmlinux ? "" : ".ko",
++			     name);
++	}
++
++	if (!s)
++		s = alloc_symbol(name);
++
+ 	s->module = mod;
++	s->is_static = !mod->from_dump;
+ 	s->export    = export;
+-	return s;
++	list_add_tail(&s->list, &mod->exported_symbols);
++	hash_add_symbol(s, exported_symbols);
+ }
+ 
+-static void sym_set_crc(const char *name, unsigned int crc)
++static void sym_add_crc(const char *name, unsigned int crc, struct module *mod)
+ {
+-	struct symbol *s = find_symbol(name);
++	struct symbol *sym;
+ 
+-	/*
+-	 * Ignore stand-alone __crc_*, which might be auto-generated symbols
+-	 * such as __*_veneer in ARM ELF.
+-	 */
+-	if (!s)
++	sym = alloc_symbol(name);
++
++	sym->crc = crc;
++	sym->crc_valid = true;
++	sym->module = mod;
++
++	hash_add_symbol(sym, crc_symbols);
++}
++
++/*
++ * The CRCs are recorded in .*.cmd files in the form of:
++ * #__crc_<name>=<crc>
++ */
++static void retrieve_crcs_from_cmdfile(const char *object, struct module *mod)
++{
++	char cmd_file[PATH_MAX];
++	char *buf, *p;
++	const char *base;
++	int dirlen, ret;
++
++	base = strrchr(object, '/');
++	if (base) {
++		base++;
++		dirlen = base - object;
++	} else {
++		dirlen = 0;
++		base = object;
++	}
++
++	ret = snprintf(cmd_file, sizeof(cmd_file), "%.*s.%s.cmd",
++		       dirlen, object, base);
++	if (ret >= sizeof(cmd_file)) {
++		error("%s: too long path was truncated\n", cmd_file);
+ 		return;
++	}
++
++	buf = read_text_file(cmd_file);
++	p = buf;
++
++	while ((p = strstr(p, "\n#__crc_"))) {
++		char *name;
++		size_t namelen;
++		unsigned int crc;
++		char *end;
++
++		name = p + strlen("\n#__crc_");
+ 
+-	s->crc = crc;
+-	s->crc_valid = 1;
++		p = strchr(name, '=');
++		if (!p) {
++			error("invalid\n");
++			goto out;
++		}
++
++		namelen = p - name;
++
++		p++;
++
++		if (!isdigit(*p)) {
++			error("invalid\n");
++			goto out;
++		}
++
++		crc = strtol(p, &end, 0);
++		p = end;
++
++		if (*p != '\n') {
++			error("invalid\n");
++			goto out;
++		}
++
++		name[namelen] = '\0';
++		sym_add_crc(name, crc, mod);
++	}
++
++out:
++	free(buf);
++}
++
++/*
++ * The symbol versions (CRC) are recorded in the .*.cmd files.
++ * Parse them to retrieve CRCs for the current module.
++ */
++static void retrieve_crcs(struct module *mod)
++{
++	char objlist[PATH_MAX];
++	char *buf, *p, *obj;
++	int ret;
++
++	if (mod->is_vmlinux) {
++		strcpy(objlist, ".vmlinux.objs");
++	} else {
++		/* objects for a module are listed in the *.mod file. */
++		ret = snprintf(objlist, sizeof(objlist), "%s.mod", mod->name);
++		if (ret >= sizeof(objlist)) {
++			error("%s: too long path was truncated\n", objlist);
++			return;
++		}
++	}
++
++	buf = read_text_file(objlist);
++	p = buf;
++
++	while ((obj = strsep(&p, "\n")) && obj[0])
++		retrieve_crcs_from_cmdfile(obj, mod);
++
++	free(buf);
+ }
+ 
+ static void *grab_file(const char *filename, size_t *size)
+@@ -576,10 +695,7 @@ static int parse_elf(struct elf_info *info, const char *filename)
+ 				fatal("%s has NOBITS .modinfo\n", filename);
+ 			info->modinfo = (void *)hdr + sechdrs[i].sh_offset;
+ 			info->modinfo_len = sechdrs[i].sh_size;
+-		} else if (strcmp(secname, "__ksymtab") == 0)
+-			info->export_sec = i;
+-		else if (strcmp(secname, "__ksymtab_gpl") == 0)
+-			info->export_gpl_sec = i;
++		}
+ 
+ 		if (sechdrs[i].sh_type == SHT_SYMTAB) {
+ 			unsigned int sh_link_idx;
+@@ -667,44 +783,11 @@ static int ignore_undef_symbol(struct elf_info *info, const char *symname)
+ 	return 0;
+ }
+ 
+-static void handle_modversion(const struct module *mod,
+-			      const struct elf_info *info,
+-			      const Elf_Sym *sym, const char *symname)
+-{
+-	unsigned int crc;
+-
+-	if (sym->st_shndx == SHN_UNDEF) {
+-		warn("EXPORT symbol \"%s\" [%s%s] version generation failed, symbol will not be versioned.\n"
+-		     "Is \"%s\" prototyped in <asm/asm-prototypes.h>?\n",
+-		     symname, mod->name, mod->is_vmlinux ? "" : ".ko",
+-		     symname);
+-
+-		return;
+-	}
+-
+-	if (sym->st_shndx == SHN_ABS) {
+-		crc = sym->st_value;
+-	} else {
+-		unsigned int *crcp;
+-
+-		/* symbol points to the CRC in the ELF object */
+-		crcp = sym_get_data(info, sym);
+-		crc = TO_NATIVE(*crcp);
+-	}
+-	sym_set_crc(symname, crc);
+-}
+-
+ static void handle_symbol(struct module *mod, struct elf_info *info,
+ 			  const Elf_Sym *sym, const char *symname)
+ {
+-	enum export export;
+ 	const char *name;
+ 
+-	if (strstarts(symname, "__ksymtab"))
+-		export = export_from_secname(info, get_secindex(info, sym));
+-	else
+-		export = export_from_sec(info, get_secindex(info, sym));
+-
+ 	switch (sym->st_shndx) {
+ 	case SHN_COMMON:
+ 		if (strstarts(symname, "__gnu_lto_")) {
+@@ -732,20 +815,23 @@ static void handle_symbol(struct module *mod, struct elf_info *info,
+ 			}
+ 		}
+ 
+-		mod->unres = alloc_symbol(symname,
+-					  ELF_ST_BIND(sym->st_info) == STB_WEAK,
+-					  mod->unres);
++		sym_add_unresolved(symname, mod,
++				   ELF_ST_BIND(sym->st_info) == STB_WEAK);
+ 		break;
+ 	default:
+ 		/* All exported symbols */
+ 		if (strstarts(symname, "__ksymtab_")) {
++			enum export export;
++
+ 			name = symname + strlen("__ksymtab_");
++			export = export_from_secname(info,
++						     get_secindex(info, sym));
+ 			sym_add_exported(name, mod, export);
+ 		}
+ 		if (strcmp(symname, "init_module") == 0)
+-			mod->has_init = 1;
++			mod->has_init = true;
+ 		if (strcmp(symname, "cleanup_module") == 0)
+-			mod->has_cleanup = 1;
++			mod->has_cleanup = true;
+ 		break;
+ 	}
+ }
+@@ -1995,10 +2081,6 @@ static char *remove_dot(char *s)
+ 		size_t m = strspn(s + n + 1, "0123456789");
+ 		if (m && (s[n + m] == '.' || s[n + m] == 0))
+ 			s[n] = 0;
+-
+-		/* strip trailing .prelink */
+-		if (strends(s, ".prelink"))
+-			s[strlen(s) - 8] = '\0';
+ 	}
+ 	return s;
+ }
+@@ -2022,10 +2104,11 @@ static void read_symbols(const char *modname)
+ 		/* strip trailing .o */
+ 		tmp = NOFAIL(strdup(modname));
+ 		tmp[strlen(tmp) - 2] = '\0';
+-		/* strip trailing .prelink */
+-		if (strends(tmp, ".prelink"))
+-			tmp[strlen(tmp) - 8] = '\0';
+ 		mod = new_module(tmp);
++
++		if (modversions)
++			retrieve_crcs(mod);
++
+ 		free(tmp);
+ 	}
+ 
+@@ -2035,9 +2118,9 @@ static void read_symbols(const char *modname)
+ 			error("missing MODULE_LICENSE() in %s\n", modname);
+ 		while (license) {
+ 			if (license_is_gpl_compatible(license))
+-				mod->gpl_compatible = 1;
++				mod->gpl_compatible = true;
+ 			else {
+-				mod->gpl_compatible = 0;
++				mod->gpl_compatible = false;
+ 				break;
+ 			}
+ 			license = get_next_modinfo(&info, "license", license);
+@@ -2064,12 +2147,7 @@ static void read_symbols(const char *modname)
+ 		/* Apply symbol namespaces from __kstrtabns_<symbol> entries. */
+ 		if (strstarts(symname, "__kstrtabns_"))
+ 			sym_update_namespace(symname + strlen("__kstrtabns_"),
+-					     namespace_from_kstrtabns(&info,
+-								      sym));
+-
+-		if (strstarts(symname, "__crc_"))
+-			handle_modversion(mod, &info, sym,
+-					  symname + strlen("__crc_"));
++					     sym_get_data(&info, sym));
+ 	}
+ 
+ 	// check for static EXPORT_SYMBOL_* functions && global vars
+@@ -2078,11 +2156,12 @@ static void read_symbols(const char *modname)
+ 
+ 		if (bind == STB_GLOBAL || bind == STB_WEAK) {
+ 			struct symbol *s =
+-				find_symbol(remove_dot(info.strtab +
+-						       sym->st_name));
++				find_symbol_in_module(remove_dot(info.strtab +
++								 sym->st_name),
++						      mod);
+ 
+ 			if (s)
+-				s->is_static = 0;
++				s->is_static = false;
+ 		}
+ 	}
+ 
+@@ -2102,7 +2181,7 @@ static void read_symbols(const char *modname)
+ 	 * the automatic versioning doesn't pick it up, but it's really
+ 	 * important anyhow */
+ 	if (modversions)
+-		mod->unres = alloc_symbol("module_layout", 0, mod->unres);
++		sym_add_unresolved("module_layout", mod, false);
+ }
+ 
+ static void read_symbols_from_files(const char *filename)
+@@ -2173,16 +2252,26 @@ static void check_exports(struct module *mod)
+ {
+ 	struct symbol *s, *exp;
+ 
+-	for (s = mod->unres; s; s = s->next) {
++	list_for_each_entry(s, &mod->unresolved_symbols, list) {
+ 		const char *basename;
+ 		exp = find_symbol(s->name);
+-		if (!exp || exp->module == mod) {
++		if (!exp) {
+ 			if (!s->weak && nr_unresolved++ < MAX_UNRESOLVED_REPORTS)
+ 				modpost_log(warn_unresolved ? LOG_WARN : LOG_ERROR,
+ 					    "\"%s\" [%s.ko] undefined!\n",
+ 					    s->name, mod->name);
+ 			continue;
+ 		}
++		if (exp->module == mod) {
++			error("\"%s\" [%s.ko] was exported without definition\n",
++			      s->name, mod->name);
++			continue;
++		}
++
++		s->module = exp->module;
++		s->crc_valid = exp->crc_valid;
++		s->crc = exp->crc;
++
+ 		basename = strrchr(mod->name, '/');
+ 		if (basename)
+ 			basename++;
+@@ -2190,7 +2279,7 @@ static void check_exports(struct module *mod)
+ 			basename = mod->name;
+ 
+ 		if (exp->namespace &&
+-		    !module_imports_namespace(mod, exp->namespace)) {
++		    !contains_namespace(&mod->imported_namespaces, exp->namespace)) {
+ 			modpost_log(allow_missing_ns_imports ? LOG_WARN : LOG_ERROR,
+ 				    "module %s uses symbol %s from namespace %s, but does not import it.\n",
+ 				    basename, exp->name, exp->namespace);
+@@ -2200,6 +2289,12 @@ static void check_exports(struct module *mod)
+ 		if (!mod->gpl_compatible)
+ 			check_for_gpl_usage(exp->export, basename, exp->name);
+ 	}
++
++	list_for_each_entry(s, &mod->exported_symbols, list) {
++		if (s->is_static)
++			error("\"%s\" [%s] is a static %s\n",
++			      s->name, mod->name, export_str(s->export));
++	}
+ }
+ 
+ static void check_modname_len(struct module *mod)
+@@ -2275,16 +2370,7 @@ static void add_staging_flag(struct buffer *b, const char *name)
+  **/
+ static void add_versions(struct buffer *b, struct module *mod)
+ {
+-	struct symbol *s, *exp;
+-
+-	for (s = mod->unres; s; s = s->next) {
+-		exp = find_symbol(s->name);
+-		if (!exp || exp->module == mod)
+-			continue;
+-		s->module = exp->module;
+-		s->crc_valid = exp->crc_valid;
+-		s->crc = exp->crc;
+-	}
++	struct symbol *s;
+ 
+ 	if (!modversions)
+ 		return;
+@@ -2293,7 +2379,7 @@ static void add_versions(struct buffer *b, struct module *mod)
+ 	buf_printf(b, "static const struct modversion_info ____versions[]\n");
+ 	buf_printf(b, "__used __section(\"__versions\") = {\n");
+ 
+-	for (s = mod->unres; s; s = s->next) {
++	list_for_each_entry(s, &mod->unresolved_symbols, list) {
+ 		if (!s->module)
+ 			continue;
+ 		if (!s->crc_valid) {
+@@ -2319,13 +2405,14 @@ static void add_depends(struct buffer *b, struct module *mod)
+ 	int first = 1;
+ 
+ 	/* Clear ->seen flag of modules that own symbols needed by this. */
+-	for (s = mod->unres; s; s = s->next)
++	list_for_each_entry(s, &mod->unresolved_symbols, list) {
+ 		if (s->module)
+ 			s->module->seen = s->module->is_vmlinux;
++	}
+ 
+ 	buf_printf(b, "\n");
+ 	buf_printf(b, "MODULE_INFO(depends, \"");
+-	for (s = mod->unres; s; s = s->next) {
++	list_for_each_entry(s, &mod->unresolved_symbols, list) {
+ 		const char *p;
+ 		if (!s->module)
+ 			continue;
+@@ -2333,7 +2420,7 @@ static void add_depends(struct buffer *b, struct module *mod)
+ 		if (s->module->seen)
+ 			continue;
+ 
+-		s->module->seen = 1;
++		s->module->seen = true;
+ 		p = strrchr(s->module->name, '/');
+ 		if (p)
+ 			p++;
+@@ -2358,6 +2445,9 @@ static void write_buf(struct buffer *b, const char *fname)
+ {
+ 	FILE *file;
+ 
++	if (error_occurred)
++		return;
++
+ 	file = fopen(fname, "w");
+ 	if (!file) {
+ 		perror(fname);
+@@ -2426,7 +2516,6 @@ static void read_dump(const char *fname)
+ 		char *symname, *namespace, *modname, *d, *export;
+ 		unsigned int crc;
+ 		struct module *mod;
+-		struct symbol *s;
+ 
+ 		if (!(symname = strchr(line, '\t')))
+ 			goto fail;
+@@ -2447,11 +2536,11 @@ static void read_dump(const char *fname)
+ 		mod = find_module(modname);
+ 		if (!mod) {
+ 			mod = new_module(modname);
+-			mod->from_dump = 1;
++			mod->from_dump = true;
+ 		}
+-		s = sym_add_exported(symname, mod, export_no(export));
+-		s->is_static = 0;
+-		sym_set_crc(symname, crc);
++
++		sym_add_crc(symname, crc, mod);
++		sym_add_exported(symname, mod, export_no(export));
+ 		sym_update_namespace(symname, namespace);
+ 	}
+ 	free(buf);
+@@ -2464,42 +2553,61 @@ static void read_dump(const char *fname)
+ static void write_dump(const char *fname)
+ {
+ 	struct buffer buf = { };
+-	struct symbol *symbol;
+-	const char *namespace;
+-	int n;
+-
+-	for (n = 0; n < SYMBOL_HASH_SIZE ; n++) {
+-		symbol = symbolhash[n];
+-		while (symbol) {
+-			if (!symbol->module->from_dump) {
+-				namespace = symbol->namespace;
+-				buf_printf(&buf, "0x%08x\t%s\t%s\t%s\t%s\n",
+-					   symbol->crc, symbol->name,
+-					   symbol->module->name,
+-					   export_str(symbol->export),
+-					   namespace ? namespace : "");
+-			}
+-			symbol = symbol->next;
++	struct module *mod;
++	struct symbol *sym;
++
++	list_for_each_entry(mod, &modules, list) {
++		if (mod->from_dump)
++			continue;
++		list_for_each_entry(sym, &mod->exported_symbols, list) {
++			buf_printf(&buf, "0x%08x\t%s\t%s\t%s\t%s\n",
++				   sym->crc, sym->name, mod->name,
++				   export_str(sym->export),
++				   sym->namespace ?: "");
+ 		}
+ 	}
+ 	write_buf(&buf, fname);
+ 	free(buf.p);
+ }
+ 
++static void write_symversions_lds(struct module *mod)
++{
++	struct buffer buf = { };
++	struct symbol *sym;
++	char lds_file[PATH_MAX];
++	int ret;
++
++	ret = snprintf(lds_file, sizeof(lds_file), "%s.symver.lds", mod->name);
++	if (ret >= sizeof(lds_file)) {
++		error("%s: too long path was truncated\n", lds_file);
++		return;
++	}
++
++	list_for_each_entry(sym, &mod->exported_symbols, list) {
++		if (!sym->crc_valid)
++			continue;
++
++		buf_printf(&buf, "__crc_%s = 0x%08x;\n", sym->name, sym->crc);
++	}
++
++	write_if_changed(&buf, lds_file);
++	free(buf.p);
++}
++
+ static void write_namespace_deps_files(const char *fname)
+ {
+ 	struct module *mod;
+ 	struct namespace_list *ns;
+ 	struct buffer ns_deps_buf = {};
+ 
+-	for (mod = modules; mod; mod = mod->next) {
++	list_for_each_entry(mod, &modules, list) {
+ 
+-		if (mod->from_dump || !mod->missing_namespaces)
++		if (mod->from_dump || list_empty(&mod->missing_namespaces))
+ 			continue;
+ 
+ 		buf_printf(&ns_deps_buf, "%s.ko:", mod->name);
+ 
+-		for (ns = mod->missing_namespaces; ns; ns = ns->next)
++		list_for_each_entry(ns, &mod->missing_namespaces, list)
+ 			buf_printf(&ns_deps_buf, " %s", ns->namespace);
+ 
+ 		buf_printf(&ns_deps_buf, "\n");
+@@ -2510,7 +2618,7 @@ static void write_namespace_deps_files(const char *fname)
+ }
+ 
+ struct dump_list {
+-	struct dump_list *next;
++	struct list_head list;
+ 	const char *file;
+ };
+ 
+@@ -2521,44 +2629,42 @@ int main(int argc, char **argv)
+ 	char *missing_namespace_deps = NULL;
+ 	char *dump_write = NULL, *files_source = NULL;
+ 	int opt;
+-	int n;
+-	struct dump_list *dump_read_start = NULL;
+-	struct dump_list **dump_read_iter = &dump_read_start;
++	LIST_HEAD(dump_lists);
++	struct dump_list *dl, *dl2;
+ 
+ 	while ((opt = getopt(argc, argv, "ei:mnT:o:awENd:")) != -1) {
+ 		switch (opt) {
+ 		case 'e':
+-			external_module = 1;
++			external_module = true;
+ 			break;
+ 		case 'i':
+-			*dump_read_iter =
+-				NOFAIL(calloc(1, sizeof(**dump_read_iter)));
+-			(*dump_read_iter)->file = optarg;
+-			dump_read_iter = &(*dump_read_iter)->next;
++			dl = NOFAIL(malloc(sizeof(*dl)));
++			dl->file = optarg;
++			list_add_tail(&dl->list, &dump_lists);
+ 			break;
+ 		case 'm':
+-			modversions = 1;
++			modversions = true;
+ 			break;
+ 		case 'n':
+-			ignore_missing_files = 1;
++			ignore_missing_files = true;
+ 			break;
+ 		case 'o':
+ 			dump_write = optarg;
+ 			break;
+ 		case 'a':
+-			all_versions = 1;
++			all_versions = true;
+ 			break;
+ 		case 'T':
+ 			files_source = optarg;
+ 			break;
+ 		case 'w':
+-			warn_unresolved = 1;
++			warn_unresolved = true;
+ 			break;
+ 		case 'E':
+ 			sec_mismatch_warn_only = false;
+ 			break;
+ 		case 'N':
+-			allow_missing_ns_imports = 1;
++			allow_missing_ns_imports = true;
+ 			break;
+ 		case 'd':
+ 			missing_namespace_deps = optarg;
+@@ -2568,13 +2674,10 @@ int main(int argc, char **argv)
+ 		}
+ 	}
+ 
+-	while (dump_read_start) {
+-		struct dump_list *tmp;
+-
+-		read_dump(dump_read_start->file);
+-		tmp = dump_read_start->next;
+-		free(dump_read_start);
+-		dump_read_start = tmp;
++	list_for_each_entry_safe(dl, dl2, &dump_lists, list) {
++		read_dump(dl->file);
++		list_del(&dl->list);
++		free(dl);
+ 	}
+ 
+ 	while (optind < argc)
+@@ -2583,8 +2686,12 @@ int main(int argc, char **argv)
+ 	if (files_source)
+ 		read_symbols_from_files(files_source);
+ 
+-	for (mod = modules; mod; mod = mod->next) {
++	list_for_each_entry(mod, &modules, list) {
+ 		char fname[PATH_MAX];
++		int ret;
++
++		if (modversions && !mod->from_dump)
++			write_symversions_lds(mod);
+ 
+ 		if (mod->is_vmlinux || mod->from_dump)
+ 			continue;
+@@ -2603,7 +2710,12 @@ int main(int argc, char **argv)
+ 		add_moddevtable(&buf, mod);
+ 		add_srcversion(&buf, mod);
+ 
+-		sprintf(fname, "%s.mod.c", mod->name);
++		ret = snprintf(fname, sizeof(fname), "%s.mod.c", mod->name);
++		if (ret >= sizeof(fname)) {
++			error("%s: too long path was truncated\n", fname);
++			continue;
++		}
++
+ 		write_if_changed(&buf, fname);
+ 	}
+ 
+@@ -2615,16 +2727,6 @@ int main(int argc, char **argv)
+ 	if (sec_mismatch_count && !sec_mismatch_warn_only)
+ 		error("Section mismatches detected.\n"
+ 		      "Set CONFIG_SECTION_MISMATCH_WARN_ONLY=y to allow them.\n");
+-	for (n = 0; n < SYMBOL_HASH_SIZE; n++) {
+-		struct symbol *s;
+-
+-		for (s = symbolhash[n]; s; s = s->next) {
+-			if (s->is_static)
+-				error("\"%s\" [%s] is a static %s\n",
+-				      s->name, s->module->name,
+-				      export_str(s->export));
+-		}
+-	}
+ 
+ 	if (nr_unresolved > MAX_UNRESOLVED_REPORTS)
+ 		warn("suppressed %u unresolved symbol warnings because there were too many)\n",
+diff --git a/scripts/mod/modpost.h b/scripts/mod/modpost.h
+index 0c47ff95c0e2..7c6ece1957fc 100644
+--- a/scripts/mod/modpost.h
++++ b/scripts/mod/modpost.h
+@@ -1,4 +1,5 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
++#include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdarg.h>
+@@ -10,8 +11,11 @@
+ #include <unistd.h>
+ #include <elf.h>
+ 
++#include "list.h"
+ #include "elfconfig.h"
+ 
++#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
++
+ /* On BSD-alike OSes elf.h defines these according to host's word size */
+ #undef ELF_ST_BIND
+ #undef ELF_ST_TYPE
+@@ -25,7 +29,6 @@
+ #define Elf_Sym     Elf32_Sym
+ #define Elf_Addr    Elf32_Addr
+ #define Elf_Sword   Elf64_Sword
+-#define Elf_Section Elf32_Half
+ #define ELF_ST_BIND ELF32_ST_BIND
+ #define ELF_ST_TYPE ELF32_ST_TYPE
+ 
+@@ -40,7 +43,6 @@
+ #define Elf_Sym     Elf64_Sym
+ #define Elf_Addr    Elf64_Addr
+ #define Elf_Sword   Elf64_Sxword
+-#define Elf_Section Elf64_Half
+ #define ELF_ST_BIND ELF64_ST_BIND
+ #define ELF_ST_TYPE ELF64_ST_TYPE
+ 
+@@ -109,26 +111,21 @@ buf_printf(struct buffer *buf, const char *fmt, ...);
+ void
+ buf_write(struct buffer *buf, const char *s, int len);
+ 
+-struct namespace_list {
+-	struct namespace_list *next;
+-	char namespace[];
+-};
+-
+ struct module {
+-	struct module *next;
++	struct list_head list;
+ 	int gpl_compatible;
+-	struct symbol *unres;
+-	int from_dump;  /* 1 if module was loaded from *.symvers */
+-	int is_vmlinux;
+-	int seen;
+-	int has_init;
+-	int has_cleanup;
++	struct list_head exported_symbols;
++	struct list_head unresolved_symbols;
++	bool from_dump;		/* true if module was loaded from *.symvers */
++	bool is_vmlinux;
++	bool seen;
++	bool has_init, has_cleanup;
+ 	struct buffer dev_table_buf;
+ 	char	     srcversion[25];
+ 	// Missing namespace dependencies
+-	struct namespace_list *missing_namespaces;
++	struct list_head missing_namespaces;
+ 	// Actual imported namespaces
+-	struct namespace_list *imported_namespaces;
++	struct list_head imported_namespaces;
+ 	char name[];
+ };
+ 
+@@ -138,8 +135,6 @@ struct elf_info {
+ 	Elf_Shdr     *sechdrs;
+ 	Elf_Sym      *symtab_start;
+ 	Elf_Sym      *symtab_stop;
+-	Elf_Section  export_sec;
+-	Elf_Section  export_gpl_sec;
+ 	char         *strtab;
+ 	char	     *modinfo;
+ 	unsigned int modinfo_len;
+diff --git a/scripts/mod/sumversion.c b/scripts/mod/sumversion.c
+index 905c0ec291e1..79bb9eaa65ac 100644
+--- a/scripts/mod/sumversion.c
++++ b/scripts/mod/sumversion.c
+@@ -387,7 +387,7 @@ static int parse_source_files(const char *objfile, struct md4_ctx *md)
+ /* Calc and record src checksum. */
+ void get_src_version(const char *modname, char sum[], unsigned sumlen)
+ {
+-	char *buf, *pos, *firstline;
++	char *buf;
+ 	struct md4_ctx md;
+ 	char *fname;
+ 	char filelist[PATH_MAX + 1];
+@@ -397,15 +397,8 @@ void get_src_version(const char *modname, char sum[], unsigned sumlen)
+ 
+ 	buf = read_text_file(filelist);
+ 
+-	pos = buf;
+-	firstline = get_line(&pos);
+-	if (!firstline) {
+-		warn("bad ending versions file for %s\n", modname);
+-		goto free;
+-	}
+-
+ 	md4_init(&md);
+-	while ((fname = strsep(&firstline, " "))) {
++	while ((fname = strsep(&buf, "\n"))) {
+ 		if (!*fname)
+ 			continue;
+ 		if (!(is_static_library(fname)) &&
+diff --git a/tools/objtool/Makefile b/tools/objtool/Makefile
+index 0dbd397f319d..29a92781b2ae 100644
+--- a/tools/objtool/Makefile
++++ b/tools/objtool/Makefile
+@@ -19,8 +19,8 @@ LIBSUBCMD		= $(LIBSUBCMD_OUTPUT)libsubcmd.a
+ OBJTOOL    := $(OUTPUT)objtool
+ OBJTOOL_IN := $(OBJTOOL)-in.o
+ 
+-LIBELF_FLAGS := $(shell pkg-config libelf --cflags 2>/dev/null)
+-LIBELF_LIBS  := $(shell pkg-config libelf --libs 2>/dev/null || echo -lelf)
++LIBELF_FLAGS := $(shell $(HOSTPKG_CONFIG) libelf --cflags 2>/dev/null)
++LIBELF_LIBS  := $(shell $(HOSTPKG_CONFIG) libelf --libs 2>/dev/null || echo -lelf)
+ 
+ all: $(OBJTOOL)
+ 
+diff --git a/usr/include/Makefile b/usr/include/Makefile
+index fa9819e022b7..f621e6078512 100644
+--- a/usr/include/Makefile
++++ b/usr/include/Makefile
+@@ -92,7 +92,7 @@ always-y := $(patsubst $(obj)/%.h,%.hdrtest, $(shell find $(obj) -name '*.h' 2>/
+ # Include the header twice to detect missing include guard.
+ quiet_cmd_hdrtest = HDRTEST $<
+       cmd_hdrtest = \
+-		$(CC) $(c_flags) -S -o /dev/null -x c /dev/null \
++		$(CC) $(c_flags) -fsyntax-only -x c /dev/null \
+ 			$(if $(filter-out $(no-header-test), $*.h), -include $< -include $<); \
+ 		$(PERL) $(srctree)/$(src)/headers_check.pl $(obj) $(SRCARCH) $<; \
+ 		touch $@
+-- 
+2.36.0
+
