@@ -1,0 +1,369 @@
+From 5f7f3b71a65d1fdd929090960f4a65c7874451df Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Fri, 13 May 2022 03:00:06 +0200
+Subject: [PATCH] migrate-cacule
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ include/linux/sched.h   |   1 +
+ kernel/sched/fair.c     | 187 +++++++++++++++++++++-------------------
+ kernel/sched/features.h |  11 +++
+ 3 files changed, 108 insertions(+), 91 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 24ec96e9723d..38c068a0d062 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -554,6 +554,7 @@ struct sched_entity {
+ #endif
+ 	struct list_head		group_node;
+ 	unsigned int			on_rq;
++	unsigned int			migrated;
+ 
+ 	u64				exec_start;
+ 	u64				sum_exec_runtime;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index b8f6a68fad94..0b6dea5a5494 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -598,12 +598,15 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
+ 			vruntime = min_vruntime(vruntime, se->vruntime);
+ 	}
+ 
+-	/* ensure we never gain time by being placed backwards. */
+-	cfs_rq->min_vruntime = max_vruntime(cfs_rq->min_vruntime, vruntime);
+-#ifndef CONFIG_64BIT
+-	smp_wmb();
+-	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+-#endif
++	/*
++	 * When there is contention, make sure min_vruntime never goes
++	 * backwards, this would violate forward progress. Without contention
++	 * however, min_vruntime should simply follow the only task around.
++	 */
++	if (cfs_rq->nr_running > 1)
++		vruntime = max_vruntime(cfs_rq->min_vruntime, vruntime);
++
++	cfs_rq->min_vruntime = vruntime;
+ }
+ 
+ static inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
+@@ -927,23 +930,10 @@ static u64 __sched_period(unsigned long nr_running)
+ static bool sched_idle_cfs_rq(struct cfs_rq *cfs_rq);
+ 
+ /*
+- * We calculate the wall-time slice from the period by taking a part
+- * proportional to the weight.
+- *
+- * s = p*P[w/rw]
++ * s' = s*P[w/rw]
+  */
+-static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
++static u64 __sched_proportion(u64 slice, struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	unsigned int nr_running = cfs_rq->nr_running;
+-	struct sched_entity *init_se = se;
+-	unsigned int min_gran;
+-	u64 slice;
+-
+-	if (sched_feat(ALT_PERIOD))
+-		nr_running = rq_of(cfs_rq)->cfs.h_nr_running;
+-
+-	slice = __sched_period(nr_running + !se->on_rq);
+-
+ 	for_each_sched_entity(se) {
+ 		struct load_weight *load;
+ 		struct load_weight lw;
+@@ -961,8 +951,29 @@ static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 		slice = __calc_delta(slice, se->load.weight, load);
+ 	}
+ 
++	return slice;
++}
++
++/*
++ * We calculate the wall-time slice from the period by taking a part
++ * proportional to the weight.
++ *
++ * s = p*P[w/rw]
++ */
++static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	unsigned int nr_running = cfs_rq->nr_running;
++	unsigned int min_gran;
++	u64 slice;
++
++	if (sched_feat(ALT_PERIOD))
++		nr_running = rq_of(cfs_rq)->cfs.h_nr_running;
++
++	slice = __sched_period(nr_running + !se->on_rq);
++	slice = __sched_proportion(slice, cfs_rq, se);
++
+ 	if (sched_feat(BASE_SLICE)) {
+-		if (se_is_idle(init_se) && !sched_idle_cfs_rq(cfs_rq))
++		if (se_is_idle(se) && !sched_idle_cfs_rq(cfs_rq))
+ 			min_gran = sysctl_sched_idle_min_granularity;
+ 		else
+ 			min_gran = sysctl_sched_min_granularity;
+@@ -1169,6 +1180,13 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ 	normalize_lifetime(now, curr);
+ #else
+ 	curr->vruntime += calc_delta_fair(delta_exec, curr);
++	if (sched_feat(FORCE_MIN_VRUNTIME)) {
++		/*
++		 * Force advance min_vruntime at the runqueue rate, this
++		 * ensures it cannot get stuck due to placement trickery.
++		 */
++		cfs_rq->min_vruntime += __calc_delta(delta_exec, NICE_0_LOAD, &cfs_rq->load);
++	}
+ 	update_min_vruntime(cfs_rq);
+ #endif
+ 
+@@ -1306,6 +1324,7 @@ update_stats_curr_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 	 * We are starting a new run period:
+ 	 */
+ #ifdef CONFIG_CACULE_SCHED
+++	se->migrated = 0;
+ 	se->exec_start = sched_clock();
+ 	se->cacule_node.last_run = sched_clock();
+ #else
+@@ -4497,18 +4516,24 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
+ {
+ 	u64 vruntime = cfs_rq->min_vruntime;
+ 
+-	/*
+-	 * The 'current' period is already promised to the current tasks,
+-	 * however the extra weight of the new task will slow them down a
+-	 * little, place the new task so that it fits in the slot that
+-	 * stays open at the end.
+-	 */
+-	if (initial && sched_feat(START_DEBIT))
+-		vruntime += sched_vslice(cfs_rq, se);
++	if (unlikely(initial)) { /* task creation is once, wakeup is often */
++		/*
++		 * The 'current' period is already promised to the current
++		 * tasks, however the extra weight of the new task will slow
++		 * them down a little, place the new task so that it fits in
++		 * the slot that stays open at the end.
++		 */
++		if (sched_feat(START_DEBIT))
++			vruntime += sched_vslice(cfs_rq, se);
+ 
+-	/* sleeps up to a single latency don't count. */
+-	if (!initial) {
+-		unsigned long thresh;
++	} else {
++		/* sleeps up to a single latency don't count. */
++		u64 now = rq_clock_task(rq_of(cfs_rq));
++		u64 sleep = now - se->exec_start;
++		u64 vtime, thresh;
++
++		/* vtime progression if @se would have been running */
++		vtime = calc_delta_fair(__sched_proportion(sleep, cfs_rq, se), se);
+ 
+ 		if (se_is_idle(se))
+ 			thresh = sysctl_sched_min_granularity;
+@@ -4522,14 +4547,34 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
+ 		if (sched_feat(GENTLE_FAIR_SLEEPERS))
+ 			thresh >>= 1;
+ 
+-		vruntime -= thresh;
++		vruntime -= min(thresh, vtime);
+ 	}
+ 
+-	/* ensure we never gain time by being placed backwards. */
+-	se->vruntime = max_vruntime(se->vruntime, vruntime);
++	se->vruntime = vruntime;
+ }
+ #endif /* CONFIG_CACULE_SCHED */
+ 
++static void place_entity_migrate(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	if (!sched_feat(PLACE_MIGRATE))
++		return;
++
++	if (cfs_rq->nr_running < se->migrated) {
++		/*
++		 * Migrated to a shorter runqueue, go first because
++		 * we were under-served on the old runqueue.
++		 */
++		se->vruntime = cfs_rq->min_vruntime;
++		return;
++	}
++
++	/*
++	 * Migrated to a longer runqueue, go last because
++	 * we got over-served on the old runqueue.
++	 */
++	se->vruntime = cfs_rq->min_vruntime + sched_vslice(cfs_rq, se);
++}
++
+ static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
+ 
+ static inline bool cfs_bandwidth_used(void);
+@@ -4550,25 +4595,12 @@ static inline bool cfs_bandwidth_used(void);
+  * this way the vruntime transition between RQs is done when both
+  * min_vruntime are up-to-date.
+  *
+- * WAKEUP (remote)
+- *
+- *	->migrate_task_rq_fair() (p->state == TASK_WAKING)
+- *	  vruntime -= min_vruntime
+- *
+- *	enqueue
+- *	  update_curr()
+- *	    update_min_vruntime()
+- *	  vruntime += min_vruntime
+- *
+- * this way we don't have the most up-to-date min_vruntime on the originating
+- * CPU and an up-to-date min_vruntime on the destination CPU.
+- */
+ 
+ static void
+ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ {
+ #if !defined(CONFIG_CACULE_SCHED)
+-	bool renorm = !(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_MIGRATED);
++	bool wakeup = flags & ENQUEUE_WAKEUP;
+ #endif
+ 	bool curr = cfs_rq->curr == se;
+ 
+@@ -4577,7 +4609,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	 * If we're the current task, we must renormalise before calling
+ 	 * update_curr().
+ 	 */
+-	if (renorm && curr)
++	if (!wakeup && curr)
+ 		se->vruntime += cfs_rq->min_vruntime;
+ #endif
+ 
+@@ -4590,7 +4622,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	 * placed in the past could significantly boost this task to the
+ 	 * fairness detriment of existing tasks.
+ 	 */
+-	if (renorm && !curr)
++	if (!wakeup && !curr)
+ 		se->vruntime += cfs_rq->min_vruntime;
+ #endif
+ 
+@@ -4608,8 +4640,10 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	account_entity_enqueue(cfs_rq, se);
+ 
+ #if !defined(CONFIG_CACULE_SCHED)
+-	if (flags & ENQUEUE_WAKEUP)
++	if (wakeup)
+ 		place_entity(cfs_rq, se, 0);
++	else if (se->migrated)
++		place_entity_migrate(cfs_rq, se);
+ #endif
+ 
+ 	check_schedstat_required();
+@@ -7315,33 +7349,7 @@ static void detach_entity_cfs_rq(struct sched_entity *se);
+  */
+ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ {
+-#if !defined(CONFIG_CACULE_SCHED)
+-	/*
+-	 * As blocked tasks retain absolute vruntime the migration needs to
+-	 * deal with this by subtracting the old and adding the new
+-	 * min_vruntime -- the latter is done by enqueue_entity() when placing
+-	 * the task on the new runqueue.
+-	 */
+-	if (READ_ONCE(p->__state) == TASK_WAKING) {
+-		struct sched_entity *se = &p->se;
+-		struct cfs_rq *cfs_rq = cfs_rq_of(se);
+-		u64 min_vruntime;
+-
+-#ifndef CONFIG_64BIT
+-		u64 min_vruntime_copy;
+-
+-		do {
+-			min_vruntime_copy = cfs_rq->min_vruntime_copy;
+-			smp_rmb();
+-			min_vruntime = cfs_rq->min_vruntime;
+-		} while (min_vruntime != min_vruntime_copy);
+-#else
+-		min_vruntime = cfs_rq->min_vruntime;
+-#endif
+-
+-		se->vruntime -= min_vruntime;
+-	}
+-#endif /* CONFIG_CACULE_SCHED */
++	struct sched_entity *se = &p->se;
+ 
+ 	if (p->on_rq == TASK_ON_RQ_MIGRATING) {
+ 		/*
+@@ -7349,7 +7357,7 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ 		 * rq->lock and can modify state directly.
+ 		 */
+ 		lockdep_assert_rq_held(task_rq(p));
+-		detach_entity_cfs_rq(&p->se);
++		detach_entity_cfs_rq(se);
+ 
+ 	} else {
+ 		/*
+@@ -7360,14 +7368,15 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ 		 * wakee task is less decayed, but giving the wakee more load
+ 		 * sounds not bad.
+ 		 */
+-		remove_entity_load_avg(&p->se);
++		remove_entity_load_avg(se);
+ 	}
+ 
+ 	/* Tell new CPU we are migrated */
+-	p->se.avg.last_update_time = 0;
++	se->avg.last_update_time = 0;
+ 
+ 	/* We have migrated, no longer consider this task hot */
+-	p->se.exec_start = 0;
++	for_each_sched_entity(se)
++		se->migrated = READ_ONCE(cfs_rq_of(se)->nr_running) + !se->on_rq;
+ 
+ 	update_scan_period(p, new_cpu);
+ }
+@@ -8113,6 +8122,9 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
+ 	if (sysctl_sched_migration_cost == 0)
+ 		return 0;
+ 
++	if (p->se.migrated)
++		return 0;
++
+ 	delta = rq_clock_task(env->src_rq) - p->se.exec_start;
+ 
+ 	return delta < (s64)sysctl_sched_migration_cost;
+@@ -12366,13 +12378,6 @@ void init_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
+ 
+-#if !defined(CONFIG_CACULE_SCHED)
+-	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
+-#ifndef CONFIG_64BIT
+-	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+-#endif
+-#endif /* CONFIG_CACULE_SCHED */
+-
+ #ifdef CONFIG_SMP
+ 	raw_spin_lock_init(&cfs_rq->removed.lock);
+ #endif
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 1cf435bbcd9c..3cbfe3ce40ef 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -100,3 +100,14 @@ SCHED_FEAT(LATENCY_WARN, false)
+ 
+ SCHED_FEAT(ALT_PERIOD, true)
+ SCHED_FEAT(BASE_SLICE, true)
++
++#ifdef CONFIG_SMP
++/*
++ * SMP migrations in particular can cause the min_vruntime to stall,
++ * leading to starvation issues.
++ */
++SCHED_FEAT(FORCE_MIN_VRUNTIME, false)
++#else
++SCHED_FEAT(FORCE_MIN_VRUNTIME, false)
++#endif
++SCHED_FEAT(PLACE_MIGRATE, true)
+-- 
+2.36.1
+
