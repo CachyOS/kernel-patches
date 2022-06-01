@@ -1,173 +1,7 @@
-From df7e6d3159d24b09d1b2b9ee16208a5e3194bc9c Mon Sep 17 00:00:00 2001
-From: Tor Vic <torvic9@mailbox.org>
-Date: Tue, 7 Dec 2021 10:01:04 +0100
-Subject: [PATCH] futex: Add entry point for FUTEX_WAIT_MULTIPLE (opcode 31)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Add an option to wait on multiple futexes using the old interface, that
-uses opcode 31 through futex() syscall. Do that by just translating the
-old interface to use the new code. This allows old and stable versions
-of Proton to still use fsync in new kernel releases.
-
-[torvic9: adapted André's commit for futex_waitv changes in 5.16]
----
- include/uapi/linux/futex.h | 13 +++++++
- kernel/futex/syscalls.c    | 75 +++++++++++++++++++++++++++++++++++++-
- 2 files changed, 87 insertions(+), 1 deletion(-)
-
-diff --git a/include/uapi/linux/futex.h b/include/uapi/linux/futex.h
-index 71a5df8d2..cf7fc988c 100644
---- a/include/uapi/linux/futex.h
-+++ b/include/uapi/linux/futex.h
-@@ -22,6 +22,7 @@
- #define FUTEX_WAIT_REQUEUE_PI	11
- #define FUTEX_CMP_REQUEUE_PI	12
- #define FUTEX_LOCK_PI2		13
-+#define FUTEX_WAIT_MULTIPLE		31
-
- #define FUTEX_PRIVATE_FLAG	128
- #define FUTEX_CLOCK_REALTIME	256
-@@ -68,6 +69,18 @@ struct futex_waitv {
- 	__u32 __reserved;
- };
-
-+/**
-+ * struct futex_wait_block - Block of futexes to be waited for
-+ * @uaddr:	User address of the futex
-+ * @val:	Futex value expected by userspace
-+ * @bitset:	Bitset for the optional bitmasked wakeup
-+ */
-+struct futex_wait_block {
-+	__u32 __user *uaddr;
-+	__u32 val;
-+	__u32 bitset;
-+};
-+
- /*
-  * Support for robust futexes: the kernel cleans up held futexes at
-  * thread exit time.
-diff --git a/kernel/futex/syscalls.c b/kernel/futex/syscalls.c
-index 6f91a07a6..2f4d4c04e 100644
---- a/kernel/futex/syscalls.c
-+++ b/kernel/futex/syscalls.c
-@@ -158,6 +158,7 @@ static __always_inline bool futex_cmd_has_timeout(u32 cmd)
- 	case FUTEX_LOCK_PI2:
- 	case FUTEX_WAIT_BITSET:
- 	case FUTEX_WAIT_REQUEUE_PI:
-+	case FUTEX_WAIT_MULTIPLE:
- 		return true;
- 	}
- 	return false;
-@@ -170,13 +171,79 @@ futex_init_timeout(u32 cmd, u32 op, struct timespec64 *ts, ktime_t *t)
- 		return -EINVAL;
-
- 	*t = timespec64_to_ktime(*ts);
--	if (cmd == FUTEX_WAIT)
-+	if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_MULTIPLE)
- 		*t = ktime_add_safe(ktime_get(), *t);
- 	else if (cmd != FUTEX_LOCK_PI && !(op & FUTEX_CLOCK_REALTIME))
- 		*t = timens_ktime_to_host(CLOCK_MONOTONIC, *t);
- 	return 0;
- }
-
-+/**
-+ * futex_read_wait_block - Read an array of futex_wait_block from userspace
-+ * @uaddr:	Userspace address of the block
-+ * @count:	Number of blocks to be read
-+ *
-+ * This function creates and allocate an array of futex_q (we zero it to
-+ * initialize the fields) and then, for each futex_wait_block element from
-+ * userspace, fill a futex_q element with proper values.
-+ */
-+inline struct futex_vector *futex_read_wait_block(u32 __user *uaddr, u32 count)
-+{
-+	unsigned int i;
-+	struct futex_vector *futexv;
-+	struct futex_wait_block fwb;
-+	struct futex_wait_block __user *entry =
-+		(struct futex_wait_block __user *)uaddr;
-+
-+	if (!count || count > FUTEX_WAITV_MAX)
-+		return ERR_PTR(-EINVAL);
-+
-+	futexv = kcalloc(count, sizeof(*futexv), GFP_KERNEL);
-+	if (!futexv)
-+		return ERR_PTR(-ENOMEM);
-+
-+	for (i = 0; i < count; i++) {
-+		if (copy_from_user(&fwb, &entry[i], sizeof(fwb))) {
-+			kfree(futexv);
-+			return ERR_PTR(-EFAULT);
-+		}
-+
-+		futexv[i].w.flags = FUTEX_32;
-+		futexv[i].w.val = fwb.val;
-+		futexv[i].w.uaddr = (uintptr_t) (fwb.uaddr);
-+		futexv[i].q = futex_q_init;
-+	}
-+
-+	return futexv;
-+}
-+
-+int futex_wait_multiple(struct futex_vector *vs, unsigned int count,
-+			struct hrtimer_sleeper *to);
-+
-+int futex_opcode_31(ktime_t *abs_time, u32 __user *uaddr, int count)
-+{
-+	int ret;
-+	struct futex_vector *vs;
-+	struct hrtimer_sleeper *to = NULL, timeout;
-+
-+	to = futex_setup_timer(abs_time, &timeout, 0, 0);
-+
-+	vs = futex_read_wait_block(uaddr, count);
-+
-+	if (IS_ERR(vs))
-+		return PTR_ERR(vs);
-+
-+	ret = futex_wait_multiple(vs, count, abs_time ? to : NULL);
-+	kfree(vs);
-+
-+	if (to) {
-+		hrtimer_cancel(&to->timer);
-+		destroy_hrtimer_on_stack(&to->timer);
-+	}
-+
-+	return ret;
-+}
-+
- SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
- 		const struct __kernel_timespec __user *, utime,
- 		u32 __user *, uaddr2, u32, val3)
-@@ -196,6 +263,9 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
- 		tp = &t;
- 	}
-
-+	if (cmd == FUTEX_WAIT_MULTIPLE)
-+		return futex_opcode_31(tp, uaddr, val);
-+
- 	return do_futex(uaddr, op, val, tp, uaddr2, (unsigned long)utime, val3);
- }
-
-@@ -392,6 +462,9 @@ SYSCALL_DEFINE6(futex_time32, u32 __user *, uaddr, int, op, u32, val,
- 		tp = &t;
- 	}
-
-+	if (cmd == FUTEX_WAIT_MULTIPLE)
-+		return futex_opcode_31(tp, uaddr, val);
-+
- 	return do_futex(uaddr, op, val, tp, uaddr2, (unsigned long)utime, val3);
- }
- #endif /* CONFIG_COMPAT_32BIT_TIME */
---
-2.34.1.75.gabe6bb3905
-
-From 0cd75a4596393ffa0d05c91970d6272fc6576c64 Mon Sep 17 00:00:00 2001
+From 5a2e6b31074106c5daebbcb1f5aa8cb96d537c47 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 10:50:45 -0600
-Subject: [PATCH 01/34] winesync: Introduce the winesync driver and character
+Subject: [PATCH 01/35] winesync: Introduce the winesync driver and character
  device
 
 ---
@@ -178,7 +12,7 @@ Subject: [PATCH 01/34] winesync: Introduce the winesync driver and character
  create mode 100644 drivers/misc/winesync.c
 
 diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
-index 41d2bb0ae..3a1450cb8 100644
+index 41d2bb0ae23a..3a1450cb8687 100644
 --- a/drivers/misc/Kconfig
 +++ b/drivers/misc/Kconfig
 @@ -483,6 +483,17 @@ config OPEN_DICE
@@ -200,7 +34,7 @@ index 41d2bb0ae..3a1450cb8 100644
  source "drivers/misc/eeprom/Kconfig"
  source "drivers/misc/cb710/Kconfig"
 diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
-index 70e800e91..d9f269c10 100644
+index 70e800e9127f..d9f269c101ff 100644
 --- a/drivers/misc/Makefile
 +++ b/drivers/misc/Makefile
 @@ -58,5 +58,6 @@ obj-$(CONFIG_HABANA_AI)		+= habanalabs/
@@ -212,7 +46,7 @@ index 70e800e91..d9f269c10 100644
  obj-$(CONFIG_OPEN_DICE)		+= open-dice.o
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
 new file mode 100644
-index 000000000..111f33c56
+index 000000000000..111f33c5676e
 --- /dev/null
 +++ b/drivers/misc/winesync.c
 @@ -0,0 +1,64 @@
@@ -281,13 +115,12 @@ index 000000000..111f33c56
 +MODULE_LICENSE("GPL");
 +MODULE_ALIAS("devname:" WINESYNC_NAME);
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 807a5ef935bf1858706dc48fa2da497fcc58129b Mon Sep 17 00:00:00 2001
+From 4301a8d004eecc44fca5dd9d84558c36bf6826fb Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 10:57:06 -0600
-Subject: [PATCH 02/34] winesync: Reserve a minor device number and ioctl range
+Subject: [PATCH 02/35] winesync: Reserve a minor device number and ioctl range
 
 ---
  Documentation/admin-guide/devices.txt              | 3 ++-
@@ -297,7 +130,7 @@ Subject: [PATCH 02/34] winesync: Reserve a minor device number and ioctl range
  4 files changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/Documentation/admin-guide/devices.txt b/Documentation/admin-guide/devices.txt
-index c07dc0ee8..4e5abe508 100644
+index c07dc0ee860e..4e5abe508426 100644
 --- a/Documentation/admin-guide/devices.txt
 +++ b/Documentation/admin-guide/devices.txt
 @@ -376,8 +376,9 @@
@@ -312,7 +145,7 @@ index c07dc0ee8..4e5abe508 100644
  
    11 char	Raw keyboard device	(Linux/SPARC only)
 diff --git a/Documentation/userspace-api/ioctl/ioctl-number.rst b/Documentation/userspace-api/ioctl/ioctl-number.rst
-index fcab013e4..f617f2c56 100644
+index fcab013e47c9..f617f2c56421 100644
 --- a/Documentation/userspace-api/ioctl/ioctl-number.rst
 +++ b/Documentation/userspace-api/ioctl/ioctl-number.rst
 @@ -375,6 +375,8 @@ Code  Seq#    Include File                                           Comments
@@ -325,7 +158,7 @@ index fcab013e4..f617f2c56 100644
                                                                       <mailto:nchatrad@amd.com>
  0xFD  all    linux/dm-ioctl.h
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 111f33c56..85cb6ccaa 100644
+index 111f33c5676e..85cb6ccaa077 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -40,7 +40,7 @@ static const struct file_operations winesync_fops = {
@@ -343,7 +176,7 @@ index 111f33c56..85cb6ccaa 100644
  MODULE_ALIAS("devname:" WINESYNC_NAME);
 +MODULE_ALIAS_MISCDEV(WINESYNC_MINOR);
 diff --git a/include/linux/miscdevice.h b/include/linux/miscdevice.h
-index 0676f1809..350aecfcf 100644
+index 0676f18093f9..350aecfcfb29 100644
 --- a/include/linux/miscdevice.h
 +++ b/include/linux/miscdevice.h
 @@ -71,6 +71,7 @@
@@ -355,13 +188,12 @@ index 0676f1809..350aecfcf 100644
  
  struct device;
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 8d01bdf4980c9c01433dfada0aaa9f263fc71039 Mon Sep 17 00:00:00 2001
+From b893a56dbac2966525b7768e827d2e536051a51c Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:15:39 -0600
-Subject: [PATCH 03/34] winesync: Introduce WINESYNC_IOC_CREATE_SEM and
+Subject: [PATCH 03/35] winesync: Introduce WINESYNC_IOC_CREATE_SEM and
  WINESYNC_IOC_DELETE
 
 ---
@@ -371,7 +203,7 @@ Subject: [PATCH 03/34] winesync: Introduce WINESYNC_IOC_CREATE_SEM and
  create mode 100644 include/uapi/linux/winesync.h
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 85cb6ccaa..36e31bbe0 100644
+index 85cb6ccaa077..36e31bbe0390 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -8,23 +8,140 @@
@@ -517,7 +349,7 @@ index 85cb6ccaa..36e31bbe0 100644
  	}
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
 new file mode 100644
-index 000000000..aabb491f3
+index 000000000000..aabb491f39d2
 --- /dev/null
 +++ b/include/uapi/linux/winesync.h
 @@ -0,0 +1,25 @@
@@ -547,13 +379,12 @@ index 000000000..aabb491f3
 +
 +#endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 98fe8cc4e3f8d3303cd9be933aafcaf31449ddfd Mon Sep 17 00:00:00 2001
+From aef4400a494b9907192823175f53af89ce87bb8e Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:22:42 -0600
-Subject: [PATCH 04/34] winesync: Introduce WINESYNC_IOC_PUT_SEM
+Subject: [PATCH 04/35] winesync: Introduce WINESYNC_IOC_PUT_SEM
 
 ---
  drivers/misc/winesync.c       | 76 +++++++++++++++++++++++++++++++++++
@@ -561,7 +392,7 @@ Subject: [PATCH 04/34] winesync: Introduce WINESYNC_IOC_PUT_SEM
  2 files changed, 78 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 36e31bbe0..84b5a5c9e 100644
+index 36e31bbe0390..84b5a5c9e0ce 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -21,9 +21,11 @@ enum winesync_type {
@@ -686,7 +517,7 @@ index 36e31bbe0..84b5a5c9e 100644
  		return -ENOSYS;
  	}
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index aabb491f3..7681a168e 100644
+index aabb491f39d2..7681a168eb92 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -21,5 +21,7 @@ struct winesync_sem_args {
@@ -698,13 +529,12 @@ index aabb491f3..7681a168e 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 58f95e165c48d764ef90c62c0ac053ed5c54150e Mon Sep 17 00:00:00 2001
+From f0af07e3f24f9d67326b105f25fd7a09eae5f440 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:31:44 -0600
-Subject: [PATCH 05/34] winesync: Introduce WINESYNC_IOC_WAIT_ANY
+Subject: [PATCH 05/35] winesync: Introduce WINESYNC_IOC_WAIT_ANY
 
 ---
  drivers/misc/winesync.c       | 226 ++++++++++++++++++++++++++++++++++
@@ -712,7 +542,7 @@ Subject: [PATCH 05/34] winesync: Introduce WINESYNC_IOC_WAIT_ANY
  2 files changed, 237 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 84b5a5c9e..d9b5ab159 100644
+index 84b5a5c9e0ce..d9b5ab159520 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -23,6 +23,8 @@ struct winesync_obj {
@@ -984,7 +814,7 @@ index 84b5a5c9e..d9b5ab159 100644
  		return -ENOSYS;
  	}
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index 7681a168e..f57ebfbe1 100644
+index 7681a168eb92..f57ebfbe1dd9 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -16,6 +16,15 @@ struct winesync_sem_args {
@@ -1012,13 +842,12 @@ index 7681a168e..f57ebfbe1 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 308ffbce24939bfda3aed43063f03d3779297fd2 Mon Sep 17 00:00:00 2001
+From 93cb9e64293a51e2ee5e397b69a4400460d5b08b Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:36:09 -0600
-Subject: [PATCH 06/34] winesync: Introduce WINESYNC_IOC_WAIT_ALL
+Subject: [PATCH 06/35] winesync: Introduce WINESYNC_IOC_WAIT_ALL
 
 ---
  drivers/misc/winesync.c       | 242 ++++++++++++++++++++++++++++++++--
@@ -1026,7 +855,7 @@ Subject: [PATCH 06/34] winesync: Introduce WINESYNC_IOC_WAIT_ALL
  2 files changed, 236 insertions(+), 8 deletions(-)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index d9b5ab159..2b708c5b8 100644
+index d9b5ab159520..2b708c5b88a6 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -23,7 +23,34 @@ struct winesync_obj {
@@ -1359,7 +1188,7 @@ index d9b5ab159..2b708c5b8 100644
  		return winesync_wait_any(dev, argp);
  	default:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index f57ebfbe1..44025a510 100644
+index f57ebfbe1dd9..44025a510cb9 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -34,5 +34,7 @@ struct winesync_wait_args {
@@ -1371,13 +1200,12 @@ index f57ebfbe1..44025a510 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 388db2c33b61e7033ce032962814e62a5e894063 Mon Sep 17 00:00:00 2001
+From e186aee3bdfbef760155f6ace5db94b3dbe1500a Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:41:10 -0600
-Subject: [PATCH 07/34] winesync: Introduce WINESYNC_IOC_CREATE_MUTEX
+Subject: [PATCH 07/35] winesync: Introduce WINESYNC_IOC_CREATE_MUTEX
 
 ---
  drivers/misc/winesync.c       | 72 +++++++++++++++++++++++++++++++++++
@@ -1385,7 +1213,7 @@ Subject: [PATCH 07/34] winesync: Introduce WINESYNC_IOC_CREATE_MUTEX
  2 files changed, 80 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 2b708c5b8..18eb05975 100644
+index 2b708c5b88a6..18eb05975907 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -16,6 +16,7 @@
@@ -1517,7 +1345,7 @@ index 2b708c5b8..18eb05975 100644
  		return winesync_create_sem(dev, argp);
  	case WINESYNC_IOC_DELETE:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index 44025a510..23606a3b1 100644
+index 44025a510cb9..23606a3b1546 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -16,6 +16,12 @@ struct winesync_sem_args {
@@ -1542,13 +1370,12 @@ index 44025a510..23606a3b1 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From f5a9e33ebdbe9313667c2e1fde83d4cc674b3879 Mon Sep 17 00:00:00 2001
+From 5e05a4dfb4b2bb87a901c065261f7befa6d7ac40 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:44:41 -0600
-Subject: [PATCH 08/34] winesync: Introduce WINESYNC_IOC_PUT_MUTEX
+Subject: [PATCH 08/35] winesync: Introduce WINESYNC_IOC_PUT_MUTEX
 
 ---
  drivers/misc/winesync.c       | 67 +++++++++++++++++++++++++++++++++++
@@ -1556,7 +1383,7 @@ Subject: [PATCH 08/34] winesync: Introduce WINESYNC_IOC_PUT_MUTEX
  2 files changed, 69 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 18eb05975..d18d08a68 100644
+index 18eb05975907..d18d08a68546 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -450,6 +450,71 @@ static int winesync_put_sem(struct winesync_device *dev, void __user *argp)
@@ -1641,7 +1468,7 @@ index 18eb05975..d18d08a68 100644
  		return winesync_put_sem(dev, argp);
  	case WINESYNC_IOC_WAIT_ALL:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index 23606a3b1..fde08cb8a 100644
+index 23606a3b1546..fde08cb8ab95 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -44,5 +44,7 @@ struct winesync_wait_args {
@@ -1653,13 +1480,12 @@ index 23606a3b1..fde08cb8a 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From e6a5a741564443ef94bb68fccf72056cd383f6b6 Mon Sep 17 00:00:00 2001
+From d344ba569abbc2ff5b170af39a559ee2ead1012e Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:46:46 -0600
-Subject: [PATCH 09/34] winesync: Introduce WINESYNC_IOC_KILL_OWNER
+Subject: [PATCH 09/35] winesync: Introduce WINESYNC_IOC_KILL_OWNER
 
 ---
  drivers/misc/winesync.c       | 80 ++++++++++++++++++++++++++++++++++-
@@ -1667,7 +1493,7 @@ Subject: [PATCH 09/34] winesync: Introduce WINESYNC_IOC_KILL_OWNER
  2 files changed, 79 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index d18d08a68..891537063 100644
+index d18d08a68546..891537063bb6 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -64,6 +64,7 @@ struct winesync_obj {
@@ -1814,7 +1640,7 @@ index d18d08a68..891537063 100644
  		return winesync_put_mutex(dev, argp);
  	case WINESYNC_IOC_PUT_SEM:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index fde08cb8a..f57aa76d5 100644
+index fde08cb8ab95..f57aa76d57f5 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -46,5 +46,6 @@ struct winesync_wait_args {
@@ -1825,13 +1651,12 @@ index fde08cb8a..f57aa76d5 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From f58e6a855ce9f69a82ce5489b1dafb786b3a064b Mon Sep 17 00:00:00 2001
+From c268953b625feeac29a4d935f4b8145fe6e064f0 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:47:55 -0600
-Subject: [PATCH 10/34] winesync: Introduce WINESYNC_IOC_READ_SEM
+Subject: [PATCH 10/35] winesync: Introduce WINESYNC_IOC_READ_SEM
 
 ---
  drivers/misc/winesync.c       | 29 +++++++++++++++++++++++++++++
@@ -1839,7 +1664,7 @@ Subject: [PATCH 10/34] winesync: Introduce WINESYNC_IOC_READ_SEM
  2 files changed, 31 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 891537063..98bedda2f 100644
+index 891537063bb6..98bedda2f8eb 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -523,6 +523,33 @@ static int winesync_put_mutex(struct winesync_device *dev, void __user *argp)
@@ -1886,7 +1711,7 @@ index 891537063..98bedda2f 100644
  		return winesync_wait_all(dev, argp);
  	case WINESYNC_IOC_WAIT_ANY:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index f57aa76d5..311eb8106 100644
+index f57aa76d57f5..311eb810647d 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -47,5 +47,7 @@ struct winesync_wait_args {
@@ -1898,13 +1723,12 @@ index f57aa76d5..311eb8106 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From e04fe107bbf262e8baaffbaa7bf903077072201c Mon Sep 17 00:00:00 2001
+From ad0a44e35f0410813b2a41b947d0919455a7191a Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:48:10 -0600
-Subject: [PATCH 11/34] winesync: Introduce WINESYNC_IOC_READ_MUTEX
+Subject: [PATCH 11/35] winesync: Introduce WINESYNC_IOC_READ_MUTEX
 
 ---
  drivers/misc/winesync.c       | 31 +++++++++++++++++++++++++++++++
@@ -1912,7 +1736,7 @@ Subject: [PATCH 11/34] winesync: Introduce WINESYNC_IOC_READ_MUTEX
  2 files changed, 33 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 98bedda2f..eae272663 100644
+index 98bedda2f8eb..eae272663abe 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -550,6 +550,35 @@ static int winesync_read_sem(struct winesync_device *dev, void __user *argp)
@@ -1961,7 +1785,7 @@ index 98bedda2f..eae272663 100644
  		return winesync_read_sem(dev, argp);
  	case WINESYNC_IOC_WAIT_ALL:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index 311eb8106..3371a303a 100644
+index 311eb810647d..3371a303a927 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -49,5 +49,7 @@ struct winesync_wait_args {
@@ -1973,13 +1797,12 @@ index 311eb8106..3371a303a 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 1b9170222b804f9071291c34359bae33cb3ee64c Mon Sep 17 00:00:00 2001
+From 8eada4b8adc5b04689abc8401a821d161a8dc919 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 11:50:49 -0600
-Subject: [PATCH 12/34] docs: winesync: Add documentation for the winesync uAPI
+Subject: [PATCH 12/35] docs: winesync: Add documentation for the winesync uAPI
 
 ---
  Documentation/userspace-api/index.rst    |   1 +
@@ -1988,7 +1811,7 @@ Subject: [PATCH 12/34] docs: winesync: Add documentation for the winesync uAPI
  create mode 100644 Documentation/userspace-api/winesync.rst
 
 diff --git a/Documentation/userspace-api/index.rst b/Documentation/userspace-api/index.rst
-index a61eac0c7..0bf697ddc 100644
+index a61eac0c73f8..0bf697ddcb09 100644
 --- a/Documentation/userspace-api/index.rst
 +++ b/Documentation/userspace-api/index.rst
 @@ -29,6 +29,7 @@ place where this information is gathered.
@@ -2001,7 +1824,7 @@ index a61eac0c7..0bf697ddc 100644
  
 diff --git a/Documentation/userspace-api/winesync.rst b/Documentation/userspace-api/winesync.rst
 new file mode 100644
-index 000000000..5de409a9c
+index 000000000000..5de409a9c3fc
 --- /dev/null
 +++ b/Documentation/userspace-api/winesync.rst
 @@ -0,0 +1,324 @@
@@ -2330,13 +2153,12 @@ index 000000000..5de409a9c
 +  object more than once. If this is attempted, the function fails with
 +  ``EINVAL``.
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 4c320866cf1397c3b1481036659def3be94e0cf9 Mon Sep 17 00:00:00 2001
+From 4d6b0225a2c50c4d4361e4e7c6ab67a9fc5802f2 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 12:06:23 -0600
-Subject: [PATCH 13/34] selftests: winesync: Add some tests for semaphore state
+Subject: [PATCH 13/35] selftests: winesync: Add some tests for semaphore state
 
 ---
  tools/testing/selftests/Makefile              |   1 +
@@ -2349,7 +2171,7 @@ Subject: [PATCH 13/34] selftests: winesync: Add some tests for semaphore state
  create mode 100644 tools/testing/selftests/drivers/winesync/winesync.c
 
 diff --git a/tools/testing/selftests/Makefile b/tools/testing/selftests/Makefile
-index 2319ec87f..ac9c725b1 100644
+index 2319ec87f53d..ac9c725b1b9c 100644
 --- a/tools/testing/selftests/Makefile
 +++ b/tools/testing/selftests/Makefile
 @@ -10,6 +10,7 @@ TARGETS += core
@@ -2362,7 +2184,7 @@ index 2319ec87f..ac9c725b1 100644
  TARGETS += filesystems
 diff --git a/tools/testing/selftests/drivers/winesync/Makefile b/tools/testing/selftests/drivers/winesync/Makefile
 new file mode 100644
-index 000000000..43b39fdee
+index 000000000000..43b39fdeea10
 --- /dev/null
 +++ b/tools/testing/selftests/drivers/winesync/Makefile
 @@ -0,0 +1,8 @@
@@ -2376,14 +2198,14 @@ index 000000000..43b39fdee
 +include ../../lib.mk
 diff --git a/tools/testing/selftests/drivers/winesync/config b/tools/testing/selftests/drivers/winesync/config
 new file mode 100644
-index 000000000..60539c826
+index 000000000000..60539c826d06
 --- /dev/null
 +++ b/tools/testing/selftests/drivers/winesync/config
 @@ -0,0 +1 @@
 +CONFIG_WINESYNC=y
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
 new file mode 100644
-index 000000000..58ade297f
+index 000000000000..58ade297fef9
 --- /dev/null
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -0,0 +1,153 @@
@@ -2541,20 +2363,19 @@ index 000000000..58ade297f
 +
 +TEST_HARNESS_MAIN
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From ac79d63b38ef05a77258c217b4a53af394ab6473 Mon Sep 17 00:00:00 2001
+From c967e8a3a45dc32e85efc26706ffdf334261e3b1 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 12:07:04 -0600
-Subject: [PATCH 14/34] selftests: winesync: Add some tests for mutex state
+Subject: [PATCH 14/35] selftests: winesync: Add some tests for mutex state
 
 ---
  .../selftests/drivers/winesync/winesync.c     | 188 ++++++++++++++++++
  1 file changed, 188 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 58ade297f..801b776da 100644
+index 58ade297fef9..801b776da5aa 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -49,6 +49,42 @@ static int put_sem(int fd, __u32 sem, __u32 *count)
@@ -2758,13 +2579,12 @@ index 58ade297f..801b776da 100644
 +
  TEST_HARNESS_MAIN
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From b25083c6473210cbcfa154966eccdb3addc95f6f Mon Sep 17 00:00:00 2001
+From 0aea9a768bdacab560726224e5e11d867cbdabae Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 12:07:45 -0600
-Subject: [PATCH 15/34] selftests: winesync: Add some tests for
+Subject: [PATCH 15/35] selftests: winesync: Add some tests for
  WINESYNC_IOC_WAIT_ANY
 
 ---
@@ -2772,7 +2592,7 @@ Subject: [PATCH 15/34] selftests: winesync: Add some tests for
  1 file changed, 107 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 801b776da..5903061d3 100644
+index 801b776da5aa..5903061d38b6 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -338,4 +338,111 @@ TEST(mutex_state)
@@ -2888,13 +2708,12 @@ index 801b776da..5903061d3 100644
 +
  TEST_HARNESS_MAIN
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 33602094f919b9b051295000b13589bd45702f3f Mon Sep 17 00:00:00 2001
+From 612742538a6b7cf8cc55abadd3c63388719b3bed Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 12:08:25 -0600
-Subject: [PATCH 16/34] selftests: winesync: Add some tests for
+Subject: [PATCH 16/35] selftests: winesync: Add some tests for
  WINESYNC_IOC_WAIT_ALL
 
 ---
@@ -2902,7 +2721,7 @@ Subject: [PATCH 16/34] selftests: winesync: Add some tests for
  1 file changed, 101 insertions(+), 3 deletions(-)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 5903061d3..0718219f5 100644
+index 5903061d38b6..0718219f54bf 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -85,8 +85,8 @@ static int put_mutex(int fd, __u32 mutex, __u32 owner, __u32 *count)
@@ -3033,13 +2852,12 @@ index 5903061d3..0718219f5 100644
 +
  TEST_HARNESS_MAIN
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 30f98900cc06b95e70cacf372dc747f3e96e57bc Mon Sep 17 00:00:00 2001
+From 70a7813dea7aa905c972b60f2021306834131264 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 12:08:54 -0600
-Subject: [PATCH 17/34] selftests: winesync: Add some tests for invalid object
+Subject: [PATCH 17/35] selftests: winesync: Add some tests for invalid object
  handling
 
 ---
@@ -3047,7 +2865,7 @@ Subject: [PATCH 17/34] selftests: winesync: Add some tests for invalid object
  1 file changed, 93 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 0718219f5..8a9fb496f 100644
+index 0718219f54bf..8a9fb496f5e0 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -543,4 +543,97 @@ TEST(test_wait_all)
@@ -3149,13 +2967,12 @@ index 0718219f5..8a9fb496f 100644
 +
  TEST_HARNESS_MAIN
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 10d9ab40302ef7440f6a999ec981e94538b1d1b1 Mon Sep 17 00:00:00 2001
+From d71d7bc97174c17b5be7f117dfcb0f23d1dd2341 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 12:09:32 -0600
-Subject: [PATCH 18/34] selftests: winesync: Add some tests for wakeup
+Subject: [PATCH 18/35] selftests: winesync: Add some tests for wakeup
  signaling with WINESYNC_IOC_WAIT_ANY
 
 ---
@@ -3163,7 +2980,7 @@ Subject: [PATCH 18/34] selftests: winesync: Add some tests for wakeup
  1 file changed, 154 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 8a9fb496f..04855df00 100644
+index 8a9fb496f5e0..04855df00894 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -636,4 +636,158 @@ TEST(invalid_objects)
@@ -3326,13 +3143,12 @@ index 8a9fb496f..04855df00 100644
 +
  TEST_HARNESS_MAIN
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 8a3d2f7555f0e33cb327c721705e8913bd9afd1d Mon Sep 17 00:00:00 2001
+From 3c471c0b8896f2fb6186b218c4ebdbd11b76cc7f Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 12:09:36 -0600
-Subject: [PATCH 19/34] selftests: winesync: Add some tests for wakeup
+Subject: [PATCH 19/35] selftests: winesync: Add some tests for wakeup
  signaling with WINESYNC_IOC_WAIT_ALL
 
 ---
@@ -3340,7 +3156,7 @@ Subject: [PATCH 19/34] selftests: winesync: Add some tests for wakeup
  1 file changed, 102 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 04855df00..ad6d0f9a2 100644
+index 04855df00894..ad6d0f9a2a35 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -790,4 +790,106 @@ TEST(wake_any)
@@ -3451,20 +3267,19 @@ index 04855df00..ad6d0f9a2 100644
 +
  TEST_HARNESS_MAIN
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From ccbc79cbbffa208e61bf77a82610044740055edf Mon Sep 17 00:00:00 2001
+From 8cbf57d8c165b40d3a5cf80e57643afc69426150 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Fri, 5 Mar 2021 12:22:55 -0600
-Subject: [PATCH 20/34] maintainers: Add an entry for winesync
+Subject: [PATCH 20/35] maintainers: Add an entry for winesync
 
 ---
  MAINTAINERS | 9 +++++++++
  1 file changed, 9 insertions(+)
 
 diff --git a/MAINTAINERS b/MAINTAINERS
-index f468864fd..f1d9e6a1c 100644
+index f468864fd268..f1d9e6a1c33a 100644
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
 @@ -21250,6 +21250,15 @@ M:	David Härdeman <david@hardeman.nu>
@@ -3484,13 +3299,12 @@ index f468864fd..f1d9e6a1c 100644
  M:	William Breathitt Gray <vilhelm.gray@gmail.com>
  L:	linux-watchdog@vger.kernel.org
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 1adb5c6eb1dd494cbbeb8eafc4c2a97dee6ef5d1 Mon Sep 17 00:00:00 2001
+From 054f45176a0cdc7d251b72332e538455e1df422f Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 18:21:03 -0600
-Subject: [PATCH 21/34] winesync: Introduce WINESYNC_IOC_CREATE_EVENT
+Subject: [PATCH 21/35] winesync: Introduce WINESYNC_IOC_CREATE_EVENT
 
 ---
  drivers/misc/winesync.c       | 65 +++++++++++++++++++++++++++++++++++
@@ -3498,7 +3312,7 @@ Subject: [PATCH 21/34] winesync: Introduce WINESYNC_IOC_CREATE_EVENT
  2 files changed, 73 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index eae272663..eaba41510 100644
+index eae272663abe..eaba41510784 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -17,6 +17,7 @@
@@ -3623,7 +3437,7 @@ index eae272663..eaba41510 100644
  		return winesync_create_mutex(dev, argp);
  	case WINESYNC_IOC_CREATE_SEM:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index 3371a303a..399940753 100644
+index 3371a303a927..3999407534e0 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -22,6 +22,12 @@ struct winesync_mutex_args {
@@ -3648,13 +3462,12 @@ index 3371a303a..399940753 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 4ca70a2dcbf21079feda10ee6a3caf665553de18 Mon Sep 17 00:00:00 2001
+From a348ed30c3b963160297e0bfe4090f1647926e22 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 18:43:30 -0600
-Subject: [PATCH 22/34] winesync: Introduce WINESYNC_IOC_SET_EVENT
+Subject: [PATCH 22/35] winesync: Introduce WINESYNC_IOC_SET_EVENT
 
 ---
  drivers/misc/winesync.c       | 45 +++++++++++++++++++++++++++++++++++
@@ -3662,7 +3475,7 @@ Subject: [PATCH 22/34] winesync: Introduce WINESYNC_IOC_SET_EVENT
  2 files changed, 47 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index eaba41510..658ad7b80 100644
+index eaba41510784..658ad7b80c29 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -704,6 +704,49 @@ static int winesync_kill_owner(struct winesync_device *dev, void __user *argp)
@@ -3725,7 +3538,7 @@ index eaba41510..658ad7b80 100644
  		return winesync_wait_all(dev, argp);
  	case WINESYNC_IOC_WAIT_ANY:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index 399940753..34cd65d87 100644
+index 3999407534e0..34cd65d879a8 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -59,5 +59,7 @@ struct winesync_wait_args {
@@ -3737,13 +3550,12 @@ index 399940753..34cd65d87 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From ae427e54b2f492133e34c6fe469f68dc29138a17 Mon Sep 17 00:00:00 2001
+From 83266bfc051b2380fa9931117a80c7133dd5c23f Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 19:00:25 -0600
-Subject: [PATCH 23/34] winesync: Introduce WINESYNC_IOC_RESET_EVENT
+Subject: [PATCH 23/35] winesync: Introduce WINESYNC_IOC_RESET_EVENT
 
 ---
  drivers/misc/winesync.c       | 31 +++++++++++++++++++++++++++++++
@@ -3751,7 +3563,7 @@ Subject: [PATCH 23/34] winesync: Introduce WINESYNC_IOC_RESET_EVENT
  2 files changed, 33 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 658ad7b80..a93f17312 100644
+index 658ad7b80c29..a93f173127f4 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -747,6 +747,35 @@ static int winesync_set_event(struct winesync_device *dev, void __user *argp)
@@ -3800,7 +3612,7 @@ index 658ad7b80..a93f17312 100644
  		return winesync_set_event(dev, argp);
  	case WINESYNC_IOC_WAIT_ALL:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index 34cd65d87..e71271fc4 100644
+index 34cd65d879a8..e71271fc44ba 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -61,5 +61,7 @@ struct winesync_wait_args {
@@ -3812,13 +3624,12 @@ index 34cd65d87..e71271fc4 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From d5b4105b697002e9369a5a52312e8084201db6b4 Mon Sep 17 00:00:00 2001
+From de8382ade68120a7ffae1233e532392a7c212cf4 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 19:10:12 -0600
-Subject: [PATCH 24/34] winesync: Introduce WINESYNC_IOC_PULSE_EVENT
+Subject: [PATCH 24/35] winesync: Introduce WINESYNC_IOC_PULSE_EVENT
 
 ---
  drivers/misc/winesync.c       | 11 +++++++++--
@@ -3826,7 +3637,7 @@ Subject: [PATCH 24/34] winesync: Introduce WINESYNC_IOC_PULSE_EVENT
  2 files changed, 11 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index a93f17312..27d5baa45 100644
+index a93f173127f4..27d5baa457df 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -704,7 +704,8 @@ static int winesync_kill_owner(struct winesync_device *dev, void __user *argp)
@@ -3876,7 +3687,7 @@ index a93f17312..27d5baa45 100644
  		return winesync_wait_all(dev, argp);
  	case WINESYNC_IOC_WAIT_ANY:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index e71271fc4..7c09d0e97 100644
+index e71271fc44ba..7c09d0e9733c 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -63,5 +63,7 @@ struct winesync_wait_args {
@@ -3888,13 +3699,12 @@ index e71271fc4..7c09d0e97 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From ad8e69fd73a68ac9cf6dfd3e83d83014a98d83f4 Mon Sep 17 00:00:00 2001
+From 69e314e45f8adfd182600d9d034880e91b6489c5 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 19:14:00 -0600
-Subject: [PATCH 25/34] winesync: Introduce WINESYNC_IOC_READ_EVENT
+Subject: [PATCH 25/35] winesync: Introduce WINESYNC_IOC_READ_EVENT
 
 ---
  drivers/misc/winesync.c       | 29 +++++++++++++++++++++++++++++
@@ -3902,7 +3712,7 @@ Subject: [PATCH 25/34] winesync: Introduce WINESYNC_IOC_READ_EVENT
  2 files changed, 31 insertions(+)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 27d5baa45..4fbf231a7 100644
+index 27d5baa457df..4fbf231a7909 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -639,6 +639,33 @@ static int winesync_read_mutex(struct winesync_device *dev, void __user *argp)
@@ -3949,7 +3759,7 @@ index 27d5baa45..4fbf231a7 100644
  		return winesync_read_mutex(dev, argp);
  	case WINESYNC_IOC_READ_SEM:
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index 7c09d0e97..fb3788339 100644
+index 7c09d0e9733c..fb3788339ffe 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -65,5 +65,7 @@ struct winesync_wait_args {
@@ -3961,13 +3771,12 @@ index 7c09d0e97..fb3788339 100644
  
  #endif
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From eef2a92ecdb746f9c15c7ee49b4b6e75903e92ee Mon Sep 17 00:00:00 2001
+From 332e78059b1a1441ff20c259b120b095f82a6dd4 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 19:34:47 -0600
-Subject: [PATCH 26/34] selftests: winesync: Add some tests for manual-reset
+Subject: [PATCH 26/35] selftests: winesync: Add some tests for manual-reset
  event state
 
 ---
@@ -3975,7 +3784,7 @@ Subject: [PATCH 26/34] selftests: winesync: Add some tests for manual-reset
  1 file changed, 92 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index ad6d0f9a2..7e99f09b1 100644
+index ad6d0f9a2a35..7e99f09b113b 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -85,6 +85,30 @@ static int put_mutex(int fd, __u32 mutex, __u32 owner, __u32 *count)
@@ -4085,13 +3894,12 @@ index ad6d0f9a2..7e99f09b1 100644
  {
  	struct winesync_mutex_args mutex_args = {0};
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 92318d3791756ffa3fe1b501ced81c2489834076 Mon Sep 17 00:00:00 2001
+From f5ec2655ee63a549c3e11b326e19c2dc5cd09a4b Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 19:45:39 -0600
-Subject: [PATCH 27/34] selftests: winesync: Add some tests for auto-reset
+Subject: [PATCH 27/35] selftests: winesync: Add some tests for auto-reset
  event state
 
 ---
@@ -4099,7 +3907,7 @@ Subject: [PATCH 27/34] selftests: winesync: Add some tests for auto-reset
  1 file changed, 59 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 7e99f09b1..3a9ac6930 100644
+index 7e99f09b113b..3a9ac69308af 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -442,6 +442,65 @@ TEST(manual_event_state)
@@ -4169,13 +3977,12 @@ index 7e99f09b1..3a9ac6930 100644
  {
  	struct winesync_mutex_args mutex_args = {0};
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 74fc7320a51a37ddf928bcbe419eb541ca6b33ce Mon Sep 17 00:00:00 2001
+From 80ebb36fbd1b87d903957bfe9f1c487f973c5b4c Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 21:00:50 -0600
-Subject: [PATCH 28/34] selftests: winesync: Add some tests for wakeup
+Subject: [PATCH 28/35] selftests: winesync: Add some tests for wakeup
  signaling with events
 
 ---
@@ -4183,7 +3990,7 @@ Subject: [PATCH 28/34] selftests: winesync: Add some tests for wakeup
  1 file changed, 150 insertions(+), 2 deletions(-)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 3a9ac6930..2ccc51510 100644
+index 3a9ac69308af..2ccc51510230 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -610,6 +610,7 @@ TEST(test_wait_any)
@@ -4429,13 +4236,12 @@ index 3a9ac6930..2ccc51510 100644
  	ret = wait_for_thread(thread, 200);
  	EXPECT_EQ(0, ret);
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From fdd69e838c60d1fc81fb7b8a333072586dccf744 Mon Sep 17 00:00:00 2001
+From d968a6f25f1b74b83259397aa71ddfa2d1b0d610 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 21:06:22 -0600
-Subject: [PATCH 29/34] selftests: winesync: Add some tests for invalid object
+Subject: [PATCH 29/35] selftests: winesync: Add some tests for invalid object
  handling with events
 
 ---
@@ -4443,7 +4249,7 @@ Subject: [PATCH 29/34] selftests: winesync: Add some tests for invalid object
  1 file changed, 34 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index 2ccc51510..f2e18836c 100644
+index 2ccc51510230..f2e18836c733 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -712,6 +712,7 @@ TEST(test_wait_all)
@@ -4502,20 +4308,19 @@ index 2ccc51510..f2e18836c 100644
  	objs[1] = sem_args.sem + 1;
  	wait_args.count = 2;
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From befd820876259f1d4d15b8d9930754dda91195da Mon Sep 17 00:00:00 2001
+From 89da47898dfd02cc1f3cf5f0b95e26ffda74b083 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 19 Jan 2022 22:01:46 -0600
-Subject: [PATCH 30/34] docs: winesync: Document event APIs
+Subject: [PATCH 30/35] docs: winesync: Document event APIs
 
 ---
  Documentation/userspace-api/winesync.rst | 104 ++++++++++++++++++++++-
  1 file changed, 101 insertions(+), 3 deletions(-)
 
 diff --git a/Documentation/userspace-api/winesync.rst b/Documentation/userspace-api/winesync.rst
-index 5de409a9c..fef87ddff 100644
+index 5de409a9c3fc..fef87ddff0e4 100644
 --- a/Documentation/userspace-api/winesync.rst
 +++ b/Documentation/userspace-api/winesync.rst
 @@ -18,8 +18,8 @@ interfaces such as futex(2) and poll(2).
@@ -4672,13 +4477,12 @@ index 5de409a9c..fef87ddff 100644
    Acquisition is atomic and totally ordered with respect to other
    operations on the same object. If two wait operations (with
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 442b69f9344b324677b7980dd62e363e5766b5f0 Mon Sep 17 00:00:00 2001
+From cfa102186d20d3451916f373ceded906aa237a39 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 13 Apr 2022 20:02:39 -0500
-Subject: [PATCH 31/34] winesync: Introduce alertable waits
+Subject: [PATCH 31/35] winesync: Introduce alertable waits
 
 ---
  drivers/misc/winesync.c       | 68 ++++++++++++++++++++++++++++++-----
@@ -4686,7 +4490,7 @@ Subject: [PATCH 31/34] winesync: Introduce alertable waits
  2 files changed, 60 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/misc/winesync.c b/drivers/misc/winesync.c
-index 4fbf231a7..7a28f58db 100644
+index 4fbf231a7909..7a28f58dbbf2 100644
 --- a/drivers/misc/winesync.c
 +++ b/drivers/misc/winesync.c
 @@ -841,10 +841,11 @@ static int setup_wait(struct winesync_device *dev,
@@ -4844,7 +4648,7 @@ index 4fbf231a7..7a28f58db 100644
  	spin_unlock(&dev->wait_all_lock);
  
 diff --git a/include/uapi/linux/winesync.h b/include/uapi/linux/winesync.h
-index fb3788339..5b4e369f7 100644
+index fb3788339ffe..5b4e369f7469 100644
 --- a/include/uapi/linux/winesync.h
 +++ b/include/uapi/linux/winesync.h
 @@ -34,7 +34,7 @@ struct winesync_wait_args {
@@ -4857,20 +4661,19 @@ index fb3788339..5b4e369f7 100644
  
  #define WINESYNC_IOC_BASE 0xf7
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From 4045edfe038a1a5a6e3cdb08a99eb039abc7be3b Mon Sep 17 00:00:00 2001
+From 9c43fe1ba1ac3f4f03c7b23195ec650a239b1248 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 20 Apr 2022 18:08:37 -0500
-Subject: [PATCH 32/34] selftests: winesync: Add tests for alertable waits
+Subject: [PATCH 32/35] selftests: winesync: Add tests for alertable waits
 
 ---
  .../selftests/drivers/winesync/winesync.c     | 191 +++++++++++++++++-
  1 file changed, 188 insertions(+), 3 deletions(-)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index f2e18836c..a87e3c487 100644
+index f2e18836c733..a87e3c48709b 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -110,7 +110,7 @@ static int read_event_state(int fd, __u32 event, __u32 *signaled, __u32 *manual)
@@ -5096,13 +4899,12 @@ index f2e18836c..a87e3c487 100644
 +
  TEST_HARNESS_MAIN
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From cb6c05b3ad8e0b9dc65cbde8db669f22666ffa4f Mon Sep 17 00:00:00 2001
+From 08f1806e8fdde07e48d67f83f5644deff5591517 Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 20 Apr 2022 18:24:43 -0500
-Subject: [PATCH 33/34] serftests: winesync: Add some tests for wakeup
+Subject: [PATCH 33/35] serftests: winesync: Add some tests for wakeup
  signaling via alerts
 
 ---
@@ -5110,7 +4912,7 @@ Subject: [PATCH 33/34] serftests: winesync: Add some tests for wakeup
  1 file changed, 66 insertions(+)
 
 diff --git a/tools/testing/selftests/drivers/winesync/winesync.c b/tools/testing/selftests/drivers/winesync/winesync.c
-index a87e3c487..169e92248 100644
+index a87e3c48709b..169e922484b0 100644
 --- a/tools/testing/selftests/drivers/winesync/winesync.c
 +++ b/tools/testing/selftests/drivers/winesync/winesync.c
 @@ -1245,8 +1245,12 @@ TEST(wake_all)
@@ -5212,20 +5014,19 @@ index a87e3c487..169e92248 100644
  	EXPECT_EQ(0, ret);
  
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
 
-
-From b06bcebe017b4766cdeb27f1e643b0930ad4c911 Mon Sep 17 00:00:00 2001
+From 2be2cfb697fedea9817e6efb27f825d03fb0f85f Mon Sep 17 00:00:00 2001
 From: Zebediah Figura <zfigura@codeweavers.com>
 Date: Wed, 20 Apr 2022 18:58:17 -0500
-Subject: [PATCH 34/34] docs: winesync: Document alertable waits
+Subject: [PATCH 34/35] docs: winesync: Document alertable waits
 
 ---
  Documentation/userspace-api/winesync.rst | 40 ++++++++++++++++++------
  1 file changed, 31 insertions(+), 9 deletions(-)
 
 diff --git a/Documentation/userspace-api/winesync.rst b/Documentation/userspace-api/winesync.rst
-index fef87ddff..d7055bf41 100644
+index fef87ddff0e4..d7055bf41820 100644
 --- a/Documentation/userspace-api/winesync.rst
 +++ b/Documentation/userspace-api/winesync.rst
 @@ -354,9 +354,13 @@ The ioctls are as follows:
@@ -5295,5 +5096,172 @@ index fef87ddff..d7055bf41 100644
 +  ``objs`` and in ``alert`` If this is attempted, the function fails
 +  with ``EINVAL``.
 -- 
-2.36.1.74.g277cf0bc36
+2.36.1
+
+From 8a07320300de26ec2665487ec384fc1234b3ee21 Mon Sep 17 00:00:00 2001
+From: Tor Vic <torvic9@mailbox.org>
+Date: Tue, 7 Dec 2021 10:01:04 +0100
+Subject: [PATCH 35/35] futex: Add entry point for FUTEX_WAIT_MULTIPLE (opcode
+ 31)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add an option to wait on multiple futexes using the old interface, that
+uses opcode 31 through futex() syscall. Do that by just translating the
+old interface to use the new code. This allows old and stable versions
+of Proton to still use fsync in new kernel releases.
+
+[torvic9: adapted André's commit for futex_waitv changes in 5.16]
+---
+ include/uapi/linux/futex.h | 13 +++++++
+ kernel/futex/syscalls.c    | 75 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/include/uapi/linux/futex.h b/include/uapi/linux/futex.h
+index 71a5df8d2689..cf7fc988c24c 100644
+--- a/include/uapi/linux/futex.h
++++ b/include/uapi/linux/futex.h
+@@ -22,6 +22,7 @@
+ #define FUTEX_WAIT_REQUEUE_PI	11
+ #define FUTEX_CMP_REQUEUE_PI	12
+ #define FUTEX_LOCK_PI2		13
++#define FUTEX_WAIT_MULTIPLE		31
+ 
+ #define FUTEX_PRIVATE_FLAG	128
+ #define FUTEX_CLOCK_REALTIME	256
+@@ -68,6 +69,18 @@ struct futex_waitv {
+ 	__u32 __reserved;
+ };
+ 
++/**
++ * struct futex_wait_block - Block of futexes to be waited for
++ * @uaddr:	User address of the futex
++ * @val:	Futex value expected by userspace
++ * @bitset:	Bitset for the optional bitmasked wakeup
++ */
++struct futex_wait_block {
++	__u32 __user *uaddr;
++	__u32 val;
++	__u32 bitset;
++};
++
+ /*
+  * Support for robust futexes: the kernel cleans up held futexes at
+  * thread exit time.
+diff --git a/kernel/futex/syscalls.c b/kernel/futex/syscalls.c
+index 086a22d1adb7..c6f5f1e84e09 100644
+--- a/kernel/futex/syscalls.c
++++ b/kernel/futex/syscalls.c
+@@ -142,6 +142,7 @@ static __always_inline bool futex_cmd_has_timeout(u32 cmd)
+ 	case FUTEX_LOCK_PI2:
+ 	case FUTEX_WAIT_BITSET:
+ 	case FUTEX_WAIT_REQUEUE_PI:
++	case FUTEX_WAIT_MULTIPLE:
+ 		return true;
+ 	}
+ 	return false;
+@@ -154,13 +155,79 @@ futex_init_timeout(u32 cmd, u32 op, struct timespec64 *ts, ktime_t *t)
+ 		return -EINVAL;
+ 
+ 	*t = timespec64_to_ktime(*ts);
+-	if (cmd == FUTEX_WAIT)
++	if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_MULTIPLE)
+ 		*t = ktime_add_safe(ktime_get(), *t);
+ 	else if (cmd != FUTEX_LOCK_PI && !(op & FUTEX_CLOCK_REALTIME))
+ 		*t = timens_ktime_to_host(CLOCK_MONOTONIC, *t);
+ 	return 0;
+ }
+ 
++/**
++ * futex_read_wait_block - Read an array of futex_wait_block from userspace
++ * @uaddr:	Userspace address of the block
++ * @count:	Number of blocks to be read
++ *
++ * This function creates and allocate an array of futex_q (we zero it to
++ * initialize the fields) and then, for each futex_wait_block element from
++ * userspace, fill a futex_q element with proper values.
++ */
++inline struct futex_vector *futex_read_wait_block(u32 __user *uaddr, u32 count)
++{
++	unsigned int i;
++	struct futex_vector *futexv;
++	struct futex_wait_block fwb;
++	struct futex_wait_block __user *entry =
++		(struct futex_wait_block __user *)uaddr;
++
++	if (!count || count > FUTEX_WAITV_MAX)
++		return ERR_PTR(-EINVAL);
++
++	futexv = kcalloc(count, sizeof(*futexv), GFP_KERNEL);
++	if (!futexv)
++		return ERR_PTR(-ENOMEM);
++
++	for (i = 0; i < count; i++) {
++		if (copy_from_user(&fwb, &entry[i], sizeof(fwb))) {
++			kfree(futexv);
++			return ERR_PTR(-EFAULT);
++		}
++
++		futexv[i].w.flags = FUTEX_32;
++		futexv[i].w.val = fwb.val;
++		futexv[i].w.uaddr = (uintptr_t) (fwb.uaddr);
++		futexv[i].q = futex_q_init;
++	}
++
++	return futexv;
++}
++
++int futex_wait_multiple(struct futex_vector *vs, unsigned int count,
++			struct hrtimer_sleeper *to);
++
++int futex_opcode_31(ktime_t *abs_time, u32 __user *uaddr, int count)
++{
++	int ret;
++	struct futex_vector *vs;
++	struct hrtimer_sleeper *to = NULL, timeout;
++
++	to = futex_setup_timer(abs_time, &timeout, 0, 0);
++
++	vs = futex_read_wait_block(uaddr, count);
++
++	if (IS_ERR(vs))
++		return PTR_ERR(vs);
++
++	ret = futex_wait_multiple(vs, count, abs_time ? to : NULL);
++	kfree(vs);
++
++	if (to) {
++		hrtimer_cancel(&to->timer);
++		destroy_hrtimer_on_stack(&to->timer);
++	}
++
++	return ret;
++}
++
+ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
+ 		const struct __kernel_timespec __user *, utime,
+ 		u32 __user *, uaddr2, u32, val3)
+@@ -180,6 +247,9 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
+ 		tp = &t;
+ 	}
+ 
++	if (cmd == FUTEX_WAIT_MULTIPLE)
++		return futex_opcode_31(tp, uaddr, val);
++
+ 	return do_futex(uaddr, op, val, tp, uaddr2, (unsigned long)utime, val3);
+ }
+ 
+@@ -370,6 +440,9 @@ SYSCALL_DEFINE6(futex_time32, u32 __user *, uaddr, int, op, u32, val,
+ 		tp = &t;
+ 	}
+ 
++	if (cmd == FUTEX_WAIT_MULTIPLE)
++		return futex_opcode_31(tp, uaddr, val);
++
+ 	return do_futex(uaddr, op, val, tp, uaddr2, (unsigned long)utime, val3);
+ }
+ #endif /* CONFIG_COMPAT_32BIT_TIME */
+-- 
+2.36.1
 
