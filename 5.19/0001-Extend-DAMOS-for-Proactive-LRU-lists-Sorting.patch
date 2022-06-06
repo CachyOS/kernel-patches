@@ -1,0 +1,198 @@
+From fd6a8d95771455e45e89a445c77595a627e8f733 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Fri, 20 May 2022 10:35:57 +0200
+Subject: [PATCH] Extend-DAMOS-for-Proactive-LRU-lists-Sorting
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ include/linux/damon.h |  2 ++
+ mm/damon/ops-common.c | 42 ++++++++++++++++++++++++++++++
+ mm/damon/ops-common.h |  2 ++
+ mm/damon/paddr.c      | 60 ++++++++++++++++++++++++++++++++++++++-----
+ mm/damon/sysfs.c      |  1 +
+ 5 files changed, 101 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/damon.h b/include/linux/damon.h
+index 7c62da31ce4b..ed5338c3133d 100644
+--- a/include/linux/damon.h
++++ b/include/linux/damon.h
+@@ -87,6 +87,7 @@ struct damon_target {
+  * @DAMOS_HUGEPAGE:	Call ``madvise()`` for the region with MADV_HUGEPAGE.
+  * @DAMOS_NOHUGEPAGE:	Call ``madvise()`` for the region with MADV_NOHUGEPAGE.
+  * @DAMOS_STAT:		Do nothing but count the stat.
++ * @DAMOS_HOT:		Mark the region as hot.
+  * @NR_DAMOS_ACTIONS:	Total number of DAMOS actions
+  */
+ enum damos_action {
+@@ -96,6 +97,7 @@ enum damos_action {
+ 	DAMOS_HUGEPAGE,
+ 	DAMOS_NOHUGEPAGE,
+ 	DAMOS_STAT,		/* Do nothing but only record the stat */
++	DAMOS_HOT,
+ 	NR_DAMOS_ACTIONS,
+ };
+ 
+diff --git a/mm/damon/ops-common.c b/mm/damon/ops-common.c
+index 10ef20b2003f..b1335de200e7 100644
+--- a/mm/damon/ops-common.c
++++ b/mm/damon/ops-common.c
+@@ -130,3 +130,45 @@ int damon_pageout_score(struct damon_ctx *c, struct damon_region *r,
+ 	/* Return coldness of the region */
+ 	return DAMOS_MAX_SCORE - hotness;
+ }
++
++int damon_hot_score(struct damon_ctx *c, struct damon_region *r,
++			struct damos *s)
++{
++	unsigned int max_nr_accesses;
++	int freq_subscore;
++	unsigned int age_in_sec;
++	int age_in_log, age_subscore;
++	unsigned int freq_weight = s->quota.weight_nr_accesses;
++	unsigned int age_weight = s->quota.weight_age;
++	int hotness;
++
++	max_nr_accesses = c->aggr_interval / c->sample_interval;
++	freq_subscore = r->nr_accesses * DAMON_MAX_SUBSCORE / max_nr_accesses;
++
++	age_in_sec = (unsigned long)r->age * c->aggr_interval / 1000000;
++	for (age_in_log = 0; age_in_log < DAMON_MAX_AGE_IN_LOG && age_in_sec;
++			age_in_log++, age_in_sec >>= 1)
++		;
++
++	/* If frequency is 0, higher age means it's colder */
++	if (freq_subscore == 0)
++		age_in_log *= -1;
++
++	/*
++	 * Now age_in_log is in [-DAMON_MAX_AGE_IN_LOG, DAMON_MAX_AGE_IN_LOG].
++	 * Scale it to be in [0, 100] and set it as age subscore.
++	 */
++	age_in_log += DAMON_MAX_AGE_IN_LOG;
++	age_subscore = age_in_log * DAMON_MAX_SUBSCORE /
++		DAMON_MAX_AGE_IN_LOG / 2;
++
++	hotness = (freq_weight * freq_subscore + age_weight * age_subscore);
++	if (freq_weight + age_weight)
++		hotness /= freq_weight + age_weight;
++	/*
++	 * Transform it to fit in [0, DAMOS_MAX_SCORE]
++	 */
++	hotness = hotness * DAMOS_MAX_SCORE / DAMON_MAX_SUBSCORE;
++
++	return hotness;
++}
+diff --git a/mm/damon/ops-common.h b/mm/damon/ops-common.h
+index e790cb5f8fe0..52329ff361cd 100644
+--- a/mm/damon/ops-common.h
++++ b/mm/damon/ops-common.h
+@@ -14,3 +14,5 @@ void damon_pmdp_mkold(pmd_t *pmd, struct mm_struct *mm, unsigned long addr);
+ 
+ int damon_pageout_score(struct damon_ctx *c, struct damon_region *r,
+ 			struct damos *s);
++int damon_hot_score(struct damon_ctx *c, struct damon_region *r,
++			struct damos *s);
+diff --git a/mm/damon/paddr.c b/mm/damon/paddr.c
+index b40ff5811bb2..2612f1e62ab9 100644
+--- a/mm/damon/paddr.c
++++ b/mm/damon/paddr.c
+@@ -204,16 +204,11 @@ static unsigned int damon_pa_check_accesses(struct damon_ctx *ctx)
+ 	return max_nr_accesses;
+ }
+ 
+-static unsigned long damon_pa_apply_scheme(struct damon_ctx *ctx,
+-		struct damon_target *t, struct damon_region *r,
+-		struct damos *scheme)
++static unsigned long damon_pa_pageout(struct damon_region *r)
+ {
+ 	unsigned long addr, applied;
+ 	LIST_HEAD(page_list);
+ 
+-	if (scheme->action != DAMOS_PAGEOUT)
+-		return 0;
+-
+ 	for (addr = r->ar.start; addr < r->ar.end; addr += PAGE_SIZE) {
+ 		struct page *page = damon_get_page(PHYS_PFN(addr));
+ 
+@@ -238,6 +233,55 @@ static unsigned long damon_pa_apply_scheme(struct damon_ctx *ctx,
+ 	return applied * PAGE_SIZE;
+ }
+ 
++static unsigned long damon_pa_mark_accessed(struct damon_region *r)
++{
++	unsigned long addr, applied = 0;
++
++	for (addr = r->ar.start; addr < r->ar.end; addr += PAGE_SIZE) {
++		struct page *page = damon_get_page(PHYS_PFN(addr));
++
++		if (!page)
++			continue;
++		mark_page_accessed(page);
++		put_page(page);
++		applied++;
++	}
++	return applied * PAGE_SIZE;
++}
++
++static unsigned long damon_pa_cold(struct damon_region *r)
++{
++	unsigned long addr, applied = 0;
++
++	for (addr = r->ar.start; addr < r->ar.end; addr += PAGE_SIZE) {
++		struct page *page = damon_get_page(PHYS_PFN(addr));
++
++		if (!page)
++			continue;
++		deactivate_page(page);
++		put_page(page);
++		applied++;
++	}
++	return applied * PAGE_SIZE;
++}
++
++static unsigned long damon_pa_apply_scheme(struct damon_ctx *ctx,
++		struct damon_target *t, struct damon_region *r,
++		struct damos *scheme)
++{
++	switch (scheme->action) {
++	case DAMOS_PAGEOUT:
++		return damon_pa_pageout(r);
++	case DAMOS_HOT:
++		return damon_pa_mark_accessed(r);
++	case DAMOS_COLD:
++		return damon_pa_cold(r);
++	default:
++		break;
++	}
++	return 0;
++}
++
+ static int damon_pa_scheme_score(struct damon_ctx *context,
+ 		struct damon_target *t, struct damon_region *r,
+ 		struct damos *scheme)
+@@ -245,6 +289,10 @@ static int damon_pa_scheme_score(struct damon_ctx *context,
+ 	switch (scheme->action) {
+ 	case DAMOS_PAGEOUT:
+ 		return damon_pageout_score(context, r, scheme);
++	case DAMOS_HOT:
++		return damon_hot_score(context, r, scheme);
++	case DAMOS_COLD:
++		return damon_pageout_score(context, r, scheme);
+ 	default:
+ 		break;
+ 	}
+diff --git a/mm/damon/sysfs.c b/mm/damon/sysfs.c
+index 09f9e8ca3d1f..a1de2278f8c2 100644
+--- a/mm/damon/sysfs.c
++++ b/mm/damon/sysfs.c
+@@ -763,6 +763,7 @@ static const char * const damon_sysfs_damos_action_strs[] = {
+ 	"hugepage",
+ 	"nohugepage",
+ 	"stat",
++	"hot",
+ };
+ 
+ static struct damon_sysfs_scheme *damon_sysfs_scheme_alloc(
+-- 
+2.36.1
+
