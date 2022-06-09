@@ -1,8 +1,9 @@
-From 00b6a439aa0cd2e3195e24047ae6712fea4b49cf Mon Sep 17 00:00:00 2001
+From 483f7af69cdce2fc7b2aa7d571c5329e9ecd5607 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Thu, 9 Jun 2022 14:08:50 +0200
+Date: Sat, 21 May 2022 15:57:20 +0200
 Subject: [PATCH] cachy
 
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  .../admin-guide/kernel-parameters.txt         | 19 +++++++++
  Documentation/admin-guide/pm/cpuidle.rst      | 15 ++++---
@@ -23,9 +24,8 @@ Subject: [PATCH] cachy
  kernel/Kconfig.hz                             | 24 +++++++++++
  kernel/rcu/Kconfig                            | 13 ++++++
  kernel/rcu/tree_nocb.h                        | 15 ++++++-
- kernel/sched/core.c                           | 36 ++++++++++------
+ kernel/sched/core.c                           |  5 ++-
  kernel/sched/fair.c                           | 20 ++++++++-
- kernel/sched/sched.h                          |  1 -
  mm/compaction.c                               |  6 ++-
  mm/internal.h                                 |  1 +
  mm/page-writeback.c                           |  8 ++++
@@ -34,7 +34,7 @@ Subject: [PATCH] cachy
  mm/vmscan.c                                   | 24 ++++++++---
  scripts/Makefile.lib                          |  4 ++
  scripts/Makefile.modfinal                     |  4 ++
- 30 files changed, 305 insertions(+), 66 deletions(-)
+ 29 files changed, 286 insertions(+), 53 deletions(-)
 
 diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
 index 3f1cc5e317ed..d491c096f0a9 100644
@@ -183,7 +183,7 @@ index 29dd27b5a339..3a8fdf881313 100644
  #define CPUID_MWAIT_LEAF		5
  #define CPUID5_ECX_EXTENSIONS_SUPPORTED 0x1
 diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
-index b370767f5b19..1c37094aa79f 100644
+index b370767f5b19..e26c63615931 100644
 --- a/arch/x86/kernel/process.c
 +++ b/arch/x86/kernel/process.c
 @@ -813,24 +813,43 @@ static void amd_e400_idle(void)
@@ -216,13 +216,13 @@ index b370767f5b19..1c37094aa79f 100644
 -	if (!cpu_has(c, X86_FEATURE_MWAIT) || boot_cpu_has_bug(X86_BUG_MONITOR))
 +	/* MWAIT is not supported on this platform. Fallback to HALT */
 +	if (!cpu_has(c, X86_FEATURE_MWAIT))
-+ 		return 0;
-+
-+	/* Monitor has a bug. Fallback to HALT */
-+	if (boot_cpu_has_bug(X86_BUG_MONITOR))
  		return 0;
  
 -	return 1;
++	/* Monitor has a bug. Fallback to HALT */
++	if (boot_cpu_has_bug(X86_BUG_MONITOR))
++		return 0;
++
 +	cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &edx);
 +
 +	/*
@@ -233,7 +233,7 @@ index b370767f5b19..1c37094aa79f 100644
 +		return 1;
 +
 +	/*
-+	 * If MWAIT extensions are available, there should be at least one
++	 * If MWAIT extensions are available, there should be least one
 +	 * MWAIT C1 substate present.
 +	 */
 +	return (edx & MWAIT_C1_SUBSTATE_MASK);
@@ -577,7 +577,7 @@ index 636d0546a4e9..08aa15d50995 100644
  		pr_info("\tNote: kernel parameter 'rcu_nocbs=', 'nohz_full', or 'isolcpus=' contains nonexistent CPUs.\n");
  		cpumask_and(rcu_nocb_mask, cpu_possible_mask,
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index d58c0389eb23..aae72ac49684 100644
+index d58c0389eb23..ed53e51688c5 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -448,8 +448,11 @@ sched_core_dequeue(struct rq *rq, struct task_struct *p, int flags) { }
@@ -593,74 +593,6 @@ index d58c0389eb23..aae72ac49684 100644
  
  /*
   * Serialization rules:
-@@ -3811,7 +3814,7 @@ bool cpus_share_cache(int this_cpu, int that_cpu)
- 	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
- }
- 
--static inline bool ttwu_queue_cond(int cpu, int wake_flags)
-+static inline bool ttwu_queue_cond(int cpu)
- {
- 	/*
- 	 * Do not complicate things with the async wake_list while the CPU is
-@@ -3827,13 +3830,22 @@ static inline bool ttwu_queue_cond(int cpu, int wake_flags)
- 	if (!cpus_share_cache(smp_processor_id(), cpu))
- 		return true;
- 
-+	if (cpu == smp_processor_id())
-+		return false;
-+
-+
- 	/*
--	 * If the task is descheduling and the only running task on the
--	 * CPU then use the wakelist to offload the task activation to
--	 * the soon-to-be-idle CPU as the current CPU is likely busy.
--	 * nr_running is checked to avoid unnecessary task stacking.
-+	 * If the wakee cpu is idle, or the task is descheduling and the
-+	 * only running task on the CPU, then use the wakelist to offload
-+	 * the task activation to the idle (or soon-to-be-idle) CPU as
-+	 * the current CPU is likely busy. nr_running is checked to
-+	 * avoid unnecessary task stacking.
-+	 *
-+	 * Note that we can only get here with (wakee) p->on_rq=0,
-+	 * p->on_cpu can be whatever, we've done the dequeue, so
-+	 * the wakee has been accounted out of ->nr_running.
- 	 */
--	if ((wake_flags & WF_ON_CPU) && cpu_rq(cpu)->nr_running <= 1)
-+	if (!cpu_rq(cpu)->nr_running)
- 		return true;
- 
- 	return false;
-@@ -3841,10 +3853,7 @@ static inline bool ttwu_queue_cond(int cpu, int wake_flags)
- 
- static bool ttwu_queue_wakelist(struct task_struct *p, int cpu, int wake_flags)
- {
--	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(cpu, wake_flags)) {
--		if (WARN_ON_ONCE(cpu == smp_processor_id()))
--			return false;
--
-+	if (sched_feat(TTWU_QUEUE) && ttwu_queue_cond(cpu)) {
- 		sched_clock_cpu(cpu); /* Sync clocks across CPUs */
- 		__ttwu_queue_wakelist(p, cpu, wake_flags);
- 		return true;
-@@ -4166,7 +4175,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
- 	 * scheduling.
- 	 */
- 	if (smp_load_acquire(&p->on_cpu) &&
--	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags | WF_ON_CPU))
-+	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
- 		goto unlock;
- 
- 	/*
-@@ -4710,7 +4719,8 @@ static inline void prepare_task(struct task_struct *next)
- 	 * Claim the task as running, we do this before switching to it
- 	 * such that any running task will have this set.
- 	 *
--	 * See the ttwu() WF_ON_CPU case and its ordering comment.
-+	 * See the smp_load_acquire(&p->on_cpu) case in ttwu() and
-+	 * its ordering comment.
- 	 */
- 	WRITE_ONCE(next->on_cpu, 1);
- #endif
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
 index a68482d66535..f71e0b3fb42a 100644
 --- a/kernel/sched/fair.c
@@ -721,18 +653,6 @@ index a68482d66535..f71e0b3fb42a 100644
  
  static inline void update_load_add(struct load_weight *lw, unsigned long inc)
  {
-diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 8dccb34eb190..43557c1ac6b2 100644
---- a/kernel/sched/sched.h
-+++ b/kernel/sched/sched.h
-@@ -2037,7 +2037,6 @@ static inline int task_on_rq_migrating(struct task_struct *p)
- 
- #define WF_SYNC     0x10 /* Waker goes to sleep after wakeup */
- #define WF_MIGRATED 0x20 /* Internal use, task got migrated */
--#define WF_ON_CPU   0x40 /* Wakee is on_cpu */
- 
- #ifdef CONFIG_SMP
- static_assert(WF_EXEC == SD_BALANCE_EXEC);
 diff --git a/mm/compaction.c b/mm/compaction.c
 index fe915db6149b..b124e7ffe8b9 100644
 --- a/mm/compaction.c
