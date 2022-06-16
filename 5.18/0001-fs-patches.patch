@@ -1,16 +1,20 @@
-From 1825228c9c09e8ed81812ee5e113d6d874f7c1b0 Mon Sep 17 00:00:00 2001
+From 052febdb8289d9985e45b43df868c73f00ab1cb1 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Tue, 14 Jun 2022 18:36:54 +0200
-Subject: [PATCH 4/5] fs-patches
+Date: Thu, 16 Jun 2022 15:51:06 +0200
+Subject: [PATCH] fs-patches
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  arch/x86/kernel/msr.c      |   2 +-
  block/Kconfig              |   2 +-
  block/Kconfig.iosched      |  12 +-
+ block/bfq-iosched.c        |   3 +
+ block/blk-mq-sched.c       |   1 +
+ block/blk-mq.c             |  27 +-
  block/elevator.c           |   4 +
  block/elevator.h           |   2 +-
- block/mq-deadline.c        |   9 +
+ block/kyber-iosched.c      |   3 +-
+ block/mq-deadline.c        |  12 +
  fs/btrfs/acl.c             |  39 +-
  fs/btrfs/check-integrity.c |   8 +-
  fs/btrfs/compression.c     |  36 +-
@@ -32,8 +36,8 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/btrfs/tree-log.c        |  27 +-
  fs/btrfs/tree-log.h        |   3 +
  fs/btrfs/zstd.c            |  14 +-
- include/linux/blkdev.h     |   1 +
- 28 files changed, 1022 insertions(+), 887 deletions(-)
+ include/linux/blkdev.h     |   5 +-
+ 32 files changed, 1041 insertions(+), 909 deletions(-)
 
 diff --git a/arch/x86/kernel/msr.c b/arch/x86/kernel/msr.c
 index ed8ac6bcbafb..d6fc5bdb0246 100644
@@ -96,6 +100,103 @@ index 615516146086..436279f3cc51 100644
  	help
  	BFQ I/O scheduler for BLK-MQ. BFQ distributes the bandwidth of
  	of the device among all processes according to their weights,
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index bf5acd8f4322..f7e2bd55a210 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -7183,6 +7183,9 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	bfq_init_root_group(bfqd->root_group, bfqd);
+ 	bfq_init_entity(&bfqd->oom_bfqq.entity, bfqd->root_group);
+ 
++	/* We dispatch from request queue wide instead of hw queue */
++	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
++
+ 	wbt_disable_default(q);
+ 	return 0;
+ 
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 9e56a69422b6..eb3c65a21362 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -564,6 +564,7 @@ int blk_mq_init_sched(struct request_queue *q, struct elevator_type *e)
+ 	int ret;
+ 
+ 	if (!e) {
++		blk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);
+ 		q->elevator = NULL;
+ 		q->nr_requests = q->tag_set->queue_depth;
+ 		return 0;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index de7fc6957271..c9c7bc359c74 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2104,20 +2104,6 @@ void blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
+ }
+ EXPORT_SYMBOL(blk_mq_run_hw_queue);
+ 
+-/*
+- * Is the request queue handled by an IO scheduler that does not respect
+- * hardware queues when dispatching?
+- */
+-static bool blk_mq_has_sqsched(struct request_queue *q)
+-{
+-	struct elevator_queue *e = q->elevator;
+-
+-	if (e && e->type->ops.dispatch_request &&
+-	    !(e->type->elevator_features & ELEVATOR_F_MQ_AWARE))
+-		return true;
+-	return false;
+-}
+-
+ /*
+  * Return prefered queue to dispatch from (if any) for non-mq aware IO
+  * scheduler.
+@@ -2150,7 +2136,7 @@ void blk_mq_run_hw_queues(struct request_queue *q, bool async)
+ 	unsigned long i;
+ 
+ 	sq_hctx = NULL;
+-	if (blk_mq_has_sqsched(q))
++	if (blk_queue_sq_sched(q))
+ 		sq_hctx = blk_mq_get_sq_hctx(q);
+ 	queue_for_each_hw_ctx(q, hctx, i) {
+ 		if (blk_mq_hctx_stopped(hctx))
+@@ -2178,7 +2164,7 @@ void blk_mq_delay_run_hw_queues(struct request_queue *q, unsigned long msecs)
+ 	unsigned long i;
+ 
+ 	sq_hctx = NULL;
+-	if (blk_mq_has_sqsched(q))
++	if (blk_queue_sq_sched(q))
+ 		sq_hctx = blk_mq_get_sq_hctx(q);
+ 	queue_for_each_hw_ctx(q, hctx, i) {
+ 		if (blk_mq_hctx_stopped(hctx))
+@@ -3441,8 +3427,9 @@ static void blk_mq_exit_hctx(struct request_queue *q,
+ 	if (blk_mq_hw_queue_mapped(hctx))
+ 		blk_mq_tag_idle(hctx);
+ 
+-	blk_mq_clear_flush_rq_mapping(set->tags[hctx_idx],
+-			set->queue_depth, flush_rq);
++	if (blk_queue_init_done(q))
++		blk_mq_clear_flush_rq_mapping(set->tags[hctx_idx],
++				set->queue_depth, flush_rq);
+ 	if (set->ops->exit_request)
+ 		set->ops->exit_request(set, flush_rq, hctx_idx);
+ 
+@@ -4436,12 +4423,14 @@ static bool blk_mq_elv_switch_none(struct list_head *head,
+ 	if (!qe)
+ 		return false;
+ 
++	/* q->elevator needs protection from ->sysfs_lock */
++	mutex_lock(&q->sysfs_lock);
++
+ 	INIT_LIST_HEAD(&qe->node);
+ 	qe->q = q;
+ 	qe->type = q->elevator->type;
+ 	list_add(&qe->node, head);
+ 
+-	mutex_lock(&q->sysfs_lock);
+ 	/*
+ 	 * After elevator_switch_mq, the previous elevator_queue will be
+ 	 * released by elevator_release. The reference of the io scheduler
 diff --git a/block/elevator.c b/block/elevator.c
 index c319765892bb..1f14fda7597d 100644
 --- a/block/elevator.c
@@ -125,11 +226,42 @@ index 16cd8bdedb7e..8d488775faaf 100644
  
  struct elv_fs_entry {
  	struct attribute attr;
+diff --git a/block/kyber-iosched.c b/block/kyber-iosched.c
+index 70ff2a599ef6..8f7c745b4a57 100644
+--- a/block/kyber-iosched.c
++++ b/block/kyber-iosched.c
+@@ -421,6 +421,8 @@ static int kyber_init_sched(struct request_queue *q, struct elevator_type *e)
+ 
+ 	blk_stat_enable_accounting(q);
+ 
++	blk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);
++
+ 	eq->elevator_data = kqd;
+ 	q->elevator = eq;
+ 
+@@ -1033,7 +1035,6 @@ static struct elevator_type kyber_sched = {
+ #endif
+ 	.elevator_attrs = kyber_sched_attrs,
+ 	.elevator_name = "kyber",
+-	.elevator_features = ELEVATOR_F_MQ_AWARE,
+ 	.elevator_owner = THIS_MODULE,
+ };
+ 
 diff --git a/block/mq-deadline.c b/block/mq-deadline.c
-index 18369e17f39f..fabf42d9c4d7 100644
+index 6ed602b2f80a..c9d85f92560c 100644
 --- a/block/mq-deadline.c
 +++ b/block/mq-deadline.c
-@@ -1151,12 +1151,21 @@ static struct elevator_type mq_deadline = {
+@@ -642,6 +642,9 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
+ 	spin_lock_init(&dd->lock);
+ 	spin_lock_init(&dd->zone_lock);
+ 
++	/* We dispatch from request queue wide instead of hw queue */
++	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
++
+ 	q->elevator = eq;
+ 	return 0;
+ 
+@@ -1148,12 +1151,21 @@ static struct elevator_type mq_deadline = {
  	.queue_debugfs_attrs = deadline_queue_debugfs_attrs,
  #endif
  	.elevator_attrs = deadline_attrs,
@@ -3232,10 +3364,14 @@ index fc42dd0badd7..0fe31a6f6e68 100644
  
  /*
 diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
-index 108e3d114bfc..6c81f09faf4a 100644
+index 108e3d114bfc..0dd8506aa3b6 100644
 --- a/include/linux/blkdev.h
 +++ b/include/linux/blkdev.h
-@@ -564,6 +564,7 @@ struct request_queue {
+@@ -561,9 +561,11 @@ struct request_queue {
+ #define QUEUE_FLAG_RQ_ALLOC_TIME 27	/* record rq->alloc_time_ns */
+ #define QUEUE_FLAG_HCTX_ACTIVE	28	/* at least one blk-mq hctx is active */
+ #define QUEUE_FLAG_NOWAIT       29	/* device supports NOWAIT */
++#define QUEUE_FLAG_SQ_SCHED     30	/* single queue style io dispatch */
  
  #define QUEUE_FLAG_MQ_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
  				 (1 << QUEUE_FLAG_SAME_COMP) |		\
@@ -3243,6 +3379,23 @@ index 108e3d114bfc..6c81f09faf4a 100644
  				 (1 << QUEUE_FLAG_NOWAIT))
  
  void blk_queue_flag_set(unsigned int flag, struct request_queue *q);
+@@ -606,6 +608,7 @@ bool blk_queue_flag_test_and_set(unsigned int flag, struct request_queue *q);
+ #define blk_queue_fua(q)	test_bit(QUEUE_FLAG_FUA, &(q)->queue_flags)
+ #define blk_queue_registered(q)	test_bit(QUEUE_FLAG_REGISTERED, &(q)->queue_flags)
+ #define blk_queue_nowait(q)	test_bit(QUEUE_FLAG_NOWAIT, &(q)->queue_flags)
++#define blk_queue_sq_sched(q)	test_bit(QUEUE_FLAG_SQ_SCHED, &(q)->queue_flags)
+ 
+ extern void blk_set_pm_only(struct request_queue *q);
+ extern void blk_clear_pm_only(struct request_queue *q);
+@@ -994,8 +997,6 @@ void disk_set_independent_access_ranges(struct gendisk *disk,
+  */
+ /* Supports zoned block devices sequential write constraint */
+ #define ELEVATOR_F_ZBD_SEQ_WRITE	(1U << 0)
+-/* Supports scheduling on multiple hardware queues */
+-#define ELEVATOR_F_MQ_AWARE		(1U << 1)
+ 
+ extern void blk_queue_required_elevator_features(struct request_queue *q,
+ 						 unsigned int features);
 -- 
 2.36.1
 
