@@ -1,0 +1,537 @@
+From 2960f0c929f9888ece9bc7e794d6998565f777c1 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 28 Jun 2022 03:20:52 +0200
+Subject: [PATCH] fair-test
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ include/linux/sched/topology.h |  62 ++++++++-
+ kernel/sched/fair.c            | 233 +++++++++++++++++++++++++++++----
+ kernel/sched/topology.c        |  12 +-
+ 3 files changed, 277 insertions(+), 30 deletions(-)
+
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index 56cffe42abbc..e3552ce192a9 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -77,10 +77,65 @@ extern int sched_domain_level_max;
+ 
+ struct sched_group;
+ 
++/*
++ * States of the sched-domain
++ *
++ * - sd_has_icores
++ *	This state is only used in LLC domains to indicate worthy
++ *	of a full scan in SIS due to idle cores available.
++ *
++ * - sd_has_icpus
++ *	This state indicates that unoccupied (sched-idle/idle) cpus
++ *	might exist in this domain. For the LLC domains it is the
++ *	default state since these cpus are the main targets of SIS
++ *	search, and is also used as a fallback state of the other
++ *	states.
++ *
++ * - sd_may_idle
++ *	This state implies the unstableness of the SIS filter, and
++ *	some bits of it may out of date. This state is only used in
++ *	SMT domains as an intermediate state between sd_has_icpus
++ *	and sd_is_busy.
++ *
++ * - sd_is_busy
++ *	This state indicates there are no unoccupied cpus in this
++ *	domain. So for LLC domains, it gives the hint on whether
++ *	we should put efforts on the SIS search or not.
++ *
++ * For LLC domains, sd_has_icores is set when the last non-idle cpu of
++ * a core becomes idle. After a full SIS scan and if no idle cores found,
++ * sd_has_icores must be cleared and the state will be set to sd_has_icpus
++ * or sd_is_busy depending on whether there is any idle cpu. And during
++ * load balancing on each SMT domain inside the LLC, the state will be
++ * re-evaluated and switch from sd_is_busy to sd_has_icpus if idle cpus
++ * exist.
++ *
++ * For SMT domains, the state is updated during load balancing at SMT
++ * level. Upper levels are ignored due to the long intervals that make
++ * information out-of-date quickly.
++ */
++enum sd_state {
++	sd_has_icores,
++	sd_has_icpus,
++	sd_may_idle,
++	sd_is_busy
++};
++
+ struct sched_domain_shared {
+ 	atomic_t	ref;
+ 	atomic_t	nr_busy_cpus;
+-	int		has_idle_cores;
++
++	int		updating;
++	int		state;	/* see enum sd_state */
++
++	/*
++	 * Record unoccupied cpus for SIS domain search.
++	 *
++	 * NOTE: this field is variable length. (Allocated dynamically
++	 * by attaching extra space to the end of the structure,
++	 * depending on how many CPUs the kernel has booted up with)
++	 */
++	unsigned long   idle_cpus[];
+ };
+ 
+ struct sched_domain {
+@@ -166,6 +221,11 @@ static inline struct cpumask *sched_domain_span(struct sched_domain *sd)
+ 	return to_cpumask(sd->span);
+ }
+ 
++static inline struct cpumask *sched_domain_icpus(struct sched_domain_shared *sds)
++{
++	return to_cpumask(sds->idle_cpus);
++}
++
+ extern void partition_sched_domains_locked(int ndoms_new,
+ 					   cpumask_var_t doms_new[],
+ 					   struct sched_domain_attr *dattr_new);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 5be882a6b632..3d0556d62820 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1577,11 +1577,11 @@ numa_type numa_classify(unsigned int imbalance_pct,
+ 
+ #ifdef CONFIG_SCHED_SMT
+ /* Forward declarations of select_idle_sibling helpers */
+-static inline bool test_idle_cores(int cpu, bool def);
++static inline bool test_idle_cores(int cpu);
+ static inline int numa_idle_core(int idle_core, int cpu)
+ {
+ 	if (!static_branch_likely(&sched_smt_present) ||
+-	    idle_core >= 0 || !test_idle_cores(cpu, false))
++	    idle_core >= 0 || !test_idle_cores(cpu))
+ 		return idle_core;
+ 
+ 	/*
+@@ -5655,11 +5655,15 @@ static inline void update_overutilized_status(struct rq *rq)
+ static inline void update_overutilized_status(struct rq *rq) { }
+ #endif
+ 
++static int unoccupied_rq(struct rq *rq)
++{
++	return rq->nr_running == rq->cfs.idle_h_nr_running;
++}
++
+ /* Runqueue only has SCHED_IDLE tasks enqueued */
+ static int sched_idle_rq(struct rq *rq)
+ {
+-	return unlikely(rq->nr_running == rq->cfs.idle_h_nr_running &&
+-			rq->nr_running);
++	return unlikely(rq->nr_running && unoccupied_rq(rq));
+ }
+ 
+ /*
+@@ -6232,24 +6236,66 @@ static inline int __select_idle_cpu(int cpu, struct task_struct *p)
+ DEFINE_STATIC_KEY_FALSE(sched_smt_present);
+ EXPORT_SYMBOL_GPL(sched_smt_present);
+ 
+-static inline void set_idle_cores(int cpu, int val)
++static inline void sd_set_state(int cpu, enum sd_state state)
+ {
+ 	struct sched_domain_shared *sds;
+ 
+ 	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
+ 	if (sds)
+-		WRITE_ONCE(sds->has_idle_cores, val);
++		WRITE_ONCE(sds->state, state);
+ }
+ 
+-static inline bool test_idle_cores(int cpu, bool def)
++static inline enum sd_state sd_get_state(int cpu)
+ {
+ 	struct sched_domain_shared *sds;
+ 
+ 	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
+ 	if (sds)
+-		return READ_ONCE(sds->has_idle_cores);
++		return READ_ONCE(sds->state);
++
++	return sd_has_icpus;
++}
++
++static inline void set_idle_cores(int cpu, int idle)
++{
++	sd_set_state(cpu, idle ? sd_has_icores : sd_has_icpus);
++}
++
++static inline bool test_idle_cores(int cpu)
++{
++	return sd_get_state(cpu) == sd_has_icores;
++}
+ 
+-	return def;
++static inline void set_idle_cpus(int cpu, int idle)
++{
++	sd_set_state(cpu, idle ? sd_has_icpus : sd_is_busy);
++}
++
++static inline bool test_idle_cpus(int cpu)
++{
++	return sd_get_state(cpu) != sd_is_busy;
++}
++
++static void sd_update_icpus(int core, int icpu)
++{
++	struct sched_domain_shared *sds;
++	struct cpumask *icpus;
++
++	sds = rcu_dereference(per_cpu(sd_llc_shared, core));
++	if (!sds)
++		return;
++
++	icpus = sched_domain_icpus(sds);
++
++	/*
++	 * XXX: The update is racy between different cores.
++	 * The non-atomic ops here is a tradeoff of accuracy
++	 * for easing the cache traffic.
++	 */
++	if (icpu == -1)
++		cpumask_andnot(icpus, icpus, cpu_smt_mask(core));
++	else if (!cpumask_test_cpu(icpu, icpus))
++		__cpumask_set_cpu(icpu, icpus);
+ }
+ 
+ /*
+@@ -6265,7 +6311,7 @@ void __update_idle_core(struct rq *rq)
+ 	int cpu;
+ 
+ 	rcu_read_lock();
+-	if (test_idle_cores(core, true))
++	if (test_idle_cores(core))
+ 		goto unlock;
+ 
+ 	for_each_cpu(cpu, cpu_smt_mask(core)) {
+@@ -6291,9 +6337,6 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
+ 	bool idle = true;
+ 	int cpu;
+ 
+-	if (!static_branch_likely(&sched_smt_present))
+-		return __select_idle_cpu(core, p);
+-
+ 	for_each_cpu(cpu, cpu_smt_mask(core)) {
+ 		if (!available_idle_cpu(cpu)) {
+ 			idle = false;
+@@ -6320,13 +6363,12 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
+ /*
+  * Scan the local SMT mask for idle CPUs.
+  */
+-static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int target)
++static int select_idle_smt(struct task_struct *p, int target)
+ {
+ 	int cpu;
+ 
+-	for_each_cpu(cpu, cpu_smt_mask(target)) {
+-		if (!cpumask_test_cpu(cpu, p->cpus_ptr) ||
+-		    !cpumask_test_cpu(cpu, sched_domain_span(sd)))
++	for_each_cpu_and(cpu, cpu_smt_mask(target), p->cpus_ptr) {
++		if (cpu == target)
+ 			continue;
+ 		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
+ 			return cpu;
+@@ -6337,13 +6379,26 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
+ 
+ #else /* CONFIG_SCHED_SMT */
+ 
+-static inline void set_idle_cores(int cpu, int val)
++static inline void set_idle_cores(int cpu, int idle)
+ {
+ }
+ 
+-static inline bool test_idle_cores(int cpu, bool def)
++static inline bool test_idle_cores(int cpu)
++{
++	return false;
++}
++
++static inline void set_idle_cpus(int cpu, int idle)
++{
++}
++
++static inline bool test_idle_cpus(int cpu)
++{
++	return true;
++}
++
++static inline void sd_update_icpus(int core, int icpu)
+ {
+-	return def;
+ }
+ 
+ static inline int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
+@@ -6351,7 +6406,7 @@ static inline int select_idle_core(struct task_struct *p, int core, struct cpuma
+ 	return __select_idle_cpu(core, p);
+ }
+ 
+-static inline int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int target)
++static inline int select_idle_smt(struct task_struct *p, int target)
+ {
+ 	return -1;
+ }
+@@ -6376,7 +6431,8 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 	if (!this_sd)
+ 		return -1;
+ 
+-	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
++	cpumask_and(cpus, has_idle_core ? sched_domain_span(sd) :
++		    sched_domain_icpus(sd->shared), p->cpus_ptr);
+ 
+ 	if (sched_feat(SIS_PROP) && !has_idle_core) {
+ 		u64 avg_cost, avg_idle, span_avg;
+@@ -6421,7 +6477,9 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 		}
+ 	}
+ 
+-	if (has_idle_core)
++	if (idle_cpu == -1)
++		set_idle_cpus(target, false);
++	else if (has_idle_core)
+ 		set_idle_cores(target, false);
+ 
+ 	if (sched_feat(SIS_PROP) && !has_idle_core) {
+@@ -6570,13 +6628,16 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		return target;
+ 
+ 	if (sched_smt_active()) {
+-		has_idle_core = test_idle_cores(target, false);
++		has_idle_core = test_idle_cores(target);
+ 
+ 		if (!has_idle_core && cpus_share_cache(prev, target)) {
+-			i = select_idle_smt(p, sd, prev);
++			i = select_idle_smt(p, prev);
+ 			if ((unsigned int)i < nr_cpumask_bits)
+ 				return i;
+ 		}
++
++		if (!has_idle_core && !test_idle_cpus(target))
++			return target;
+ 	}
+ 
+ 	i = select_idle_cpu(p, sd, has_idle_core, target);
+@@ -8389,6 +8450,9 @@ struct sd_lb_stats {
+ 	unsigned long avg_load;	/* Average load across all groups in sd */
+ 	unsigned int prefer_sibling; /* tasks should go to sibling first */
+ 
++	int sd_state;
++	int idle_cpu;
++
+ 	struct sg_lb_stats busiest_stat;/* Statistics of the busiest group */
+ 	struct sg_lb_stats local_stat;	/* Statistics of the local group */
+ };
+@@ -8407,6 +8471,8 @@ static inline void init_sd_lb_stats(struct sd_lb_stats *sds)
+ 		.local = NULL,
+ 		.total_load = 0UL,
+ 		.total_capacity = 0UL,
++		.sd_state = sd_is_busy,
++		.idle_cpu = -1,
+ 		.busiest_stat = {
+ 			.idle_cpus = UINT_MAX,
+ 			.group_type = group_has_spare,
+@@ -8747,6 +8813,20 @@ sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs
+ 	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
+ }
+ 
++static inline void sd_classify(struct sd_lb_stats *sds, struct rq *rq, int cpu)
++{
++	if (sds->sd_state != sd_has_icpus && unoccupied_rq(rq)) {
++		/*
++		 * Prefer idle cpus than unoccupied ones. This
++		 * is achieved by only allowing the idle ones
++		 * unconditionally overwrite the preious record
++		 * while the occupied ones can't.
++		 */
++		sds->idle_cpu = cpu;
++		sds->sd_state = sd_has_icpus;
++	}
++}
++
+ /**
+  * update_sg_lb_stats - Update sched_group's statistics for load balancing.
+  * @env: The load balancing environment.
+@@ -8761,14 +8841,16 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 				      struct sg_lb_stats *sgs,
+ 				      int *sg_status)
+ {
+-	int i, nr_running, local_group;
++	int i, nr_running, local_group, update_core;
+ 
+ 	memset(sgs, 0, sizeof(*sgs));
+ 
+ 	local_group = group == sds->local;
++	update_core = env->sd->flags & SD_SHARE_CPUCAPACITY;
+ 
+ 	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
+ 		struct rq *rq = cpu_rq(i);
++		bool update = update_core && (env->dst_cpu != i);
+ 
+ 		sgs->group_load += cpu_load(rq);
+ 		sgs->group_util += cpu_util_cfs(i);
+@@ -8778,6 +8860,13 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 		nr_running = rq->nr_running;
+ 		sgs->sum_nr_running += nr_running;
+ 
++		/*
++		 * The dst_cpu is not preferred since it might
++		 * be fed with tasks soon.
++		 */
++		if (update)
++			sd_classify(sds, rq, i);
++
+ 		if (nr_running > 1)
+ 			*sg_status |= SG_OVERLOAD;
+ 
+@@ -8792,7 +8881,17 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 		 * No need to call idle_cpu() if nr_running is not 0
+ 		 */
+ 		if (!nr_running && idle_cpu(i)) {
++			/*
++			 * Prefer the last idle cpu by overwriting
++			 * preious one. The first idle cpu in this
++			 * domain (if any) can trigger balancing
++			 * and fed with tasks, so we'd better choose
++			 * a candidate in an opposite way.
++			 */
++			if (update)
++				sds->idle_cpu = i;
+ 			sgs->idle_cpus++;
++
+ 			/* Idle cpu can't have misfit task */
+ 			continue;
+ 		}
+@@ -9300,6 +9399,83 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 	return idlest;
+ }
+ 
++static void sd_update_state(struct lb_env *env, struct sd_lb_stats *sds)
++{
++	struct sched_domain_shared *sd_smt_shared = env->sd->shared;
++	enum sd_state new = sds->sd_state;
++	int icpu = sds->idle_cpu, this = env->dst_cpu;
++
++	/*
++	 * Parallel updating can hardly contribute accuracy to
++	 * the filter, besides it can be one of the burdens on
++	 * cache traffic.
++	 */
++	if (cmpxchg(&sd_smt_shared->updating, 0, 1))
++		return;
++
++	/*
++	 * The dst_cpu is likely to be fed with tasks soon.
++	 * If it is the only unoccupied cpu in this domain,
++	 * we still handle it the same way as as_has_icpus
++	 * but turn the SMT into the unstable state, rather
++	 * than waiting to the end of load balancing since
++	 * it's also important that update the filter as
++	 * early as possible to keep it fresh.
++	 */
++	if (new == sd_is_busy) {
++		if (idle_cpu(this) || sched_idle_cpu(this)) {
++			new = sd_may_idle;
++			icpu = this;
++		}
++	}
++
++	/*
++	 * There is at least one unoccupied cpu available, so
++	 * propagate it to the filter to avoid false negative
++	 * issue which could result in lost tracking of some
++	 * idle cpus thus throughupt downgraded.
++	 */
++	if (new != sd_is_busy) {
++		/*
++		 * The sd_may_idle state is taken into
++		 * consideration as well because from
++		 * here we couldn't actually know task
++		 * migrations would happen or not.
++		 */
++		if (!test_idle_cpus(this))
++			set_idle_cpus(this, true);
++	} else {
++		/*
++		 * Nothing changes so nothing to update or
++		 * propagate.
++		 */
++		if (sd_smt_shared->state == sd_is_busy)
++			goto out;
++
++		/*
++		 * Allow false positive to exist for some time
++		 * to make a tradeoff of accuracy of the filter
++		 * for relieving cache traffic.
++		 */
++		if (sd_smt_shared->state == sd_has_icpus) {
++			new = sd_may_idle;
++			goto update;
++		}
++
++		/*
++		 * If the false positive issue has already been
++		 * there for a while, a correction of the filter
++		 * is needed.
++		 */
++	}
++
++	sd_update_icpus(this, sds->idle_cpu);
++update:
++	sd_smt_shared->state = new;
++out:
++	xchg(&sd_smt_shared->updating, 0);
++}
++
+ /**
+  * update_sd_lb_stats - Update sched_domain's statistics for load balancing.
+  * @env: The load balancing environment.
+@@ -9350,8 +9526,9 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
+ 	/* Tag domain that child domain prefers tasks go to siblings first */
+ 	sds->prefer_sibling = child && child->flags & SD_PREFER_SIBLING;
+ 
+-
+-	if (env->sd->flags & SD_NUMA)
++	if (env->sd->flags & SD_SHARE_CPUCAPACITY)
++		sd_update_state(env, sds);
++	else if (env->sd->flags & SD_NUMA)
+ 		env->fbq_type = fbq_classify_group(&sds->busiest_stat);
+ 
+ 	if (!env->sd->parent) {
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 810750e62118..482f5da00b61 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1620,6 +1620,16 @@ sd_init(struct sched_domain_topology_level *tl,
+ 		sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
+ 		atomic_inc(&sd->shared->ref);
+ 		atomic_set(&sd->shared->nr_busy_cpus, sd_weight);
++
++		/*
++		 * Initialize SMT domains to be busy, so that we don't
++		 * need to propagate idle cpus to LLC domains which are
++		 * default to fully busy (no cpus set). This will be
++		 * updated in the first load balancing on SMT domains
++		 * if necessary.
++		 */
++		if (sd->flags & SD_SHARE_CPUCAPACITY)
++			WRITE_ONCE(sd->shared->state, sd_is_busy);
+ 	}
+ 
+ 	sd->private = sdd;
+@@ -2085,7 +2095,7 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
+ 
+ 			*per_cpu_ptr(sdd->sd, j) = sd;
+ 
+-			sds = kzalloc_node(sizeof(struct sched_domain_shared),
++			sds = kzalloc_node(sizeof(struct sched_domain_shared) + cpumask_size(),
+ 					GFP_KERNEL, cpu_to_node(j));
+ 			if (!sds)
+ 				return -ENOMEM;
+-- 
+2.37.0
+
