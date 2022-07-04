@@ -1,7 +1,7 @@
-From 0ea802c892460a60c2c903483aeb93352292dac8 Mon Sep 17 00:00:00 2001
+From 6453d0a22e6e00aa67edda66c31daac0692f8538 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sat, 2 Jul 2022 03:30:44 +0200
-Subject: [PATCH 09/18] misc
+Subject: [PATCH 09/15] misc
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -60,9 +60,12 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  include/linux/cpumask.h                       |  125 +-
  include/linux/gfp.h                           |  334 +---
  include/linux/gfp_flags.h                     |  338 ++++
+ include/linux/mm_types.h                      |    5 +
+ include/linux/mmzone.h                        |   12 +-
  lib/bitmap.c                                  |    9 +-
  lib/cpumask.c                                 |   97 +-
  lib/test_bitmap.c                             |   62 +
+ mm/page_alloc.c                               |  393 +++--
  net/ipv4/netfilter/Kconfig                    |    9 +
  net/netfilter/Kconfig                         |    8 +
  net/netfilter/Makefile                        |    3 +
@@ -71,7 +74,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  tools/include/linux/bitmap.h                  |   12 +-
  tools/include/linux/bitops.h                  |   16 +
  tools/lib/bitmap.c                            |    6 +-
- 66 files changed, 4256 insertions(+), 805 deletions(-)
+ 69 files changed, 4498 insertions(+), 973 deletions(-)
  create mode 100644 drivers/net/wireless/realtek/rtw88/rtw8723du.c
  create mode 100644 drivers/net/wireless/realtek/rtw88/rtw8723du.h
  create mode 100644 drivers/net/wireless/realtek/rtw88/rtw8821cu.c
@@ -5096,6 +5099,72 @@ index 000000000000..846cc8151340
 +#define GFP_MOVABLE_SHIFT 3
 +
 +#endif /* __LINUX_GFP_FLAGS_H */
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index d04ecb679137..e831d46481b6 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -89,6 +89,7 @@ struct page {
+ 			 */
+ 			union {
+ 				struct list_head lru;
++
+ 				/* Or, for the Unevictable "LRU list" slot */
+ 				struct {
+ 					/* Always even, to negate PageTail */
+@@ -96,6 +97,10 @@ struct page {
+ 					/* Count page's or folio's mlocks */
+ 					unsigned int mlock_count;
+ 				};
++
++				/* Or, free page */
++				struct list_head buddy_list;
++				struct list_head pcp_list;
+ 			};
+ 			/* See page-flags.h for PAGE_MAPPING_FLAGS */
+ 			struct address_space *mapping;
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index b2e8869be7cf..3cbb5c2f94a1 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -569,15 +569,18 @@ enum zone_watermarks {
+ };
+ 
+ /*
+- * One per migratetype for each PAGE_ALLOC_COSTLY_ORDER plus one additional
+- * for pageblock size for THP if configured.
++ * One per migratetype for each PAGE_ALLOC_COSTLY_ORDER. One additional list
++ * for THP which will usually be GFP_MOVABLE. Even if it is another type,
++ * it should not contribute to serious fragmentation causing THP allocation
++ * failures.
+  */
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ #define NR_PCP_THP 1
+ #else
+ #define NR_PCP_THP 0
+ #endif
+-#define NR_PCP_LISTS (MIGRATE_PCPTYPES * (PAGE_ALLOC_COSTLY_ORDER + 1 + NR_PCP_THP))
++#define NR_LOWORDER_PCP_LISTS (MIGRATE_PCPTYPES * (PAGE_ALLOC_COSTLY_ORDER + 1))
++#define NR_PCP_LISTS (NR_LOWORDER_PCP_LISTS + NR_PCP_THP)
+ 
+ /*
+  * Shift to encode migratetype and order in the same integer, with order
+@@ -593,6 +596,7 @@ enum zone_watermarks {
+ 
+ /* Fields and list protected by pagesets local_lock in page_alloc.c */
+ struct per_cpu_pages {
++	spinlock_t lock;	/* Protects lists field */
+ 	int count;		/* number of pages in the list */
+ 	int high;		/* high watermark, emptying needed */
+ 	int batch;		/* chunk size for buddy add/remove */
+@@ -603,7 +607,7 @@ struct per_cpu_pages {
+ 
+ 	/* Lists of pages, one per migrate type stored on the pcp-lists */
+ 	struct list_head lists[NR_PCP_LISTS];
+-};
++} ____cacheline_aligned_in_smp;
+ 
+ struct per_cpu_zonestat {
+ #ifdef CONFIG_SMP
 diff --git a/lib/bitmap.c b/lib/bitmap.c
 index 0d5c2ece0bcb..8f05cb60019c 100644
 --- a/lib/bitmap.c
@@ -5358,6 +5427,727 @@ index 0c82f07f74fc..d67e2d1e6276 100644
  }
  
  KSTM_MODULE_LOADERS(test_bitmap);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 041c16aa8f2f..9017f505cee6 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -127,13 +127,97 @@ atomic_long_t kswapd_waiters = ATOMIC_LONG_INIT(0);
+ static DEFINE_MUTEX(pcp_batch_high_lock);
+ #define MIN_PERCPU_PAGELIST_HIGH_FRACTION (8)
+ 
+-struct pagesets {
+-	local_lock_t lock;
+-};
+-static DEFINE_PER_CPU(struct pagesets, pagesets) = {
+-	.lock = INIT_LOCAL_LOCK(lock),
+-};
++#if defined(CONFIG_SMP) || defined(CONFIG_PREEMPT_RT)
++/*
++ * On SMP, spin_trylock is sufficient protection.
++ * On PREEMPT_RT, spin_trylock is equivalent on both SMP and UP.
++ */
++#define pcp_trylock_prepare(flags)	do { } while (0)
++#define pcp_trylock_finish(flag)	do { } while (0)
++#else
++
++/* UP spin_trylock always succeeds so disable IRQs to prevent re-entrancy. */
++#define pcp_trylock_prepare(flags)	local_irq_save(flags)
++#define pcp_trylock_finish(flags)	local_irq_restore(flags)
++#endif
++
++/*
++ * Locking a pcp requires a PCP lookup followed by a spinlock. To avoid
++ * a migration causing the wrong PCP to be locked and remote memory being
++ * potentially allocated, pin the task to the CPU for the lookup+lock.
++ * preempt_disable is used on !RT because it is faster than migrate_disable.
++ * migrate_disable is used on RT because otherwise RT spinlock usage is
++ * interfered with and a high priority task cannot preempt the allocator.
++ */
++#ifndef CONFIG_PREEMPT_RT
++#define pcpu_task_pin()		preempt_disable()
++#define pcpu_task_unpin()	preempt_enable()
++#else
++#define pcpu_task_pin()		migrate_disable()
++#define pcpu_task_unpin()	migrate_enable()
++#endif
+ 
++/*
++ * Generic helper to lookup and a per-cpu variable with an embedded spinlock.
++ * Return value should be used with equivalent unlock helper.
++ */
++#define pcpu_spin_lock(type, member, ptr)				\
++({									\
++	type *_ret;							\
++	pcpu_task_pin();						\
++	_ret = this_cpu_ptr(ptr);					\
++	spin_lock(&_ret->member);					\
++	_ret;								\
++})
++
++#define pcpu_spin_lock_irqsave(type, member, ptr, flags)		\
++({									\
++	type *_ret;							\
++	pcpu_task_pin();						\
++	_ret = this_cpu_ptr(ptr);					\
++	spin_lock_irqsave(&_ret->member, flags);			\
++	_ret;								\
++})
++
++#define pcpu_spin_trylock_irqsave(type, member, ptr, flags)		\
++({									\
++	type *_ret;							\
++	pcpu_task_pin();						\
++	_ret = this_cpu_ptr(ptr);					\
++	if (!spin_trylock_irqsave(&_ret->member, flags)) {		\
++		pcpu_task_unpin();					\
++		_ret = NULL;						\
++	}								\
++	_ret;								\
++})
++
++#define pcpu_spin_unlock(member, ptr)					\
++({									\
++	spin_unlock(&ptr->member);					\
++	pcpu_task_unpin();						\
++})
++
++#define pcpu_spin_unlock_irqrestore(member, ptr, flags)			\
++({									\
++	spin_unlock_irqrestore(&ptr->member, flags);			\
++	pcpu_task_unpin();						\
++})
++
++/* struct per_cpu_pages specific helpers. */
++#define pcp_spin_lock(ptr)						\
++	pcpu_spin_lock(struct per_cpu_pages, lock, ptr)
++
++#define pcp_spin_lock_irqsave(ptr, flags)				\
++	pcpu_spin_lock_irqsave(struct per_cpu_pages, lock, ptr, flags)
++
++#define pcp_spin_trylock_irqsave(ptr, flags)				\
++	pcpu_spin_trylock_irqsave(struct per_cpu_pages, lock, ptr, flags)
++
++#define pcp_spin_unlock(ptr)						\
++	pcpu_spin_unlock(lock, ptr)
++
++#define pcp_spin_unlock_irqrestore(ptr, flags)				\
++	pcpu_spin_unlock_irqrestore(lock, ptr, flags)
+ #ifdef CONFIG_USE_PERCPU_NUMA_NODE_ID
+ DEFINE_PER_CPU(int, numa_node);
+ EXPORT_PER_CPU_SYMBOL(numa_node);
+@@ -152,13 +236,7 @@ DEFINE_PER_CPU(int, _numa_mem_);		/* Kernel "local memory" node */
+ EXPORT_PER_CPU_SYMBOL(_numa_mem_);
+ #endif
+ 
+-/* work_structs for global per-cpu drains */
+-struct pcpu_drain {
+-	struct zone *zone;
+-	struct work_struct work;
+-};
+ static DEFINE_MUTEX(pcpu_drain_mutex);
+-static DEFINE_PER_CPU(struct pcpu_drain, pcpu_drain);
+ 
+ #ifdef CONFIG_GCC_PLUGIN_LATENT_ENTROPY
+ volatile unsigned long latent_entropy __latent_entropy;
+@@ -650,7 +728,7 @@ static inline unsigned int order_to_pindex(int migratetype, int order)
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	if (order > PAGE_ALLOC_COSTLY_ORDER) {
+ 		VM_BUG_ON(order != pageblock_order);
+-		base = PAGE_ALLOC_COSTLY_ORDER + 1;
++		return NR_LOWORDER_PCP_LISTS;
+ 	}
+ #else
+ 	VM_BUG_ON(order > PAGE_ALLOC_COSTLY_ORDER);
+@@ -664,7 +742,7 @@ static inline int pindex_to_order(unsigned int pindex)
+ 	int order = pindex / MIGRATE_PCPTYPES;
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-	if (order > PAGE_ALLOC_COSTLY_ORDER)
++	if (pindex == NR_LOWORDER_PCP_LISTS)
+ 		order = pageblock_order;
+ #else
+ 	VM_BUG_ON(order > PAGE_ALLOC_COSTLY_ORDER);
+@@ -782,7 +860,7 @@ static inline bool set_page_guard(struct zone *zone, struct page *page,
+ 		return false;
+ 
+ 	__SetPageGuard(page);
+-	INIT_LIST_HEAD(&page->lru);
++	INIT_LIST_HEAD(&page->buddy_list);
+ 	set_page_private(page, order);
+ 	/* Guard pages are not available for any usage */
+ 	__mod_zone_freepage_state(zone, -(1 << order), migratetype);
+@@ -959,7 +1037,7 @@ static inline void add_to_free_list(struct page *page, struct zone *zone,
+ {
+ 	struct free_area *area = &zone->free_area[order];
+ 
+-	list_add(&page->lru, &area->free_list[migratetype]);
++	list_add(&page->buddy_list, &area->free_list[migratetype]);
+ 	area->nr_free++;
+ }
+ 
+@@ -969,7 +1047,7 @@ static inline void add_to_free_list_tail(struct page *page, struct zone *zone,
+ {
+ 	struct free_area *area = &zone->free_area[order];
+ 
+-	list_add_tail(&page->lru, &area->free_list[migratetype]);
++	list_add_tail(&page->buddy_list, &area->free_list[migratetype]);
+ 	area->nr_free++;
+ }
+ 
+@@ -983,7 +1061,7 @@ static inline void move_to_free_list(struct page *page, struct zone *zone,
+ {
+ 	struct free_area *area = &zone->free_area[order];
+ 
+-	list_move_tail(&page->lru, &area->free_list[migratetype]);
++	list_move_tail(&page->buddy_list, &area->free_list[migratetype]);
+ }
+ 
+ static inline void del_page_from_free_list(struct page *page, struct zone *zone,
+@@ -993,7 +1071,7 @@ static inline void del_page_from_free_list(struct page *page, struct zone *zone,
+ 	if (page_reported(page))
+ 		__ClearPageReported(page);
+ 
+-	list_del(&page->lru);
++	list_del(&page->buddy_list);
+ 	__ClearPageBuddy(page);
+ 	set_page_private(page, 0);
+ 	zone->free_area[order].nr_free--;
+@@ -1460,10 +1538,7 @@ static void free_pcppages_bulk(struct zone *zone, int count,
+ 	/* Ensure requested pindex is drained first. */
+ 	pindex = pindex - 1;
+ 
+-	/*
+-	 * local_lock_irq held so equivalent to spin_lock_irqsave for
+-	 * both PREEMPT_RT and non-PREEMPT_RT configurations.
+-	 */
++	/* Caller must hold IRQ-safe pcp->lock so IRQs are disabled. */
+ 	spin_lock(&zone->lock);
+ 	isolated_pageblocks = has_isolate_pageblock(zone);
+ 
+@@ -1491,11 +1566,11 @@ static void free_pcppages_bulk(struct zone *zone, int count,
+ 		do {
+ 			int mt;
+ 
+-			page = list_last_entry(list, struct page, lru);
++			page = list_last_entry(list, struct page, pcp_list);
+ 			mt = get_pcppage_migratetype(page);
+ 
+ 			/* must delete to avoid corrupting pcp list */
+-			list_del(&page->lru);
++			list_del(&page->pcp_list);
+ 			count -= nr_pages;
+ 			pcp->count -= nr_pages;
+ 
+@@ -3032,10 +3107,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 	const bool can_resched = !preempt_count() && !irqs_disabled();
+ 	int i, allocated = 0, last_mod = 0;
+ 
+-	/*
+-	 * local_lock_irq held so equivalent to spin_lock_irqsave for
+-	 * both PREEMPT_RT and non-PREEMPT_RT configurations.
+-	 */
++	/* Caller must hold IRQ-safe pcp->lock so IRQs are disabled. */
+ 	spin_lock(&zone->lock);
+ 	for (i = 0; i < count; ++i) {
+ 		struct page *page = __rmqueue(zone, order, migratetype,
+@@ -3068,7 +3140,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 		 * for IO devices that can merge IO requests if the physical
+ 		 * pages are ordered properly.
+ 		 */
+-		list_add_tail(&page->lru, list);
++		list_add_tail(&page->pcp_list, list);
+ 		allocated++;
+ 		if (is_migrate_cma(get_pcppage_migratetype(page)))
+ 			__mod_zone_page_state(zone, NR_FREE_CMA_PAGES,
+@@ -3091,51 +3163,48 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+  * Called from the vmstat counter updater to drain pagesets of this
+  * currently executing processor on remote nodes after they have
+  * expired.
+- *
+- * Note that this function must be called with the thread pinned to
+- * a single processor.
+  */
+ void drain_zone_pages(struct zone *zone, struct per_cpu_pages *pcp)
+ {
+-	unsigned long flags;
+ 	int to_drain, batch;
+ 
+-	local_lock_irqsave(&pagesets.lock, flags);
+ 	batch = READ_ONCE(pcp->batch);
+ 	to_drain = min(pcp->count, batch);
+-	if (to_drain > 0)
++	if (to_drain > 0) {
++		unsigned long flags;
++
++		/*
++		 * free_pcppages_bulk expects IRQs disabled for zone->lock
++		 * so even though pcp->lock is not intended to be IRQ-safe,
++		 * it's needed in this context.
++		 */
++		spin_lock_irqsave(&pcp->lock, flags);
+ 		free_pcppages_bulk(zone, to_drain, pcp, 0);
+-	local_unlock_irqrestore(&pagesets.lock, flags);
++		spin_unlock_irqrestore(&pcp->lock, flags);
++	}
+ }
+ #endif
+ 
+ /*
+  * Drain pcplists of the indicated processor and zone.
+- *
+- * The processor must either be the current processor and the
+- * thread pinned to the current processor or a processor that
+- * is not online.
+  */
+ static void drain_pages_zone(unsigned int cpu, struct zone *zone)
+ {
+-	unsigned long flags;
+ 	struct per_cpu_pages *pcp;
+ 
+-	local_lock_irqsave(&pagesets.lock, flags);
+-
+ 	pcp = per_cpu_ptr(zone->per_cpu_pageset, cpu);
+-	if (pcp->count)
+-		free_pcppages_bulk(zone, pcp->count, pcp, 0);
++	if (pcp->count) {
++		unsigned long flags;
+ 
+-	local_unlock_irqrestore(&pagesets.lock, flags);
++		/* See drain_zone_pages on why this is disabling IRQs */
++		spin_lock_irqsave(&pcp->lock, flags);
++		free_pcppages_bulk(zone, pcp->count, pcp, 0);
++		spin_unlock_irqrestore(&pcp->lock, flags);
++	}
+ }
+ 
+ /*
+  * Drain pcplists of all zones on the indicated processor.
+- *
+- * The processor must either be the current processor and the
+- * thread pinned to the current processor or a processor that
+- * is not online.
+  */
+ static void drain_pages(unsigned int cpu)
+ {
+@@ -3148,9 +3217,6 @@ static void drain_pages(unsigned int cpu)
+ 
+ /*
+  * Spill all of this CPU's per-cpu pages back into the buddy allocator.
+- *
+- * The CPU has to be pinned. When zone parameter is non-NULL, spill just
+- * the single zone's pages.
+  */
+ void drain_local_pages(struct zone *zone)
+ {
+@@ -3162,24 +3228,6 @@ void drain_local_pages(struct zone *zone)
+ 		drain_pages(cpu);
+ }
+ 
+-static void drain_local_pages_wq(struct work_struct *work)
+-{
+-	struct pcpu_drain *drain;
+-
+-	drain = container_of(work, struct pcpu_drain, work);
+-
+-	/*
+-	 * drain_all_pages doesn't use proper cpu hotplug protection so
+-	 * we can race with cpu offline when the WQ can move this from
+-	 * a cpu pinned worker to an unbound one. We can operate on a different
+-	 * cpu which is alright but we also have to make sure to not move to
+-	 * a different one.
+-	 */
+-	migrate_disable();
+-	drain_local_pages(drain->zone);
+-	migrate_enable();
+-}
+-
+ /*
+  * The implementation of drain_all_pages(), exposing an extra parameter to
+  * drain on all cpus.
+@@ -3200,13 +3248,6 @@ static void __drain_all_pages(struct zone *zone, bool force_all_cpus)
+ 	 */
+ 	static cpumask_t cpus_with_pcps;
+ 
+-	/*
+-	 * Make sure nobody triggers this path before mm_percpu_wq is fully
+-	 * initialized.
+-	 */
+-	if (WARN_ON_ONCE(!mm_percpu_wq))
+-		return;
+-
+ 	/*
+ 	 * Do not drain if one is already in progress unless it's specific to
+ 	 * a zone. Such callers are primarily CMA and memory hotplug and need
+@@ -3256,14 +3297,11 @@ static void __drain_all_pages(struct zone *zone, bool force_all_cpus)
+ 	}
+ 
+ 	for_each_cpu(cpu, &cpus_with_pcps) {
+-		struct pcpu_drain *drain = per_cpu_ptr(&pcpu_drain, cpu);
+-
+-		drain->zone = zone;
+-		INIT_WORK(&drain->work, drain_local_pages_wq);
+-		queue_work_on(cpu, mm_percpu_wq, &drain->work);
++		if (zone)
++			drain_pages_zone(cpu, zone);
++		else
++			drain_pages(cpu);
+ 	}
+-	for_each_cpu(cpu, &cpus_with_pcps)
+-		flush_work(&per_cpu_ptr(&pcpu_drain, cpu)->work);
+ 
+ 	mutex_unlock(&pcpu_drain_mutex);
+ }
+@@ -3272,8 +3310,6 @@ static void __drain_all_pages(struct zone *zone, bool force_all_cpus)
+  * Spill all the per-cpu pages from all CPUs back into the buddy allocator.
+  *
+  * When zone parameter is non-NULL, spill just the single zone's pages.
+- *
+- * Note that this can be extremely slow as the draining happens in a workqueue.
+  */
+ void drain_all_pages(struct zone *zone)
+ {
+@@ -3318,7 +3354,7 @@ void mark_free_pages(struct zone *zone)
+ 
+ 	for_each_migratetype_order(order, t) {
+ 		list_for_each_entry(page,
+-				&zone->free_area[order].free_list[t], lru) {
++				&zone->free_area[order].free_list[t], buddy_list) {
+ 			unsigned long i;
+ 
+ 			pfn = page_to_pfn(page);
+@@ -3395,19 +3431,17 @@ static int nr_pcp_high(struct per_cpu_pages *pcp, struct zone *zone,
+ 	return min(READ_ONCE(pcp->batch) << 2, high);
+ }
+ 
+-static void free_unref_page_commit(struct page *page, int migratetype,
++static void free_unref_page_commit(struct zone *zone, struct per_cpu_pages *pcp,
++				   struct page *page, int migratetype,
+ 				   unsigned int order)
+ {
+-	struct zone *zone = page_zone(page);
+-	struct per_cpu_pages *pcp;
+ 	int high;
+ 	int pindex;
+ 	bool free_high;
+ 
+ 	__count_vm_event(PGFREE);
+-	pcp = this_cpu_ptr(zone->per_cpu_pageset);
+ 	pindex = order_to_pindex(migratetype, order);
+-	list_add(&page->lru, &pcp->lists[pindex]);
++	list_add(&page->pcp_list, &pcp->lists[pindex]);
+ 	pcp->count += 1 << order;
+ 
+ 	/*
+@@ -3432,6 +3466,9 @@ static void free_unref_page_commit(struct page *page, int migratetype,
+ void free_unref_page(struct page *page, unsigned int order)
+ {
+ 	unsigned long flags;
++	unsigned long __maybe_unused UP_flags;
++	struct per_cpu_pages *pcp;
++	struct zone *zone;
+ 	unsigned long pfn = page_to_pfn(page);
+ 	int migratetype;
+ 
+@@ -3454,9 +3491,16 @@ void free_unref_page(struct page *page, unsigned int order)
+ 		migratetype = MIGRATE_MOVABLE;
+ 	}
+ 
+-	local_lock_irqsave(&pagesets.lock, flags);
+-	free_unref_page_commit(page, migratetype, order);
+-	local_unlock_irqrestore(&pagesets.lock, flags);
++	zone = page_zone(page);
++	pcp_trylock_prepare(UP_flags);
++	pcp = pcp_spin_trylock_irqsave(zone->per_cpu_pageset, flags);
++	if (pcp) {
++		free_unref_page_commit(zone, pcp, page, migratetype, order);
++		pcp_spin_unlock_irqrestore(pcp, flags);
++	} else {
++		free_one_page(zone, page, pfn, order, migratetype, FPI_NONE);
++	}
++	pcp_trylock_finish(UP_flags);
+ }
+ 
+ /*
+@@ -3465,6 +3509,8 @@ void free_unref_page(struct page *page, unsigned int order)
+ void free_unref_page_list(struct list_head *list)
+ {
+ 	struct page *page, *next;
++	struct per_cpu_pages *pcp = NULL;
++	struct zone *locked_zone = NULL;
+ 	unsigned long flags;
+ 	int batch_count = 0;
+ 	int migratetype;
+@@ -3489,8 +3535,18 @@ void free_unref_page_list(struct list_head *list)
+ 		}
+ 	}
+ 
+-	local_lock_irqsave(&pagesets.lock, flags);
+ 	list_for_each_entry_safe(page, next, list, lru) {
++		struct zone *zone = page_zone(page);
++
++		/* Different zone, different pcp lock. */
++		if (zone != locked_zone) {
++			if (pcp)
++				pcp_spin_unlock_irqrestore(pcp, flags);
++
++			locked_zone = zone;
++			pcp = pcp_spin_lock_irqsave(locked_zone->per_cpu_pageset, flags);
++		}
++
+ 		/*
+ 		 * Non-isolated types over MIGRATE_PCPTYPES get added
+ 		 * to the MIGRATE_MOVABLE pcp list.
+@@ -3500,19 +3556,21 @@ void free_unref_page_list(struct list_head *list)
+ 			migratetype = MIGRATE_MOVABLE;
+ 
+ 		trace_mm_page_free_batched(page);
+-		free_unref_page_commit(page, migratetype, 0);
++		free_unref_page_commit(zone, pcp, page, migratetype, 0);
+ 
+ 		/*
+ 		 * Guard against excessive IRQ disabled times when we get
+ 		 * a large list of pages to free.
+ 		 */
+ 		if (++batch_count == SWAP_CLUSTER_MAX) {
+-			local_unlock_irqrestore(&pagesets.lock, flags);
++			pcp_spin_unlock_irqrestore(pcp, flags);
+ 			batch_count = 0;
+-			local_lock_irqsave(&pagesets.lock, flags);
++			pcp = pcp_spin_lock_irqsave(locked_zone->per_cpu_pageset, flags);
+ 		}
+ 	}
+-	local_unlock_irqrestore(&pagesets.lock, flags);
++
++	if (pcp)
++		pcp_spin_unlock_irqrestore(pcp, flags);
+ }
+ 
+ /*
+@@ -3637,6 +3695,43 @@ static inline void zone_statistics(struct zone *preferred_zone, struct zone *z,
+ #endif
+ }
+ 
++static __always_inline
++struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
++			   unsigned int order, unsigned int alloc_flags,
++			   int migratetype)
++{
++	struct page *page;
++	unsigned long flags;
++
++	do {
++		page = NULL;
++		spin_lock_irqsave(&zone->lock, flags);
++		/*
++		 * order-0 request can reach here when the pcplist is skipped
++		 * due to non-CMA allocation context. HIGHATOMIC area is
++		 * reserved for high-order atomic allocation, so order-0
++		 * request should skip it.
++		 */
++		if (order > 0 && alloc_flags & ALLOC_HARDER)
++			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
++		if (!page) {
++			page = __rmqueue(zone, order, migratetype, alloc_flags);
++			if (!page) {
++				spin_unlock_irqrestore(&zone->lock, flags);
++				return NULL;
++			}
++		}
++		__mod_zone_freepage_state(zone, -(1 << order),
++					  get_pcppage_migratetype(page));
++		spin_unlock_irqrestore(&zone->lock, flags);
++	} while (check_new_pages(page, order));
++
++	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
++	zone_statistics(preferred_zone, zone, 1);
++
++	return page;
++}
++
+ /* Remove page from the per-cpu list, caller must protect the list */
+ static inline
+ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
+@@ -3670,8 +3765,8 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
+ 				return NULL;
+ 		}
+ 
+-		page = list_first_entry(list, struct page, lru);
+-		list_del(&page->lru);
++		page = list_first_entry(list, struct page, pcp_list);
++		list_del(&page->pcp_list);
+ 		pcp->count -= 1 << order;
+ 	} while (check_new_pcp(page, order));
+ 
+@@ -3688,19 +3783,29 @@ static struct page *rmqueue_pcplist(struct zone *preferred_zone,
+ 	struct list_head *list;
+ 	struct page *page;
+ 	unsigned long flags;
++	unsigned long __maybe_unused UP_flags;
+ 
+-	local_lock_irqsave(&pagesets.lock, flags);
++	/*
++	 * spin_trylock may fail due to a parallel drain. In the future, the
++	 * trylock will also protect against IRQ reentrancy.
++	 */
++	pcp_trylock_prepare(UP_flags);
++	pcp = pcp_spin_trylock_irqsave(zone->per_cpu_pageset, flags);
++	if (!pcp) {
++		pcp_trylock_finish(UP_flags);
++		return NULL;
++	}
+ 
+ 	/*
+ 	 * On allocation, reduce the number of pages that are batch freed.
+ 	 * See nr_pcp_free() where free_factor is increased for subsequent
+ 	 * frees.
+ 	 */
+-	pcp = this_cpu_ptr(zone->per_cpu_pageset);
+ 	pcp->free_factor >>= 1;
+ 	list = &pcp->lists[order_to_pindex(migratetype, order)];
+ 	page = __rmqueue_pcplist(zone, order, migratetype, alloc_flags, pcp, list);
+-	local_unlock_irqrestore(&pagesets.lock, flags);
++	pcp_spin_unlock_irqrestore(pcp, flags);
++	pcp_trylock_finish(UP_flags);
+ 	if (page) {
+ 		__count_zid_vm_events(PGALLOC, page_zonenum(page), 1);
+ 		zone_statistics(preferred_zone, zone, 1);
+@@ -3717,68 +3822,20 @@ struct page *rmqueue(struct zone *preferred_zone,
+ 			gfp_t gfp_flags, unsigned int alloc_flags,
+ 			int migratetype)
+ {
+-	unsigned long flags;
+ 	struct page *page;
+ 
+-	if (likely(pcp_allowed_order(order))) {
+-		/*
+-		 * MIGRATE_MOVABLE pcplist could have the pages on CMA area and
+-		 * we need to skip it when CMA area isn't allowed.
+-		 */
+-		if (!IS_ENABLED(CONFIG_CMA) || alloc_flags & ALLOC_CMA ||
+-				migratetype != MIGRATE_MOVABLE) {
+-			page = rmqueue_pcplist(preferred_zone, zone, order,
+-					gfp_flags, migratetype, alloc_flags);
+-			goto out;
+-		}
+-	}
+-
+-	/*
+-	 * We most definitely don't want callers attempting to
+-	 * allocate greater than order-1 page units with __GFP_NOFAIL.
+-	 */
+-	WARN_ON_ONCE((gfp_flags & __GFP_NOFAIL) && (order > 1));
+-
+-	do {
+-		page = NULL;
+-		spin_lock_irqsave(&zone->lock, flags);
+-		/*
+-		 * order-0 request can reach here when the pcplist is skipped
+-		 * due to non-CMA allocation context. HIGHATOMIC area is
+-		 * reserved for high-order atomic allocation, so order-0
+-		 * request should skip it.
+-		 */
+-		if (order > 0 && alloc_flags & ALLOC_HARDER) {
+-			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+-			if (page)
+-				trace_mm_page_alloc_zone_locked(page, order, migratetype);
+-		}
+-		if (!page) {
+-			page = __rmqueue(zone, order, migratetype, alloc_flags);
+-			if (!page)
+-				goto failed;
+-		}
+-		__mod_zone_freepage_state(zone, -(1 << order),
+-					  get_pcppage_migratetype(page));
+-		spin_unlock_irqrestore(&zone->lock, flags);
+-	} while (check_new_pages(page, order));
+-
+-	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
+-	zone_statistics(preferred_zone, zone, 1);
++	page = rmqueue_buddy(preferred_zone, zone, order, alloc_flags,
++							migratetype);
+ 
+ out:
+ 	/* Separate test+clear to avoid unnecessary atomics */
+-	if (test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags)) {
++	if (unlikely(test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags))) {
+ 		clear_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
+ 		wakeup_kswapd(zone, 0, 0, zone_idx(zone));
+ 	}
+ 
+ 	VM_BUG_ON_PAGE(page && bad_range(zone, page), page);
+ 	return page;
+-
+-failed:
+-	spin_unlock_irqrestore(&zone->lock, flags);
+-	return NULL;
+ }
+ 
+ #ifdef CONFIG_FAIL_PAGE_ALLOC
+@@ -5252,6 +5309,7 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
+ {
+ 	struct page *page;
+ 	unsigned long flags;
++	unsigned long __maybe_unused UP_flags;
+ 	struct zone *zone;
+ 	struct zoneref *z;
+ 	struct per_cpu_pages *pcp;
+@@ -5332,11 +5390,14 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
+ 	if (unlikely(!zone))
+ 		goto failed;
+ 
++	/* Is a parallel drain in progress? */
++	pcp_trylock_prepare(UP_flags);
++	pcp = pcp_spin_trylock_irqsave(zone->per_cpu_pageset, flags);
++	if (!pcp)
++		goto failed_irq;
++
+ 	/* Attempt the batch allocation */
+-	local_lock_irqsave(&pagesets.lock, flags);
+-	pcp = this_cpu_ptr(zone->per_cpu_pageset);
+ 	pcp_list = &pcp->lists[order_to_pindex(ac.migratetype, 0)];
+-
+ 	while (nr_populated < nr_pages) {
+ 
+ 		/* Skip existing pages */
+@@ -5349,8 +5410,10 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
+ 								pcp, pcp_list);
+ 		if (unlikely(!page)) {
+ 			/* Try and allocate at least one page */
+-			if (!nr_account)
++			if (!nr_account) {
++				pcp_spin_unlock_irqrestore(pcp, flags);
+ 				goto failed_irq;
++			}
+ 			break;
+ 		}
+ 		nr_account++;
+@@ -5363,7 +5426,8 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
+ 		nr_populated++;
+ 	}
+ 
+-	local_unlock_irqrestore(&pagesets.lock, flags);
++	pcp_spin_unlock_irqrestore(pcp, flags);
++	pcp_trylock_finish(UP_flags);
+ 
+ 	__count_zid_vm_events(PGALLOC, zone_idx(zone), nr_account);
+ 	zone_statistics(ac.preferred_zoneref->zone, zone, nr_account);
+@@ -5372,7 +5436,7 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
+ 	return nr_populated;
+ 
+ failed_irq:
+-	local_unlock_irqrestore(&pagesets.lock, flags);
++	pcp_trylock_finish(UP_flags);
+ 
+ failed:
+ 	page = __alloc_pages(gfp, 0, preferred_nid, nodemask);
+@@ -7002,6 +7066,7 @@ static void per_cpu_pages_init(struct per_cpu_pages *pcp, struct per_cpu_zonesta
+ 	memset(pcp, 0, sizeof(*pcp));
+ 	memset(pzstats, 0, sizeof(*pzstats));
+ 
++	spin_lock_init(&pcp->lock);
+ 	for (pindex = 0; pindex < NR_PCP_LISTS; pindex++)
+ 		INIT_LIST_HEAD(&pcp->lists[pindex]);
+ 
 diff --git a/net/ipv4/netfilter/Kconfig b/net/ipv4/netfilter/Kconfig
 index aab384126f61..83ecd0e61bbf 100644
 --- a/net/ipv4/netfilter/Kconfig
