@@ -1,0 +1,1181 @@
+From a7212dc70ad60dfa05bf0db3c5cabfbf8e202dd7 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 19 Jul 2022 17:14:45 +0200
+Subject: [PATCH 10/10] fs-patches
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+(cherry picked from commit ebffc25831f9e1e8ebfe2c78d204f1442494ee5a)
+---
+ block/blk-cgroup.c       |   1 +
+ block/blk-ioc.c          |   2 +
+ block/blk-ioprio.c       |  57 +------
+ block/blk-ioprio.h       |   9 +
+ block/blk-mq.c           |  11 ++
+ block/ioprio.c           |  58 ++++++-
+ fs/btrfs/delayed-inode.c | 358 ++++++++++++++++++++++++++-------------
+ fs/btrfs/delayed-inode.h |   7 +
+ fs/btrfs/file.c          |   2 +-
+ fs/btrfs/inode.c         |  31 +++-
+ fs/btrfs/reflink.c       |   8 +-
+ fs/btrfs/tree-log.c      |  18 +-
+ fs/btrfs/tree-log.h      |   3 +
+ fs/btrfs/volumes.h       |   7 +
+ include/linux/ioprio.h   |  24 ++-
+ 15 files changed, 391 insertions(+), 205 deletions(-)
+
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index 764e740b0c0f..6906981563f8 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -1299,6 +1299,7 @@ int blkcg_init_queue(struct request_queue *q)
+ 	ret = blk_iolatency_init(q);
+ 	if (ret) {
+ 		blk_throtl_exit(q);
++		blk_ioprio_exit(q);
+ 		goto err_destroy_all;
+ 	}
+ 
+diff --git a/block/blk-ioc.c b/block/blk-ioc.c
+index df9cfe4ca532..63fc02042408 100644
+--- a/block/blk-ioc.c
++++ b/block/blk-ioc.c
+@@ -247,6 +247,8 @@ static struct io_context *alloc_io_context(gfp_t gfp_flags, int node)
+ 	INIT_HLIST_HEAD(&ioc->icq_list);
+ 	INIT_WORK(&ioc->release_work, ioc_release_fn);
+ #endif
++	ioc->ioprio = IOPRIO_DEFAULT;
++
+ 	return ioc;
+ }
+ 
+diff --git a/block/blk-ioprio.c b/block/blk-ioprio.c
+index 79e797f5d194..c00060a02c6e 100644
+--- a/block/blk-ioprio.c
++++ b/block/blk-ioprio.c
+@@ -62,7 +62,6 @@ struct ioprio_blkg {
+ struct ioprio_blkcg {
+ 	struct blkcg_policy_data cpd;
+ 	enum prio_policy	 prio_policy;
+-	bool			 prio_set;
+ };
+ 
+ static inline struct ioprio_blkg *pd_to_ioprio(struct blkg_policy_data *pd)
+@@ -113,7 +112,6 @@ static ssize_t ioprio_set_prio_policy(struct kernfs_open_file *of, char *buf,
+ 	if (ret < 0)
+ 		return ret;
+ 	blkcg->prio_policy = ret;
+-	blkcg->prio_set = true;
+ 	return nbytes;
+ }
+ 
+@@ -183,26 +181,20 @@ static struct blkcg_policy ioprio_policy = {
+ 	.pd_free_fn	= ioprio_free_pd,
+ };
+ 
+-struct blk_ioprio {
+-	struct rq_qos rqos;
+-};
+-
+-static void blkcg_ioprio_track(struct rq_qos *rqos, struct request *rq,
+-			       struct bio *bio)
++void blkcg_set_ioprio(struct bio *bio)
+ {
+ 	struct ioprio_blkcg *blkcg = ioprio_blkcg_from_bio(bio);
+ 	u16 prio;
+ 
+-	if (!blkcg->prio_set)
++	if (!blkcg || blkcg->prio_policy == POLICY_NO_CHANGE)
+ 		return;
+ 
+ 	/*
+ 	 * Except for IOPRIO_CLASS_NONE, higher I/O priority numbers
+ 	 * correspond to a lower priority. Hence, the max_t() below selects
+ 	 * the lower priority of bi_ioprio and the cgroup I/O priority class.
+-	 * If the cgroup policy has been set to POLICY_NO_CHANGE == 0, the
+-	 * bio I/O priority is not modified. If the bio I/O priority equals
+-	 * IOPRIO_CLASS_NONE, the cgroup I/O priority is assigned to the bio.
++	 * If the bio I/O priority equals IOPRIO_CLASS_NONE, the cgroup I/O
++	 * priority is assigned to the bio.
+ 	 */
+ 	prio = max_t(u16, bio->bi_ioprio,
+ 			IOPRIO_PRIO_VALUE(blkcg->prio_policy, 0));
+@@ -210,49 +202,14 @@ static void blkcg_ioprio_track(struct rq_qos *rqos, struct request *rq,
+ 		bio->bi_ioprio = prio;
+ }
+ 
+-static void blkcg_ioprio_exit(struct rq_qos *rqos)
++void blk_ioprio_exit(struct request_queue *q)
+ {
+-	struct blk_ioprio *blkioprio_blkg =
+-		container_of(rqos, typeof(*blkioprio_blkg), rqos);
+-
+-	blkcg_deactivate_policy(rqos->q, &ioprio_policy);
+-	kfree(blkioprio_blkg);
++	blkcg_deactivate_policy(q, &ioprio_policy);
+ }
+ 
+-static struct rq_qos_ops blkcg_ioprio_ops = {
+-	.track	= blkcg_ioprio_track,
+-	.exit	= blkcg_ioprio_exit,
+-};
+-
+ int blk_ioprio_init(struct request_queue *q)
+ {
+-	struct blk_ioprio *blkioprio_blkg;
+-	struct rq_qos *rqos;
+-	int ret;
+-
+-	blkioprio_blkg = kzalloc(sizeof(*blkioprio_blkg), GFP_KERNEL);
+-	if (!blkioprio_blkg)
+-		return -ENOMEM;
+-
+-	ret = blkcg_activate_policy(q, &ioprio_policy);
+-	if (ret) {
+-		kfree(blkioprio_blkg);
+-		return ret;
+-	}
+-
+-	rqos = &blkioprio_blkg->rqos;
+-	rqos->id = RQ_QOS_IOPRIO;
+-	rqos->ops = &blkcg_ioprio_ops;
+-	rqos->q = q;
+-
+-	/*
+-	 * Registering the rq-qos policy after activating the blk-cgroup
+-	 * policy guarantees that ioprio_blkcg_from_bio(bio) != NULL in the
+-	 * rq-qos callbacks.
+-	 */
+-	rq_qos_add(q, rqos);
+-
+-	return 0;
++	return blkcg_activate_policy(q, &ioprio_policy);
+ }
+ 
+ static int __init ioprio_init(void)
+diff --git a/block/blk-ioprio.h b/block/blk-ioprio.h
+index a7785c2f1aea..5a1eb550e178 100644
+--- a/block/blk-ioprio.h
++++ b/block/blk-ioprio.h
+@@ -6,14 +6,23 @@
+ #include <linux/kconfig.h>
+ 
+ struct request_queue;
++struct bio;
+ 
+ #ifdef CONFIG_BLK_CGROUP_IOPRIO
+ int blk_ioprio_init(struct request_queue *q);
++void blk_ioprio_exit(struct request_queue *q);
++void blkcg_set_ioprio(struct bio *bio);
+ #else
+ static inline int blk_ioprio_init(struct request_queue *q)
+ {
+ 	return 0;
+ }
++static inline void blk_ioprio_exit(struct request_queue *q)
++{
++}
++static inline void blkcg_set_ioprio(struct bio *bio)
++{
++}
+ #endif
+ 
+ #endif /* _BLK_IOPRIO_H_ */
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 93d9d60980fb..c81f579ace59 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -42,6 +42,7 @@
+ #include "blk-stat.h"
+ #include "blk-mq-sched.h"
+ #include "blk-rq-qos.h"
++#include "blk-ioprio.h"
+ 
+ static DEFINE_PER_CPU(struct llist_head, blk_cpu_done);
+ 
+@@ -2783,6 +2784,14 @@ static inline struct request *blk_mq_get_cached_request(struct request_queue *q,
+ 	return rq;
+ }
+ 
++static void bio_set_ioprio(struct bio *bio)
++{
++	/* Nobody set ioprio so far? Initialize it based on task's nice value */
++	if (IOPRIO_PRIO_CLASS(bio->bi_ioprio) == IOPRIO_CLASS_NONE)
++		bio->bi_ioprio = get_current_ioprio();
++	blkcg_set_ioprio(bio);
++}
++
+ /**
+  * blk_mq_submit_bio - Create and send a request to block device.
+  * @bio: Bio pointer.
+@@ -2812,6 +2821,8 @@ void blk_mq_submit_bio(struct bio *bio)
+ 	if (!bio_integrity_prep(bio))
+ 		return;
+ 
++	bio_set_ioprio(bio);
++
+ 	rq = blk_mq_get_cached_request(q, plug, &bio, nr_segs);
+ 	if (!rq) {
+ 		if (!bio)
+diff --git a/block/ioprio.c b/block/ioprio.c
+index 2fe068fcaad5..32a456b45804 100644
+--- a/block/ioprio.c
++++ b/block/ioprio.c
+@@ -138,6 +138,32 @@ SYSCALL_DEFINE3(ioprio_set, int, which, int, who, int, ioprio)
+ 	return ret;
+ }
+ 
++/*
++ * If the task has set an I/O priority, use that. Otherwise, return
++ * the default I/O priority.
++ *
++ * Expected to be called for current task or with task_lock() held to keep
++ * io_context stable.
++ */
++int __get_task_ioprio(struct task_struct *p)
++{
++	struct io_context *ioc = p->io_context;
++	int prio;
++
++	if (p != current)
++		lockdep_assert_held(&p->alloc_lock);
++	if (ioc)
++		prio = ioc->ioprio;
++	else
++		prio = IOPRIO_DEFAULT;
++
++	if (IOPRIO_PRIO_CLASS(prio) == IOPRIO_CLASS_NONE)
++		prio = IOPRIO_PRIO_VALUE(task_nice_ioclass(p),
++					 task_nice_ioprio(p));
++	return prio;
++}
++EXPORT_SYMBOL_GPL(__get_task_ioprio);
++
+ static int get_task_ioprio(struct task_struct *p)
+ {
+ 	int ret;
+@@ -145,22 +171,38 @@ static int get_task_ioprio(struct task_struct *p)
+ 	ret = security_task_getioprio(p);
+ 	if (ret)
+ 		goto out;
+-	ret = IOPRIO_DEFAULT;
++	task_lock(p);
++	ret = __get_task_ioprio(p);
++	task_unlock(p);
++out:
++	return ret;
++}
++
++/*
++ * Return raw IO priority value as set by userspace. We use this for
++ * ioprio_get(pid, IOPRIO_WHO_PROCESS) so that we keep historical behavior and
++ * also so that userspace can distinguish unset IO priority (which just gets
++ * overriden based on task's nice value) from IO priority set to some value.
++ */
++static int get_task_raw_ioprio(struct task_struct *p)
++{
++	int ret;
++
++	ret = security_task_getioprio(p);
++	if (ret)
++		goto out;
+ 	task_lock(p);
+ 	if (p->io_context)
+ 		ret = p->io_context->ioprio;
++	else
++		ret = IOPRIO_DEFAULT;
+ 	task_unlock(p);
+ out:
+ 	return ret;
+ }
+ 
+-int ioprio_best(unsigned short aprio, unsigned short bprio)
++static int ioprio_best(unsigned short aprio, unsigned short bprio)
+ {
+-	if (!ioprio_valid(aprio))
+-		aprio = IOPRIO_DEFAULT;
+-	if (!ioprio_valid(bprio))
+-		bprio = IOPRIO_DEFAULT;
+-
+ 	return min(aprio, bprio);
+ }
+ 
+@@ -181,7 +223,7 @@ SYSCALL_DEFINE2(ioprio_get, int, which, int, who)
+ 			else
+ 				p = find_task_by_vpid(who);
+ 			if (p)
+-				ret = get_task_ioprio(p);
++				ret = get_task_raw_ioprio(p);
+ 			break;
+ 		case IOPRIO_WHO_PGRP:
+ 			if (!who)
+diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+index 748bf6b0d860..e131a697c0cc 100644
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -52,18 +52,6 @@ static inline void btrfs_init_delayed_node(
+ 	INIT_LIST_HEAD(&delayed_node->p_list);
+ }
+ 
+-static inline int btrfs_is_continuous_delayed_item(
+-					struct btrfs_delayed_item *item1,
+-					struct btrfs_delayed_item *item2)
+-{
+-	if (item1->key.type == BTRFS_DIR_INDEX_KEY &&
+-	    item1->key.objectid == item2->key.objectid &&
+-	    item1->key.type == item2->key.type &&
+-	    item1->key.offset + 1 == item2->key.offset)
+-		return 1;
+-	return 0;
+-}
+-
+ static struct btrfs_delayed_node *btrfs_get_delayed_node(
+ 		struct btrfs_inode *btrfs_inode)
+ {
+@@ -398,8 +386,7 @@ static struct btrfs_delayed_item *__btrfs_lookup_delayed_insertion_item(
+ }
+ 
+ static int __btrfs_add_delayed_item(struct btrfs_delayed_node *delayed_node,
+-				    struct btrfs_delayed_item *ins,
+-				    int action)
++				    struct btrfs_delayed_item *ins)
+ {
+ 	struct rb_node **p, *node;
+ 	struct rb_node *parent_node = NULL;
+@@ -408,9 +395,9 @@ static int __btrfs_add_delayed_item(struct btrfs_delayed_node *delayed_node,
+ 	int cmp;
+ 	bool leftmost = true;
+ 
+-	if (action == BTRFS_DELAYED_INSERTION_ITEM)
++	if (ins->ins_or_del == BTRFS_DELAYED_INSERTION_ITEM)
+ 		root = &delayed_node->ins_root;
+-	else if (action == BTRFS_DELAYED_DELETION_ITEM)
++	else if (ins->ins_or_del == BTRFS_DELAYED_DELETION_ITEM)
+ 		root = &delayed_node->del_root;
+ 	else
+ 		BUG();
+@@ -436,32 +423,19 @@ static int __btrfs_add_delayed_item(struct btrfs_delayed_node *delayed_node,
+ 	rb_link_node(node, parent_node, p);
+ 	rb_insert_color_cached(node, root, leftmost);
+ 	ins->delayed_node = delayed_node;
+-	ins->ins_or_del = action;
+ 
+-	if (ins->key.type == BTRFS_DIR_INDEX_KEY &&
+-	    action == BTRFS_DELAYED_INSERTION_ITEM &&
++	/* Delayed items are always for dir index items. */
++	ASSERT(ins->key.type == BTRFS_DIR_INDEX_KEY);
++
++	if (ins->ins_or_del == BTRFS_DELAYED_INSERTION_ITEM &&
+ 	    ins->key.offset >= delayed_node->index_cnt)
+-			delayed_node->index_cnt = ins->key.offset + 1;
++		delayed_node->index_cnt = ins->key.offset + 1;
+ 
+ 	delayed_node->count++;
+ 	atomic_inc(&delayed_node->root->fs_info->delayed_root->items);
+ 	return 0;
+ }
+ 
+-static int __btrfs_add_delayed_insertion_item(struct btrfs_delayed_node *node,
+-					      struct btrfs_delayed_item *item)
+-{
+-	return __btrfs_add_delayed_item(node, item,
+-					BTRFS_DELAYED_INSERTION_ITEM);
+-}
+-
+-static int __btrfs_add_delayed_deletion_item(struct btrfs_delayed_node *node,
+-					     struct btrfs_delayed_item *item)
+-{
+-	return __btrfs_add_delayed_item(node, item,
+-					BTRFS_DELAYED_DELETION_ITEM);
+-}
+-
+ static void finish_one_item(struct btrfs_delayed_root *delayed_root)
+ {
+ 	int seq = atomic_inc_return(&delayed_root->items_seq);
+@@ -573,7 +547,13 @@ static int btrfs_delayed_item_reserve_metadata(struct btrfs_trans_handle *trans,
+ 		trace_btrfs_space_reservation(fs_info, "delayed_item",
+ 					      item->key.objectid,
+ 					      num_bytes, 1);
+-		item->bytes_reserved = num_bytes;
++		/*
++		 * For insertions we track reserved metadata space by accounting
++		 * for the number of leaves that will be used, based on the delayed
++		 * node's index_items_size field.
++		 */
++		if (item->ins_or_del == BTRFS_DELAYED_DELETION_ITEM)
++			item->bytes_reserved = num_bytes;
+ 	}
+ 
+ 	return ret;
+@@ -672,23 +652,41 @@ static void btrfs_delayed_inode_release_metadata(struct btrfs_fs_info *fs_info,
+ }
+ 
+ /*
+- * Insert a single delayed item or a batch of delayed items that have consecutive
+- * keys if they exist.
++ * Insert a single delayed item or a batch of delayed items, as many as possible
++ * that fit in a leaf. The delayed items (dir index keys) are sorted by their key
++ * in the rbtree, and if there's a gap between two consecutive dir index items,
++ * then it means at some point we had delayed dir indexes to add but they got
++ * removed (by btrfs_delete_delayed_dir_index()) before we attempted to flush them
++ * into the subvolume tree. Dir index keys also have their offsets coming from a
++ * monotonically increasing counter, so we can't get new keys with an offset that
++ * fits within a gap between delayed dir index items.
+  */
+ static int btrfs_insert_delayed_item(struct btrfs_trans_handle *trans,
+ 				     struct btrfs_root *root,
+ 				     struct btrfs_path *path,
+ 				     struct btrfs_delayed_item *first_item)
+ {
++	struct btrfs_fs_info *fs_info = root->fs_info;
++	struct btrfs_delayed_node *node = first_item->delayed_node;
+ 	LIST_HEAD(item_list);
+ 	struct btrfs_delayed_item *curr;
+ 	struct btrfs_delayed_item *next;
+-	const int max_size = BTRFS_LEAF_DATA_SIZE(root->fs_info);
++	const int max_size = BTRFS_LEAF_DATA_SIZE(fs_info);
+ 	struct btrfs_item_batch batch;
+ 	int total_size;
+ 	char *ins_data = NULL;
+ 	int ret;
+ 
++	lockdep_assert_held(&node->mutex);
++
++	/*
++	 * For delayed items to insert, we track reserved metadata bytes based
++	 * on the number of leaves that we will use.
++	 * See btrfs_insert_delayed_dir_index() and
++	 * btrfs_delayed_item_reserve_metadata()).
++	 */
++	ASSERT(first_item->bytes_reserved == 0);
++
+ 	list_add_tail(&first_item->tree_list, &item_list);
+ 	batch.total_data_size = first_item->data_len;
+ 	batch.nr = 1;
+@@ -699,9 +697,11 @@ static int btrfs_insert_delayed_item(struct btrfs_trans_handle *trans,
+ 		int next_size;
+ 
+ 		next = __btrfs_next_delayed_item(curr);
+-		if (!next || !btrfs_is_continuous_delayed_item(curr, next))
++		if (!next)
+ 			break;
+ 
++		ASSERT(next->bytes_reserved == 0);
++
+ 		next_size = next->data_len + sizeof(struct btrfs_item);
+ 		if (total_size + next_size > max_size)
+ 			break;
+@@ -760,9 +760,20 @@ static int btrfs_insert_delayed_item(struct btrfs_trans_handle *trans,
+ 
+ 	list_for_each_entry_safe(curr, next, &item_list, tree_list) {
+ 		list_del(&curr->tree_list);
+-		btrfs_delayed_item_release_metadata(root, curr);
+ 		btrfs_release_delayed_item(curr);
+ 	}
++
++	/*
++	 * We inserted one batch of items into a leaf, now release one unit of
++	 * metadata space from the delayed block reserve.
++	 */
++	if (!test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags))
++		btrfs_block_rsv_release(fs_info, &fs_info->delayed_block_rsv,
++					btrfs_calc_insert_metadata_size(fs_info, 1),
++					NULL);
++
++	ASSERT(node->index_items_size >= total_size);
++	node->index_items_size -= total_size;
+ out:
+ 	kfree(ins_data);
+ 	return ret;
+@@ -796,62 +807,75 @@ static int btrfs_batch_delete_items(struct btrfs_trans_handle *trans,
+ 				    struct btrfs_path *path,
+ 				    struct btrfs_delayed_item *item)
+ {
++	struct btrfs_fs_info *fs_info = root->fs_info;
+ 	struct btrfs_delayed_item *curr, *next;
+-	struct extent_buffer *leaf;
+-	struct btrfs_key key;
+-	struct list_head head;
+-	int nitems, i, last_item;
+-	int ret = 0;
++	struct extent_buffer *leaf = path->nodes[0];
++	LIST_HEAD(batch_list);
++	int nitems, slot, last_slot;
++	int ret;
++	u64 total_reserved_size = item->bytes_reserved;
+ 
+-	BUG_ON(!path->nodes[0]);
++	ASSERT(leaf != NULL);
+ 
+-	leaf = path->nodes[0];
++	slot = path->slots[0];
++	last_slot = btrfs_header_nritems(leaf) - 1;
++	/*
++	 * Our caller always gives us a path pointing to an existing item, so
++	 * this can not happen.
++	 */
++	ASSERT(slot <= last_slot);
++	if (WARN_ON(slot > last_slot))
++		return -ENOENT;
+ 
+-	i = path->slots[0];
+-	last_item = btrfs_header_nritems(leaf) - 1;
+-	if (i > last_item)
+-		return -ENOENT;	/* FIXME: Is errno suitable? */
++	nitems = 1;
++	curr = item;
++	list_add_tail(&curr->tree_list, &batch_list);
+ 
+-	next = item;
+-	INIT_LIST_HEAD(&head);
+-	btrfs_item_key_to_cpu(leaf, &key, i);
+-	nitems = 0;
+ 	/*
+-	 * count the number of the dir index items that we can delete in batch
++	 * Keep checking if the next delayed item matches the next item in the
++	 * leaf - if so, we can add it to the batch of items to delete from the
++	 * leaf.
+ 	 */
+-	while (btrfs_comp_cpu_keys(&next->key, &key) == 0) {
+-		list_add_tail(&next->tree_list, &head);
+-		nitems++;
++	while (slot < last_slot) {
++		struct btrfs_key key;
+ 
+-		curr = next;
+ 		next = __btrfs_next_delayed_item(curr);
+ 		if (!next)
+ 			break;
+ 
+-		if (!btrfs_is_continuous_delayed_item(curr, next))
+-			break;
+-
+-		i++;
+-		if (i > last_item)
++		slot++;
++		btrfs_item_key_to_cpu(leaf, &key, slot);
++		if (btrfs_comp_cpu_keys(&next->key, &key) != 0)
+ 			break;
+-		btrfs_item_key_to_cpu(leaf, &key, i);
++		nitems++;
++		curr = next;
++		list_add_tail(&curr->tree_list, &batch_list);
++		total_reserved_size += curr->bytes_reserved;
+ 	}
+ 
+-	if (!nitems)
+-		return 0;
+-
+ 	ret = btrfs_del_items(trans, root, path, path->slots[0], nitems);
+ 	if (ret)
+-		goto out;
++		return ret;
++
++	/* In case of BTRFS_FS_LOG_RECOVERING items won't have reserved space */
++	if (total_reserved_size > 0) {
++		/*
++		 * Check btrfs_delayed_item_reserve_metadata() to see why we
++		 * don't need to release/reserve qgroup space.
++		 */
++		trace_btrfs_space_reservation(fs_info, "delayed_item",
++					      item->key.objectid, total_reserved_size,
++					      0);
++		btrfs_block_rsv_release(fs_info, &fs_info->delayed_block_rsv,
++					total_reserved_size, NULL);
++	}
+ 
+-	list_for_each_entry_safe(curr, next, &head, tree_list) {
+-		btrfs_delayed_item_release_metadata(root, curr);
++	list_for_each_entry_safe(curr, next, &batch_list, tree_list) {
+ 		list_del(&curr->tree_list);
+ 		btrfs_release_delayed_item(curr);
+ 	}
+ 
+-out:
+-	return ret;
++	return 0;
+ }
+ 
+ static int btrfs_delete_delayed_items(struct btrfs_trans_handle *trans,
+@@ -859,43 +883,52 @@ static int btrfs_delete_delayed_items(struct btrfs_trans_handle *trans,
+ 				      struct btrfs_root *root,
+ 				      struct btrfs_delayed_node *node)
+ {
+-	struct btrfs_delayed_item *curr, *prev;
+ 	int ret = 0;
+ 
+-do_again:
+-	mutex_lock(&node->mutex);
+-	curr = __btrfs_first_delayed_deletion_item(node);
+-	if (!curr)
+-		goto delete_fail;
++	while (ret == 0) {
++		struct btrfs_delayed_item *item;
++
++		mutex_lock(&node->mutex);
++		item = __btrfs_first_delayed_deletion_item(node);
++		if (!item) {
++			mutex_unlock(&node->mutex);
++			break;
++		}
++
++		ret = btrfs_search_slot(trans, root, &item->key, path, -1, 1);
++		if (ret > 0) {
++			/*
++			 * There's no matching item in the leaf. This means we
++			 * have already deleted this item in a past run of the
++			 * delayed items. We ignore errors when running delayed
++			 * items from an async context, through a work queue job
++			 * running btrfs_async_run_delayed_root(), and don't
++			 * release delayed items that failed to complete. This
++			 * is because we will retry later, and at transaction
++			 * commit time we always run delayed items and will
++			 * then deal with errors if they fail to run again.
++			 *
++			 * So just release delayed items for which we can't find
++			 * an item in the tree, and move to the next item.
++			 */
++			btrfs_release_path(path);
++			btrfs_release_delayed_item(item);
++			ret = 0;
++		} else if (ret == 0) {
++			ret = btrfs_batch_delete_items(trans, root, path, item);
++			btrfs_release_path(path);
++		}
+ 
+-	ret = btrfs_search_slot(trans, root, &curr->key, path, -1, 1);
+-	if (ret < 0)
+-		goto delete_fail;
+-	else if (ret > 0) {
+ 		/*
+-		 * can't find the item which the node points to, so this node
+-		 * is invalid, just drop it.
++		 * We unlock and relock on each iteration, this is to prevent
++		 * blocking other tasks for too long while we are being run from
++		 * the async context (work queue job). Those tasks are typically
++		 * running system calls like creat/mkdir/rename/unlink/etc which
++		 * need to add delayed items to this delayed node.
+ 		 */
+-		prev = curr;
+-		curr = __btrfs_next_delayed_item(prev);
+-		btrfs_release_delayed_item(prev);
+-		ret = 0;
+-		btrfs_release_path(path);
+-		if (curr) {
+-			mutex_unlock(&node->mutex);
+-			goto do_again;
+-		} else
+-			goto delete_fail;
++		mutex_unlock(&node->mutex);
+ 	}
+ 
+-	btrfs_batch_delete_items(trans, root, path, curr);
+-	btrfs_release_path(path);
+-	mutex_unlock(&node->mutex);
+-	goto do_again;
+-
+-delete_fail:
+-	btrfs_release_path(path);
+-	mutex_unlock(&node->mutex);
+ 	return ret;
+ }
+ 
+@@ -1347,6 +1380,23 @@ void btrfs_balance_delayed_items(struct btrfs_fs_info *fs_info)
+ 	btrfs_wq_run_delayed_node(delayed_root, fs_info, BTRFS_DELAYED_BATCH);
+ }
+ 
++/*
++ * Return how many leaves of metadata we will use for inserting a given amount
++ * (in bytes) of dir index items (including sizeof struct btrfs_item).
++ */
++static unsigned int num_dir_index_leaves(const struct btrfs_fs_info *fs_info,
++					 u32 index_items_size)
++{
++	const unsigned int leaf_data_size = BTRFS_LEAF_DATA_SIZE(fs_info);
++	unsigned int result;
++
++	result = index_items_size / leaf_data_size;
++	if ((index_items_size % leaf_data_size) != 0)
++		result++;
++
++	return result;
++}
++
+ /* Will return 0 or -ENOMEM */
+ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 				   const char *name, int name_len,
+@@ -1354,9 +1404,13 @@ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 				   struct btrfs_disk_key *disk_key, u8 type,
+ 				   u64 index)
+ {
++	struct btrfs_fs_info *fs_info = trans->fs_info;
+ 	struct btrfs_delayed_node *delayed_node;
+ 	struct btrfs_delayed_item *delayed_item;
+ 	struct btrfs_dir_item *dir_item;
++	unsigned int leaves_before;
++	unsigned int leaves_after;
++	u32 data_len;
+ 	int ret;
+ 
+ 	delayed_node = btrfs_get_or_create_delayed_node(dir);
+@@ -1372,6 +1426,7 @@ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 	delayed_item->key.objectid = btrfs_ino(dir);
+ 	delayed_item->key.type = BTRFS_DIR_INDEX_KEY;
+ 	delayed_item->key.offset = index;
++	delayed_item->ins_or_del = BTRFS_DELAYED_INSERTION_ITEM;
+ 
+ 	dir_item = (struct btrfs_dir_item *)delayed_item->data;
+ 	dir_item->location = *disk_key;
+@@ -1381,15 +1436,47 @@ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 	btrfs_set_stack_dir_type(dir_item, type);
+ 	memcpy((char *)(dir_item + 1), name, name_len);
+ 
+-	ret = btrfs_delayed_item_reserve_metadata(trans, dir->root, delayed_item);
+-	/*
+-	 * we have reserved enough space when we start a new transaction,
+-	 * so reserving metadata failure is impossible
+-	 */
+-	BUG_ON(ret);
++	data_len = delayed_item->data_len + sizeof(struct btrfs_item);
+ 
+ 	mutex_lock(&delayed_node->mutex);
+-	ret = __btrfs_add_delayed_insertion_item(delayed_node, delayed_item);
++	leaves_before = num_dir_index_leaves(fs_info,
++					     delayed_node->index_items_size);
++	leaves_after = num_dir_index_leaves(fs_info,
++					    delayed_node->index_items_size +
++					    data_len);
++
++	ASSERT(leaves_after >= leaves_before);
++	ASSERT((leaves_after - leaves_before) <= 1);
++
++	if (leaves_after > leaves_before) {
++		ret = btrfs_delayed_item_reserve_metadata(trans, dir->root,
++							  delayed_item);
++		/*
++		 * Space was reserved for a dir index item insertion when we
++		 * started the transaction, so getting a failure here should be
++		 * impossible.
++		 */
++		if (WARN_ON(ret)) {
++			mutex_unlock(&delayed_node->mutex);
++			btrfs_release_delayed_item(delayed_item);
++			goto release_node;
++		}
++	} else if (!test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags)) {
++		const u64 bytes = btrfs_calc_insert_metadata_size(fs_info, 1);
++
++		/*
++		 * Adding the new dir index item does not require touching another
++		 * leaf, so we can release 1 unit of metadata that was previously
++		 * reserved when starting the transaction. This applies only to
++		 * the case where we had a transaction start and excludes the
++		 * transaction join case (when replaying log trees).
++		 */
++		btrfs_block_rsv_release(fs_info, trans->block_rsv, bytes, NULL);
++		ASSERT(trans->bytes_reserved >= bytes);
++		trans->bytes_reserved -= bytes;
++	}
++
++	ret = __btrfs_add_delayed_item(delayed_node, delayed_item);
+ 	if (unlikely(ret)) {
+ 		btrfs_err(trans->fs_info,
+ 			  "err add delayed dir index item(name: %.*s) into the insertion tree of the delayed node(root id: %llu, inode id: %llu, errno: %d)",
+@@ -1397,6 +1484,7 @@ int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 			  delayed_node->inode_id, ret);
+ 		BUG();
+ 	}
++	delayed_node->index_items_size += data_len;
+ 	mutex_unlock(&delayed_node->mutex);
+ 
+ release_node:
+@@ -1409,6 +1497,9 @@ static int btrfs_delete_delayed_insertion_item(struct btrfs_fs_info *fs_info,
+ 					       struct btrfs_key *key)
+ {
+ 	struct btrfs_delayed_item *item;
++	unsigned int leaves_before;
++	unsigned int leaves_after;
++	u32 data_len;
+ 
+ 	mutex_lock(&node->mutex);
+ 	item = __btrfs_lookup_delayed_insertion_item(node, key);
+@@ -1417,7 +1508,32 @@ static int btrfs_delete_delayed_insertion_item(struct btrfs_fs_info *fs_info,
+ 		return 1;
+ 	}
+ 
+-	btrfs_delayed_item_release_metadata(node->root, item);
++	/*
++	 * For delayed items to insert, we track reserved metadata bytes based
++	 * on the number of leaves that we will use.
++	 * See btrfs_insert_delayed_dir_index() and
++	 * btrfs_delayed_item_reserve_metadata()).
++	 */
++	ASSERT(item->bytes_reserved == 0);
++
++	data_len = item->data_len + sizeof(struct btrfs_item);
++	ASSERT(node->index_items_size >= data_len);
++
++	leaves_before = num_dir_index_leaves(fs_info, node->index_items_size);
++	node->index_items_size -= data_len;
++	leaves_after = num_dir_index_leaves(fs_info, node->index_items_size);
++
++	ASSERT(leaves_after <= leaves_before);
++	ASSERT((leaves_before - leaves_after) <= 1);
++
++	if (leaves_after < leaves_before &&
++	    !test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags)) {
++		const u64 bytes = btrfs_calc_insert_metadata_size(fs_info, 1);
++
++		btrfs_block_rsv_release(fs_info, &fs_info->delayed_block_rsv,
++					bytes, NULL);
++	}
++
+ 	btrfs_release_delayed_item(item);
+ 	mutex_unlock(&node->mutex);
+ 	return 0;
+@@ -1451,6 +1567,7 @@ int btrfs_delete_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 	}
+ 
+ 	item->key = item_key;
++	item->ins_or_del = BTRFS_DELAYED_DELETION_ITEM;
+ 
+ 	ret = btrfs_delayed_item_reserve_metadata(trans, dir->root, item);
+ 	/*
+@@ -1465,7 +1582,7 @@ int btrfs_delete_delayed_dir_index(struct btrfs_trans_handle *trans,
+ 	}
+ 
+ 	mutex_lock(&node->mutex);
+-	ret = __btrfs_add_delayed_deletion_item(node, item);
++	ret = __btrfs_add_delayed_item(node, item);
+ 	if (unlikely(ret)) {
+ 		btrfs_err(trans->fs_info,
+ 			  "err add delayed dir index item(index: %llu) into the deletion tree of the delayed node(root id: %llu, inode id: %llu, errno: %d)",
+@@ -1833,12 +1950,25 @@ static void __btrfs_kill_delayed_node(struct btrfs_delayed_node *delayed_node)
+ 	mutex_lock(&delayed_node->mutex);
+ 	curr_item = __btrfs_first_delayed_insertion_item(delayed_node);
+ 	while (curr_item) {
+-		btrfs_delayed_item_release_metadata(root, curr_item);
+ 		prev_item = curr_item;
+ 		curr_item = __btrfs_next_delayed_item(prev_item);
+ 		btrfs_release_delayed_item(prev_item);
+ 	}
+ 
++	if (!test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags) &&
++	    delayed_node->index_items_size > 0) {
++		unsigned int num_leaves;
++		u64 bytes;
++
++		num_leaves = num_dir_index_leaves(fs_info,
++						  delayed_node->index_items_size);
++		bytes = btrfs_calc_insert_metadata_size(fs_info, num_leaves);
++
++		btrfs_block_rsv_release(fs_info, &fs_info->delayed_block_rsv,
++					bytes, NULL);
++	}
++	delayed_node->index_items_size = 0;
++
+ 	curr_item = __btrfs_first_delayed_deletion_item(delayed_node);
+ 	while (curr_item) {
+ 		btrfs_delayed_item_release_metadata(root, curr_item);
+diff --git a/fs/btrfs/delayed-inode.h b/fs/btrfs/delayed-inode.h
+index b2412160c5bc..2af0d8227479 100644
+--- a/fs/btrfs/delayed-inode.h
++++ b/fs/btrfs/delayed-inode.h
+@@ -55,6 +55,13 @@ struct btrfs_delayed_node {
+ 	struct mutex mutex;
+ 	struct btrfs_inode_item inode_item;
+ 	refcount_t refs;
++	/*
++	 * The sum of the sizes of all index items we will be inserting for
++	 * this inode (if it represents a directory), including the size of
++	 * struct btrfs_item. 32 bits is enough, as we flush delayed items
++	 * way before reaching the 32 bits limit. Protected by @mutex.
++	 */
++	u32 index_items_size;
+ 	u64 index_cnt;
+ 	unsigned long flags;
+ 	int count;
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 9dfde1af8a64..89c6d7ff1987 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -2308,7 +2308,7 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+ 	btrfs_release_log_ctx_extents(&ctx);
+ 	if (ret < 0) {
+ 		/* Fallthrough and commit/free transaction. */
+-		ret = 1;
++		ret = BTRFS_LOG_FORCE_COMMIT;
+ 	}
+ 
+ 	/* we've logged all the items and now have a consistent
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index d50448bf8eed..d6e9b596c7ba 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -6366,7 +6366,13 @@ int btrfs_create_new_inode(struct btrfs_trans_handle *trans,
+ 	}
+ 
+ 	btrfs_mark_buffer_dirty(path->nodes[0]);
+-	btrfs_release_path(path);
++	/*
++	 * We don't need the path anymore, plus inheriting properties, adding
++	 * ACLs, security xattrs, orphan item or adding the link, will result in
++	 * allocating yet another path. So just free our path.
++	 */
++	btrfs_free_path(path);
++	path = NULL;
+ 
+ 	if (args->subvol) {
+ 		struct inode *parent;
+@@ -6423,8 +6429,7 @@ int btrfs_create_new_inode(struct btrfs_trans_handle *trans,
+ 		goto discard;
+ 	}
+ 
+-	ret = 0;
+-	goto out;
++	return 0;
+ 
+ discard:
+ 	/*
+@@ -7588,8 +7593,12 @@ static int btrfs_dio_iomap_begin(struct inode *inode, loff_t start,
+ 	const u64 data_alloc_len = length;
+ 	bool unlock_extents = false;
+ 
++	/*
++	 * Cap the size of reads to that usually seen in buffered I/O as we need
++	 * to allocate a contiguous array for the checksums.
++	 */
+ 	if (!write)
+-		len = min_t(u64, len, fs_info->sectorsize);
++		len = min_t(u64, len, fs_info->sectorsize * BTRFS_MAX_BIO_SECTORS);
+ 
+ 	lockstart = start;
+ 	lockend = start + len - 1;
+@@ -9560,15 +9569,21 @@ static int btrfs_rename2(struct user_namespace *mnt_userns, struct inode *old_di
+ 			 struct dentry *old_dentry, struct inode *new_dir,
+ 			 struct dentry *new_dentry, unsigned int flags)
+ {
++	int ret;
++
+ 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
+ 		return -EINVAL;
+ 
+ 	if (flags & RENAME_EXCHANGE)
+-		return btrfs_rename_exchange(old_dir, old_dentry, new_dir,
+-					  new_dentry);
++		ret = btrfs_rename_exchange(old_dir, old_dentry, new_dir,
++					    new_dentry);
++	else
++		ret = btrfs_rename(mnt_userns, old_dir, old_dentry, new_dir,
++				   new_dentry, flags);
++
++	btrfs_btree_balance_dirty(BTRFS_I(new_dir)->root->fs_info);
+ 
+-	return btrfs_rename(mnt_userns, old_dir, old_dentry, new_dir,
+-			    new_dentry, flags);
++	return ret;
+ }
+ 
+ struct btrfs_delalloc_work {
+diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+index a3549d587464..977e0d218d79 100644
+--- a/fs/btrfs/reflink.c
++++ b/fs/btrfs/reflink.c
+@@ -5,6 +5,7 @@
+ #include "compression.h"
+ #include "ctree.h"
+ #include "delalloc-space.h"
++#include "disk-io.h"
+ #include "reflink.h"
+ #include "transaction.h"
+ #include "subpage.h"
+@@ -658,7 +659,8 @@ static void btrfs_double_mmap_unlock(struct inode *inode1, struct inode *inode2)
+ static int btrfs_extent_same_range(struct inode *src, u64 loff, u64 len,
+ 				   struct inode *dst, u64 dst_loff)
+ {
+-	const u64 bs = BTRFS_I(src)->root->fs_info->sb->s_blocksize;
++	struct btrfs_fs_info *fs_info = BTRFS_I(src)->root->fs_info;
++	const u64 bs = fs_info->sb->s_blocksize;
+ 	int ret;
+ 
+ 	/*
+@@ -669,6 +671,8 @@ static int btrfs_extent_same_range(struct inode *src, u64 loff, u64 len,
+ 	ret = btrfs_clone(src, dst, loff, len, ALIGN(len, bs), dst_loff, 1);
+ 	btrfs_double_extent_unlock(src, loff, dst, dst_loff, len);
+ 
++	btrfs_btree_balance_dirty(fs_info);
++
+ 	return ret;
+ }
+ 
+@@ -778,6 +782,8 @@ static noinline int btrfs_clone_files(struct file *file, struct file *file_src,
+ 				round_down(destoff, PAGE_SIZE),
+ 				round_up(destoff + len, PAGE_SIZE) - 1);
+ 
++	btrfs_btree_balance_dirty(fs_info);
++
+ 	return ret;
+ }
+ 
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 370388fadf96..c94713c811bb 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -171,7 +171,7 @@ static int start_log_trans(struct btrfs_trans_handle *trans,
+ 		int index = (root->log_transid + 1) % 2;
+ 
+ 		if (btrfs_need_log_full_commit(trans)) {
+-			ret = -EAGAIN;
++			ret = BTRFS_LOG_FORCE_COMMIT;
+ 			goto out;
+ 		}
+ 
+@@ -194,7 +194,7 @@ static int start_log_trans(struct btrfs_trans_handle *trans,
+ 		 * writing.
+ 		 */
+ 		if (zoned && !created) {
+-			ret = -EAGAIN;
++			ret = BTRFS_LOG_FORCE_COMMIT;
+ 			goto out;
+ 		}
+ 
+@@ -3121,7 +3121,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
+ 
+ 	/* bail out if we need to do a full commit */
+ 	if (btrfs_need_log_full_commit(trans)) {
+-		ret = -EAGAIN;
++		ret = BTRFS_LOG_FORCE_COMMIT;
+ 		mutex_unlock(&root->log_mutex);
+ 		goto out;
+ 	}
+@@ -3222,7 +3222,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
+ 		}
+ 		btrfs_wait_tree_log_extents(log, mark);
+ 		mutex_unlock(&log_root_tree->log_mutex);
+-		ret = -EAGAIN;
++		ret = BTRFS_LOG_FORCE_COMMIT;
+ 		goto out;
+ 	}
+ 
+@@ -3261,7 +3261,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
+ 		blk_finish_plug(&plug);
+ 		btrfs_wait_tree_log_extents(log, mark);
+ 		mutex_unlock(&log_root_tree->log_mutex);
+-		ret = -EAGAIN;
++		ret = BTRFS_LOG_FORCE_COMMIT;
+ 		goto out_wake_log_root;
+ 	}
+ 
+@@ -5848,7 +5848,7 @@ static int btrfs_log_inode(struct btrfs_trans_handle *trans,
+ 	    inode_only == LOG_INODE_ALL &&
+ 	    inode->last_unlink_trans >= trans->transid) {
+ 		btrfs_set_log_full_commit(trans);
+-		ret = 1;
++		ret = BTRFS_LOG_FORCE_COMMIT;
+ 		goto out_unlock;
+ 	}
+ 
+@@ -6562,12 +6562,12 @@ static int btrfs_log_inode_parent(struct btrfs_trans_handle *trans,
+ 	bool log_dentries = false;
+ 
+ 	if (btrfs_test_opt(fs_info, NOTREELOG)) {
+-		ret = 1;
++		ret = BTRFS_LOG_FORCE_COMMIT;
+ 		goto end_no_trans;
+ 	}
+ 
+ 	if (btrfs_root_refs(&root->root_item) == 0) {
+-		ret = 1;
++		ret = BTRFS_LOG_FORCE_COMMIT;
+ 		goto end_no_trans;
+ 	}
+ 
+@@ -6665,7 +6665,7 @@ static int btrfs_log_inode_parent(struct btrfs_trans_handle *trans,
+ end_trans:
+ 	if (ret < 0) {
+ 		btrfs_set_log_full_commit(trans);
+-		ret = 1;
++		ret = BTRFS_LOG_FORCE_COMMIT;
+ 	}
+ 
+ 	if (ret)
+diff --git a/fs/btrfs/tree-log.h b/fs/btrfs/tree-log.h
+index 1620f8170629..57ab5f3b8dc7 100644
+--- a/fs/btrfs/tree-log.h
++++ b/fs/btrfs/tree-log.h
+@@ -12,6 +12,9 @@
+ /* return value for btrfs_log_dentry_safe that means we don't need to log it at all */
+ #define BTRFS_NO_LOG_SYNC 256
+ 
++/* We can't use the tree log for whatever reason, force a transaction commit */
++#define BTRFS_LOG_FORCE_COMMIT				(1)
++
+ struct btrfs_log_ctx {
+ 	int log_ret;
+ 	int log_transid;
+diff --git a/fs/btrfs/volumes.h b/fs/btrfs/volumes.h
+index 6721002000ee..b495cb6f74cf 100644
+--- a/fs/btrfs/volumes.h
++++ b/fs/btrfs/volumes.h
+@@ -354,6 +354,13 @@ struct btrfs_fs_devices {
+ 				- 2 * sizeof(struct btrfs_chunk))	\
+ 				/ sizeof(struct btrfs_stripe) + 1)
+ 
++/*
++ * Maximum number of sectors for a single bio to limit the size of the
++ * checksum array.  This matches the number of bio_vecs per bio and thus the
++ * I/O size for buffered I/O.
++ */
++#define BTRFS_MAX_BIO_SECTORS				(256)
++
+ /*
+  * Additional info to pass along bio.
+  *
+diff --git a/include/linux/ioprio.h b/include/linux/ioprio.h
+index 3f53bc27a19b..7578d4f6a969 100644
+--- a/include/linux/ioprio.h
++++ b/include/linux/ioprio.h
+@@ -11,7 +11,7 @@
+ /*
+  * Default IO priority.
+  */
+-#define IOPRIO_DEFAULT	IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_BE_NORM)
++#define IOPRIO_DEFAULT	IOPRIO_PRIO_VALUE(IOPRIO_CLASS_NONE, 0)
+ 
+ /*
+  * Check that a priority value has a valid class.
+@@ -46,23 +46,19 @@ static inline int task_nice_ioclass(struct task_struct *task)
+ 		return IOPRIO_CLASS_BE;
+ }
+ 
+-/*
+- * If the calling process has set an I/O priority, use that. Otherwise, return
+- * the default I/O priority.
+- */
+-static inline int get_current_ioprio(void)
++#ifdef CONFIG_BLOCK
++int __get_task_ioprio(struct task_struct *p);
++#else
++static inline int __get_task_ioprio(struct task_struct *p)
+ {
+-	struct io_context *ioc = current->io_context;
+-
+-	if (ioc)
+-		return ioc->ioprio;
+ 	return IOPRIO_DEFAULT;
+ }
++#endif /* CONFIG_BLOCK */
+ 
+-/*
+- * For inheritance, return the highest of the two given priorities
+- */
+-extern int ioprio_best(unsigned short aprio, unsigned short bprio);
++static inline int get_current_ioprio(void)
++{
++	return __get_task_ioprio(current);
++}
+ 
+ extern int set_task_ioprio(struct task_struct *task, int ioprio);
+ 
+-- 
+2.37.1
+
