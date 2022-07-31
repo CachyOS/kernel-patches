@@ -1,7 +1,7 @@
-From fba664197622587b86ec4c828900ec4a68b1363f Mon Sep 17 00:00:00 2001
+From c2791f6c8b17e3fae3af10e0fe29728d594b78f9 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sun, 31 Jul 2022 12:21:26 +0200
-Subject: [PATCH 01/14] cachy
+Date: Sun, 31 Jul 2022 12:35:15 +0200
+Subject: [PATCH 01/13] cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -67,6 +67,8 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  drivers/ata/libahci.c                         |    4 +-
  drivers/base/arch_topology.c                  |    2 +-
  drivers/base/firmware_loader/main.c           |    2 +
+ drivers/block/zram/Kconfig                    |   18 +
+ drivers/block/zram/zram_drv.c                 |   39 +
  drivers/cpufreq/amd-pstate.c                  |   62 +-
  drivers/cpufreq/cppc_cpufreq.c                |    2 +-
  drivers/cpufreq/intel_pstate.c                |    7 +
@@ -131,7 +133,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/sched/core.c                           |    7 +
  kernel/sched/core_sched.c                     |   18 +-
  kernel/sched/debug.c                          |    1 +
- kernel/sched/fair.c                           |  462 ++-
+ kernel/sched/fair.c                           |  408 ++-
  kernel/sched/features.h                       |    5 +-
  kernel/sched/sched.h                          |   74 +-
  kernel/sched/topology.c                       |   12 +-
@@ -148,6 +150,9 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  lib/raid6/algos.c                             |    4 +-
  lib/string.c                                  |   62 +-
  lib/test_bitmap.c                             |   68 +
+ lib/zstd/compress/zstd_double_fast.c          |   61 +-
+ lib/zstd/compress/zstd_fast.c                 |   69 +-
+ lib/zstd/compress/zstd_lazy.c                 |  223 +-
  mm/compaction.c                               |    6 +-
  mm/ksm.c                                      |   99 +-
  mm/madvise.c                                  |  115 +
@@ -172,7 +177,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  tools/include/linux/bitmap.h                  |   12 +-
  tools/include/linux/bitops.h                  |   16 +
  tools/lib/bitmap.c                            |    6 +-
- 167 files changed, 6083 insertions(+), 1351 deletions(-)
+ 172 files changed, 6291 insertions(+), 1499 deletions(-)
  create mode 100644 include/asm-generic/bitops/generic-non-atomic.h
  create mode 100644 include/asm-generic/bitops/non-instrumented-non-atomic.h
  create mode 100644 include/linux/gfp_types.h
@@ -2623,6 +2628,90 @@ index ac3f34e80194..1d13577560ae 100644
  	"/lib/firmware/updates/" UTS_RELEASE,
  	"/lib/firmware/updates",
  	"/lib/firmware/" UTS_RELEASE,
+diff --git a/drivers/block/zram/Kconfig b/drivers/block/zram/Kconfig
+index d4100b0c083e..8739ea13161f 100644
+--- a/drivers/block/zram/Kconfig
++++ b/drivers/block/zram/Kconfig
+@@ -78,3 +78,21 @@ config ZRAM_MEMORY_TRACKING
+ 	  /sys/kernel/debug/zram/zramX/block_state.
+ 
+ 	  See Documentation/admin-guide/blockdev/zram.rst for more information.
++
++config ZRAM_ENTROPY
++	bool "Use entropy optimization for zram"
++	depends on ZRAM && ZRAM_DEF_COMP_ZSTD
++	help
++	  With this feature, entropy will be calculated for each page.
++	  Pages above ZRAM_ENTROPY_THRESHOLD entropy will be
++	  stored uncompressed. Use this feature if you need a performance
++	  boost and a small loss in compression.
++
++config ZRAM_ENTROPY_THRESHOLD
++	int
++	depends on ZRAM && ZRAM_ENTROPY
++	default 100000 if ZRAM_DEF_COMP_ZSTD
++	help
++	  Pages with entropy above ZRAM_ENTROPY_THRESHOLD will be stored
++	  uncompressed. The default value was chosen as a result a lot of
++	  experiments. You can try set your own value.
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index b8549c61ff2c..1140bc12a441 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -1344,6 +1344,35 @@ static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
+ 	return ret;
+ }
+ 
++
++#ifdef CONFIG_ZRAM_ENTROPY
++static inline u32 ilog2_w(u64 n)
++{
++	return ilog2(n * n * n * n);
++}
++
++static inline s32 shannon_entropy(const u8 *src)
++{
++	s32 entropy_sum = 0;
++	u32 sz_base, i;
++	u16 entropy_count[256] = { 0 };
++
++	for (i = 0; i < PAGE_SIZE; ++i)
++		entropy_count[src[i]]++;
++
++	sz_base = ilog2_w(PAGE_SIZE);
++	for (i = 0; i < ARRAY_SIZE(entropy_count); ++i) {
++		if (entropy_count[i] > 0) {
++			s32 p = entropy_count[i];
++
++			entropy_sum += p * (sz_base - ilog2_w((u64)p));
++		}
++	}
++
++	return entropy_sum;
++}
++#endif
++
+ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 				u32 index, struct bio *bio)
+ {
+@@ -1369,7 +1398,17 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 
+ 	zstrm = zcomp_stream_get(zram->comp);
+ 	src = kmap_atomic(page);
++
++#ifdef CONFIG_ZRAM_ENTROPY
++	/* Just save this page uncompressible */
++	if (shannon_entropy((const u8 *)src) > CONFIG_ZRAM_ENTROPY_THRESHOLD)
++		comp_len = PAGE_SIZE;
++	else
++		ret = zcomp_compress(zstrm, src, &comp_len);
++#else
+ 	ret = zcomp_compress(zstrm, src, &comp_len);
++#endif
++
+ 	kunmap_atomic(src);
+ 
+ 	if (unlikely(ret)) {
 diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
 index 9ac75c1cde9c..d3bc441b3923 100644
 --- a/drivers/cpufreq/amd-pstate.c
@@ -5981,7 +6070,7 @@ index bb3d63bdf4ae..e0e356eb038d 100644
  	nr_switches = p->nvcsw + p->nivcsw;
  
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 77b2048a9326..fc2dbe91e34d 100644
+index 77b2048a9326..8a2c4699b38e 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -68,9 +68,13 @@
@@ -6273,20 +6362,20 @@ index 77b2048a9326..fc2dbe91e34d 100644
 +}
 +
 +static inline bool test_idle_cores(int cpu)
-+{
+ {
 +	return false;
-+}
-+
+ }
+ 
+-static inline bool test_idle_cores(int cpu, bool def)
 +static inline void set_idle_cpus(int cpu, int idle)
 +{
 +}
 +
 +static inline bool test_idle_cpus(int cpu)
- {
++{
 +	return true;
- }
- 
--static inline bool test_idle_cores(int cpu, bool def)
++}
++
 +static inline void sd_update_icpus(int core, int icpu)
  {
 -	return def;
@@ -6424,17 +6513,6 @@ index 77b2048a9326..fc2dbe91e34d 100644
  
  	update_scan_period(p, new_cpu);
  }
-@@ -7585,8 +7705,8 @@ enum group_type {
- 	 */
- 	group_fully_busy,
- 	/*
--	 * SD_ASYM_CPUCAPACITY only: One task doesn't fit with CPU's capacity
--	 * and must be migrated to a more powerful CPU.
-+	 * One task doesn't fit with CPU's capacity and must be migrated to a
-+	 * more powerful CPU.
- 	 */
- 	group_misfit_task,
- 	/*
 @@ -7681,12 +7801,15 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
  	 * Don't migrate task if the task's cookie does not match
  	 * with the destination CPU's core cookie.
@@ -6471,7 +6549,7 @@ index 77b2048a9326..fc2dbe91e34d 100644
  		.busiest_stat = {
  			.idle_cpus = UINT_MAX,
  			.group_type = group_has_spare,
-@@ -8669,6 +8797,33 @@ sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs
+@@ -8669,6 +8797,20 @@ sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs
  	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
  }
  
@@ -6489,23 +6567,10 @@ index 77b2048a9326..fc2dbe91e34d 100644
 +	}
 +}
 +
-+static inline bool
-+sched_reduced_capacity(struct rq *rq, struct sched_domain *sd)
-+{
-+	/*
-+	 * When there is more than 1 task, the group_overloaded case already
-+	 * takes care of cpu with reduced capacity
-+	 */
-+	if (rq->cfs.h_nr_running != 1)
-+		return false;
-+
-+	return check_cpu_capacity(rq, sd);
-+}
-+
  /**
   * update_sg_lb_stats - Update sched_group's statistics for load balancing.
   * @env: The load balancing environment.
-@@ -8683,16 +8838,19 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+@@ -8683,14 +8825,16 @@ static inline void update_sg_lb_stats(struct lb_env *env,
  				      struct sg_lb_stats *sgs,
  				      int *sg_status)
  {
@@ -6519,15 +6584,11 @@ index 77b2048a9326..fc2dbe91e34d 100644
  
  	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
  		struct rq *rq = cpu_rq(i);
-+		unsigned long load = cpu_load(rq);
 +		bool update = update_core && (env->dst_cpu != i);
  
--		sgs->group_load += cpu_load(rq);
-+		sgs->group_load += load;
+ 		sgs->group_load += cpu_load(rq);
  		sgs->group_util += cpu_util_cfs(i);
- 		sgs->group_runnable += cpu_runnable(rq);
- 		sgs->sum_h_nr_running += rq->cfs.h_nr_running;
-@@ -8700,6 +8858,13 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+@@ -8700,6 +8844,13 @@ static inline void update_sg_lb_stats(struct lb_env *env,
  		nr_running = rq->nr_running;
  		sgs->sum_nr_running += nr_running;
  
@@ -6541,7 +6602,7 @@ index 77b2048a9326..fc2dbe91e34d 100644
  		if (nr_running > 1)
  			*sg_status |= SG_OVERLOAD;
  
-@@ -8714,7 +8879,17 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+@@ -8714,7 +8865,17 @@ static inline void update_sg_lb_stats(struct lb_env *env,
  		 * No need to call idle_cpu() if nr_running is not 0
  		 */
  		if (!nr_running && idle_cpu(i)) {
@@ -6559,40 +6620,7 @@ index 77b2048a9326..fc2dbe91e34d 100644
  			/* Idle cpu can't have misfit task */
  			continue;
  		}
-@@ -8722,11 +8897,17 @@ static inline void update_sg_lb_stats(struct lb_env *env,
- 		if (local_group)
- 			continue;
- 
--		/* Check for a misfit task on the cpu */
--		if (env->sd->flags & SD_ASYM_CPUCAPACITY &&
--		    sgs->group_misfit_task_load < rq->misfit_task_load) {
--			sgs->group_misfit_task_load = rq->misfit_task_load;
--			*sg_status |= SG_OVERLOAD;
-+		if (env->sd->flags & SD_ASYM_CPUCAPACITY) {
-+			/* Check for a misfit task on the cpu */
-+			if (sgs->group_misfit_task_load < rq->misfit_task_load) {
-+				sgs->group_misfit_task_load = rq->misfit_task_load;
-+				*sg_status |= SG_OVERLOAD;
-+			}
-+		} else if ((env->idle != CPU_NOT_IDLE) &&
-+			   sched_reduced_capacity(rq, env->sd)) {
-+			/* Check for a task running on a CPU with reduced capacity */
-+			if (sgs->group_misfit_task_load < load)
-+				sgs->group_misfit_task_load = load;
- 		}
- 	}
- 
-@@ -8779,7 +8960,8 @@ static bool update_sd_pick_busiest(struct lb_env *env,
- 	 * CPUs in the group should either be possible to resolve
- 	 * internally or be covered by avg_load imbalance (eventually).
- 	 */
--	if (sgs->group_type == group_misfit_task &&
-+	if ((env->sd->flags & SD_ASYM_CPUCAPACITY) &&
-+	    (sgs->group_type == group_misfit_task) &&
- 	    (!capacity_greater(capacity_of(env->dst_cpu), sg->sgc->max_capacity) ||
- 	     sds->local_stat.group_type != group_has_spare))
- 		return false;
-@@ -9222,6 +9404,154 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+@@ -9222,6 +9383,154 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
  	return idlest;
  }
  
@@ -6747,7 +6775,7 @@ index 77b2048a9326..fc2dbe91e34d 100644
  /**
   * update_sd_lb_stats - Update sched_domain's statistics for load balancing.
   * @env: The load balancing environment.
-@@ -9234,6 +9564,7 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
+@@ -9234,6 +9543,7 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
  	struct sched_group *sg = env->sd->groups;
  	struct sg_lb_stats *local = &sds->local_stat;
  	struct sg_lb_stats tmp_sgs;
@@ -6755,7 +6783,7 @@ index 77b2048a9326..fc2dbe91e34d 100644
  	int sg_status = 0;
  
  	do {
-@@ -9266,14 +9597,16 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
+@@ -9266,14 +9576,16 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
  		sds->total_load += sgs->group_load;
  		sds->total_capacity += sgs->group_capacity;
  
@@ -6774,7 +6802,7 @@ index 77b2048a9326..fc2dbe91e34d 100644
  		env->fbq_type = fbq_classify_group(&sds->busiest_stat);
  
  	if (!env->sd->parent) {
-@@ -9291,6 +9624,8 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
+@@ -9291,6 +9603,8 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
  		WRITE_ONCE(rd->overutilized, SG_OVERUTILIZED);
  		trace_sched_overutilized_tp(rd, SG_OVERUTILIZED);
  	}
@@ -6783,28 +6811,6 @@ index 77b2048a9326..fc2dbe91e34d 100644
  }
  
  #define NUMA_IMBALANCE_MIN 2
-@@ -9325,9 +9660,18 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
- 	busiest = &sds->busiest_stat;
- 
- 	if (busiest->group_type == group_misfit_task) {
--		/* Set imbalance to allow misfit tasks to be balanced. */
--		env->migration_type = migrate_misfit;
--		env->imbalance = 1;
-+		if (env->sd->flags & SD_ASYM_CPUCAPACITY) {
-+			/* Set imbalance to allow misfit tasks to be balanced. */
-+			env->migration_type = migrate_misfit;
-+			env->imbalance = 1;
-+		} else {
-+			/*
-+			 * Set load imbalance to allow moving task from cpu
-+			 * with reduced capacity.
-+			 */
-+			env->migration_type = migrate_load;
-+			env->imbalance = busiest->group_misfit_task_load;
-+		}
- 		return;
- 	}
- 
 diff --git a/kernel/sched/features.h b/kernel/sched/features.h
 index 1cf435bbcd9c..d58baad2cee2 100644
 --- a/kernel/sched/features.h
@@ -7723,6 +7729,533 @@ index d5923a640457..98754ff9fe68 100644
  }
  
  KSTM_MODULE_LOADERS(test_bitmap);
+diff --git a/lib/zstd/compress/zstd_double_fast.c b/lib/zstd/compress/zstd_double_fast.c
+index b0424d23ac57..fb941a5b70f5 100644
+--- a/lib/zstd/compress/zstd_double_fast.c
++++ b/lib/zstd/compress/zstd_double_fast.c
+@@ -313,6 +313,26 @@ size_t ZSTD_compressBlock_doubleFast_generic(
+     return (size_t)(iend - anchor);
+ }
+ 
++#define ZSTD_GEN_FN(dictMode, mls)                                                                           \
++    static size_t ZSTD_compressBlock_doubleFast_##dictMode##_##mls(                                          \
++            ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],                              \
++            void const* src, size_t srcSize)                                                                 \
++    {                                                                                                        \
++        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, mls, ZSTD_##dictMode); \
++    }
++
++ZSTD_GEN_FN(noDict, 4)
++ZSTD_GEN_FN(noDict, 5)
++ZSTD_GEN_FN(noDict, 6)
++ZSTD_GEN_FN(noDict, 7)
++
++ZSTD_GEN_FN(dictMatchState, 4)
++ZSTD_GEN_FN(dictMatchState, 5)
++ZSTD_GEN_FN(dictMatchState, 6)
++ZSTD_GEN_FN(dictMatchState, 7)
++
++#undef ZSTD_GEN_FN
++
+ 
+ size_t ZSTD_compressBlock_doubleFast(
+         ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],
+@@ -323,13 +343,13 @@ size_t ZSTD_compressBlock_doubleFast(
+     {
+     default: /* includes case 3 */
+     case 4 :
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, 4, ZSTD_noDict);
++        return ZSTD_compressBlock_doubleFast_noDict_4(ms, seqStore, rep, src, srcSize);
+     case 5 :
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, 5, ZSTD_noDict);
++        return ZSTD_compressBlock_doubleFast_noDict_5(ms, seqStore, rep, src, srcSize);
+     case 6 :
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, 6, ZSTD_noDict);
++        return ZSTD_compressBlock_doubleFast_noDict_6(ms, seqStore, rep, src, srcSize);
+     case 7 :
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, 7, ZSTD_noDict);
++        return ZSTD_compressBlock_doubleFast_noDict_7(ms, seqStore, rep, src, srcSize);
+     }
+ }
+ 
+@@ -343,13 +363,13 @@ size_t ZSTD_compressBlock_doubleFast_dictMatchState(
+     {
+     default: /* includes case 3 */
+     case 4 :
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, 4, ZSTD_dictMatchState);
++        return ZSTD_compressBlock_doubleFast_dictMatchState_4(ms, seqStore, rep, src, srcSize);
+     case 5 :
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, 5, ZSTD_dictMatchState);
++        return ZSTD_compressBlock_doubleFast_dictMatchState_5(ms, seqStore, rep, src, srcSize);
+     case 6 :
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, 6, ZSTD_dictMatchState);
++        return ZSTD_compressBlock_doubleFast_dictMatchState_6(ms, seqStore, rep, src, srcSize);
+     case 7 :
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, 7, ZSTD_dictMatchState);
++        return ZSTD_compressBlock_doubleFast_dictMatchState_7(ms, seqStore, rep, src, srcSize);
+     }
+ }
+ 
+@@ -385,7 +405,7 @@ static size_t ZSTD_compressBlock_doubleFast_extDict_generic(
+ 
+     /* if extDict is invalidated due to maxDistance, switch to "regular" variant */
+     if (prefixStartIndex == dictStartIndex)
+-        return ZSTD_compressBlock_doubleFast_generic(ms, seqStore, rep, src, srcSize, mls, ZSTD_noDict);
++        return ZSTD_compressBlock_doubleFast(ms, seqStore, rep, src, srcSize);
+ 
+     /* Search Loop */
+     while (ip < ilimit) {  /* < instead of <=, because (ip+1) */
+@@ -499,6 +519,21 @@ static size_t ZSTD_compressBlock_doubleFast_extDict_generic(
+ }
+ 
+ 
++#define ZSTD_GEN_FN(mls)                                                                            \
++    static size_t ZSTD_compressBlock_doubleFast_extDict_##mls(                                      \
++            ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],                     \
++            void const* src, size_t srcSize)                                                        \
++    {                                                                                               \
++        return ZSTD_compressBlock_doubleFast_extDict_generic(ms, seqStore, rep, src, srcSize, mls); \
++    }
++
++ZSTD_GEN_FN(4)
++ZSTD_GEN_FN(5)
++ZSTD_GEN_FN(6)
++ZSTD_GEN_FN(7)
++
++#undef ZSTD_GEN_FN
++
+ size_t ZSTD_compressBlock_doubleFast_extDict(
+         ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],
+         void const* src, size_t srcSize)
+@@ -508,12 +543,12 @@ size_t ZSTD_compressBlock_doubleFast_extDict(
+     {
+     default: /* includes case 3 */
+     case 4 :
+-        return ZSTD_compressBlock_doubleFast_extDict_generic(ms, seqStore, rep, src, srcSize, 4);
++        return ZSTD_compressBlock_doubleFast_extDict_4(ms, seqStore, rep, src, srcSize);
+     case 5 :
+-        return ZSTD_compressBlock_doubleFast_extDict_generic(ms, seqStore, rep, src, srcSize, 5);
++        return ZSTD_compressBlock_doubleFast_extDict_5(ms, seqStore, rep, src, srcSize);
+     case 6 :
+-        return ZSTD_compressBlock_doubleFast_extDict_generic(ms, seqStore, rep, src, srcSize, 6);
++        return ZSTD_compressBlock_doubleFast_extDict_6(ms, seqStore, rep, src, srcSize);
+     case 7 :
+-        return ZSTD_compressBlock_doubleFast_extDict_generic(ms, seqStore, rep, src, srcSize, 7);
++        return ZSTD_compressBlock_doubleFast_extDict_7(ms, seqStore, rep, src, srcSize);
+     }
+ }
+diff --git a/lib/zstd/compress/zstd_fast.c b/lib/zstd/compress/zstd_fast.c
+index 96b7d48e2868..e0652e31d421 100644
+--- a/lib/zstd/compress/zstd_fast.c
++++ b/lib/zstd/compress/zstd_fast.c
+@@ -182,6 +182,20 @@ ZSTD_compressBlock_fast_generic(
+     return (size_t)(iend - anchor);
+ }
+ 
++#define ZSTD_GEN_FN(mls)                                                              \
++    static size_t ZSTD_compressBlock_fast_##mls(                                      \
++            ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],       \
++            void const* src, size_t srcSize)                                          \
++    {                                                                                 \
++        return ZSTD_compressBlock_fast_generic(ms, seqStore, rep, src, srcSize, mls); \
++    }
++
++ZSTD_GEN_FN(4)
++ZSTD_GEN_FN(5)
++ZSTD_GEN_FN(6)
++ZSTD_GEN_FN(7)
++
++#undef ZSTD_GEN_FN
+ 
+ size_t ZSTD_compressBlock_fast(
+         ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],
+@@ -193,13 +207,13 @@ size_t ZSTD_compressBlock_fast(
+     {
+     default: /* includes case 3 */
+     case 4 :
+-        return ZSTD_compressBlock_fast_generic(ms, seqStore, rep, src, srcSize, 4);
++        return ZSTD_compressBlock_fast_4(ms, seqStore, rep, src, srcSize);
+     case 5 :
+-        return ZSTD_compressBlock_fast_generic(ms, seqStore, rep, src, srcSize, 5);
++        return ZSTD_compressBlock_fast_5(ms, seqStore, rep, src, srcSize);
+     case 6 :
+-        return ZSTD_compressBlock_fast_generic(ms, seqStore, rep, src, srcSize, 6);
++        return ZSTD_compressBlock_fast_6(ms, seqStore, rep, src, srcSize);
+     case 7 :
+-        return ZSTD_compressBlock_fast_generic(ms, seqStore, rep, src, srcSize, 7);
++        return ZSTD_compressBlock_fast_7(ms, seqStore, rep, src, srcSize);
+     }
+ }
+ 
+@@ -351,6 +365,21 @@ size_t ZSTD_compressBlock_fast_dictMatchState_generic(
+     return (size_t)(iend - anchor);
+ }
+ 
++#define ZSTD_GEN_FN(mls)                                                                             \
++    static size_t ZSTD_compressBlock_fast_dictMatchState_##mls(                                      \
++            ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],                      \
++            void const* src, size_t srcSize)                                                         \
++    {                                                                                                \
++        return ZSTD_compressBlock_fast_dictMatchState_generic(ms, seqStore, rep, src, srcSize, mls); \
++    }
++
++ZSTD_GEN_FN(4)
++ZSTD_GEN_FN(5)
++ZSTD_GEN_FN(6)
++ZSTD_GEN_FN(7)
++
++#undef ZSTD_GEN_FN
++
+ size_t ZSTD_compressBlock_fast_dictMatchState(
+         ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],
+         void const* src, size_t srcSize)
+@@ -361,13 +390,13 @@ size_t ZSTD_compressBlock_fast_dictMatchState(
+     {
+     default: /* includes case 3 */
+     case 4 :
+-        return ZSTD_compressBlock_fast_dictMatchState_generic(ms, seqStore, rep, src, srcSize, 4);
++        return ZSTD_compressBlock_fast_dictMatchState_4(ms, seqStore, rep, src, srcSize);
+     case 5 :
+-        return ZSTD_compressBlock_fast_dictMatchState_generic(ms, seqStore, rep, src, srcSize, 5);
++        return ZSTD_compressBlock_fast_dictMatchState_5(ms, seqStore, rep, src, srcSize);
+     case 6 :
+-        return ZSTD_compressBlock_fast_dictMatchState_generic(ms, seqStore, rep, src, srcSize, 6);
++        return ZSTD_compressBlock_fast_dictMatchState_6(ms, seqStore, rep, src, srcSize);
+     case 7 :
+-        return ZSTD_compressBlock_fast_dictMatchState_generic(ms, seqStore, rep, src, srcSize, 7);
++        return ZSTD_compressBlock_fast_dictMatchState_7(ms, seqStore, rep, src, srcSize);
+     }
+ }
+ 
+@@ -402,7 +431,7 @@ static size_t ZSTD_compressBlock_fast_extDict_generic(
+ 
+     /* switch to "regular" variant if extDict is invalidated due to maxDistance */
+     if (prefixStartIndex == dictStartIndex)
+-        return ZSTD_compressBlock_fast_generic(ms, seqStore, rep, src, srcSize, mls);
++        return ZSTD_compressBlock_fast(ms, seqStore, rep, src, srcSize);
+ 
+     /* Search Loop */
+     while (ip < ilimit) {  /* < instead of <=, because (ip+1) */
+@@ -475,6 +504,20 @@ static size_t ZSTD_compressBlock_fast_extDict_generic(
+     return (size_t)(iend - anchor);
+ }
+ 
++#define ZSTD_GEN_FN(mls)                                                                      \
++    static size_t ZSTD_compressBlock_fast_extDict_##mls(                                      \
++            ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],               \
++            void const* src, size_t srcSize)                                                  \
++    {                                                                                         \
++        return ZSTD_compressBlock_fast_extDict_generic(ms, seqStore, rep, src, srcSize, mls); \
++    }
++
++ZSTD_GEN_FN(4)
++ZSTD_GEN_FN(5)
++ZSTD_GEN_FN(6)
++ZSTD_GEN_FN(7)
++
++#undef ZSTD_GEN_FN
+ 
+ size_t ZSTD_compressBlock_fast_extDict(
+         ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],
+@@ -485,12 +528,12 @@ size_t ZSTD_compressBlock_fast_extDict(
+     {
+     default: /* includes case 3 */
+     case 4 :
+-        return ZSTD_compressBlock_fast_extDict_generic(ms, seqStore, rep, src, srcSize, 4);
++        return ZSTD_compressBlock_fast_extDict_4(ms, seqStore, rep, src, srcSize);
+     case 5 :
+-        return ZSTD_compressBlock_fast_extDict_generic(ms, seqStore, rep, src, srcSize, 5);
++        return ZSTD_compressBlock_fast_extDict_5(ms, seqStore, rep, src, srcSize);
+     case 6 :
+-        return ZSTD_compressBlock_fast_extDict_generic(ms, seqStore, rep, src, srcSize, 6);
++        return ZSTD_compressBlock_fast_extDict_6(ms, seqStore, rep, src, srcSize);
+     case 7 :
+-        return ZSTD_compressBlock_fast_extDict_generic(ms, seqStore, rep, src, srcSize, 7);
++        return ZSTD_compressBlock_fast_extDict_7(ms, seqStore, rep, src, srcSize);
+     }
+ }
+diff --git a/lib/zstd/compress/zstd_lazy.c b/lib/zstd/compress/zstd_lazy.c
+index fb54d4e28a2b..1db22db5b1e9 100644
+--- a/lib/zstd/compress/zstd_lazy.c
++++ b/lib/zstd/compress/zstd_lazy.c
+@@ -392,55 +392,6 @@ ZSTD_BtFindBestMatch( ZSTD_matchState_t* ms,
+ }
+ 
+ 
+-static size_t
+-ZSTD_BtFindBestMatch_selectMLS (  ZSTD_matchState_t* ms,
+-                            const BYTE* ip, const BYTE* const iLimit,
+-                                  size_t* offsetPtr)
+-{
+-    switch(ms->cParams.minMatch)
+-    {
+-    default : /* includes case 3 */
+-    case 4 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 4, ZSTD_noDict);
+-    case 5 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 5, ZSTD_noDict);
+-    case 7 :
+-    case 6 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 6, ZSTD_noDict);
+-    }
+-}
+-
+-
+-static size_t ZSTD_BtFindBestMatch_dictMatchState_selectMLS (
+-                        ZSTD_matchState_t* ms,
+-                        const BYTE* ip, const BYTE* const iLimit,
+-                        size_t* offsetPtr)
+-{
+-    switch(ms->cParams.minMatch)
+-    {
+-    default : /* includes case 3 */
+-    case 4 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 4, ZSTD_dictMatchState);
+-    case 5 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 5, ZSTD_dictMatchState);
+-    case 7 :
+-    case 6 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 6, ZSTD_dictMatchState);
+-    }
+-}
+-
+-
+-static size_t ZSTD_BtFindBestMatch_extDict_selectMLS (
+-                        ZSTD_matchState_t* ms,
+-                        const BYTE* ip, const BYTE* const iLimit,
+-                        size_t* offsetPtr)
+-{
+-    switch(ms->cParams.minMatch)
+-    {
+-    default : /* includes case 3 */
+-    case 4 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 4, ZSTD_extDict);
+-    case 5 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 5, ZSTD_extDict);
+-    case 7 :
+-    case 6 : return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, 6, ZSTD_extDict);
+-    }
+-}
+-
+-
+-
+ /* *********************************
+ *  Hash Chain
+ ***********************************/
+@@ -595,7 +546,7 @@ void ZSTD_dedicatedDictSearch_lazy_loadDictionary(ZSTD_matchState_t* ms, const B
+ 
+ /* inlining is important to hardwire a hot branch (template emulation) */
+ FORCE_INLINE_TEMPLATE
+-size_t ZSTD_HcFindBestMatch_generic (
++size_t ZSTD_HcFindBestMatch(
+                         ZSTD_matchState_t* ms,
+                         const BYTE* const ip, const BYTE* const iLimit,
+                         size_t* offsetPtr,
+@@ -783,76 +734,106 @@ size_t ZSTD_HcFindBestMatch_generic (
+     return ml;
+ }
+ 
++typedef size_t (*searchMax_f)(
++                    ZSTD_matchState_t* ms,
++                    const BYTE* ip, const BYTE* iLimit, size_t* offsetPtr);
+ 
+-FORCE_INLINE_TEMPLATE size_t ZSTD_HcFindBestMatch_selectMLS (
+-                        ZSTD_matchState_t* ms,
+-                        const BYTE* ip, const BYTE* const iLimit,
+-                        size_t* offsetPtr)
+-{
+-    switch(ms->cParams.minMatch)
+-    {
+-    default : /* includes case 3 */
+-    case 4 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 4, ZSTD_noDict);
+-    case 5 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 5, ZSTD_noDict);
+-    case 7 :
+-    case 6 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 6, ZSTD_noDict);
+-    }
+-}
++/*
++ * This struct contains the functions necessary for lazy to search.
++ * Currently, that is only searchMax. However, it is still valuable to have the
++ * VTable because this makes it easier to add more functions to the VTable later.
++ */
++typedef struct {
++    searchMax_f searchMax;
++} ZSTD_LazyVTable;
++
++#define GEN_ZSTD_BT_VTABLE(dictMode, mls, ...)                                        \
++    static size_t ZSTD_BtFindBestMatch_##dictMode##_##mls(                            \
++            ZSTD_matchState_t* ms,                                                    \
++            const BYTE* ip, const BYTE* const iLimit,                                 \
++            size_t* offsetPtr)                                                        \
++    {                                                                                 \
++        assert(MAX(4, MIN(6, ms->cParams.minMatch)) == mls);                          \
++        return ZSTD_BtFindBestMatch(ms, ip, iLimit, offsetPtr, mls, ZSTD_##dictMode); \
++    }                                                                                 \
++    static const ZSTD_LazyVTable ZSTD_BtVTable_##dictMode##_##mls = {                 \
++        ZSTD_BtFindBestMatch_##dictMode##_##mls                                       \
++    };
+ 
++#define GEN_ZSTD_HC_VTABLE(dictMode, mls, ...)                                        \
++    static size_t ZSTD_HcFindBestMatch_##dictMode##_##mls(                            \
++            ZSTD_matchState_t* ms,                                                    \
++            const BYTE* ip, const BYTE* const iLimit,                                 \
++            size_t* offsetPtr)                                                        \
++    {                                                                                 \
++        assert(MAX(4, MIN(6, ms->cParams.minMatch)) == mls);                          \
++        return ZSTD_HcFindBestMatch(ms, ip, iLimit, offsetPtr, mls, ZSTD_##dictMode); \
++    }                                                                                 \
++    static const ZSTD_LazyVTable ZSTD_HcVTable_##dictMode##_##mls = {                 \
++        ZSTD_HcFindBestMatch_##dictMode##_##mls                                       \
++    };
+ 
+-static size_t ZSTD_HcFindBestMatch_dictMatchState_selectMLS (
+-                        ZSTD_matchState_t* ms,
+-                        const BYTE* ip, const BYTE* const iLimit,
+-                        size_t* offsetPtr)
+-{
+-    switch(ms->cParams.minMatch)
+-    {
+-    default : /* includes case 3 */
+-    case 4 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 4, ZSTD_dictMatchState);
+-    case 5 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 5, ZSTD_dictMatchState);
+-    case 7 :
+-    case 6 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 6, ZSTD_dictMatchState);
++#define ZSTD_FOR_EACH_MLS(X, dictMode) \
++    X(dictMode, 4)                     \
++    X(dictMode, 5)                     \
++    X(dictMode, 6)
++
++#define ZSTD_FOR_EACH_DICT_MODE(X, ...) \
++    X(__VA_ARGS__, noDict)              \
++    X(__VA_ARGS__, extDict)             \
++    X(__VA_ARGS__, dictMatchState)      \
++    X(__VA_ARGS__, dedicatedDictSearch)
++
++/* Generate Binary Tree VTables for each combination of (dictMode, mls) */
++ZSTD_FOR_EACH_DICT_MODE(ZSTD_FOR_EACH_MLS, GEN_ZSTD_BT_VTABLE)
++/* Generate Hash Chain VTables for each combination of (dictMode, mls) */
++ZSTD_FOR_EACH_DICT_MODE(ZSTD_FOR_EACH_MLS, GEN_ZSTD_HC_VTABLE)
++
++#define GEN_ZSTD_BT_VTABLE_ARRAY(dictMode) \
++    {                                      \
++        &ZSTD_BtVTable_##dictMode##_4,     \
++        &ZSTD_BtVTable_##dictMode##_5,     \
++        &ZSTD_BtVTable_##dictMode##_6      \
+     }
+-}
+-
+ 
+-static size_t ZSTD_HcFindBestMatch_dedicatedDictSearch_selectMLS (
+-                        ZSTD_matchState_t* ms,
+-                        const BYTE* ip, const BYTE* const iLimit,
+-                        size_t* offsetPtr)
+-{
+-    switch(ms->cParams.minMatch)
+-    {
+-    default : /* includes case 3 */
+-    case 4 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 4, ZSTD_dedicatedDictSearch);
+-    case 5 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 5, ZSTD_dedicatedDictSearch);
+-    case 7 :
+-    case 6 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 6, ZSTD_dedicatedDictSearch);
++#define GEN_ZSTD_HC_VTABLE_ARRAY(dictMode) \
++    {                                      \
++        &ZSTD_HcVTable_##dictMode##_4,     \
++        &ZSTD_HcVTable_##dictMode##_5,     \
++        &ZSTD_HcVTable_##dictMode##_6      \
+     }
+-}
+ 
+-
+-FORCE_INLINE_TEMPLATE size_t ZSTD_HcFindBestMatch_extDict_selectMLS (
+-                        ZSTD_matchState_t* ms,
+-                        const BYTE* ip, const BYTE* const iLimit,
+-                        size_t* offsetPtr)
+-{
+-    switch(ms->cParams.minMatch)
+-    {
+-    default : /* includes case 3 */
+-    case 4 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 4, ZSTD_extDict);
+-    case 5 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 5, ZSTD_extDict);
+-    case 7 :
+-    case 6 : return ZSTD_HcFindBestMatch_generic(ms, ip, iLimit, offsetPtr, 6, ZSTD_extDict);
++#define GEN_ZSTD_VTABLE_ARRAY(X) \
++    {                            \
++        X(noDict),               \
++        X(extDict),              \
++        X(dictMatchState),       \
++        X(dedicatedDictSearch)   \
+     }
+-}
+-
+ 
+ /* *******************************
+ *  Common parser - lazy strategy
+ *********************************/
+ typedef enum { search_hashChain, search_binaryTree } searchMethod_e;
+ 
++static ZSTD_LazyVTable const* ZSTD_selectLazyVTable(ZSTD_matchState_t const* ms, searchMethod_e searchMethod, ZSTD_dictMode_e dictMode)
++{
++    /* Fill the Hc/Bt VTable arrays with the right functions for the (dictMode, mls) combination. */
++    ZSTD_LazyVTable const* const hcVTables[4][3] = GEN_ZSTD_VTABLE_ARRAY(GEN_ZSTD_HC_VTABLE_ARRAY);
++    ZSTD_LazyVTable const* const btVTables[4][3] = GEN_ZSTD_VTABLE_ARRAY(GEN_ZSTD_BT_VTABLE_ARRAY);
++    /* Fill the Row VTable array with the right functions for the (dictMode, mls, rowLog) combination. */
++
++    U32 const mls = MAX(4, MIN(6, ms->cParams.minMatch));
++    switch (searchMethod) {
++        case search_hashChain:
++            return hcVTables[dictMode][mls - 4];
++        case search_binaryTree:
++            return btVTables[dictMode][mls - 4];
++        default:
++            return NULL;
++    }
++}
++
+ FORCE_INLINE_TEMPLATE size_t
+ ZSTD_compressBlock_lazy_generic(
+                         ZSTD_matchState_t* ms, seqStore_t* seqStore,
+@@ -870,36 +851,13 @@ ZSTD_compressBlock_lazy_generic(
+     const U32 prefixLowestIndex = ms->window.dictLimit;
+     const BYTE* const prefixLowest = base + prefixLowestIndex;
+ 
+-    typedef size_t (*searchMax_f)(
+-                        ZSTD_matchState_t* ms,
+-                        const BYTE* ip, const BYTE* iLimit, size_t* offsetPtr);
+-
+     /*
+      * This table is indexed first by the four ZSTD_dictMode_e values, and then
+      * by the two searchMethod_e values. NULLs are placed for configurations
+      * that should never occur (extDict modes go to the other implementation
+      * below and there is no DDSS for binary tree search yet).
+      */
+-    const searchMax_f searchFuncs[4][2] = {
+-        {
+-            ZSTD_HcFindBestMatch_selectMLS,
+-            ZSTD_BtFindBestMatch_selectMLS
+-        },
+-        {
+-            NULL,
+-            NULL
+-        },
+-        {
+-            ZSTD_HcFindBestMatch_dictMatchState_selectMLS,
+-            ZSTD_BtFindBestMatch_dictMatchState_selectMLS
+-        },
+-        {
+-            ZSTD_HcFindBestMatch_dedicatedDictSearch_selectMLS,
+-            NULL
+-        }
+-    };
+-
+-    searchMax_f const searchMax = searchFuncs[dictMode][searchMethod == search_binaryTree];
++    searchMax_f const searchMax = ZSTD_selectLazyVTable(ms, searchMethod, dictMode)->searchMax;
+     U32 offset_1 = rep[0], offset_2 = rep[1], savedOffset=0;
+ 
+     const int isDMS = dictMode == ZSTD_dictMatchState;
+@@ -1221,10 +1179,7 @@ size_t ZSTD_compressBlock_lazy_extDict_generic(
+     const BYTE* const dictStart  = dictBase + ms->window.lowLimit;
+     const U32 windowLog = ms->cParams.windowLog;
+ 
+-    typedef size_t (*searchMax_f)(
+-                        ZSTD_matchState_t* ms,
+-                        const BYTE* ip, const BYTE* iLimit, size_t* offsetPtr);
+-    searchMax_f searchMax = searchMethod==search_binaryTree ? ZSTD_BtFindBestMatch_extDict_selectMLS : ZSTD_HcFindBestMatch_extDict_selectMLS;
++    searchMax_f const searchMax = ZSTD_selectLazyVTable(ms, searchMethod, ZSTD_extDict)->searchMax;
+ 
+     U32 offset_1 = rep[0], offset_2 = rep[1];
+ 
 diff --git a/mm/compaction.c b/mm/compaction.c
 index 1f89b969c12b..2462ff734a10 100644
 --- a/mm/compaction.c
