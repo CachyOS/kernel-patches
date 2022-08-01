@@ -1,0 +1,229 @@
+From d05b43059dfa115037cd37bc276a8316391def28 Mon Sep 17 00:00:00 2001
+From: Vincent Donnefort <vincent.donnefort@arm.com>
+Date: Tue, 21 Jun 2022 10:04:08 +0100
+Subject: [PATCH 18/32] sched/fair: Provide u64 read for 32-bits arch helper
+
+Introducing macro helpers u64_u32_{store,load}() to factorize lockless
+accesses to u64 variables for 32-bits architectures.
+
+Users are for now cfs_rq.min_vruntime and sched_avg.last_update_time. To
+accommodate the later where the copy lies outside of the structure
+(cfs_rq.last_udpate_time_copy instead of sched_avg.last_update_time_copy),
+use the _copy() version of those helpers.
+
+Those new helpers encapsulate smp_rmb() and smp_wmb() synchronization and
+therefore, have a small penalty for 32-bits machines in set_task_rq_fair()
+and init_cfs_rq().
+
+Signed-off-by: Vincent Donnefort <vincent.donnefort@arm.com>
+Signed-off-by: Vincent Donnefort <vdonnefort@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Tested-by: Lukasz Luba <lukasz.luba@arm.com>
+Link: https://lkml.kernel.org/r/20220621090414.433602-2-vdonnefort@google.com
+---
+ kernel/sched/fair.c  | 84 ++++++++------------------------------------
+ kernel/sched/sched.h | 41 ++++++++++++++++++++-
+ 2 files changed, 54 insertions(+), 71 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index f80ae86bb404..8dc0903abc82 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -612,11 +612,8 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
+ 	}
+ 
+ 	/* ensure we never gain time by being placed backwards. */
+-	cfs_rq->min_vruntime = max_vruntime(cfs_rq->min_vruntime, vruntime);
+-#ifndef CONFIG_64BIT
+-	smp_wmb();
+-	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+-#endif
++	u64_u32_store(cfs_rq->min_vruntime,
++		      max_vruntime(cfs_rq->min_vruntime, vruntime));
+ }
+ 
+ static inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
+@@ -3348,6 +3345,11 @@ static inline void cfs_rq_util_change(struct cfs_rq *cfs_rq, int flags)
+ }
+ 
+ #ifdef CONFIG_SMP
++static inline u64 cfs_rq_last_update_time(struct cfs_rq *cfs_rq)
++{
++	return u64_u32_load_copy(cfs_rq->avg.last_update_time,
++				 cfs_rq->last_update_time_copy);
++}
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ /*
+  * Because list_add_leaf_cfs_rq always places a child cfs_rq on the list
+@@ -3458,27 +3460,9 @@ void set_task_rq_fair(struct sched_entity *se,
+ 	if (!(se->avg.last_update_time && prev))
+ 		return;
+ 
+-#ifndef CONFIG_64BIT
+-	{
+-		u64 p_last_update_time_copy;
+-		u64 n_last_update_time_copy;
+-
+-		do {
+-			p_last_update_time_copy = prev->load_last_update_time_copy;
+-			n_last_update_time_copy = next->load_last_update_time_copy;
+-
+-			smp_rmb();
+-
+-			p_last_update_time = prev->avg.last_update_time;
+-			n_last_update_time = next->avg.last_update_time;
++	p_last_update_time = cfs_rq_last_update_time(prev);
++	n_last_update_time = cfs_rq_last_update_time(next);
+ 
+-		} while (p_last_update_time != p_last_update_time_copy ||
+-			 n_last_update_time != n_last_update_time_copy);
+-	}
+-#else
+-	p_last_update_time = prev->avg.last_update_time;
+-	n_last_update_time = next->avg.last_update_time;
+-#endif
+ 	__update_load_avg_blocked_se(p_last_update_time, se);
+ 	se->avg.last_update_time = n_last_update_time;
+ }
+@@ -3831,12 +3815,9 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
+ 	}
+ 
+ 	decayed |= __update_load_avg_cfs_rq(now, cfs_rq);
+-
+-#ifndef CONFIG_64BIT
+-	smp_wmb();
+-	cfs_rq->load_last_update_time_copy = sa->last_update_time;
+-#endif
+-
++	u64_u32_store_copy(sa->last_update_time,
++			   cfs_rq->last_update_time_copy,
++			   sa->last_update_time);
+ 	return decayed;
+ }
+ 
+@@ -3968,27 +3949,6 @@ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
+ 	}
+ }
+ 
+-#ifndef CONFIG_64BIT
+-static inline u64 cfs_rq_last_update_time(struct cfs_rq *cfs_rq)
+-{
+-	u64 last_update_time_copy;
+-	u64 last_update_time;
+-
+-	do {
+-		last_update_time_copy = cfs_rq->load_last_update_time_copy;
+-		smp_rmb();
+-		last_update_time = cfs_rq->avg.last_update_time;
+-	} while (last_update_time != last_update_time_copy);
+-
+-	return last_update_time;
+-}
+-#else
+-static inline u64 cfs_rq_last_update_time(struct cfs_rq *cfs_rq)
+-{
+-	return cfs_rq->avg.last_update_time;
+-}
+-#endif
+-
+ /*
+  * Synchronize entity load avg of dequeued entity without locking
+  * the previous rq.
+@@ -6968,21 +6928,8 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ 	if (READ_ONCE(p->__state) == TASK_WAKING) {
+ 		struct sched_entity *se = &p->se;
+ 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
+-		u64 min_vruntime;
+-
+-#ifndef CONFIG_64BIT
+-		u64 min_vruntime_copy;
+-
+-		do {
+-			min_vruntime_copy = cfs_rq->min_vruntime_copy;
+-			smp_rmb();
+-			min_vruntime = cfs_rq->min_vruntime;
+-		} while (min_vruntime != min_vruntime_copy);
+-#else
+-		min_vruntime = cfs_rq->min_vruntime;
+-#endif
+ 
+-		se->vruntime -= min_vruntime;
++		se->vruntime -= u64_u32_load(cfs_rq->min_vruntime);
+ 	}
+ 
+ 	if (p->on_rq == TASK_ON_RQ_MIGRATING) {
+@@ -11508,10 +11455,7 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
+ void init_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
+-	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
+-#ifndef CONFIG_64BIT
+-	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+-#endif
++	u64_u32_store(cfs_rq->min_vruntime, (u64)(-(1LL << 20)));
+ #ifdef CONFIG_SMP
+ 	raw_spin_lock_init(&cfs_rq->removed.lock);
+ #endif
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 02c970501295..8a3c8a0db660 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -520,6 +520,45 @@ struct cfs_bandwidth { };
+ 
+ #endif	/* CONFIG_CGROUP_SCHED */
+ 
++/*
++ * u64_u32_load/u64_u32_store
++ *
++ * Use a copy of a u64 value to protect against data race. This is only
++ * applicable for 32-bits architectures.
++ */
++#ifdef CONFIG_64BIT
++# define u64_u32_load_copy(var, copy)       var
++# define u64_u32_store_copy(var, copy, val) (var = val)
++#else
++# define u64_u32_load_copy(var, copy)					\
++({									\
++	u64 __val, __val_copy;						\
++	do {								\
++		__val_copy = copy;					\
++		/*							\
++		 * paired with u64_u32_store_copy(), ordering access	\
++		 * to var and copy.					\
++		 */							\
++		smp_rmb();						\
++		__val = var;						\
++	} while (__val != __val_copy);					\
++	__val;								\
++})
++# define u64_u32_store_copy(var, copy, val)				\
++do {									\
++	typeof(val) __val = (val);					\
++	var = __val;							\
++	/*								\
++	 * paired with u64_u32_load_copy(), ordering access to var and	\
++	 * copy.							\
++	 */								\
++	smp_wmb();							\
++	copy = __val;							\
++} while (0)
++#endif
++# define u64_u32_load(var)      u64_u32_load_copy(var, var##_copy)
++# define u64_u32_store(var, val) u64_u32_store_copy(var, var##_copy, val)
++
+ /* CFS-related fields in a runqueue */
+ struct cfs_rq {
+ 	struct load_weight	load;
+@@ -560,7 +599,7 @@ struct cfs_rq {
+ 	 */
+ 	struct sched_avg	avg;
+ #ifndef CONFIG_64BIT
+-	u64			load_last_update_time_copy;
++	u64			last_update_time_copy;
+ #endif
+ 	struct {
+ 		raw_spinlock_t	lock ____cacheline_aligned;
+-- 
+2.37.1
+
