@@ -1,7 +1,7 @@
-From 037df3acf47a14a9fd9502267c796251bc7c3a49 Mon Sep 17 00:00:00 2001
+From 496ab7169fa35349edc372e056f7b5be8f48f94a Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Tue, 9 Aug 2022 13:32:48 +0200
-Subject: [PATCH 03/17] sched
+Date: Fri, 12 Aug 2022 16:56:51 +0200
+Subject: [PATCH 03/16] sched
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -16,21 +16,21 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/cgroup/rstat.c                     |  44 +-
  kernel/exit.c                             |   2 +-
  kernel/rseq.c                             |  23 +-
- kernel/sched/core.c                       | 238 +++---
+ kernel/sched/core.c                       | 239 +++---
  kernel/sched/core_sched.c                 |  15 +-
  kernel/sched/cpudeadline.c                |   2 +-
  kernel/sched/cpufreq_schedutil.c          |   5 +-
- kernel/sched/cputime.c                    |  15 +
+ kernel/sched/cputime.c                    |  48 +-
  kernel/sched/deadline.c                   |  34 +-
  kernel/sched/fair.c                       | 918 ++++++++++++++--------
  kernel/sched/features.h                   |   5 +-
  kernel/sched/pelt.h                       |  40 +-
  kernel/sched/rt.c                         |  19 +-
- kernel/sched/sched.h                      | 106 ++-
+ kernel/sched/sched.h                      | 112 ++-
  kernel/sched/topology.c                   |  23 +-
  tools/testing/selftests/rseq/rseq-riscv.h |  50 +-
  tools/testing/selftests/rseq/rseq.c       |   3 +-
- 25 files changed, 1036 insertions(+), 572 deletions(-)
+ 25 files changed, 1075 insertions(+), 573 deletions(-)
 
 diff --git a/drivers/powercap/dtpm_cpu.c b/drivers/powercap/dtpm_cpu.c
 index f5eced0842b3..6a88eb7e9f75 100644
@@ -390,7 +390,7 @@ index 97ac20b4f738..bda8175f8f99 100644
  
  static int clear_rseq_cs(struct task_struct *t)
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index da0bf6fe9ecd..3890cd2b4326 100644
+index da0bf6fe9ecd..cd351fa3b8f6 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -873,15 +873,11 @@ static inline void hrtick_rq_init(struct rq *rq)
@@ -796,7 +796,15 @@ index da0bf6fe9ecd..3890cd2b4326 100644
  
  		rq_attach_root(rq, &def_root_domain);
  #ifdef CONFIG_NO_HZ_COMMON
-@@ -10513,6 +10553,12 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota,
+@@ -9688,6 +9728,7 @@ void __init sched_init(void)
+ 
+ 		rq->core_cookie = 0UL;
+ #endif
++		cputime_cpu_init(i);
+ 	}
+ 
+ 	set_load_weight(&init_task, false);
+@@ -10513,6 +10554,12 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota,
  				     burst + quota > max_cfs_runtime))
  		return -EINVAL;
  
@@ -809,7 +817,7 @@ index da0bf6fe9ecd..3890cd2b4326 100644
  	/*
  	 * Prevent race between setting of cfs_rq->runtime_enabled and
  	 * unthrottle_offline_cfs_rqs().
-@@ -10572,8 +10618,10 @@ static int tg_set_cfs_quota(struct task_group *tg, long cfs_quota_us)
+@@ -10572,8 +10619,10 @@ static int tg_set_cfs_quota(struct task_group *tg, long cfs_quota_us)
  
  	period = ktime_to_ns(tg->cfs_bandwidth.period);
  	burst = tg->cfs_bandwidth.burst;
@@ -898,7 +906,7 @@ index 3dbf351d12d5..1207c78f85c1 100644
  }
  
 diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
-index 78a233d43757..95fc77853743 100644
+index 78a233d43757..ba3bcb40795e 100644
 --- a/kernel/sched/cputime.c
 +++ b/kernel/sched/cputime.c
 @@ -226,6 +226,21 @@ void account_idle_time(u64 cputime)
@@ -923,6 +931,54 @@ index 78a233d43757..95fc77853743 100644
  /*
   * When a guest is interrupted for a longer amount of time, missed clock
   * ticks are not redelivered later. Due to that, this function may on
+@@ -1045,6 +1060,19 @@ static int kcpustat_cpu_fetch_vtime(struct kernel_cpustat *dst,
+ 	return 0;
+ }
+ 
++/*
++ * Stores the time of the last acquisition, which is used to handle the case of
++ * time backwards.
++ */
++static DEFINE_PER_CPU(struct kernel_cpustat, cpustat_prev);
++static DEFINE_PER_CPU(raw_spinlock_t, cpustat_prev_lock);
++
++void cputime_cpu_init(int cpu)
++{
++	raw_spin_lock_init(per_cpu_ptr(&cpustat_prev_lock, cpu));
++}
++
++
+ void kcpustat_cpu_fetch(struct kernel_cpustat *dst, int cpu)
+ {
+ 	const struct kernel_cpustat *src = &kcpustat_cpu(cpu);
+@@ -1072,8 +1100,26 @@ void kcpustat_cpu_fetch(struct kernel_cpustat *dst, int cpu)
+ 		err = kcpustat_cpu_fetch_vtime(dst, src, curr, cpu);
+ 		rcu_read_unlock();
+ 
+-		if (!err)
++		if (!err) {
++			int i;
++			int map[5] = {CPUTIME_USER, CPUTIME_SYSTEM, CPUTIME_NICE,
++				CPUTIME_GUEST, CPUTIME_GUEST_NICE};
++			struct kernel_cpustat *prev = &per_cpu(cpustat_prev, cpu);
++			raw_spinlock_t *cpustat_lock = &per_cpu(cpustat_prev_lock, cpu);
++			u64 *dst_stat = dst->cpustat;
++			u64 *prev_stat = prev->cpustat;
++
++			raw_spin_lock(cpustat_lock);
++			for (i = 0; i < 5; i++) {
++				int idx = map[i];
++
++				if (dst_stat[idx] < prev_stat[idx])
++					dst_stat[idx] = prev_stat[idx];
++			}
++			*prev = *dst;
++			raw_spin_unlock(cpustat_lock);
+ 			return;
++		}
+ 
+ 		cpu_relax();
+ 	}
 diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
 index 7bf561262cb8..1d9c90958baa 100644
 --- a/kernel/sched/deadline.c
@@ -2747,7 +2803,7 @@ index 8c9ed9664840..054b6711e961 100644
  		ret = cpupri_find_fitness(&task_rq(task)->rd->cpupri,
  					  task, lowest_mask,
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 47b89a0fc6e5..f661fa52cbc2 100644
+index 47b89a0fc6e5..16c090dfefed 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -320,21 +320,6 @@ struct dl_bw {
@@ -2935,6 +2991,17 @@ index 47b89a0fc6e5..f661fa52cbc2 100644
  static inline unsigned long cpu_bw_dl(struct rq *rq)
  {
  	return (rq->dl.running_bw * SCHED_CAPACITY_SCALE) >> BW_SHIFT;
+@@ -3116,4 +3162,10 @@ extern int sched_dynamic_mode(const char *str);
+ extern void sched_dynamic_update(int mode);
+ #endif
+ 
++#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
++extern void cputime_cpu_init(int cpu);
++#else
++static inline void cputime_cpu_init(int cpu) {}
++#endif
++
+ #endif /* _KERNEL_SCHED_SCHED_H */
 diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
 index 05b6c2ad90b9..8739c2a5a54e 100644
 --- a/kernel/sched/topology.c
@@ -3142,5 +3209,5 @@ index 986b9458efb2..4177f9507bbe 100644
  		rseq_offset = *libc_rseq_offset_p;
  		rseq_size = *libc_rseq_size_p;
 -- 
-2.37.1
+2.37.2
 
