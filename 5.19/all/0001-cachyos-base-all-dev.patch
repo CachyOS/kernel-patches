@@ -3297,7 +3297,7 @@ index 50bba370486e..e873a768f9e8 100644
 -- 
 2.37.2
 
-From 077cd3230b4e0dbefc8643e0fc5015b5935ee518 Mon Sep 17 00:00:00 2001
+From dfe9624eea66b4170d3d8360ef60ea52f2a96f5e Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Mon, 15 Aug 2022 20:48:01 +0200
 Subject: [PATCH 02/16] cachy
@@ -3344,6 +3344,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  arch/x86/entry/syscalls/syscall_32.tbl        |   1 +
  arch/x86/entry/syscalls/syscall_64.tbl        |   1 +
  arch/x86/include/asm/bitops.h                 |  76 ++--
+ arch/x86/include/asm/mwait.h                  |   1 +
  arch/x86/include/asm/topology.h               |   1 +
  arch/x86/include/asm/vdso/processor.h         |   2 +-
  arch/x86/include/asm/vermagic.h               |  66 +++
@@ -3353,6 +3354,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  arch/x86/kernel/cpu/microcode/intel.c         |  14 +-
  arch/x86/kernel/itmt.c                        |  29 +-
  arch/x86/kernel/msr.c                         |   2 +-
+ arch/x86/kernel/process.c                     |  35 +-
  arch/x86/kernel/tsc.c                         |   3 +
  arch/x86/mm/fault.c                           |   4 +-
  arch/x86/mm/pkeys.c                           |  15 +-
@@ -3540,7 +3542,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  tools/testing/selftests/vm/.gitignore         |   1 +
  tools/testing/selftests/vm/Makefile           |   1 +
  tools/testing/selftests/vm/test-ksm-auto.c    | 273 ++++++++++++
- 236 files changed, 4255 insertions(+), 3284 deletions(-)
+ 238 files changed, 4281 insertions(+), 3294 deletions(-)
  create mode 100644 include/asm-generic/bitops/generic-non-atomic.h
  create mode 100644 include/asm-generic/bitops/non-instrumented-non-atomic.h
  create mode 100644 include/linux/gfp_types.h
@@ -5679,6 +5681,18 @@ index a288ecd230ab..95343716ebc1 100644
  /**
   * fls - find last set bit in word
   * @x: the word to search
+diff --git a/arch/x86/include/asm/mwait.h b/arch/x86/include/asm/mwait.h
+index 29dd27b5a339..3a8fdf881313 100644
+--- a/arch/x86/include/asm/mwait.h
++++ b/arch/x86/include/asm/mwait.h
+@@ -13,6 +13,7 @@
+ #define MWAIT_SUBSTATE_SIZE		4
+ #define MWAIT_HINT2CSTATE(hint)		(((hint) >> MWAIT_SUBSTATE_SIZE) & MWAIT_CSTATE_MASK)
+ #define MWAIT_HINT2SUBSTATE(hint)	((hint) & MWAIT_CSTATE_MASK)
++#define MWAIT_C1_SUBSTATE_MASK  0xf0
+ 
+ #define CPUID_MWAIT_LEAF		5
+ #define CPUID5_ECX_EXTENSIONS_SUPPORTED 0x1
 diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
 index 458c891a8273..d86eb1ebf59f 100644
 --- a/arch/x86/include/asm/topology.h
@@ -6029,6 +6043,64 @@ index ed8ac6bcbafb..d6fc5bdb0246 100644
  
  static ssize_t msr_read(struct file *file, char __user *buf,
  			size_t count, loff_t *ppos)
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 9346c95e8879..58a6ea472db9 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -810,28 +810,43 @@ static void amd_e400_idle(void)
+ }
+ 
+ /*
+- * Intel Core2 and older machines prefer MWAIT over HALT for C1.
+- * We can't rely on cpuidle installing MWAIT, because it will not load
+- * on systems that support only C1 -- so the boot default must be MWAIT.
++ * Prefer MWAIT over HALT if MWAIT is supported, MWAIT_CPUID leaf
++ * exists and whenever MONITOR/MWAIT extensions are present there is at
++ * least one C1 substate.
+  *
+- * Some AMD machines are the opposite, they depend on using HALT.
+- *
+- * So for default C1, which is used during boot until cpuidle loads,
+- * use MWAIT-C1 on Intel HW that has it, else use HALT.
++ * Do not prefer MWAIT if MONITOR instruction has a bug or idle=nomwait
++ * is passed to kernel commandline parameter.
+  */
+ static int prefer_mwait_c1_over_halt(const struct cpuinfo_x86 *c)
+ {
++	u32 eax, ebx, ecx, edx;
++
+ 	/* User has disallowed the use of MWAIT. Fallback to HALT */
+ 	if (boot_option_idle_override == IDLE_NOMWAIT)
+ 		return 0;
+ 
+-	if (c->x86_vendor != X86_VENDOR_INTEL)
++	/* MWAIT is not supported on this platform. Fallback to HALT */
++	if (!cpu_has(c, X86_FEATURE_MWAIT))
+ 		return 0;
+ 
+-	if (!cpu_has(c, X86_FEATURE_MWAIT) || boot_cpu_has_bug(X86_BUG_MONITOR))
++	/* Monitor has a bug. Fallback to HALT */
++	if (boot_cpu_has_bug(X86_BUG_MONITOR))
+ 		return 0;
+ 
+-	return 1;
++	cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &edx);
++
++	/*
++	 * If MWAIT extensions are not available, it is safe to use MWAIT
++	 * with EAX=0, ECX=0.
++	 */
++	if (!(ecx & CPUID5_ECX_EXTENSIONS_SUPPORTED))
++		return 1;
++
++	/*
++	 * If MWAIT extensions are available, there should be at least one
++	 * MWAIT C1 substate present.
++	 */
++	return (edx & MWAIT_C1_SUBSTATE_MASK);
+ }
+ 
+ /*
 diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
 index cafacb2e58cc..c2f80184fd33 100644
 --- a/arch/x86/kernel/tsc.c
@@ -17781,7 +17853,7 @@ index 000000000000..0d71593e008e
 -- 
 2.37.2
 
-From 2366c4c4da163db067477a4589246c39f7b4c5ab Mon Sep 17 00:00:00 2001
+From c00d92d9cd190fca02f285d1302b7d4d755dd4fa Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Mon, 15 Aug 2022 20:54:51 +0200
 Subject: [PATCH 03/16] sched
@@ -20214,7 +20286,7 @@ index 986b9458efb2..4177f9507bbe 100644
 -- 
 2.37.2
 
-From b1baa1e9ae90dc6e7066e23539c61260ae8a0936 Mon Sep 17 00:00:00 2001
+From 6a8339a3fdad1d04995a81d419e5362bb8cab9f9 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 5 Aug 2022 19:32:17 +0200
 Subject: [PATCH 04/16] Extend-DAMOS-for-Proactive-LRU-lists-Sorting
@@ -21462,7 +21534,7 @@ index 09f9e8ca3d1f..0f65db55fa28 100644
 -- 
 2.37.2
 
-From cd4de3fd34e34b74873fc1fa58f8a62dbd7dab27 Mon Sep 17 00:00:00 2001
+From 9607dc37ca0832b42df9ffd329663a9f3a3bc18c Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Tue, 9 Aug 2022 13:34:11 +0200
 Subject: [PATCH 05/16] fixes
@@ -24288,7 +24360,7 @@ index 39f39ed3c94c..38bbc486baaf 100644
 -- 
 2.37.2
 
-From a75f5c2fb18e6f4e23378b0ecec4072e52180a50 Mon Sep 17 00:00:00 2001
+From 152ca6c076e642aa9e0f74611ce7cb503695dac6 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Mon, 15 Aug 2022 20:55:30 +0200
 Subject: [PATCH 06/16] fs-patches
@@ -45370,7 +45442,7 @@ index 1a692997fac4..e32083e4ce0d 100644
 -- 
 2.37.2
 
-From 5b84cc1cd88faa1e58eb3cae98eab98ee0a8debe Mon Sep 17 00:00:00 2001
+From 9bea09ff65eaafb8476cb041f7a83e48bdf5c53c Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 5 Aug 2022 19:33:12 +0200
 Subject: [PATCH 07/16] futex-winesync
@@ -48916,7 +48988,7 @@ index 000000000000..169e922484b0
 -- 
 2.37.2
 
-From 9e7de058ca159286cb87f40a5a148dfed32edc34 Mon Sep 17 00:00:00 2001
+From 66e27c89b5859acfe5eb4181005119010a8db5ba Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 5 Aug 2022 19:33:31 +0200
 Subject: [PATCH 08/16] hwmon
@@ -55236,7 +55308,7 @@ index 8bd6435c13e8..42762e87b014 100644
 -- 
 2.37.2
 
-From 5d53f06b6d5a42b15eaf86d1edd58819f3b7d874 Mon Sep 17 00:00:00 2001
+From 478bad825db0bdb62d355e4eb32ddd993c22d713 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 5 Aug 2022 19:33:47 +0200
 Subject: [PATCH 09/16] Introducing-OpenVPN-Data-Channel-Offload
@@ -61403,7 +61475,7 @@ index 4828794efcf8..8008c762e6b8 100644
 -- 
 2.37.2
 
-From b02ea618de93902ed1075c6f839ccfceb723b019 Mon Sep 17 00:00:00 2001
+From 0c9c3cfcf77951f2bb1841f84117196047efa4df Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 14 Aug 2022 11:11:23 +0200
 Subject: [PATCH 10/16] kbuild-module
@@ -63353,7 +63425,7 @@ index 7c477ca7dc98..8fa7c5b8a1a1 100755
 -- 
 2.37.2
 
-From cd940ac970923867704ab75cac98ce48d0d6aade Mon Sep 17 00:00:00 2001
+From 918f3bdcffe38624f2d3a38756c6fda8ec94c5db Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Tue, 9 Aug 2022 13:35:16 +0200
 Subject: [PATCH 11/16] ksmbd
@@ -64388,7 +64460,7 @@ index c4d59d2735f0..da9163b00350 100644
 -- 
 2.37.2
 
-From 68d12ada7d761135bab8d128c091d61312055fda Mon Sep 17 00:00:00 2001
+From 6128e6766951ec6508d8a9a38aaeebab28ccaa9a Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Mon, 15 Aug 2022 20:56:01 +0200
 Subject: [PATCH 12/16] lrng
@@ -74989,7 +75061,7 @@ index c7ec85abbe56..5defc80b0d4e 100644
 -- 
 2.37.2
 
-From 671addcb3a01a294d84f71005d24dbb1d99a866e Mon Sep 17 00:00:00 2001
+From 11b3b95f3f7b365728737c539d4ac36e179639b3 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Tue, 9 Aug 2022 13:35:54 +0200
 Subject: [PATCH 13/16] lru
@@ -80370,7 +80442,7 @@ index 592569a8974c..84a9e0ab04ad 100644
 -- 
 2.37.2
 
-From fc86079ecf5730906700f06f7580f6663fa1adab Mon Sep 17 00:00:00 2001
+From 3b08798aa1f71f7cdcbe720c02ec571dda852016 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 5 Aug 2022 19:35:01 +0200
 Subject: [PATCH 14/16] misc
@@ -81508,7 +81580,7 @@ index f62770a0a84f..2dda88a30554 100644
 -- 
 2.37.2
 
-From 367e25151aca7010626533349a3666fafae5342a Mon Sep 17 00:00:00 2001
+From ff2699c364d63edfd6ee62ea1100a8779ef24a7c Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 5 Aug 2022 19:35:13 +0200
 Subject: [PATCH 15/16] perf
@@ -82064,7 +82136,7 @@ index fb35b926024c..726132039c38 100644
 -- 
 2.37.2
 
-From fbff10ad53b907158f9954a2cee8a25406e2b863 Mon Sep 17 00:00:00 2001
+From 84930ae91d866c343c87801a176736cebcbda86f Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 5 Aug 2022 19:35:26 +0200
 Subject: [PATCH 16/16] rcu
