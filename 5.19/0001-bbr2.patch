@@ -1,30 +1,107 @@
-From 5a518cecc68db92da62b82965e3a2ed7cd14bf7b Mon Sep 17 00:00:00 2001
+From 4176f0dc1ae42a9e2a4a8ff7c85265675c2a2971 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sun, 14 Aug 2022 10:55:13 +0200
-Subject: [PATCH 01/16] bbr2
+Date: Fri, 19 Aug 2022 16:56:10 +0200
+Subject: [PATCH 01/17] bbr2
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- include/linux/tcp.h                |    3 +-
- include/net/inet_connection_sock.h |    3 +-
- include/net/tcp.h                  |   41 +-
- include/uapi/linux/inet_diag.h     |   33 +
- net/ipv4/Kconfig                   |   22 +
- net/ipv4/Makefile                  |    1 +
- net/ipv4/bpf_tcp_ca.c              |    2 +-
- net/ipv4/tcp.c                     |    1 +
- net/ipv4/tcp_bbr.c                 |   38 +-
- net/ipv4/tcp_bbr2.c                | 2674 ++++++++++++++++++++++++++++
- net/ipv4/tcp_cong.c                |    1 +
- net/ipv4/tcp_input.c               |   27 +-
- net/ipv4/tcp_output.c              |   26 +-
- net/ipv4/tcp_rate.c                |   30 +-
- net/ipv4/tcp_timer.c               |    1 +
- 15 files changed, 2868 insertions(+), 35 deletions(-)
+ Documentation/networking/ip-sysctl.rst |   58 +
+ include/linux/tcp.h                    |    6 +-
+ include/net/inet_connection_sock.h     |    3 +-
+ include/net/netns/ipv4.h               |    5 +
+ include/net/tcp.h                      |   58 +-
+ include/uapi/linux/inet_diag.h         |   33 +
+ include/uapi/linux/snmp.h              |    1 +
+ net/ipv4/Kconfig                       |   22 +
+ net/ipv4/Makefile                      |    3 +-
+ net/ipv4/bpf_tcp_ca.c                  |    2 +-
+ net/ipv4/proc.c                        |    1 +
+ net/ipv4/sysctl_net_ipv4.c             |   43 +
+ net/ipv4/tcp.c                         |    1 +
+ net/ipv4/tcp_bbr.c                     |   38 +-
+ net/ipv4/tcp_bbr2.c                    | 2692 ++++++++++++++++++++++++
+ net/ipv4/tcp_cong.c                    |    1 +
+ net/ipv4/tcp_input.c                   |   27 +-
+ net/ipv4/tcp_ipv4.c                    |    7 +
+ net/ipv4/tcp_output.c                  |   26 +-
+ net/ipv4/tcp_plb.c                     |  100 +
+ net/ipv4/tcp_rate.c                    |   30 +-
+ net/ipv4/tcp_timer.c                   |    1 +
+ 22 files changed, 3122 insertions(+), 36 deletions(-)
  create mode 100644 net/ipv4/tcp_bbr2.c
+ create mode 100644 net/ipv4/tcp_plb.c
 
+diff --git a/Documentation/networking/ip-sysctl.rst b/Documentation/networking/ip-sysctl.rst
+index d7a1bf1a55b5..8fdacb84591d 100644
+--- a/Documentation/networking/ip-sysctl.rst
++++ b/Documentation/networking/ip-sysctl.rst
+@@ -1021,6 +1021,64 @@ tcp_challenge_ack_limit - INTEGER
+ 	in RFC 5961 (Improving TCP's Robustness to Blind In-Window Attacks)
+ 	Default: 1000
+ 
++tcp_plb_enabled - BOOLEAN
++	If set, TCP PLB (Protective Load Balancing) is enabled. PLB is
++	described in the following paper:
++	https://doi.org/10.1145/3544216.3544226. Based on PLB parameters,
++	upon sensing sustained congestion, TCP triggers a change in
++	flow label field for outgoing IPv6 packets. A change in flow label
++	field potentially changes the path of outgoing packets for switches
++	that use ECMP/WCMP for routing.
++
++	Default: 0
++
++tcp_plb_cong_thresh - INTEGER
++	Fraction of packets marked with congestion over a round (RTT) to
++	tag that round as congested. This is referred to as K in the PLB paper:
++	https://doi.org/10.1145/3544216.3544226.
++
++	The 0-1 fraction range is mapped to 0-256 range to avoid floating
++	point operations. For example, 128 means that if at least 50% of
++	the packets in a round were marked as congested then the round
++	will be tagged as congested.
++
++	Possible Values: 0 - 256
++
++	Default: 128
++
++tcp_plb_idle_rehash_rounds - INTEGER
++	Number of consecutive congested rounds (RTT) seen after which
++	a rehash can be performed, given there are no packets in flight.
++	This is referred to as M in PLB paper:
++	https://doi.org/10.1145/3544216.3544226.
++
++	Possible Values: 0 - 31
++
++	Default: 3
++
++tcp_plb_rehash_rounds - INTEGER
++	Number of consecutive congested rounds (RTT) seen after which
++	a forced rehash can be performed. Be careful when setting this
++	parameter, as a small value increases the risk of retransmissions.
++	This is referred to as N in PLB paper:
++	https://doi.org/10.1145/3544216.3544226.
++
++	Possible Values: 0 - 31
++
++	Default: 12
++
++tcp_plb_suspend_rto_sec - INTEGER
++	Time, in seconds, to suspend PLB in event of an RTO. In order to avoid
++	having PLB repath onto a connectivity "black hole", after an RTO a TCP
++	connection suspends PLB repathing for a random duration between 1x and
++	2x of this parameter. Randomness is added to avoid concurrent rehashing
++	of multiple TCP connections. This should be set corresponding to the
++	amount of time it takes to repair a failed link.
++
++	Possible Values: 0 - 255
++
++	Default: 60
++
+ UDP variables
+ =============
+ 
 diff --git a/include/linux/tcp.h b/include/linux/tcp.h
-index 1168302b7927..138c1e6f161a 100644
+index 1168302b7927..f76a121c8c08 100644
 --- a/include/linux/tcp.h
 +++ b/include/linux/tcp.h
 @@ -225,7 +225,8 @@ struct tcp_sock {
@@ -37,8 +114,18 @@ index 1168302b7927..138c1e6f161a 100644
  	u32	chrono_start;	/* Start time in jiffies of a TCP chrono */
  	u32	chrono_stat[3];	/* Time in jiffies for chrono_stat stats */
  	u8	chrono_type:2,	/* current chronograph type */
+@@ -413,6 +414,9 @@ struct tcp_sock {
+ 	 */
+ 	struct request_sock __rcu *fastopen_rsk;
+ 	struct saved_syn *saved_syn;
++
++/* Rerouting information */
++	u16	ecn_rehash;	/* PLB triggered rehash attempts */
+ };
+ 
+ enum tsq_enum {
 diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
-index ee88f0f1350f..1412edffa9a0 100644
+index ee88f0f1350f..e3075b3f1ece 100644
 --- a/include/net/inet_connection_sock.h
 +++ b/include/net/inet_connection_sock.h
 @@ -132,7 +132,8 @@ struct inet_connection_sock {
@@ -47,12 +134,28 @@ index ee88f0f1350f..1412edffa9a0 100644
  
 -	u64			  icsk_ca_priv[104 / sizeof(u64)];
 +/* XXX inflated by temporary internal debugging info */
-+	u64			  icsk_ca_priv[216 / sizeof(u64)];
++	u64			  icsk_ca_priv[224 / sizeof(u64)];
  #define ICSK_CA_PRIV_SIZE	  sizeof_field(struct inet_connection_sock, icsk_ca_priv)
  };
  
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index ce0cc4e8d8c7..e42f765c3cd8 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -178,6 +178,11 @@ struct netns_ipv4 {
+ 	unsigned int sysctl_tcp_fastopen_blackhole_timeout;
+ 	atomic_t tfo_active_disable_times;
+ 	unsigned long tfo_active_disable_stamp;
++	u8 sysctl_tcp_plb_enabled;
++	int sysctl_tcp_plb_cong_thresh;
++	u8 sysctl_tcp_plb_idle_rehash_rounds;
++	u8 sysctl_tcp_plb_rehash_rounds;
++	u8 sysctl_tcp_plb_suspend_rto_sec;
+ 
+ 	int sysctl_udp_wmem_min;
+ 	int sysctl_udp_rmem_min;
 diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 78a64e1b33a7..21775ebe90ca 100644
+index 78a64e1b33a7..d5659694e4c2 100644
 --- a/include/net/tcp.h
 +++ b/include/net/tcp.h
 @@ -370,6 +370,7 @@ static inline void tcp_dec_quickack_mode(struct sock *sk,
@@ -162,6 +265,30 @@ index 78a64e1b33a7..21775ebe90ca 100644
  void tcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb);
  void tcp_rate_skb_delivered(struct sock *sk, struct sk_buff *skb,
  			    struct rate_sample *rs);
+@@ -2124,6 +2155,23 @@ extern void tcp_rack_advance(struct tcp_sock *tp, u8 sacked, u32 end_seq,
+ extern void tcp_rack_reo_timeout(struct sock *sk);
+ extern void tcp_rack_update_reo_wnd(struct sock *sk, struct rate_sample *rs);
+ 
++/* tcp_plb.c */
++
++#define TCP_PLB_SCALE 8	/* scaling factor for fractions in PLB (e.g. ce_ratio) */
++
++/* State for PLB (Protective Load Balancing) for a single TCP connection. */
++struct tcp_plb_state {
++	u8	consec_cong_rounds:5, /* consecutive congested rounds */
++		enabled:1,	/* Check if PLB is enabled */
++		unused:2;
++	u32	pause_until; /* jiffies32 when PLB can resume repathing */
++};
++
++void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
++			  const int cong_ratio);
++void tcp_plb_check_rehash(struct sock *sk, struct tcp_plb_state *plb);
++void tcp_plb_update_state_upon_rto(struct sock *sk, struct tcp_plb_state *plb);
++
+ /* At how many usecs into the future should the RTO fire? */
+ static inline s64 tcp_rto_delta_us(const struct sock *sk)
+ {
 diff --git a/include/uapi/linux/inet_diag.h b/include/uapi/linux/inet_diag.h
 index 20ee93f0f876..96d52dd9c48a 100644
 --- a/include/uapi/linux/inet_diag.h
@@ -209,6 +336,18 @@ index 20ee93f0f876..96d52dd9c48a 100644
 +	struct tcp_bbr2_info	bbr2;
  };
  #endif /* _UAPI_INET_DIAG_H_ */
+diff --git a/include/uapi/linux/snmp.h b/include/uapi/linux/snmp.h
+index 904909d020e2..9b3a92244950 100644
+--- a/include/uapi/linux/snmp.h
++++ b/include/uapi/linux/snmp.h
+@@ -292,6 +292,7 @@ enum
+ 	LINUX_MIB_TCPDSACKIGNOREDDUBIOUS,	/* TCPDSACKIgnoredDubious */
+ 	LINUX_MIB_TCPMIGRATEREQSUCCESS,		/* TCPMigrateReqSuccess */
+ 	LINUX_MIB_TCPMIGRATEREQFAILURE,		/* TCPMigrateReqFailure */
++	LINUX_MIB_TCPECNREHASH,			/* TCPECNRehash */
+ 	__LINUX_MIB_MAX
+ };
+ 
 diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
 index e983bb0c5012..d172ffbdf27f 100644
 --- a/net/ipv4/Kconfig
@@ -257,9 +396,18 @@ index e983bb0c5012..d172ffbdf27f 100644
  
  config TCP_MD5SIG
 diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
-index bbdd9c44f14e..8dee1547d820 100644
+index bbdd9c44f14e..e7a86a50838a 100644
 --- a/net/ipv4/Makefile
 +++ b/net/ipv4/Makefile
+@@ -10,7 +10,7 @@ obj-y     := route.o inetpeer.o protocol.o \
+ 	     tcp.o tcp_input.o tcp_output.o tcp_timer.o tcp_ipv4.o \
+ 	     tcp_minisocks.o tcp_cong.o tcp_metrics.o tcp_fastopen.o \
+ 	     tcp_rate.o tcp_recovery.o tcp_ulp.o \
+-	     tcp_offload.o datagram.o raw.o udp.o udplite.o \
++	     tcp_offload.o tcp_plb.o datagram.o raw.o udp.o udplite.o \
+ 	     udp_offload.o arp.o icmp.o devinet.o af_inet.o igmp.o \
+ 	     fib_frontend.o fib_semantics.o fib_trie.o fib_notifier.o \
+ 	     inet_fragment.o ping.o ip_tunnel_core.o gre_offload.o \
 @@ -46,6 +46,7 @@ obj-$(CONFIG_INET_TCP_DIAG) += tcp_diag.o
  obj-$(CONFIG_INET_UDP_DIAG) += udp_diag.o
  obj-$(CONFIG_INET_RAW_DIAG) += raw_diag.o
@@ -281,6 +429,79 @@ index f79ab942f03b..389f4c874f87 100644
  	offsetof(struct tcp_congestion_ops, sndbuf_expand),
  	offsetof(struct tcp_congestion_ops, cong_control),
  };
+diff --git a/net/ipv4/proc.c b/net/ipv4/proc.c
+index 0088a4c64d77..e0a664b467e0 100644
+--- a/net/ipv4/proc.c
++++ b/net/ipv4/proc.c
+@@ -297,6 +297,7 @@ static const struct snmp_mib snmp4_net_list[] = {
+ 	SNMP_MIB_ITEM("TCPDSACKIgnoredDubious", LINUX_MIB_TCPDSACKIGNOREDDUBIOUS),
+ 	SNMP_MIB_ITEM("TCPMigrateReqSuccess", LINUX_MIB_TCPMIGRATEREQSUCCESS),
+ 	SNMP_MIB_ITEM("TCPMigrateReqFailure", LINUX_MIB_TCPMIGRATEREQFAILURE),
++	SNMP_MIB_ITEM("TCPECNRehash", LINUX_MIB_TCPECNREHASH),
+ 	SNMP_MIB_SENTINEL
+ };
+ 
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 5490c285668b..ed35a9485e71 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -39,6 +39,8 @@ static u32 u32_max_div_HZ = UINT_MAX / HZ;
+ static int one_day_secs = 24 * 3600;
+ static u32 fib_multipath_hash_fields_all_mask __maybe_unused =
+ 	FIB_MULTIPATH_HASH_FIELD_ALL_MASK;
++static int tcp_plb_max_rounds = 31;
++static int tcp_plb_max_cong_thresh = 256;
+ 
+ /* obsolete */
+ static int sysctl_tcp_low_latency __read_mostly;
+@@ -1346,6 +1348,47 @@ static struct ctl_table ipv4_net_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_TWO,
+ 	},
++	{
++		.procname       = "tcp_plb_enabled",
++		.data           = &init_net.ipv4.sysctl_tcp_plb_enabled,
++		.maxlen         = sizeof(u8),
++		.mode           = 0644,
++		.proc_handler   = proc_dou8vec_minmax,
++		.extra1         = SYSCTL_ZERO,
++		.extra2         = SYSCTL_ONE,
++	},
++	{
++		.procname       = "tcp_plb_cong_thresh",
++		.data           = &init_net.ipv4.sysctl_tcp_plb_cong_thresh,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec_minmax,
++		.extra1         = SYSCTL_ZERO,
++		.extra2         = &tcp_plb_max_cong_thresh,
++	},
++	{
++		.procname       = "tcp_plb_idle_rehash_rounds",
++		.data           = &init_net.ipv4.sysctl_tcp_plb_idle_rehash_rounds,
++		.maxlen         = sizeof(u8),
++		.mode           = 0644,
++		.proc_handler   = proc_dou8vec_minmax,
++		.extra2		= &tcp_plb_max_rounds,
++	},
++	{
++		.procname       = "tcp_plb_rehash_rounds",
++		.data           = &init_net.ipv4.sysctl_tcp_plb_rehash_rounds,
++		.maxlen         = sizeof(u8),
++		.mode           = 0644,
++		.proc_handler   = proc_dou8vec_minmax,
++		.extra2         = &tcp_plb_max_rounds,
++	},
++	{
++		.procname       = "tcp_plb_suspend_rto_sec",
++		.data           = &init_net.ipv4.sysctl_tcp_plb_suspend_rto_sec,
++		.maxlen         = sizeof(u8),
++		.mode           = 0644,
++		.proc_handler   = proc_dou8vec_minmax,
++	},
+ 	{ }
+ };
+ 
 diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
 index 3ae2ea048883..0eaed1811919 100644
 --- a/net/ipv4/tcp.c
@@ -360,10 +581,10 @@ index 075e744bfb48..8ab6e8f713f8 100644
  };
 diff --git a/net/ipv4/tcp_bbr2.c b/net/ipv4/tcp_bbr2.c
 new file mode 100644
-index 000000000000..488429f0f3d0
+index 000000000000..2e39f7a353be
 --- /dev/null
 +++ b/net/ipv4/tcp_bbr2.c
-@@ -0,0 +1,2674 @@
+@@ -0,0 +1,2692 @@
 +/* BBR (Bottleneck Bandwidth and RTT) congestion control, v2
 + *
 + * BBRv2 is a model-based congestion control algorithm that aims for low
@@ -533,6 +754,7 @@ index 000000000000..488429f0f3d0
 +		initialized:1;	       /* has bbr_init() been called? */
 +	u32	alpha_last_delivered;	 /* tp->delivered    at alpha update */
 +	u32	alpha_last_delivered_ce; /* tp->delivered_ce at alpha update */
++	struct	tcp_plb_state plb;
 +
 +	/* Params configurable using setsockopt. Refer to correspoding
 +	 * module param for detailed description of params.
@@ -1099,7 +1321,11 @@ index 000000000000..488429f0f3d0
 +	struct tcp_sock *tp = tcp_sk(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
 +
-+	if (event == CA_EVENT_TX_START && tp->app_limited) {
++	if (event == CA_EVENT_TX_START) {
++		tcp_plb_check_rehash(sk, &bbr->plb);
++
++		if (!tp->app_limited)
++			return;
 +		bbr->idle_restart = 1;
 +		bbr->ack_epoch_mstamp = tp->tcp_mstamp;
 +		bbr->ack_epoch_acked = 0;
@@ -1755,7 +1981,7 @@ index 000000000000..488429f0f3d0
 +	}
 +}
 +
-+static void bbr2_update_ecn_alpha(struct sock *sk)
++static int bbr2_update_ecn_alpha(struct sock *sk)
 +{
 +	struct tcp_sock *tp = tcp_sk(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
@@ -1764,14 +1990,14 @@ index 000000000000..488429f0f3d0
 +	u32 gain;
 +
 +	if (bbr->params.ecn_factor == 0)
-+		return;
++		return -1;
 +
 +	delivered = tp->delivered - bbr->alpha_last_delivered;
 +	delivered_ce = tp->delivered_ce - bbr->alpha_last_delivered_ce;
 +
 +	if (delivered == 0 ||		/* avoid divide by zero */
 +	    WARN_ON_ONCE(delivered < 0 || delivered_ce < 0))  /* backwards? */
-+		return;
++		return -1;
 +
 +	/* See if we should use ECN sender logic for this connection. */
 +	if (!bbr->ecn_eligible && bbr_ecn_enable &&
@@ -1790,6 +2016,7 @@ index 000000000000..488429f0f3d0
 +	bbr->alpha_last_delivered_ce = tp->delivered_ce;
 +
 +	bbr2_check_ecn_too_high_in_startup(sk, ce_ratio);
++	return (int)ce_ratio;
 +}
 +
 +/* Each round trip of BBR_BW_PROBE_UP, double volume of probing data. */
@@ -2604,6 +2831,7 @@ index 000000000000..488429f0f3d0
 +	struct bbr_context ctx = { 0 };
 +	bool update_model = true;
 +	u32 bw;
++	int ce_ratio = -1;
 +
 +	bbr->debug.event = '.';  /* init to default NOP (no event yet) */
 +
@@ -2611,7 +2839,9 @@ index 000000000000..488429f0f3d0
 +	if (bbr->round_start) {
 +		bbr->rounds_since_probe =
 +			min_t(s32, bbr->rounds_since_probe + 1, 0xFF);
-+		bbr2_update_ecn_alpha(sk);
++		ce_ratio = bbr2_update_ecn_alpha(sk);
++		tcp_plb_update_state(sk, &bbr->plb, ce_ratio);
++		tcp_plb_check_rehash(sk, &bbr->plb);
 +	}
 +
 +	bbr->ecn_in_round  |= rs->is_ece;
@@ -2774,6 +3004,7 @@ index 000000000000..488429f0f3d0
 +{
 +	struct tcp_sock *tp = tcp_sk(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
++	const struct net *net = sock_net(sk);
 +
 +	bbr_init(sk);	/* run shared init code for v1 and v2 */
 +
@@ -2835,6 +3066,13 @@ index 000000000000..488429f0f3d0
 +	bbr->ecn_alpha = bbr->params.ecn_alpha_init;
 +	bbr->alpha_last_delivered = 0;
 +	bbr->alpha_last_delivered_ce = 0;
++
++	bbr->plb.enabled = 0;
++	bbr->plb.consec_cong_rounds = 0;
++	bbr->plb.pause_until = 0;
++	if ((tp->ecn_flags & TCP_ECN_OK) &&
++	    net->ipv4.sysctl_tcp_plb_enabled)
++		bbr->plb.enabled = 1;
 +
 +	tp->fast_ack_mode = min_t(u32, 0x2U, bbr_fast_ack_mode);
 +
@@ -2980,6 +3218,7 @@ index 000000000000..488429f0f3d0
 +		struct rate_sample rs = { .losses = 1 };
 +		struct bbr_context ctx = { 0 };
 +
++		tcp_plb_update_state_upon_rto(sk, &bbr->plb);
 +		bbr->prev_ca_state = TCP_CA_Loss;
 +		bbr->full_bw = 0;
 +		if (!bbr2_is_probing_bandwidth(sk) && bbr->inflight_lo == ~0U) {
@@ -3136,6 +3375,24 @@ index b1637990d570..21c2922d937b 100644
  	    /* We ACK each frame or... */
  	    tcp_in_quickack_mode(sk) ||
  	    /* Protocol state mandates a one-time immediate ACK */
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 586c102ce152..b1c2c46c4830 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -3158,6 +3158,13 @@ static int __net_init tcp_sk_init(struct net *net)
+ 	net->ipv4.sysctl_tcp_fastopen_blackhole_timeout = 0;
+ 	atomic_set(&net->ipv4.tfo_active_disable_times, 0);
+ 
++	/* Set default values for PLB */
++	net->ipv4.sysctl_tcp_plb_enabled = 0; /* Disabled by default */
++	net->ipv4.sysctl_tcp_plb_cong_thresh = 128; /* 50% congestion */
++	net->ipv4.sysctl_tcp_plb_idle_rehash_rounds = 3;
++	net->ipv4.sysctl_tcp_plb_rehash_rounds = 12;
++	net->ipv4.sysctl_tcp_plb_suspend_rto_sec = 60;
++
+ 	/* Reno is always built in */
+ 	if (!net_eq(net, &init_net) &&
+ 	    bpf_try_module_get(init_net.ipv4.tcp_congestion_control,
 diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
 index aed0c5f828be..a3ffd615f45b 100644
 --- a/net/ipv4/tcp_output.c
@@ -3202,6 +3459,112 @@ index aed0c5f828be..a3ffd615f45b 100644
  			goto repair; /* Skip network transmission */
  		}
  
+diff --git a/net/ipv4/tcp_plb.c b/net/ipv4/tcp_plb.c
+new file mode 100644
+index 000000000000..71b02c0404ce
+--- /dev/null
++++ b/net/ipv4/tcp_plb.c
+@@ -0,0 +1,100 @@
++/* Protective Load Balancing (PLB)
++ *
++ * PLB was designed to reduce link load imbalance across datacenter
++ * switches. PLB is a host-based optimization; it leverages congestion
++ * signals from the transport layer to randomly change the path of the
++ * connection experiencing sustained congestion. PLB prefers to repath
++ * after idle periods to minimize packet reordering. It repaths by
++ * changing the IPv6 Flow Label on the packets of a connection, which
++ * datacenter switches include as part of ECMP/WCMP hashing.
++ *
++ * PLB is described in detail in:
++ *
++ *	Mubashir Adnan Qureshi, Yuchung Cheng, Qianwen Yin, Qiaobin Fu,
++ *	Gautam Kumar, Masoud Moshref, Junhua Yan, Van Jacobson,
++ *	David Wetherall,Abdul Kabbani:
++ *	"PLB: Congestion Signals are Simple and Effective for
++ *	 Network Load Balancing"
++ *	In ACM SIGCOMM 2022, Amsterdam Netherlands.
++ *
++ */
++
++#include <net/tcp.h>
++
++/* Called once per round-trip to update PLB state for a connection. */
++void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb,
++			  const int cong_ratio)
++{
++	struct net *net = sock_net(sk);
++
++	if (!plb->enabled)
++		return;
++
++	if (cong_ratio >= 0) {
++		if (cong_ratio < net->ipv4.sysctl_tcp_plb_cong_thresh)
++			plb->consec_cong_rounds = 0;
++		else if (plb->consec_cong_rounds <
++			 net->ipv4.sysctl_tcp_plb_rehash_rounds)
++			plb->consec_cong_rounds++;
++	}
++}
++EXPORT_SYMBOL_GPL(tcp_plb_update_state);
++
++/* Check whether recent congestion has been persistent enough to warrant
++ * a load balancing decision that switches the connection to another path.
++ */
++void tcp_plb_check_rehash(struct sock *sk, struct tcp_plb_state *plb)
++{
++	struct net *net = sock_net(sk);
++	bool can_idle_rehash, can_force_rehash;
++
++	if (!plb->enabled)
++		return;
++
++	/* Note that tcp_jiffies32 can wrap, so we clear pause_until
++	 * to 0 to indicate there is no recent RTO event that constrains
++	 * PLB rehashing.
++	 */
++	if (plb->pause_until &&
++	    !before(tcp_jiffies32, plb->pause_until))
++		plb->pause_until = 0;
++
++	can_idle_rehash = net->ipv4.sysctl_tcp_plb_idle_rehash_rounds &&
++			  !tcp_sk(sk)->packets_out &&
++			  plb->consec_cong_rounds >=
++			  net->ipv4.sysctl_tcp_plb_idle_rehash_rounds;
++	can_force_rehash = plb->consec_cong_rounds >=
++			   net->ipv4.sysctl_tcp_plb_rehash_rounds;
++
++	if (!plb->pause_until && (can_idle_rehash || can_force_rehash)) {
++		sk_rethink_txhash(sk);
++		plb->consec_cong_rounds = 0;
++		tcp_sk(sk)->ecn_rehash++;
++		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPECNREHASH);
++	}
++}
++EXPORT_SYMBOL_GPL(tcp_plb_check_rehash);
++
++/* Upon RTO, disallow load balancing for a while, to avoid having load
++ * balancing decisions switch traffic to a black-holed path that was
++ * previously avoided with a sk_rethink_txhash() call at RTO time.
++ */
++void tcp_plb_update_state_upon_rto(struct sock *sk, struct tcp_plb_state *plb)
++{
++	struct net *net = sock_net(sk);
++	u32 pause;
++
++	if (!plb->enabled)
++		return;
++
++	pause = net->ipv4.sysctl_tcp_plb_suspend_rto_sec * HZ;
++	pause += prandom_u32_max(pause);
++	plb->pause_until = tcp_jiffies32 + pause;
++
++	/* Reset PLB state upon RTO, since an RTO causes a sk_rethink_txhash() call
++	 * that may switch this connection to a path with completely different
++	 * congestion characteristics.
++	 */
++	plb->consec_cong_rounds = 0;
++}
++EXPORT_SYMBOL_GPL(tcp_plb_update_state_upon_rto);
 diff --git a/net/ipv4/tcp_rate.c b/net/ipv4/tcp_rate.c
 index a8f6d9d06f2e..a8b4c9504570 100644
 --- a/net/ipv4/tcp_rate.c

@@ -1,7 +1,7 @@
-From 43cf6ffb1724739cb7092a2cec54448c81227888 Mon Sep 17 00:00:00 2001
+From d56fce1099be385a42fa0fb14517c20fce99107c Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 15 Aug 2022 20:48:01 +0200
-Subject: [PATCH 02/16] cachy
+Date: Fri, 19 Aug 2022 16:58:21 +0200
+Subject: [PATCH 02/17] cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -93,8 +93,11 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  drivers/nvme/host/core.c                      |   2 +-
  drivers/pci/pci.c                             |   2 +-
  drivers/powercap/intel_rapl_common.c          |   2 +-
+ drivers/scsi/sd.c                             |  84 +++-
+ drivers/scsi/sd.h                             |   5 +
  drivers/soundwire/bus.h                       |   2 +-
  drivers/thermal/intel/intel_powerclamp.c      |  10 +
+ drivers/usb/gadget/udc/core.c                 |  11 +-
  drivers/virtio/virtio_balloon.c               |  47 +--
  fs/afs/mntpt.c                                |   6 -
  fs/aio.c                                      |  36 +-
@@ -177,7 +180,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  include/linux/page_counter.h                  |   1 +
  include/linux/pagemap.h                       |  35 +-
  include/linux/pagevec.h                       |  10 -
- include/linux/sched.h                         |   2 +
+ include/linux/sched.h                         |   1 +
  include/linux/swap.h                          |   3 +-
  include/linux/syscalls.h                      |   1 +
  include/linux/user_namespace.h                |   4 +
@@ -195,8 +198,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/module/procfs.c                        |  13 +
  kernel/module/signing.c                       |   4 +
  kernel/sched/debug.c                          |   1 +
- kernel/sched/fair.c                           |  79 +++-
- kernel/sched/features.h                       |   2 +
+ kernel/sched/fair.c                           |  20 +-
  kernel/sched/wait.c                           |  24 ++
  kernel/sys_ni.c                               |   1 +
  kernel/sysctl.c                               |  12 +
@@ -229,6 +231,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  mm/swap.c                                     |  29 --
  mm/swap_state.c                               |   4 +-
  mm/truncate.c                                 |   2 +-
+ mm/usercopy.c                                 |   2 +-
  mm/util.c                                     |   4 +-
  mm/vmpressure.c                               |   4 +
  mm/vmscan.c                                   |  60 ++-
@@ -243,7 +246,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  tools/testing/selftests/vm/.gitignore         |   1 +
  tools/testing/selftests/vm/Makefile           |   1 +
  tools/testing/selftests/vm/test-ksm-auto.c    | 273 ++++++++++++
- 238 files changed, 4281 insertions(+), 3294 deletions(-)
+ 241 files changed, 4312 insertions(+), 3303 deletions(-)
  create mode 100644 include/asm-generic/bitops/generic-non-atomic.h
  create mode 100644 include/asm-generic/bitops/non-instrumented-non-atomic.h
  create mode 100644 include/linux/gfp_types.h
@@ -3959,6 +3962,150 @@ index a9c99d9e8b42..8b288a554a9a 100644
  		       boot_cpu_data.x86, boot_cpu_data.x86_model);
  
  		return -ENODEV;
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index a1a2ac09066f..081e39b3543b 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -103,6 +103,7 @@ static void sd_config_discard(struct scsi_disk *, unsigned int);
+ static void sd_config_write_same(struct scsi_disk *);
+ static int  sd_revalidate_disk(struct gendisk *);
+ static void sd_unlock_native_capacity(struct gendisk *disk);
++static void sd_start_done_work(struct work_struct *work);
+ static int  sd_probe(struct device *);
+ static int  sd_remove(struct device *);
+ static void sd_shutdown(struct device *);
+@@ -3463,6 +3464,7 @@ static int sd_probe(struct device *dev)
+ 	sdkp->max_retries = SD_MAX_RETRIES;
+ 	atomic_set(&sdkp->openers, 0);
+ 	atomic_set(&sdkp->device->ioerr_cnt, 0);
++	INIT_WORK(&sdkp->start_done_work, sd_start_done_work);
+ 
+ 	if (!sdp->request_queue->rq_timeout) {
+ 		if (sdp->type != TYPE_MOD)
+@@ -3585,12 +3587,69 @@ static void scsi_disk_release(struct device *dev)
+ 	kfree(sdkp);
+ }
+ 
++/* Process sense data after a START command finished. */
++static void sd_start_done_work(struct work_struct *work)
++{
++	struct scsi_disk *sdkp = container_of(work, typeof(*sdkp),
++					      start_done_work);
++	struct scsi_sense_hdr sshdr;
++	int res = sdkp->start_result;
++
++	if (res == 0)
++		return;
++
++	sd_print_result(sdkp, "Start/Stop Unit failed", res);
++
++	if (res < 0)
++		return;
++
++	if (scsi_normalize_sense(sdkp->start_sense_buffer,
++				 sdkp->start_sense_len, &sshdr))
++		sd_print_sense_hdr(sdkp, &sshdr);
++}
++
++/* A START command finished. May be called from interrupt context. */
++static void sd_start_done(struct request *req, blk_status_t status)
++{
++	const struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(req);
++	struct scsi_disk *sdkp = scsi_disk(req->q->disk);
++
++	sdkp->start_result = scmd->result;
++	WARN_ON_ONCE(scmd->sense_len > SCSI_SENSE_BUFFERSIZE);
++	sdkp->start_sense_len = scmd->sense_len;
++	memcpy(sdkp->start_sense_buffer, scmd->sense_buffer,
++	       ARRAY_SIZE(sdkp->start_sense_buffer));
++	WARN_ON_ONCE(!schedule_work(&sdkp->start_done_work));
++}
++
++/* Submit a START command asynchronously. */
++static int sd_submit_start(struct scsi_disk *sdkp, u8 cmd[], u8 cmd_len)
++{
++	struct scsi_device *sdev = sdkp->device;
++	struct request_queue *q = sdev->request_queue;
++	struct request *req;
++	struct scsi_cmnd *scmd;
++
++	req = scsi_alloc_request(q, REQ_OP_DRV_IN, BLK_MQ_REQ_PM);
++	if (IS_ERR(req))
++		return PTR_ERR(req);
++
++	scmd = blk_mq_rq_to_pdu(req);
++	scmd->cmd_len = cmd_len;
++	memcpy(scmd->cmnd, cmd, cmd_len);
++	scmd->allowed = sdkp->max_retries;
++	req->timeout = SD_TIMEOUT;
++	req->rq_flags |= RQF_PM | RQF_QUIET;
++	req->end_io = sd_start_done;
++	blk_execute_rq_nowait(req, /*at_head=*/true);
++
++	return 0;
++}
++
+ static int sd_start_stop_device(struct scsi_disk *sdkp, int start)
+ {
+ 	unsigned char cmd[6] = { START_STOP };	/* START_VALID */
+-	struct scsi_sense_hdr sshdr;
+ 	struct scsi_device *sdp = sdkp->device;
+-	int res;
+ 
+ 	if (start)
+ 		cmd[4] |= 1;	/* START */
+@@ -3601,23 +3660,10 @@ static int sd_start_stop_device(struct scsi_disk *sdkp, int start)
+ 	if (!scsi_device_online(sdp))
+ 		return -ENODEV;
+ 
+-	res = scsi_execute(sdp, cmd, DMA_NONE, NULL, 0, NULL, &sshdr,
+-			SD_TIMEOUT, sdkp->max_retries, 0, RQF_PM, NULL);
+-	if (res) {
+-		sd_print_result(sdkp, "Start/Stop Unit failed", res);
+-		if (res > 0 && scsi_sense_valid(&sshdr)) {
+-			sd_print_sense_hdr(sdkp, &sshdr);
+-			/* 0x3a is medium not present */
+-			if (sshdr.asc == 0x3a)
+-				res = 0;
+-		}
+-	}
++	/* Wait until processing of sense data has finished. */
++	flush_work(&sdkp->start_done_work);
+ 
+-	/* SCSI error codes must not go to the generic layer */
+-	if (res)
+-		return -EIO;
+-
+-	return 0;
++	return sd_submit_start(sdkp, cmd, sizeof(cmd));
+ }
+ 
+ /*
+@@ -3644,6 +3690,8 @@ static void sd_shutdown(struct device *dev)
+ 		sd_printk(KERN_NOTICE, sdkp, "Stopping disk\n");
+ 		sd_start_stop_device(sdkp, 0);
+ 	}
++
++	flush_work(&sdkp->start_done_work);
+ }
+ 
+ static int sd_suspend_common(struct device *dev, bool ignore_stop_errors)
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index 5eea762f84d1..b89187761d61 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -150,6 +150,11 @@ struct scsi_disk {
+ 	unsigned	urswrz : 1;
+ 	unsigned	security : 1;
+ 	unsigned	ignore_medium_access_errors : 1;
++
++	int		start_result;
++	u32		start_sense_len;
++	u8		start_sense_buffer[SCSI_SENSE_BUFFERSIZE];
++	struct work_struct start_done_work;
+ };
+ #define to_scsi_disk(obj) container_of(obj, struct scsi_disk, disk_dev)
+ 
 diff --git a/drivers/soundwire/bus.h b/drivers/soundwire/bus.h
 index 7631ef5e71fb..d3ed828daac0 100644
 --- a/drivers/soundwire/bus.h
@@ -4000,6 +4147,30 @@ index c841ab37e7c6..fe3d190ab12b 100644
  	if (!x86_match_cpu(intel_powerclamp_ids)) {
  		pr_err("CPU does not support MWAIT\n");
  		return -ENODEV;
+diff --git a/drivers/usb/gadget/udc/core.c b/drivers/usb/gadget/udc/core.c
+index 7886497253cc..cafcf260394c 100644
+--- a/drivers/usb/gadget/udc/core.c
++++ b/drivers/usb/gadget/udc/core.c
+@@ -1728,13 +1728,14 @@ static int usb_udc_uevent(struct device *dev, struct kobj_uevent_env *env)
+ 		return ret;
+ 	}
+ 
+-	if (udc->driver) {
++	mutex_lock(&udc_lock);
++	if (udc->driver)
+ 		ret = add_uevent_var(env, "USB_UDC_DRIVER=%s",
+ 				udc->driver->function);
+-		if (ret) {
+-			dev_err(dev, "failed to add uevent USB_UDC_DRIVER\n");
+-			return ret;
+-		}
++	mutex_unlock(&udc_lock);
++	if (ret) {
++		dev_err(dev, "failed to add uevent USB_UDC_DRIVER\n");
++		return ret;
+ 	}
+ 
+ 	return 0;
 diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
 index b9737da6c4dd..bd360b91e9d3 100644
 --- a/drivers/virtio/virtio_balloon.c
@@ -9072,18 +9243,10 @@ index 67b1246f136b..6649154a2115 100644
  		struct address_space *mapping, pgoff_t *index, pgoff_t end,
  		xa_mark_t tag);
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 6d877c7e22ff..5f112f724a19 100644
+index 6d877c7e22ff..ce76b7c8a8e6 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -539,6 +539,7 @@ struct sched_entity {
- 	struct rb_node			run_node;
- 	struct list_head		group_node;
- 	unsigned int			on_rq;
-+	unsigned int			migrated;
- 
- 	u64				exec_start;
- 	u64				sum_exec_runtime;
-@@ -1050,6 +1051,7 @@ struct task_struct {
+@@ -1050,6 +1050,7 @@ struct task_struct {
  	/* Cached requested key. */
  	struct key			*cached_requested_key;
  #endif
@@ -9474,7 +9637,7 @@ index bb3d63bdf4ae..e0e356eb038d 100644
  	nr_switches = p->nvcsw + p->nivcsw;
  
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 0cba1b2e295b..a131ecbdbea9 100644
+index 0cba1b2e295b..45548434e148 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -68,9 +68,13 @@
@@ -9533,145 +9696,6 @@ index 0cba1b2e295b..a131ecbdbea9 100644
  
  #ifdef CONFIG_SYSCTL
  static struct ctl_table sched_fair_sysctls[] = {
-@@ -1048,6 +1066,7 @@ update_stats_curr_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
- 	/*
- 	 * We are starting a new run period:
- 	 */
-+	se->migrated = 0;
- 	se->exec_start = rq_clock_task(rq_of(cfs_rq));
- }
- 
-@@ -4256,17 +4275,18 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
- {
- 	u64 vruntime = cfs_rq->min_vruntime;
- 
--	/*
--	 * The 'current' period is already promised to the current tasks,
--	 * however the extra weight of the new task will slow them down a
--	 * little, place the new task so that it fits in the slot that
--	 * stays open at the end.
--	 */
--	if (initial && sched_feat(START_DEBIT))
--		vruntime += sched_vslice(cfs_rq, se);
-+	if (unlikely(initial)) { /* task creation is once, wakeup is often */
-+		/*
-+		 * The 'current' period is already promised to the current
-+		 * tasks, however the extra weight of the new task will slow
-+		 * them down a little, place the new task so that it fits in
-+		 * the slot that stays open at the end.
-+		 */
-+		if (sched_feat(START_DEBIT))
-+			vruntime += sched_vslice(cfs_rq, se);
- 
--	/* sleeps up to a single latency don't count. */
--	if (!initial) {
-+	} else {
-+		/* sleeps up to a single latency don't count. */
- 		unsigned long thresh;
- 
- 		if (se_is_idle(se))
-@@ -4287,6 +4307,27 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
- 	/* ensure we never gain time by being placed backwards. */
- 	se->vruntime = max_vruntime(se->vruntime, vruntime);
- }
-+ 
-+static void place_entity_migrate(struct cfs_rq *cfs_rq, struct sched_entity *se)
-+{
-+	if (!sched_feat(PLACE_MIGRATE))
-+		return;
-+
-+	if (cfs_rq->nr_running < se->migrated) {
-+		/*
-+		 * Migrated to a shorter runqueue, go first because
-+		 * we were under-served on the old runqueue.
-+		 */
-+		se->vruntime = cfs_rq->min_vruntime;
-+		return;
-+	}
-+
-+	/*
-+	 * Migrated to a longer runqueue, go last because
-+	 * we got over-served on the old runqueue.
-+	 */
-+	se->vruntime = cfs_rq->min_vruntime + sched_vslice(cfs_rq, se);
-+}
- 
- static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
- 
-@@ -4361,6 +4402,8 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
- 
- 	if (flags & ENQUEUE_WAKEUP)
- 		place_entity(cfs_rq, se, 0);
-+	else if (se->migrated)
-+		place_entity_migrate(cfs_rq, se);
- 
- 	check_schedstat_required();
- 	update_stats_enqueue_fair(cfs_rq, se, flags);
-@@ -6964,6 +7007,7 @@ static void detach_entity_cfs_rq(struct sched_entity *se);
-  */
- static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
- {
-+	struct sched_entity *se = &p->se;
- 	/*
- 	 * As blocked tasks retain absolute vruntime the migration needs to
- 	 * deal with this by subtracting the old and adding the new
-@@ -6971,7 +7015,6 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
- 	 * the task on the new runqueue.
- 	 */
- 	if (READ_ONCE(p->__state) == TASK_WAKING) {
--		struct sched_entity *se = &p->se;
- 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
- 		u64 min_vruntime;
- 
-@@ -6996,7 +7039,7 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
- 		 * rq->lock and can modify state directly.
- 		 */
- 		lockdep_assert_rq_held(task_rq(p));
--		detach_entity_cfs_rq(&p->se);
-+		detach_entity_cfs_rq(se);
- 
- 	} else {
- 		/*
-@@ -7007,14 +7050,15 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
- 		 * wakee task is less decayed, but giving the wakee more load
- 		 * sounds not bad.
- 		 */
--		remove_entity_load_avg(&p->se);
-+		remove_entity_load_avg(se);
- 	}
- 
- 	/* Tell new CPU we are migrated */
--	p->se.avg.last_update_time = 0;
-+	se->avg.last_update_time = 0;
- 
- 	/* We have migrated, no longer consider this task hot */
--	p->se.exec_start = 0;
-+	for_each_sched_entity(se)
-+		se->migrated = READ_ONCE(cfs_rq_of(se)->nr_running) + !se->on_rq;
- 
- 	update_scan_period(p, new_cpu);
- }
-@@ -7700,6 +7744,9 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
- 	if (sysctl_sched_migration_cost == 0)
- 		return 0;
- 
-+	if (p->se.migrated)
-+		return 0;
-+
- 	delta = rq_clock_task(env->src_rq) - p->se.exec_start;
- 
- 	return delta < (s64)sysctl_sched_migration_cost;
-diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index ee7f23c76bd3..d58baad2cee2 100644
---- a/kernel/sched/features.h
-+++ b/kernel/sched/features.h
-@@ -101,3 +101,5 @@ SCHED_FEAT(LATENCY_WARN, false)
- 
- SCHED_FEAT(ALT_PERIOD, true)
- SCHED_FEAT(BASE_SLICE, true)
-+
-+SCHED_FEAT(PLACE_MIGRATE, true)
-\ No newline at end of file
 diff --git a/kernel/sched/wait.c b/kernel/sched/wait.c
 index 9860bb9a847c..c7f045873a5f 100644
 --- a/kernel/sched/wait.c
@@ -13391,6 +13415,19 @@ index ab50d0d59a2a..0b0708bf935f 100644
   * mapping->nrpages can be non-zero when this function returns even after
   * truncation of the whole mapping.
   */
+diff --git a/mm/usercopy.c b/mm/usercopy.c
+index 4e1da708699b..c1ee15a98633 100644
+--- a/mm/usercopy.c
++++ b/mm/usercopy.c
+@@ -161,7 +161,7 @@ static inline void check_bogus_address(const unsigned long ptr, unsigned long n,
+ static inline void check_heap_object(const void *ptr, unsigned long n,
+ 				     bool to_user)
+ {
+-	uintptr_t addr = (uintptr_t)ptr;
++	unsigned long addr = (unsigned long)ptr;
+ 	unsigned long offset;
+ 	struct folio *folio;
+ 
 diff --git a/mm/util.c b/mm/util.c
 index 0837570c9225..53af0e79d3e4 100644
 --- a/mm/util.c
