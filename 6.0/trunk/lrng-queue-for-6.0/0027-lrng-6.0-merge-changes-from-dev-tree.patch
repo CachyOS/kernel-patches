@@ -1,0 +1,603 @@
+From 9aa673e6438d6662360154ae69dfbf8b3b330448 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Tue, 6 Sep 2022 20:19:45 +0200
+Subject: [PATCH 27/27] lrng-6.0: merge changes from dev tree
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ MAINTAINERS                                   |  7 ++
+ drivers/char/lrng/lrng_drng_mgr.c             | 78 ++++++++++++++++++-
+ drivers/char/lrng/lrng_es_cpu.c               | 17 ++--
+ drivers/char/lrng/lrng_es_krng.c              | 33 ++------
+ drivers/char/lrng/lrng_es_mgr.c               | 49 +++++++++---
+ drivers/char/lrng/lrng_es_mgr.h               |  2 +
+ drivers/char/lrng/lrng_interface_dev_common.c | 17 ++++
+ drivers/char/lrng/lrng_interface_dev_common.h |  1 +
+ .../char/lrng/lrng_interface_random_kernel.c  | 15 +++-
+ .../char/lrng/lrng_interface_random_user.c    | 40 +++++++++-
+ include/linux/lrng.h                          | 74 ++++++++++++++++++
+ 11 files changed, 279 insertions(+), 54 deletions(-)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index d30f26e07..994cf778f 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -11740,6 +11740,13 @@ F:	Documentation/litmus-tests/
+ F:	Documentation/memory-barriers.txt
+ F:	tools/memory-model/
+ 
++LINUX RANDOM NUMBER GENERATOR (LRNG) DRIVER
++M:	Stephan Mueller <smueller@chronox.de>
++S:	Maintained
++W:	https://www.chronox.de/lrng.html
++F:	drivers/char/lrng/
++F:	include/linux/lrng.h
++
+ LIS3LV02D ACCELEROMETER DRIVER
+ M:	Eric Piel <eric.piel@tremplin-utc.net>
+ S:	Maintained
+diff --git a/drivers/char/lrng/lrng_drng_mgr.c b/drivers/char/lrng/lrng_drng_mgr.c
+index 0171f72c8..e9e08c186 100644
+--- a/drivers/char/lrng/lrng_drng_mgr.c
++++ b/drivers/char/lrng/lrng_drng_mgr.c
+@@ -179,7 +179,7 @@ int lrng_drng_initalize(void)
+ 	pr_debug("LRNG for general use is available\n");
+ 
+ 	/* Seed the DRNG with any entropy available */
+-	if (!lrng_pool_trylock()) {
++	if (lrng_pool_trylock()) {
+ 		pr_info("Initial DRNG initialized triggering first seeding\n");
+ 		lrng_drng_seed_work(NULL);
+ 	} else {
+@@ -421,7 +421,7 @@ int lrng_drng_get(struct lrng_drng *drng, u8 *outbuf, u32 outbuflen)
+ 
+ 		/* In normal operation, check whether to reseed */
+ 		if (!pr && lrng_drng_must_reseed(drng)) {
+-			if (lrng_pool_trylock()) {
++			if (!lrng_pool_trylock()) {
+ 				drng->force_reseed = true;
+ 			} else {
+ 				lrng_drng_seed(drng);
+@@ -437,7 +437,7 @@ int lrng_drng_get(struct lrng_drng *drng, u8 *outbuf, u32 outbuflen)
+ 				u32 coll_ent_bits;
+ 
+ 				/* If we cannot get the pool lock, try again. */
+-				if (lrng_pool_trylock()) {
++				if (!lrng_pool_trylock()) {
+ 					mutex_unlock(&drng->lock);
+ 					continue;
+ 				}
+@@ -545,6 +545,17 @@ void lrng_reset(void)
+ 
+ /******************* Generic LRNG kernel output interfaces ********************/
+ 
++static int lrng_drng_sleep_while_not_all_nodes_seeded(unsigned int nonblock)
++{
++	if (lrng_pool_all_numa_nodes_seeded_get())
++		return 0;
++	if (nonblock)
++		return -EAGAIN;
++	wait_event_interruptible(lrng_init_wait,
++				 lrng_pool_all_numa_nodes_seeded_get());
++	return 0;
++}
++
+ int lrng_drng_sleep_while_nonoperational(int nonblock)
+ {
+ 	if (likely(lrng_state_operational()))
+@@ -563,6 +574,67 @@ int lrng_drng_sleep_while_non_min_seeded(void)
+ 					lrng_state_min_seeded());
+ }
+ 
++ssize_t lrng_get_seed(u64 *buf, size_t nbytes, unsigned int flags)
++{
++	struct entropy_buf *eb = (struct entropy_buf *)(buf + 2);
++	u64 buflen = sizeof(struct entropy_buf) + 2 * sizeof(u64);
++	u64 collected_bits = 0;
++	int ret;
++
++	/* Ensure buffer is aligned as required */
++	BUILD_BUG_ON(sizeof(buflen) < LRNG_KCAPI_ALIGN);
++	if (nbytes < sizeof(buflen))
++		return -EINVAL;
++
++	/* Write buffer size into first word */
++	buf[0] = buflen;
++	if (nbytes < buflen)
++		return -EMSGSIZE;
++
++	ret = lrng_drng_sleep_while_not_all_nodes_seeded(
++		flags & LRNG_GET_SEED_NONBLOCK);
++	if (ret)
++		return ret;
++
++	/* Try to get the pool lock and sleep on it to get it. */
++	lrng_pool_lock();
++
++	/* If an LRNG DRNG becomes unseeded, give this DRNG precedence. */
++	if (!lrng_pool_all_numa_nodes_seeded_get()) {
++		lrng_pool_unlock();
++		return 0;
++	}
++
++	/*
++	 * Try to get seed data - a rarely used busyloop is cheaper than a wait
++	 * queue that is constantly woken up by the hot code path of
++	 * lrng_init_ops.
++	 */
++	for (;;) {
++		lrng_fill_seed_buffer(eb,
++			lrng_get_seed_entropy_osr(flags &
++						  LRNG_GET_SEED_FULLY_SEEDED));
++		collected_bits = lrng_entropy_rate_eb(eb);
++
++		/* Break the collection loop if we got entropy, ... */
++		if (collected_bits ||
++		    /* ... a DRNG becomes unseeded, give DRNG precedence, ... */
++		    !lrng_pool_all_numa_nodes_seeded_get() ||
++		    /* ... if the caller does not want a blocking behavior. */
++		    (flags & LRNG_GET_SEED_NONBLOCK))
++			break;
++
++		schedule();
++	}
++
++	lrng_pool_unlock();
++
++	/* Write collected entropy size into second word */
++	buf[1] = collected_bits;
++
++	return (ssize_t)buflen;
++}
++
+ void lrng_get_random_bytes_full(void *buf, int nbytes)
+ {
+ 	lrng_drng_sleep_while_nonoperational(0);
+diff --git a/drivers/char/lrng/lrng_es_cpu.c b/drivers/char/lrng/lrng_es_cpu.c
+index 3910108cf..f982cc31d 100644
+--- a/drivers/char/lrng/lrng_es_cpu.c
++++ b/drivers/char/lrng/lrng_es_cpu.c
+@@ -65,7 +65,8 @@ static u32 lrng_cpu_poolsize(void)
+ 
+ static u32 lrng_get_cpu_data(u8 *outbuf, u32 requested_bits)
+ {
+-	u32 i;
++	size_t longs = 0;
++	u32 i,  req = requested_bits >> 3;
+ 
+ 	/* operate on full blocks */
+ 	BUILD_BUG_ON(LRNG_DRNG_SECURITY_STRENGTH_BYTES % sizeof(unsigned long));
+@@ -73,10 +74,14 @@ static u32 lrng_get_cpu_data(u8 *outbuf, u32 requested_bits)
+ 	/* ensure we have aligned buffers */
+ 	BUILD_BUG_ON(LRNG_KCAPI_ALIGN % sizeof(unsigned long));
+ 
+-	for (i = 0; i < (requested_bits >> 3);
+-	     i += sizeof(unsigned long)) {
+-		if (!arch_get_random_seed_long((unsigned long *)(outbuf + i)) &&
+-		    !arch_get_random_long((unsigned long *)(outbuf + i))) {
++	for (i = 0; i < req; i += longs) {
++		longs = arch_get_random_seed_longs(
++			(unsigned long *)(outbuf + i), req - i);
++		if (longs)
++			continue;
++		longs = arch_get_random_longs((unsigned long *)(outbuf + i),
++					      req - i);
++		if (!longs) {
+ 			cpu_entropy = 0;
+ 			return 0;
+ 		}
+@@ -175,7 +180,7 @@ static u32 lrng_cpu_multiplier(void)
+ 	if (data_multiplier > 0)
+ 		return data_multiplier;
+ 
+-	if (IS_ENABLED(CONFIG_X86) && !arch_get_random_seed_long(&v)) {
++	if (IS_ENABLED(CONFIG_X86) && !arch_get_random_seed_longs(&v, 1)) {
+ 		/*
+ 		 * Intel SPEC: pulling 512 blocks from RDRAND ensures
+ 		 * one reseed making it logically equivalent to RDSEED.
+diff --git a/drivers/char/lrng/lrng_es_krng.c b/drivers/char/lrng/lrng_es_krng.c
+index 0ef88e6c8..519ba640c 100644
+--- a/drivers/char/lrng/lrng_es_krng.c
++++ b/drivers/char/lrng/lrng_es_krng.c
+@@ -23,17 +23,12 @@ MODULE_PARM_DESC(krng_entropy, "Entropy in bits of 256 data bits from the kernel
+ 
+ static atomic_t lrng_krng_initial_rate = ATOMIC_INIT(0);
+ 
+-static struct notifier_block lrng_krng_ready = {
+-	.notifier_call = NULL,
+-};
+-
+ static u32 lrng_krng_fips_entropylevel(u32 entropylevel)
+ {
+ 	return fips_enabled ? 0 : entropylevel;
+ }
+ 
+-static int lrng_krng_adjust_entropy(struct notifier_block *nb,
+-				    unsigned long action, void *data)
++static int lrng_krng_adjust_entropy(void)
+ {
+ 	u32 entropylevel;
+ 
+@@ -50,27 +45,11 @@ static int lrng_krng_adjust_entropy(struct notifier_block *nb,
+ 
+ static u32 lrng_krng_entropylevel(u32 requested_bits)
+ {
+-	if (lrng_krng_ready.notifier_call == NULL) {
+-		int err;
+-
+-		lrng_krng_ready.notifier_call = lrng_krng_adjust_entropy;
+-
+-		err = register_random_ready_notifier(&lrng_krng_ready);
+-		switch (err) {
+-		case 0:
+-			atomic_set(&lrng_krng_initial_rate, krng_entropy);
+-			krng_entropy = 0;
+-			pr_debug("Kernel RNG is not yet seeded, setting entropy rate to 0 bits of entropy\n");
+-			break;
+-
+-		case -EALREADY:
+-			pr_debug("Kernel RNG is fully seeded, setting entropy rate to %u bits of entropy\n",
+-				 lrng_krng_fips_entropylevel(krng_entropy));
+-			break;
+-		default:
+-			lrng_krng_ready.notifier_call = NULL;
+-			return 0;
+-		}
++	static bool init = false;
++
++	if (unlikely(!init) && rng_is_initialized()) {
++		init = true;
++		lrng_krng_adjust_entropy();
+ 	}
+ 
+ 	return lrng_fast_noise_entropylevel(
+diff --git a/drivers/char/lrng/lrng_es_mgr.c b/drivers/char/lrng/lrng_es_mgr.c
+index 5bec39d9e..23eba26b9 100644
+--- a/drivers/char/lrng/lrng_es_mgr.c
++++ b/drivers/char/lrng/lrng_es_mgr.c
+@@ -40,14 +40,15 @@ struct lrng_state {
+ 	 */
+ 
+ 	atomic_t boot_entropy_thresh;	/* Reseed threshold */
+-	atomic_t reseed_in_progress;	/* Flag for on executing reseed */
++	struct mutex reseed_in_progress;	/* Flag for on executing reseed */
+ 	struct work_struct lrng_seed_work;	/* (re)seed work queue */
+ };
+ 
+ static struct lrng_state lrng_state = {
+ 	false, false, false, false, false, false,
+ 	.boot_entropy_thresh	= ATOMIC_INIT(LRNG_INIT_ENTROPY_BITS),
+-	.reseed_in_progress	= ATOMIC_INIT(0),
++	.reseed_in_progress	=
++		__MUTEX_INITIALIZER(lrng_state.reseed_in_progress),
+ };
+ 
+ /*
+@@ -107,12 +108,17 @@ void lrng_debug_report_seedlevel(const char *name)
+  */
+ int lrng_pool_trylock(void)
+ {
+-	return atomic_cmpxchg(&lrng_state.reseed_in_progress, 0, 1);
++	return mutex_trylock(&lrng_state.reseed_in_progress);
++}
++
++void lrng_pool_lock(void)
++{
++	mutex_lock(&lrng_state.reseed_in_progress);
+ }
+ 
+ void lrng_pool_unlock(void)
+ {
+-	atomic_set(&lrng_state.reseed_in_progress, 0);
++	mutex_unlock(&lrng_state.reseed_in_progress);
+ }
+ 
+ /* Set new entropy threshold for reseeding during boot */
+@@ -144,6 +150,13 @@ void lrng_reset_state(void)
+ void lrng_pool_all_numa_nodes_seeded(bool set)
+ {
+ 	lrng_state.all_online_numa_node_seeded = set;
++	if (set)
++		wake_up_all(&lrng_init_wait);
++}
++
++bool lrng_pool_all_numa_nodes_seeded_get(void)
++{
++	return lrng_state.all_online_numa_node_seeded;
+ }
+ 
+ /* Return boolean whether LRNG reached minimally seed level */
+@@ -334,19 +347,33 @@ int __init lrng_rand_initialize(void)
+ 				    sizeof(unsigned long))];
+ 		struct new_utsname utsname;
+ 	} seed __aligned(LRNG_KCAPI_ALIGN);
++	size_t longs = 0;
+ 	unsigned int i;
+ 
+ 	seed.time = ktime_get_real();
+ 
+-	for (i = 0; i < ARRAY_SIZE(seed.data); i++) {
++	for (i = 0; i < ARRAY_SIZE(seed.data); i += longs) {
+ #ifdef CONFIG_LRNG_RANDOM_IF
+-		if (!arch_get_random_seed_long_early(&(seed.data[i])) &&
+-		    !arch_get_random_long_early(&seed.data[i]))
++		longs = arch_get_random_seed_longs_early(
++			seed.data + i, ARRAY_SIZE(seed.data) - i);
++		if (longs)
++			continue;
++		longs = arch_get_random_longs_early(seed.data + i,
++						    ARRAY_SIZE(seed.data) - i);
++		if (longs)
++			continue;
+ #else
+-		if (!arch_get_random_seed_long(&(seed.data[i])) &&
+-		    !arch_get_random_long(&seed.data[i]))
++		longs = arch_get_random_seed_longs(seed.data + i,
++						   ARRAY_SIZE(seed.data) - i);
++		if (longs)
++			continue;
++		longs = arch_get_random_longs(seed.data + i,
++					      ARRAY_SIZE(seed.data) - i);
++		if (longs)
++			continue;
+ #endif
+-			seed.data[i] = random_get_entropy();
++		seed.data[i] = random_get_entropy();
++		longs = 1;
+ 	}
+ 	memcpy(&seed.utsname, utsname(), sizeof(*(utsname())));
+ 
+@@ -384,7 +411,7 @@ void lrng_es_add_entropy(void)
+ 		return;
+ 
+ 	/* Ensure that the seeding only occurs once at any given time. */
+-	if (lrng_pool_trylock())
++	if (!lrng_pool_trylock())
+ 		return;
+ 
+ 	/* Seed the DRNG with any available noise. */
+diff --git a/drivers/char/lrng/lrng_es_mgr.h b/drivers/char/lrng/lrng_es_mgr.h
+index 877698dba..f9bbd4863 100644
+--- a/drivers/char/lrng/lrng_es_mgr.h
++++ b/drivers/char/lrng/lrng_es_mgr.h
+@@ -23,6 +23,7 @@ extern struct lrng_es_cb *lrng_es[];
+ #define for_each_lrng_es(ctr)		\
+ 	for ((ctr) = 0; (ctr) < lrng_ext_es_last; (ctr)++)
+ 
++bool lrng_pool_all_numa_nodes_seeded_get(void);
+ bool lrng_state_min_seeded(void);
+ void lrng_debug_report_seedlevel(const char *name);
+ int lrng_rand_initialize(void);
+@@ -37,6 +38,7 @@ void lrng_reset_state(void);
+ bool lrng_state_fully_seeded(void);
+ 
+ int lrng_pool_trylock(void);
++void lrng_pool_lock(void);
+ void lrng_pool_unlock(void);
+ void lrng_pool_all_numa_nodes_seeded(bool set);
+ 
+diff --git a/drivers/char/lrng/lrng_interface_dev_common.c b/drivers/char/lrng/lrng_interface_dev_common.c
+index c366b29fe..09d056307 100644
+--- a/drivers/char/lrng/lrng_interface_dev_common.c
++++ b/drivers/char/lrng/lrng_interface_dev_common.c
+@@ -79,6 +79,23 @@ void lrng_state_exseed_allow_all(void)
+ 
+ /************************ LRNG user output interfaces *************************/
+ 
++ssize_t lrng_read_seed(char __user *buf, size_t nbytes, unsigned int flags)
++{
++	ssize_t ret = 0;
++	u64 t[(sizeof(struct entropy_buf) + 3 * sizeof(u64) - 1) / sizeof(u64)];
++
++	memset(t, 0, sizeof(t));
++	ret = lrng_get_seed(t, min_t(size_t, nbytes, sizeof(t)), flags);
++	if (ret == -EMSGSIZE && copy_to_user(buf, t, sizeof(u64))) {
++		ret = -EFAULT;
++	} else if (ret > 0 && copy_to_user(buf, t, ret)) {
++		ret = -EFAULT;
++	}
++	memzero_explicit(t, sizeof(t));
++
++	return ret;
++}
++
+ ssize_t lrng_read_common(char __user *buf, size_t nbytes, bool pr)
+ {
+ 	ssize_t ret = 0;
+diff --git a/drivers/char/lrng/lrng_interface_dev_common.h b/drivers/char/lrng/lrng_interface_dev_common.h
+index 8bc289224..9e6603ad8 100644
+--- a/drivers/char/lrng/lrng_interface_dev_common.h
++++ b/drivers/char/lrng/lrng_interface_dev_common.h
+@@ -42,6 +42,7 @@ ssize_t lrng_read_common_block(int nonblock, int pr,
+ 			       char __user *buf, size_t nbytes);
+ ssize_t lrng_drng_read_block(struct file *file, char __user *buf, size_t nbytes,
+ 			     loff_t *ppos);
++ssize_t lrng_read_seed(char __user *buf, size_t nbytes, unsigned int flags);
+ ssize_t lrng_read_common(char __user *buf, size_t nbytes, bool pr);
+ bool lrng_need_entropy(void);
+ 
+diff --git a/drivers/char/lrng/lrng_interface_random_kernel.c b/drivers/char/lrng/lrng_interface_random_kernel.c
+index ec6310884..471390bfd 100644
+--- a/drivers/char/lrng/lrng_interface_random_kernel.c
++++ b/drivers/char/lrng/lrng_interface_random_kernel.c
+@@ -21,6 +21,15 @@
+ 
+ /********************************** Helper ***********************************/
+ 
++static bool lrng_trust_bootloader __initdata =
++	IS_ENABLED(CONFIG_RANDOM_TRUST_BOOTLOADER);
++
++static int __init lrng_parse_trust_bootloader(char *arg)
++{
++	return kstrtobool(arg, &lrng_trust_bootloader);
++}
++early_param("random.trust_bootloader", lrng_parse_trust_bootloader);
++
+ int __init random_init(const char *command_line)
+ {
+ 	int ret = lrng_rand_initialize();
+@@ -71,11 +80,9 @@ EXPORT_SYMBOL_GPL(add_hwgenerator_randomness);
+  *	 insert into entropy pool.
+  * @size: length of buffer
+  */
+-void add_bootloader_randomness(const void *buf, size_t size)
++void __init add_bootloader_randomness(const void *buf, size_t size)
+ {
+-	lrng_pool_insert_aux(buf, size,
+-			     IS_ENABLED(CONFIG_RANDOM_TRUST_BOOTLOADER) ?
+-			     size * 8 : 0);
++	lrng_pool_insert_aux(buf, size, lrng_trust_bootloader ? size * 8 : 0);
+ }
+ 
+ /*
+diff --git a/drivers/char/lrng/lrng_interface_random_user.c b/drivers/char/lrng/lrng_interface_random_user.c
+index 0565ba7a3..d12e88380 100644
+--- a/drivers/char/lrng/lrng_interface_random_user.c
++++ b/drivers/char/lrng/lrng_interface_random_user.c
+@@ -46,10 +46,29 @@ const struct file_operations urandom_fops = {
+ 	.llseek = noop_llseek,
+ };
+ 
++/*
++ * GRND_SEED
++ *
++ * This flag requests to provide the data directly from the entropy sources.
++ *
++ * The behavior of the call is exactly as outlined for the function
++ * lrng_get_seed in lrng.h.
++ */
++#define GRND_SEED		0x0010
++
++/*
++ * GRND_FULLY_SEEDED
++ *
++ * This flag indicates whether the caller wants to reseed a DRNG that is already
++ * fully seeded. See esdm_get_seed in lrng.h for details.
++ */
++#define GRND_FULLY_SEEDED	0x0020
++
+ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
+ 		unsigned int, flags)
+ {
+-	if (flags & ~(GRND_NONBLOCK|GRND_RANDOM|GRND_INSECURE))
++	if (flags & ~(GRND_NONBLOCK|GRND_RANDOM|GRND_INSECURE|
++		      GRND_SEED|GRND_FULLY_SEEDED))
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -59,12 +78,27 @@ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
+ 	if ((flags &
+ 	     (GRND_INSECURE|GRND_RANDOM)) == (GRND_INSECURE|GRND_RANDOM))
+ 		return -EINVAL;
++	if ((flags &
++	     (GRND_INSECURE|GRND_SEED)) == (GRND_INSECURE|GRND_SEED))
++		return -EINVAL;
++	if ((flags &
++	     (GRND_RANDOM|GRND_SEED)) == (GRND_RANDOM|GRND_SEED))
++		return -EINVAL;
+ 
+ 	if (count > INT_MAX)
+ 		count = INT_MAX;
+ 
+-	if (flags & GRND_INSECURE)
++	if (flags & GRND_INSECURE) {
+ 		return lrng_drng_read(NULL, buf, count, NULL);
++	} else if (flags & GRND_SEED) {
++		unsigned int seed_flags = (flags & GRND_NONBLOCK) ?
++					  LRNG_GET_SEED_NONBLOCK : 0;
++
++		seed_flags |= (flags & GRND_FULLY_SEEDED) ?
++			      LRNG_GET_SEED_FULLY_SEEDED : 0;
++		return lrng_read_seed(buf, count, seed_flags);
++	}
+ 
+-	return lrng_read_common_block(flags & GRND_NONBLOCK, 0, buf, count);
++	return lrng_read_common_block(flags & GRND_NONBLOCK,
++				      flags & GRND_RANDOM, buf, count);
+ }
+diff --git a/include/linux/lrng.h b/include/linux/lrng.h
+index 8ec50ac7d..c0d31a03d 100644
+--- a/include/linux/lrng.h
++++ b/include/linux/lrng.h
+@@ -174,4 +174,78 @@ void lrng_get_random_bytes_min(void *buf, int nbytes);
+ int lrng_get_random_bytes_pr(void *buf, int nbytes);
+ #endif
+ 
++/*
++ * lrng_get_seed() - Fill buffer with data from entropy sources
++ *
++ * This call allows accessing the entropy sources directly and fill the buffer
++ * with data from all available entropy sources. This filled buffer is
++ * identical to the temporary seed buffer used by the LRNG to seed its DRNGs.
++ *
++ * The call is to allows users to seed their DRNG directly from the entropy
++ * sources in case the caller does not want to use the LRNG's DRNGs. This
++ * buffer can be directly used to seed the caller's DRNG from.
++ *
++ * The call blocks as long as one LRNG DRNG is not yet fully seeded. If
++ * LRNG_GET_SEED_NONBLOCK is specified, it does not block in this case, but
++ * returns with an error.
++ *
++ * Considering SP800-90C, there is a differentiation between the seeding
++ * requirements during instantiating a DRNG and at runtime of the DRNG. When
++ * specifying LRNG_GET_SEED_FULLY_SEEDED the caller indicates the DRNG was
++ * already fully seeded and the regular amount of entropy is requested.
++ * Otherwise, the LRNG will obtain the entropy rate required for initial
++ * seeding. The following minimum entropy rates will be obtained:
++ *
++ * * FIPS mode:
++ *	* Initial seeding: 384 bits of entropy
++ *	* Runtime seeding: 256 bits of entropy
++ * * Non-FIPS mode:
++ *	* 128 bits of entropy in any case
++ *
++ * Albeit these are minimum entropy rates, the LRNG tries to request the
++ * given amount of entropy from each entropy source individually. If the
++ * minimum amount of entropy cannot be obtained collectively by all entropy
++ * sources, the LRNG will not fill the buffer.
++ *
++ * The return data in buf is structurally equivalent to the following
++ * definition:
++ *
++ * struct {
++ *	u64 seedlen;
++ *	u64 entropy_rate;
++ *	struct entropy_buf seed;
++ * } __attribute((__packed__));
++ *
++ * As struct entropy_buf is not known outsize of the LRNG, the LRNG fills
++ * seedlen first with the size of struct entropy_buf. If the caller-provided
++ * buffer buf is smaller than u64, then -EINVAL is returned
++ * and buf is not touched. If it is u64 or larger but smaller
++ * than the size of the structure above, -EMSGSIZE is returned and seedlen
++ * is filled with the size of the buffer. Finally, if buf is large
++ * enough to hold all data, it is filled with the seed data and the seedlen
++ * is set to sizeof(struct entropy_buf). The entropy rate is returned with
++ * the variable entropy_rate and provides the value in bits.
++ *
++ * The seed buffer is the data that should be handed to the caller's DRNG as
++ * seed data.
++ *
++ * @buf [out] Buffer to be filled with data from the entropy sources - note, the
++ *	      buffer is marked as u64 to ensure it is aligned to 64 bits.
++ * @nbytes [in] Size of the buffer allocated by the caller - this value
++ *		provides size of @param buf in bytes.
++ * @flags [in] Flags field to adjust the behavior
++ *
++ * @return -EINVAL or -EMSGSIZE indicating the buffer is too small, -EAGAIN when
++ *	   the call would block, but NONBLOCK is specified, > 0 the size of
++ *	   the filled buffer.
++ */
++#ifdef CONFIG_LRNG
++enum lrng_get_seed_flags {
++	LRNG_GET_SEED_NONBLOCK = 0x0001, /**< Do not block the call */
++	LRNG_GET_SEED_FULLY_SEEDED = 0x0002, /**< DRNG is fully seeded */
++};
++
++ssize_t lrng_get_seed(u64 *buf, size_t nbytes, unsigned int flags);
++#endif
++
+ #endif /* _LRNG_H */
+-- 
+2.37.3.485.gbe1a02a17e
+
