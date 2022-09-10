@@ -1,0 +1,1421 @@
+[RFC PATCH 0/5] sched: Userspace Hinting for Task Placement
+@ 2022-09-10 10:53 K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 1/5] task_struct: Add field for per-task userspace scheduler hint K Prateek Nayak
+                   ` (4 more replies)
+  0 siblings, 5 replies; 6+ messages in thread
+From: K Prateek Nayak @ 2022-09-10 10:53 UTC (permalink / raw)
+  To: linux-kernel
+  Cc: aubrey.li, efault, gautham.shenoy, libo.chen, mgorman, mingo,
+	peterz, song.bao.hua, srikar, tglx, valentin.schneider,
+	vincent.guittot, wuyun.abel, wyes.karny, yu.c.chen, yangyicong
+
+This series implements one possible mechanism of Userspace Hinting
+for scheduler aimed at influencing task placement. This work will be
+discussed as a part of the talk "Linux Kernel Scheduling and split-LLC
+architectures: Overview, Challenges and Opportunities"
+(https://lpc.events/event/16/contributions/1274/)
+in the "Real-time and Scheduling MC" at Linux Plumbers Conference 2022.
+
+Note: This is an experimental patchset that exposes some low-level knobs
+to influence task placement decision at various decision points in
+the scheduler. The current API design is experimental and is only
+capable of setting low-level hints. This API is not meant for public
+consumption and only serves as a means to test and demonstrate the
+efficacy of hints in helping the scheduler make optimal placement
+decisions based on the requirements provided by the applications.
+Scheduler is free to ignore the hints set by the user if it believes
+that following the hints will put the system in a suboptimal state.
+
+- Motivation
+
+The heuristics used by the scheduler today, such as the WF_SYNC flag,
+wake_wide() logic, etc., fall short at accurately inferring the nature
+of the workload in terms of whether it is preferable to consolidate a
+group of threads close together or if they should be spread apart. The
+inability to infer the nature of the workload can lead to a series of
+incorrect placement decisions that can be detrimental to the workload
+performance. The penalty seems to be severe on systems with split-LLC
+such as AMD EPYC.
+
+Consider a workload like schbench. It is observed that the 99th
+percentile latency reported by schebench improves drastically if
+the messenger and worker are on the same LLC. However, the signaling
+between the messenger and the workers happens via a futex which does
+not set the WF_SYNC flag when waking up the waiting tasks. In such a
+scenario, scheduler will not pull the worker thread towards the
+messenger, leaving it in a suboptimal state, on an external LLC even
+though there is room on the messenger's LLC to accommodate the worker.
+
+Another example is that of tbench where tasks sleep soon after the
+initial wakeup. In such a scenario, with only few running tasks in the
+system, the NUMA imbalance threshold is never crossed and all the
+following placements of new tasks exhibiting similar behavior will
+happen on the same NUMA node and more often on a select few LLCs
+within it. When all the tbench threads are forked, a wakeup signal will
+lead to all the waiting tasks waking up at once, storming the LLCs,
+overloading them. The imbalance at subsequent wakeup is due to the
+non-uniform distribution of task across the system during the initial
+placement. tbench could have benefited from spreading the tasks early
+on, reducing the many migrations it would require later to reach an
+optimal state however the current heuristics do not allow for this to
+happen.
+
+Peter Zijlstra, almost a year ago, had indicated that a high-level
+hinting framework is needed to prevent addition of more low-level
+heuristics, complicating the scheduler logic.
+(https://lore.kernel.org/lkml/YVwnsrZWrnWHaoqN@hirez.programming.kicks-ass.net/)
+Peter suggested that the high-level hints can describe the type of
+workload the user is running and internally, the scheduler can take
+care of modifying few parameters and heuristics to make the workload
+run optimally on a best effort basis.
+
+Following are, and I quote, the hints described by Peter in his
+response:
+
+```
+- tail latency; prepared to waste time to increase the odds of running
+  sooner. Possible effect: have this task always do a full
+  select_idle_sibling() scan.
+
+  (there's also the anti case, which I'm not sure how to enumerate,
+  basically they don't want select_idle_sibling(), just place the task
+  wherever)
+
+- non-interactive; doesn't much care about wakeup latency; can suffer
+  packing?
+
+- background; (implies non-interactive?) doesn't much care about
+  completion time either, just cares about efficiency
+
+- interactive; cares much about wakeup-latency; cares less about
+  throughput.
+
+- (energy) efficient; cares more about energy usage than performance
+```
+
+Although the focus is on how to bias CPU time based on the workload
+characteristics and modifying the idle CPU search space for the same,
+the choice of an LLC to place the task on is equally important,
+especially in split-LLC architectures.
+
+In this experiment, we show the importance of task placement, its
+effect on workload performance, and how influencing the task placement
+in the right direction using the low-level knobs can have significant
+performance impact on a split-LLC systems such as the AMD EPYC, where
+the performance penalty of getting a task placement decision wrong can
+be very high.
+
+- Design
+
+The patch series exposes low-level hints, that instructs the scheduler
+of the requested behavior at each decision points in the scheduler.
+These hints can be categorized into 3 types:
+
+- Hints for initial wakeup
+
+  These hints include:
+    o PR_SCHED_HINT_FORK_AFFINE: Place the task close to the parent as
+      long as there is an equivalent of an idle core in the local group.
+    o PR_SCHED_HINT_FORK_SPREAD: When there is a tie in number of idle
+      CPUs between the local group and the idlest group during initial
+      task placement, go with the group with least utilization.
+
+  The implementation currently overlooks any NUMA bias at the time of
+  initial placement.
+
+- Hints for subsequent wakeup
+
+  These hints include:
+    o PR_SCHED_HINT_WAKE_AFFINE: Bias task placement towards the
+      MC Domain of the waker task.
+    o PR_SCHED_HINT_WAKE_HOLD: Bias task placement towards the
+      MC Domain where the task previously ran.
+
+  These hints are followed on a best effort basis. If the targeted MC
+  Domain advertises it has an idle core through the sched_domain_shared
+  object, the wakeup hints are followed.
+
+Only one hint from each category can be set at once to ensure a defined
+behavior. Hits from different category can be combined at once as they
+are independent of each other.
+
+Load balancer is aware of the hints and will try to not migrate a task as
+long as the LLC is not overloaded.
+
+Children will inherit hints from parent. This was done so that hints can be
+set from a wrapper script and did not need any modification of the
+workload.
+
+- Potential Hints for the Future
+
+  o PR_SCHED_HINT_WAKE_WIDE
+
+  Setting PR_SCHED_HINT_WAKE_WIDE will lead to the scheduler searching
+  the CPUs outside the targeted MC Domain (and within the parent
+  domain) if the MC Domain is fully loaded and no idle CPU can be found.
+
+  This can be realised as a generic extension to Yicong Yang's efforts to
+  optimize task placement in a clustered system where the scheduler
+  searches the CPU cluster for an idle CPU before searching the rest of the
+  CPUs in the MC domain.
+  (https://lore.kernel.org/lkml/20220822073610.27205-1-yangyicong@huawei.com/)
+  For non-clustered system, this can be extended to first search the
+  CPUs of the MC domain and then look for a CPU in the higher domain,
+  if necessary, with the feature being gated behind a hint.
+
+  Although unimplemented, this hint has been mentioned here to promote
+  discussion on the concept and possible design.
+
+- Workflow Illustration
+
+  o For Initial Task Placement:
+									 Yes
+	Parent Task ----------> Group has an equivalent of idle core? ------------> Local Group
+	    | 					^ 			|
+	    | fork() 				| 			|   No
+	    v 					| 			|---------> Default Behavior
+	New Task --------------> PR_SCHED_HINT_FORK_AFFINE
+	(Inherits 	|
+	 Hints) 	|------> tie in number of idle CPUs 					    Yes
+				between local and idlest group? --> PR_SCHED_HINT_FORK_SPREAD set? ------> Group with lowest
+						| 			     	| 				utilization
+					     No | 				| No
+						v 				|
+					Default Behavior <-----------------------
+
+  o For Subsequent Wakeup:
+
+								Yes
+	Waker Task ------------------------> MC has idle core? ------------> Wake up on waker's MC Domain
+	    | 						^ 		|
+	    | ttwu 					| 		|    No
+	    v 						| 		|---------> Default Behavior
+	Wakee Task -- prev_cpu and --------> PR_SCHED_HINT_WAKE_AFFINE 				^
+		       current CPU 		|						|
+		      do not share 		|						|
+		        L3 cache 		|						|
+		    and wakeup hints		|						|
+			are set.		|--------> PR_SCHED_HINT_WAKE_HOLD 		|
+								| 			  	|
+								| 				| No
+								v 				|
+							Previous MC has idle core?  -------------
+					        		|
+								v
+							Wake on MC Domain where
+					  		  task previously ran
+
+- API
+
+Note: This is a highly experimental and barebone API designed to
+prototype hinting. This is not intended for public consumption.
+
+The hint can be set from the prctl() interface as follows:
+
+	#include <sys/prctl.h>
+
+	prctl(PR_SCHED_HINT /* prctl cmd */,
+	      PR_SCHED_HINT_FORK_AFFINE | PR_SCHED_HINT_WAKE_AFFINE /* Combination of hints */,
+	      0 /* pid of task to set hint for. 0 is current task */,
+	      0, 0);
+
+Once the hint is set, the scheduler tries its best to follow the hints
+when it hits a decision point.
+
+- Results and Explanation on AMD EPYC
+
+Changes are based on tip:sched/core at
+commit: 5531ecffa4b9 "sched: Add update_current_exec_runtime helper"
+
+For ease of the readers, following short forms are used to refer to the
+hints:
+
+	fork_affine: PR_SCHED_HINT_FORK_AFFINE
+	fork_spread: PR_SCHED_HINT_FORK_SPREAD
+	wake_affine: PR_SCHED_HINT_WAKE_AFFINE
+	wake_hold:   PR_SCHED_HINT_WAKE_HOLD
+
+Following are results from tests carried out on a dual socket Zen3
+system (2 x 64C/128T) in NPS1 mode:
+
+- Hackbench
+
+  o Fork Time Hint
+
+	  Test:                   tip                   no-hint              fork_affine             fork_spread
+ 	 1-groups:         4.31 (0.00 pct)         4.46 (-3.48 pct)        4.27 (0.92 pct)         4.28 (0.69 pct)
+ 	 2-groups:         4.93 (0.00 pct)         4.85 (1.62 pct)         4.91 (0.40 pct)         5.15 (-4.46 pct)
+ 	 4-groups:         5.38 (0.00 pct)         5.35 (0.55 pct)         5.36 (0.37 pct)         5.31 (1.30 pct)
+ 	 8-groups:         5.59 (0.00 pct)         5.49 (1.78 pct)         5.51 (1.43 pct)         5.51 (1.43 pct)
+	16-groups:         7.18 (0.00 pct)         7.38 (-2.78 pct)        7.31 (-1.81 pct)        7.25 (-0.97 pct)
+
+    Due to the communicating nature of the hackbench threads, they
+    prefer to placed on the same LLC to maximize cache efficiency.
+    It does not prefer spreading at fork time.
+
+  o Wakeup Hint
+
+	  Test:                   tip                     no-hint            wake_affine         wake_hold    
+ 	 1-groups:         4.31 (0.00 pct)         4.46 (-3.48 pct)      4.20 (2.55 pct)    4.11 (4.64 pct) 
+ 	 2-groups:         4.93 (0.00 pct)         4.85 (1.62 pct)       4.74 (3.85 pct)    5.15 (-4.46 pct)
+ 	 4-groups:         5.38 (0.00 pct)         5.35 (0.55 pct)       5.04 (6.31 pct)    4.54 (15.61 pct)
+	 8-groups:         5.59 (0.00 pct)         5.49 (1.78 pct)       5.39 (3.57 pct)    5.71 (-2.14 pct)
+	16-groups:         7.18 (0.00 pct)         7.38 (-2.78 pct)      7.24 (-0.83 pct)   7.76 (-8.07 pct)
+    
+    As the tasks within a groups have a producer consumer behavior,
+    hackbench threads benefit from following the waker task. Hence an
+    affine wakeup leads to better performance.
+
+  o Combination of Hints
+
+	  Test:                   tip          fork_affine + wake_affine   fork_spread + wake_hold
+	 1-groups:         4.31 (0.00 pct)     	  4.20 (2.55 pct)          4.81 (-11.60 pct)
+	 2-groups:         4.93 (0.00 pct)     	  4.74 (3.85 pct)          5.09 (-3.24 pct)
+ 	 4-groups:         5.38 (0.00 pct)     	  5.01 (6.87 pct)          5.62 (-4.46 pct)
+ 	 8-groups:         5.59 (0.00 pct)     	  5.38 (3.75 pct)          5.69 (-1.78 pct)
+	16-groups:         7.18 (0.00 pct)     	  7.25 (-0.97 pct)         7.97 (-11.00 pct)
+
+    A combination of the hints showing good result from above continue
+    to benefit the hackbench threads.
+
+    *Hackbench works best with the combination of relevant hints*
+
+- schbench
+
+  o Fork Time Hint
+
+	#workers:     tip                     no-hint                fork_affine            fork_spread
+	  1:      37.00 (0.00 pct)        38.00 (-2.70 pct)       17.00 (54.05 pct)       34.00 (8.10 pct)
+	  2:      39.00 (0.00 pct)        36.00 (7.69 pct)        21.00 (46.15 pct)       39.00 (0.00 pct)
+	  4:      41.00 (0.00 pct)        41.00 (0.00 pct)        28.00 (31.70 pct)       40.00 (2.43 pct)
+	  8:      53.00 (0.00 pct)        54.00 (-1.88 pct)       39.00 (26.41 pct)       53.00 (0.00 pct)
+	 16:      73.00 (0.00 pct)        74.00 (-1.36 pct)       68.00 (6.84 pct)        73.00 (0.00 pct)
+	 32:     116.00 (0.00 pct)       124.00 (-6.89 pct)      113.00 (2.58 pct)       119.00 (-2.58 pct)
+	 64:     217.00 (0.00 pct)       215.00 (0.92 pct)       205.00 (5.52 pct)       222.00 (-2.30 pct)
+	128:     477.00 (0.00 pct)       440.00 (7.75 pct)       445.00 (6.70 pct)       453.00 (5.03 pct)
+	256:     1062.00 (0.00 pct)      1026.00 (3.38 pct)      1007.00 (5.17 pct)      1021.00 (3.86 pct)
+	512:     47552.00 (0.00 pct)     47168.00 (0.80 pct)     47296.00 (0.53 pct)     47552.00 (0.00 pct)
+
+    schbench tasks prefer an affine fork keeping most worker task on the
+    same LLC and only migrating necessary tasks out later. This reduces
+    the p99 latency significantly.
+
+  o Wakeup Hint
+
+	#workers:     tip                     no-hint                 wake_affine		     wake_hold
+	  1:      37.00 (0.00 pct)        38.00 (-2.70 pct)        18.00 (51.35 pct)      	 32.00 (13.51 pct)
+	  2:      39.00 (0.00 pct)        36.00 (7.69 pct)         18.00 (53.84 pct)      	 36.00 (7.69 pct)
+	  4:      41.00 (0.00 pct)        41.00 (0.00 pct)         21.00 (48.78 pct)      	 33.00 (19.51 pct)
+	  8:      53.00 (0.00 pct)        54.00 (-1.88 pct)        31.00 (41.50 pct)      	 51.00 (3.77 pct)
+	 16:      73.00 (0.00 pct)        74.00 (-1.36 pct)      2636.00 (-3510.95 pct)   	 75.00 (-2.73 pct)
+	 32:     116.00 (0.00 pct)       124.00 (-6.89 pct)     15696.00 (-13431.03 pct)        124.00 (-6.89 pct)
+	 64:     217.00 (0.00 pct)       215.00 (0.92 pct)      15280.00 (-6941.47 pct)         224.00 (-3.22 pct)
+	128:     477.00 (0.00 pct)       440.00 (7.75 pct)      14800.00 (-3002.72 pct)         493.00 (-3.35 pct)
+	256:     1062.00 (0.00 pct)      1026.00 (3.38 pct)     15696.00 (-1377.96 pct)         1026.00 (3.38 pct)
+	512:     47552.00 (0.00 pct)     47168.00 (0.80 pct)    60736.00 (-27.72 pct)  	       49856.00 (-4.84 pct)
+    
+    "wake_affine" hint is beneficial as long as the number of messengers
+    and the workers is fewer than the number of CPUs in the LLC, beyond
+    that point it causes overloading and thus causing the workers to wait
+    behind one another which makes the tail-latency worse. Wake hold
+    shows some improvements and minimal regression by avoiding cross LLC
+    migration as a result of the hint.
+
+  o Combination of Hints
+
+	#workers:     tip                     no-hint   	fork_affine + wake_affine    fork_spread + wake_hold
+	  1:      37.00 (0.00 pct)        38.00 (-2.70 pct)          17.00 (54.05 pct)   	 40.00 (-8.10 pct)
+	  2:      39.00 (0.00 pct)        36.00 (7.69 pct)           18.00 (53.84 pct)   	 40.00 (-2.56 pct)
+	  4:      41.00 (0.00 pct)        41.00 (0.00 pct)           20.00 (51.21 pct)   	 40.00 (2.43 pct)
+	  8:      53.00 (0.00 pct)        54.00 (-1.88 pct)          31.00 (41.50 pct)   	 54.00 (-1.88 pct)
+	 16:      73.00 (0.00 pct)        74.00 (-1.36 pct)        2884.00 (-3850.68 pct)        80.00 (-9.58 pct)
+	 32:     116.00 (0.00 pct)       124.00 (-6.89 pct)       15408.00 (-13182.75 pct)      123.00 (-6.03 pct)
+	 64:     217.00 (0.00 pct)       215.00 (0.92 pct)        15344.00 (-6970.96 pct)       224.00 (-3.22 pct)
+	128:     477.00 (0.00 pct)       440.00 (7.75 pct)        14896.00 (-3022.85 pct)       450.00 (5.66 pct)
+	256:     1062.00 (0.00 pct)      1026.00 (3.38 pct)       15664.00 (-1374.95 pct)       997.00 (6.12 pct)
+	512:     47552.00 (0.00 pct)     47168.00 (0.80 pct)      60992.00 (-28.26 pct)       55232.00 (-16.15 pct)
+    
+    Combination of hints bring out worst of the scenarios.
+
+    *schbench works best with only fork hint set*
+
+- tbench
+
+  o Fork Time Hints
+
+	Clients:      tip                    no-hint               fork_affine              fork_spread
+	    1    573.26 (0.00 pct)       572.29 (-0.16 pct)      572.70 (-0.09 pct)      569.64 (-0.63 pct)
+	    2    1131.19 (0.00 pct)      1119.57 (-1.02 pct)     1131.97 (0.06 pct)      1101.03 (-2.66 pct)
+	    4    2100.07 (0.00 pct)      2070.66 (-1.40 pct)     2094.80 (-0.25 pct)     2011.64 (-4.21 pct)
+	    8    3809.88 (0.00 pct)      3784.16 (-0.67 pct)     3458.94 (-9.21 pct)     3867.70 (1.51 pct)
+	   16    6560.72 (0.00 pct)      6449.64 (-1.69 pct)     6342.78 (-3.32 pct)     6700.50 (2.13 pct)
+	   32    12203.23 (0.00 pct)     12180.02 (-0.19 pct)    10411.44 (-14.68 pct)   13104.29 (7.38 pct)
+	   64    22389.81 (0.00 pct)     23084.51 (3.10 pct)     16614.14 (-25.79 pct)   24353.76 (8.77 pct)
+	  128    32449.37 (0.00 pct)     33561.28 (3.42 pct)     19971.67 (-38.45 pct)   36201.16 (11.56 pct)
+	  256    58962.40 (0.00 pct)     59118.43 (0.26 pct)     26836.13 (-54.48 pct)   61721.06 (4.67 pct)
+	  512    59608.71 (0.00 pct)     60246.78 (1.07 pct)     36889.55 (-38.11 pct)   59696.57 (0.14 pct)
+	 1024    58037.02 (0.00 pct)     58532.41 (0.85 pct)     39936.06 (-31.18 pct)   57445.62 (-1.01 pct)
+
+    tbench showcases the thundering herd problem where the task after
+    initial wakeup quickly go to sleep. For such a case, finding an
+    idle group based on utilization using the fork spread allows for a
+    better distribution of tasks early on and lesser migrations later to
+    reach a stable state.
+    
+    *tbench can gain some more performance with fork spread hint on a split-LLC system such as AMD EPYC*
+
+- Results from Unified LLC
+
+Changes are based on tip:sched/core at
+commit: 5531ecffa4b9 "sched: Add update_current_exec_runtime helper"
+
+For ease of the readers, same short forms are followed.
+
+Following are results from tests carried out on a dual socket
+system based on  3rd Generation Intel Xeon Scalable Processors
+(2 x 32C/64T):
+
+- Hackbench
+
+0 Fork time hint
+
+  Test:                   tip                   no-hint                fork_affine             fork_spread           
+   1-groups:         2.38 (0.00 pct)         2.33 (2.10 pct)         2.25 (5.46 pct)         2.49 (-4.62 pct)        
+   2-groups:         3.84 (0.00 pct)         3.64 (5.20 pct)         3.80 (1.04 pct)         3.77 (1.82 pct)         
+   4-groups:         4.50 (0.00 pct)         4.39 (2.44 pct)         4.38 (2.66 pct)         4.40 (2.22 pct)         
+   8-groups:         5.84 (0.00 pct)         5.94 (-1.71 pct)        5.96 (-2.05 pct)        5.92 (-1.36 pct)        
+  16-groups:        11.91 (0.00 pct)        12.37 (-3.86 pct)       12.80 (-7.47 pct)       12.68 (-6.46 pct)
+
+  For lower number of groups, the hints show benefit for the test
+  system, however, the performance degrades for larger number of groups
+  for both the type of fork time hints.
+
+o Wakeup Hint
+
+  Test:                   tip                   no-hint               wake_affine              wake_hold      
+   1-groups:         2.38 (0.00 pct)         2.33 (2.10 pct)        1.98 (16.80 pct)        2.01 (15.54 pct)  
+   2-groups:         3.84 (0.00 pct)         3.64 (5.20 pct)        3.39 (11.71 pct)        3.96 (-3.12 pct)  
+   4-groups:         4.50 (0.00 pct)         4.39 (2.44 pct)        4.13 (8.22 pct)         4.83 (-7.33 pct)  
+   8-groups:         5.84 (0.00 pct)         5.94 (-1.71 pct)       6.03 (-3.25 pct)        6.11 (-4.62 pct)  
+  16-groups:        11.91 (0.00 pct)        12.37 (-3.86 pct)       9.47 (20.48 pct)       10.78 (9.48 pct)   
+
+  Affine wakeup seems to benefit a unified LLC system too. However,
+  wake_hold has inconsistent behavior here too like in case of split-LLC
+  systems.
+
+o Combination of hint
+
+  Test:                   tip                   no-hint          fork_affine+wake_affine   fork_spread+wake_hold
+   1-groups:         2.38 (0.00 pct)         2.33 (2.10 pct)        1.98 (16.80 pct)         3.44 (-44.53 pct)
+   2-groups:         3.84 (0.00 pct)         3.64 (5.20 pct)        3.43 (10.67 pct)         4.39 (-14.32 pct)
+   4-groups:         4.50 (0.00 pct)         4.39 (2.44 pct)        4.16 (7.55 pct)          4.52 (-0.44 pct)
+   8-groups:         5.84 (0.00 pct)         5.94 (-1.71 pct)       6.01 (-2.91 pct)         5.99 (-2.56 pct)
+  16-groups:        11.91 (0.00 pct)        12.37 (-3.86 pct)       9.65 (18.97 pct)        10.63 (10.74 pct)
+
+  With fork affine and wake affine, the benefit compounds based on the
+  test results.
+
+- schbench
+
+o fork time hints
+
+  #workers:     tip                     no-hint                fork_affine            fork_spread
+    1:      18.00 (0.00 pct)        14.00 (22.22 pct)       16.00 (11.11 pct)       15.00 (16.66 pct)
+    2:      17.00 (0.00 pct)        18.00 (-5.88 pct)       16.00 (5.88 pct)        19.00 (-11.76 pct)
+    4:      20.00 (0.00 pct)        21.00 (-5.00 pct)       19.00 (5.00 pct)        21.00 (-5.00 pct)
+    8:      28.00 (0.00 pct)        29.00 (-3.57 pct)       27.00 (3.57 pct)        28.00 (0.00 pct)
+   16:      45.00 (0.00 pct)        46.00 (-2.22 pct)       42.00 (6.66 pct)        45.00 (0.00 pct)
+   32:      79.00 (0.00 pct)        79.00 (0.00 pct)        74.00 (6.32 pct)        79.00 (0.00 pct)
+   64:     166.00 (0.00 pct)       167.00 (-0.60 pct)      163.00 (1.80 pct)       165.00 (0.60 pct)
+  128:     270.00 (0.00 pct)       291.00 (-7.77 pct)      276.00 (-2.22 pct)      297.00 (-10.00 pct)
+  256:     42432.00 (0.00 pct)     42560.00 (-0.30 pct)    42816.00 (-0.90 pct)    42304.00 (0.30 pct)
+  512:     90240.00 (0.00 pct)     90240.00 (0.00 pct)     90240.00 (0.00 pct)     90496.00 (-0.28 pct)
+
+  An affine fork benefits the test system however the spread at fork is
+  not ideal for it.
+
+o Wakeup hints
+
+  #workers:     tip                     no-hint               wake_affine                        wake_hold
+    1:      18.00 (0.00 pct)        14.00 (22.22 pct)       15.00 (16.66 pct)               17.00 (5.55 pct)
+    2:      17.00 (0.00 pct)        18.00 (-5.88 pct)       15.00 (11.76 pct)               18.00 (-5.88 pct)
+    4:      20.00 (0.00 pct)        21.00 (-5.00 pct)       19.00 (5.00 pct)                21.00 (-5.00 pct)
+    8:      28.00 (0.00 pct)        29.00 (-3.57 pct)       27.00 (3.57 pct)                29.00 (-3.57 pct)
+   16:      45.00 (0.00 pct)        46.00 (-2.22 pct)       45.00 (0.00 pct)                48.00 (-6.66 pct)
+   32:      79.00 (0.00 pct)        79.00 (0.00 pct)        80.00 (-1.26 pct)               82.00 (-3.79 pct)
+   64:     166.00 (0.00 pct)       167.00 (-0.60 pct)      144.00 (13.25 pct)              165.00 (0.60 pct)
+  128:     270.00 (0.00 pct)       291.00 (-7.77 pct)      28384.00 (-10412.59 pct)        256.00 (5.18 pct)
+  256:     42432.00 (0.00 pct)     42560.00 (-0.30 pct)    60352.00 (-42.23 pct)         43584.00 (-2.71 pct)
+  512:     90240.00 (0.00 pct)     90240.00 (0.00 pct)     116608.00 (-29.21 pct)        91008.00 (-0.85 pct)
+
+  Affine wakeup is beneficial as long as the number of workers is less
+  than the CPUs in each socket. Beyond that, the socket gets overloaded
+  and leads to massive increase in tail latency like what was seen
+  in the split-LLC case. Staying on same LLC benefits from initial
+  distribution and having an idle CPU in the same LLC unless system is
+  heavily overloaded.
+
+o Combination of hints
+
+  #workers:     tip                     no-hint            fork_affine+wake_affine       fork_spread+wake_hold
+    1:      18.00 (0.00 pct)        14.00 (22.22 pct)        14.00 (22.22 pct)              14.00 (22.22 pct)
+    2:      17.00 (0.00 pct)        18.00 (-5.88 pct)        14.00 (17.64 pct)              16.00 (5.88 pct)
+    4:      20.00 (0.00 pct)        21.00 (-5.00 pct)        19.00 (5.00 pct)               21.00 (-5.00 pct)
+    8:      28.00 (0.00 pct)        29.00 (-3.57 pct)        26.00 (7.14 pct)               28.00 (0.00 pct)
+   16:      45.00 (0.00 pct)        46.00 (-2.22 pct)        40.00 (11.11 pct)              46.00 (-2.22 pct)
+   32:      79.00 (0.00 pct)        79.00 (0.00 pct)         81.00 (-2.53 pct)              80.00 (-1.26 pct)
+   64:     166.00 (0.00 pct)       167.00 (-0.60 pct)       142.00 (14.45 pct)             166.00 (0.00 pct)
+  128:     270.00 (0.00 pct)       291.00 (-7.77 pct)     28192.00 (-10341.48 pct)         251.00 (7.03 pct)
+  256:     42432.00 (0.00 pct)     42560.00 (-0.30 pct)   62016.00 (-46.15 pct)          42816.00 (-0.90 pct)
+  512:     90240.00 (0.00 pct)     90240.00 (0.00 pct)   108672.00 (-20.42 pct)          93056.00 (-3.12 pct)
+
+  Combination the right hints compounds the benefit. Affine hints show
+  good improvements until the LLC threshold is crossed. A good spread
+  and holding the position helps in reducing expensive cross socket
+  migration benefiting the benchmark in some cases.
+
+- tbench
+
+o Fork time hints
+
+  Clients:      tip                     no-hint               fork_affine             fork_spread
+      1    122.36 (0.00 pct)       121.33 (-0.84 pct)      121.49 (-0.71 pct)      134.69 (10.07 pct)
+      2    247.13 (0.00 pct)       266.78 (7.95 pct)       271.97 (10.05 pct)      245.39 (-0.70 pct)
+      4    516.31 (0.00 pct)       537.59 (4.12 pct)       511.37 (-0.95 pct)      508.46 (-1.52 pct)
+      8    1033.53 (0.00 pct)      1106.22 (7.03 pct)      1010.87 (-2.19 pct)     1175.12 (13.69 pct)
+     16    3094.23 (0.00 pct)      2509.74 (-18.88 pct)    3410.97 (10.23 pct)     2588.06 (-16.35 pct)
+     32    10757.40 (0.00 pct)     10585.54 (-1.59 pct)    10481.10 (-2.56 pct)    10711.71 (-0.42 pct)
+     64    16170.10 (0.00 pct)     15864.99 (-1.88 pct)    15856.51 (-1.93 pct)    16009.95 (-0.99 pct)
+    128    15168.29 (0.00 pct)     16547.25 (9.09 pct)     23796.79 (56.88 pct)    14229.63 (-6.18 pct)
+    256    32474.25 (0.00 pct)     32100.39 (-1.15 pct)    31633.93 (-2.58 pct)    32513.67 (0.12 pct)
+    512    29543.03 (0.00 pct)     29537.67 (-0.01 pct)    29282.98 (-0.88 pct)    29894.14 (1.18 pct)
+
+   An affine fork seems to benefit tbench when the system is fully
+   loaded in case of workloads such as tbench on the test system. This
+   is quite opposite of the unified LLC system which benefitted from
+   spreading on fork.
+
+- Stream
+
+  - 10 runs
+
+  o 1 thread
+  
+  Test:        tip                     no_hint                 fork_spread
+   Copy:   28127.35 (0.00 pct)     28367.72 (0.85 pct)     27293.80 (-2.96 pct)
+  Scale:   16248.13 (0.00 pct)     16332.26 (0.51 pct)     15901.45 (-2.13 pct)
+    Add:   17146.86 (0.00 pct)     17491.69 (2.01 pct)     17062.82 (-0.49 pct)
+  Triad:   17552.85 (0.00 pct)     17723.45 (0.97 pct)     17301.79 (-1.43 pct)
+  
+  o 2 threads
+  
+  Test:        tip                     no_hint                 fork_spread
+   Copy:   48920.60 (0.00 pct)     49831.92 (1.86 pct)     53687.16 (9.74 pct)
+  Scale:   27370.11 (0.00 pct)     27560.13 (0.69 pct)     32197.46 (17.63 pct)
+    Add:   29909.84 (0.00 pct)     30363.41 (1.51 pct)     34311.99 (14.71 pct)
+  Triad:   30225.18 (0.00 pct)     30520.83 (0.97 pct)     34982.68 (15.74 pct)
+  
+  o 4 threads
+  
+  Test:        tip                     no_hint                 fork_spread
+   Copy:   79603.85 (0.00 pct)     80394.36 (0.99 pct)     89379.42 (12.28 pct)
+  Scale:   46870.97 (0.00 pct)     47417.41 (1.16 pct)     54352.83 (15.96 pct)
+    Add:   52066.71 (0.00 pct)     52623.44 (1.06 pct)     59269.40 (13.83 pct)
+  Triad:   52069.18 (0.00 pct)     52646.49 (1.10 pct)     59830.77 (14.90 pct)
+  
+  o 8 threads
+  
+  Test:         tip                     no_hint                 fork_spread
+   Copy:   113566.60 (0.00 pct)    113613.06 (0.04 pct)    128656.04 (13.28 pct)
+  Scale:   71443.07 (0.00 pct)     71722.27 (0.39 pct)     79848.75 (11.76 pct)
+    Add:   81408.48 (0.00 pct)     81491.98 (0.10 pct)     90695.65 (11.40 pct)
+  Triad:   81987.96 (0.00 pct)     81992.01 (0.00 pct)     92047.47 (12.26 pct)
+  
+  o 16 threads
+  
+  Test:          tip                     no_hint                 fork_spread
+   Copy:   152139.80 (0.00 pct)    151279.55 (-0.56 pct)   148607.24 (-2.32 pct)
+  Scale:   103163.08 (0.00 pct)    103628.35 (0.45 pct)    102184.90 (-0.94 pct)
+    Add:   113404.79 (0.00 pct)    113284.87 (-0.10 pct)   111183.33 (-1.95 pct)
+  Triad:   115388.28 (0.00 pct)    116244.97 (0.74 pct)    114411.79 (-0.84 pct)
+  
+  o 32 threads
+  
+  Test:          tip                     no_hint                 fork_spread
+   Copy:   161240.24 (0.00 pct)    161470.60 (0.14 pct)    162977.90 (1.07 pct)
+  Scale:   124507.68 (0.00 pct)    126147.95 (1.31 pct)    126678.26 (1.74 pct)
+    Add:   130164.90 (0.00 pct)    130225.95 (0.04 pct)    131567.75 (1.07 pct)
+  Triad:   132933.44 (0.00 pct)    134431.69 (1.12 pct)    135044.50 (1.58 pct)
+  
+  - 100 runs
+  
+  o 1 thread
+  
+  Test:        tip                     no_hint                 fork_spread
+   Copy:   28087.03 (0.00 pct)     28391.25 (1.08 pct)     27232.70 (-3.04 pct)
+  Scale:   16187.98 (0.00 pct)     16295.17 (0.66 pct)     15827.29 (-2.22 pct)
+    Add:   17122.77 (0.00 pct)     17497.03 (2.18 pct)     16987.19 (-0.79 pct)
+  Triad:   17524.57 (0.00 pct)     17770.79 (1.40 pct)     17220.50 (-1.73 pct)
+  
+  o 2 threads
+  
+  Test:        tip                     no_hint                 fork_spread
+   Copy:   49153.60 (0.00 pct)     49578.59 (0.86 pct)     52587.24 (6.98 pct)
+  Scale:   27712.34 (0.00 pct)     27634.70 (-0.28 pct)    30989.75 (11.82 pct)
+    Add:   30252.12 (0.00 pct)     30473.89 (0.73 pct)     33258.64 (9.93 pct)
+  Triad:   30526.42 (0.00 pct)     30643.25 (0.38 pct)     33795.72 (10.70 pct)
+  o 4 threads
+  
+  Test:        tip                     no_hint                 fork_spread
+   Copy:   81401.84 (0.00 pct)     81154.71 (-0.30 pct)    92914.24 (14.14 pct)
+  Scale:   47690.70 (0.00 pct)     47356.46 (-0.70 pct)    54671.55 (14.63 pct)
+    Add:   52859.84 (0.00 pct)     52586.28 (-0.51 pct)    59958.56 (13.42 pct)
+  Triad:   52931.46 (0.00 pct)     52647.24 (-0.53 pct)    60669.41 (14.61 pct)
+  
+  o 8 threads
+  
+  Test:         tip                     no_hint                 fork_spread
+   Copy:   115285.88 (0.00 pct)    116381.75 (0.95 pct)    132874.03 (15.25 pct)
+  Scale:   72189.01 (0.00 pct)     72751.02 (0.77 pct)     82349.53 (14.07 pct)
+    Add:   82438.52 (0.00 pct)     82758.78 (0.38 pct)     93489.17 (13.40 pct)
+  Triad:   82791.24 (0.00 pct)     83446.12 (0.79 pct)     95010.20 (14.75 pct)
+  
+  o 16 threads
+  
+  Test:         tip                     no_hint                 fork_spread
+   Copy:   152361.42 (0.00 pct)    151922.38 (-0.28 pct)   152300.21 (-0.04 pct)
+  Scale:   103042.94 (0.00 pct)    103833.81 (0.76 pct)    104310.93 (1.23 pct)
+    Add:   114032.41 (0.00 pct)    113004.05 (-0.90 pct)   113682.56 (-0.30 pct)
+  Triad:   115319.73 (0.00 pct)    116174.81 (0.74 pct)    116782.15 (1.26 pct)
+
+  o 32 threads
+
+  Test:         tip                     no_hint                 fork_spread
+   Copy:   161485.98 (0.00 pct)    162183.58 (0.43 pct)    163371.33 (1.16 pct)
+  Scale:   125366.83 (0.00 pct)    126356.26 (0.78 pct)    126856.35 (1.18 pct)
+    Add:   129846.24 (0.00 pct)    130469.97 (0.48 pct)    131863.96 (1.55 pct)
+  Triad:   133523.78 (0.00 pct)    134498.68 (0.73 pct)    134996.96 (1.10 pct)
+
+  In case of Stream, the benchmark is benefiting from spreading early as
+  it reduces cache-contention and has an added advantage of the higher
+  cross-socket bandwidth. After Mel Gorman's NUMA imbalance rework for
+  split-LLC systems, (commit: e496132ebedd "sched/fair: Adjust the
+  allowed NUMA imbalance when SD_NUMA spans multiple LLCs") systems such
+  as AMD EPYC spread tasks by default once the number of tasks in NUMA
+  domain crosses the number of LLCs in it thus not needing a hint anymore
+  to spread the Stream threads optimally.
+
+- Limitations in current implementation
+
+o The wakeup path uses sd_shared->has_idle_core as a bailout metric for
+  hint in the subsequent wakeup path. This metric is not accurate and
+  can lead to tasks piling on the same CPU. There exist other
+  alternatives such as atomically reading sd_shared->nr_busy_cpus that
+  can lead to higher scheduling latency.
+
+o Considerations are not made for task pinning and asymmetric CPU
+  capacity. The logic today assumes all CPUs in the system as equal.
+
+o Parts of implementation assume a SMT-2 system to calculate the number
+  of cores in sched group. This can be improved by adding a generic
+  logic that counts number of online cores when the topology is
+  generated to account for systems with different SMT configurations
+  and be accurate after a CPU hotplug.
+
+o The API exposes low-level decision points which might not be ideal
+  for user with little to no knowledge of scheduler internals.
+  As such, an abstract user hint should map to an appropriate
+  combination of these low-level hints.
+
+# Future Work
+
+o Fix the shortcomings exposed by the prototype - mainly the bailout
+  point in the wakeup path.
+o Explore other possible hints to influence task placement that can
+  benefit other workloads.
+o Test hinting on larger workloads containing tasks exhibiting different
+  behavior.
+o Make hinting a usable feature based on community feedback.
+o Deciding on an interface through which users can provide hints to the
+  scheduler.
+o Enumerating the hints that are sensible to the user.
+
+Any feedback on the prototype, approach, and design is
+highly appreciated.
+
+--
+K Prateek Nayak (5):
+  task_struct: Add field for per-task userspace scheduler hint
+  prctl: Add interface and helper functions to set hints
+  sched/fair: Add support for hints in the subsequent wakeup path
+  sched/fair: Consider hints in the initial task wakeup path
+  sched/fair: Add exception for hints in load balancing path
+
+ include/linux/sched.h      |  2 +
+ include/uapi/linux/prctl.h |  9 ++++
+ init/init_task.c           |  1 +
+ kernel/sched/core.c        | 83 ++++++++++++++++++++++++++++++++
+ kernel/sched/fair.c        | 98 ++++++++++++++++++++++++++++++++++++--
+ kernel/sys.c               |  5 ++
+ 6 files changed, 195 insertions(+), 3 deletions(-)
+
+-- 
+2.25.1
+
+
+^ permalink raw reply	[flat|nested] 6+ messages in thread
+
+* [PATCH 1/5] task_struct: Add field for per-task userspace scheduler hint
+  2022-09-10 10:53 [RFC PATCH 0/5] sched: Userspace Hinting for Task Placement K Prateek Nayak
+@ 2022-09-10 10:53 ` K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 2/5] prctl: Add interface and helper functions to set hints K Prateek Nayak
+                   ` (3 subsequent siblings)
+  4 siblings, 0 replies; 6+ messages in thread
+From: K Prateek Nayak @ 2022-09-10 10:53 UTC (permalink / raw)
+  To: linux-kernel
+  Cc: aubrey.li, efault, gautham.shenoy, libo.chen, mgorman, mingo,
+	peterz, song.bao.hua, srikar, tglx, valentin.schneider,
+	vincent.guittot, wuyun.abel, wyes.karny, yu.c.chen, yangyicong
+
+- Add a field named "hint" to store the per-task userspace scheduler
+  hint set via the prctl() interface.
+- Hints are inherited from parent on fork. Inherited hints can be reset
+  from the same prctl() interface used to set hint to default or any
+  other value.
+- Hints are best effort case and scheduler doesn't make any guarantees
+  of strictly adhering to it.
+
+Signed-off-by: K Prateek Nayak <kprateek.nayak@amd.com>
+---
+ include/linux/sched.h | 1 +
+ init/init_task.c      | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e7b2f8a5c711..fc953c9e956a 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -769,6 +769,7 @@ struct task_struct {
+ 	int				wake_cpu;
+ #endif
+ 	int				on_rq;
++	unsigned int			hint;
+ 
+ 	int				prio;
+ 	int				static_prio;
+diff --git a/init/init_task.c b/init/init_task.c
+index ff6c4b9bfe6b..f5208e6a1934 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -79,6 +79,7 @@ struct task_struct init_task
+ 	.static_prio	= MAX_PRIO - 20,
+ 	.normal_prio	= MAX_PRIO - 20,
+ 	.policy		= SCHED_NORMAL,
++	.hint		= 0,
+ 	.cpus_ptr	= &init_task.cpus_mask,
+ 	.user_cpus_ptr	= NULL,
+ 	.cpus_mask	= CPU_MASK_ALL,
+-- 
+2.25.1
+
+
+^ permalink raw reply	[flat|nested] 6+ messages in thread
+
+* [PATCH 2/5] prctl: Add interface and helper functions to set hints
+  2022-09-10 10:53 [RFC PATCH 0/5] sched: Userspace Hinting for Task Placement K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 1/5] task_struct: Add field for per-task userspace scheduler hint K Prateek Nayak
+@ 2022-09-10 10:53 ` K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 3/5] sched/fair: Add support for hints in the subsequent wakeup path K Prateek Nayak
+                   ` (2 subsequent siblings)
+  4 siblings, 0 replies; 6+ messages in thread
+From: K Prateek Nayak @ 2022-09-10 10:53 UTC (permalink / raw)
+  To: linux-kernel
+  Cc: aubrey.li, efault, gautham.shenoy, libo.chen, mgorman, mingo,
+	peterz, song.bao.hua, srikar, tglx, valentin.schneider,
+	vincent.guittot, wuyun.abel, wyes.karny, yu.c.chen, yangyicong
+
+Hints are low-level knobs that can influence task placement decisions
+at various scheduler decision points.
+
+- Design of wakeup hints
+
+Hints are of two kinds:
+
+    o fork time hints: These hints influence initial placement. It is
+      observed that a correct initial placement can have a long lasting
+      effect on workload performance. These hints override scheduler
+      behavior when the system is not heavily loaded to overlook any
+      pre-configured bias in scheduler (such as NUMA Imbalance) and
+      place tasks in a way user finds beneficial.
+      These hints are of the form PR_SCHED_HINT_FORK_* namely:
+      	- PR_SCHED_HINT_FORK_AFFINE
+      	- PR_SCHED_HINT_FORK_SPREAD
+
+    o wakeup hints: These hints target a specific MC Domain during
+      wakeup. The user can choose to bias the placement towards waker's
+      LLC if we believe the waker-wakee follow a producer-consumer
+      pattern. The user can also choose to bias the placement towards
+      the MC domain where the tasks previously ran if we believe waker's
+      signaling is just for synchronization and the wakee will continue
+      to consume the data, it produced during its last run.
+      These hints are of the form PR_SCHED_HINT_WAKE_* namely:
+        - PR_SCHED_HINT_WAKE_AFFINE
+      	- PR_SCHED_HINT_WAKE_HOLD
+
+Only one hint of each type can be set at once currently. Failure to do
+so will lead to prctl() call returning -EINVAL.
+
+- API Design
+
+An example of setting hint PR_SCHED_HINT_FORK_AFFINE and
+PR_SCHED_HINT_WAKE_AFFINE for the current running process is a follows:
+
+	#include <sys/prctl.h>
+
+	prctl(PR_SCHED_HINT /* prctl() cmd */,
+	      PR_SCHED_HINT_WAKE_AFFINE | PR_SCHED_HINT_FORK_AFFINE /* Hints */,
+	      0 /* pid of task to set hint for. pid 0 sets hint current task */,
+	      0, 0);
+
+The above command sets PR_SCHED_HINT_WAKE_AFFINE and
+PR_SCHED_HINT_FORK_AFFINE for the task calling the prctl(). For a hint
+to be set, the task should be ftrace-able.
+
+As hints can be inherited by childern, one can wrap the runner script
+with a hint to avail the benefits and need not change the workload.
+
+Signed-off-by: K Prateek Nayak <kprateek.nayak@amd.com>
+---
+ include/linux/sched.h      |  1 +
+ include/uapi/linux/prctl.h |  8 ++++
+ kernel/sched/core.c        | 81 ++++++++++++++++++++++++++++++++++++++
+ kernel/sys.c               |  5 +++
+ 4 files changed, 95 insertions(+)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index fc953c9e956a..84a630d7c529 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2405,5 +2405,6 @@ static inline void sched_core_fork(struct task_struct *p) { }
+ #endif
+ 
+ extern void sched_set_stop_task(int cpu, struct task_struct *stop);
++extern int sched_set_hint(unsigned int hint, pid_t pid);
+ 
+ #endif
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
+index a5e06dcbba13..0a5dd42f1eab 100644
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -284,4 +284,12 @@ struct prctl_mm_map {
+ #define PR_SET_VMA		0x53564d41
+ # define PR_SET_VMA_ANON_NAME		0
+ 
++/* Hint the scheduler of the expected task behavior */
++#define PR_SCHED_HINT			65
++# define PR_SCHED_HINT_DEFAULT		0
++# define PR_SCHED_HINT_FORK_AFFINE	(1U << 0) /* Initial placement close to forking CPU */
++# define PR_SCHED_HINT_FORK_SPREAD	(1U << 1) /* Initial placement biased towards idlest group */
++# define PR_SCHED_HINT_WAKE_AFFINE	(1U << 2) /* Subsequent wakeup target waker's MC domain */
++# define PR_SCHED_HINT_WAKE_HOLD	(1U << 3) /* Subsequent wakeup target last run's MC domain */
++
+ #endif /* _LINUX_PRCTL_H */
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 7d289d87acf7..60bee250d7b4 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -71,6 +71,7 @@
+ # endif
+ #endif
+ 
++#include <uapi/linux/prctl.h>
+ #include <uapi/linux/sched/types.h>
+ 
+ #include <asm/switch_to.h>
+@@ -7323,6 +7324,86 @@ static void __setscheduler_params(struct task_struct *p,
+ 	set_load_weight(p, true);
+ }
+ 
++/*
++ * Check whether the hints are valid and clear.
++ * Returns 0 if the hints are invalid of if
++ * the set hints are ambiguous and can lead to
++ * inconsistent behavior.
++ * Returns 1 for valid hint.
++ */
++static int valid_hint(unsigned int hint) {
++	if (!hint)
++		return 1;
++
++	/*
++	 * Largest value of hint can be calculated by setting the hints
++	 * with the largest numeric value in each independent category.
++	 */
++	if (hint > (PR_SCHED_HINT_WAKE_HOLD | PR_SCHED_HINT_FORK_SPREAD))
++		return 0;
++
++	/*
++	 * Only one of the fork time hints must be
++	 * set. Consistent behavior cannot be
++	 * guarenteed with conflicting hints.
++	 */
++	if ((hint & PR_SCHED_HINT_FORK_AFFINE) &&
++	    (hint & PR_SCHED_HINT_FORK_SPREAD))
++		return 0;
++
++	/*
++	 * Only one of the wakeup hints must be
++	 * set for the same reason stated above.
++	 */
++	if ((hint & PR_SCHED_HINT_WAKE_AFFINE) &&
++	    (hint & PR_SCHED_HINT_WAKE_HOLD))
++		return 0;
++
++	return 1;
++}
++
++/* Called from prctl interface: PR_SCHED_HINT */
++int sched_set_hint(unsigned int hint, pid_t pid)
++{
++	struct task_struct *task;
++	int err = 0;
++
++	/*
++	 * Make sure hint is valid and the user has not
++	 * requested for conflicting behavior at any
++	 * given decision point.
++	 */
++	if (!valid_hint(hint))
++		return -EINVAL;
++
++	rcu_read_lock();
++	if (pid == 0) {
++		task = current;
++	} else {
++		task = find_task_by_vpid(pid);
++		if (!task) {
++			rcu_read_unlock();
++			return -ESRCH;
++		}
++	}
++	get_task_struct(task);
++	rcu_read_unlock();
++
++	/*
++	 * Check if this process has the right to modify the specified
++	 * process. Use the regular "ptrace_may_access()" checks.
++	 */
++	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)) {
++		err = -EPERM;
++		goto out;
++	}
++
++	WRITE_ONCE(task->hint, hint);
++out:
++	put_task_struct(task);
++	return err;
++}
++
+ /*
+  * Check the target process has a UID that matches the current process's:
+  */
+diff --git a/kernel/sys.c b/kernel/sys.c
+index b911fa6d81ab..505ceea548bd 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2623,6 +2623,11 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 	case PR_SET_VMA:
+ 		error = prctl_set_vma(arg2, arg3, arg4, arg5);
+ 		break;
++	case PR_SCHED_HINT:
++		if (arg4 || arg5)
++			return -EINVAL;
++		error = sched_set_hint(arg2, arg3);
++		break;
+ 	default:
+ 		error = -EINVAL;
+ 		break;
+-- 
+2.25.1
+
+
+^ permalink raw reply	[flat|nested] 6+ messages in thread
+
+* [PATCH 3/5] sched/fair: Add support for hints in the subsequent wakeup path
+  2022-09-10 10:53 [RFC PATCH 0/5] sched: Userspace Hinting for Task Placement K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 1/5] task_struct: Add field for per-task userspace scheduler hint K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 2/5] prctl: Add interface and helper functions to set hints K Prateek Nayak
+@ 2022-09-10 10:53 ` K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 4/5] sched/fair: Consider hints in the initial task " K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 5/5] sched/fair: Add exception for hints in load balancing path K Prateek Nayak
+  4 siblings, 0 replies; 6+ messages in thread
+From: K Prateek Nayak @ 2022-09-10 10:53 UTC (permalink / raw)
+  To: linux-kernel
+  Cc: aubrey.li, efault, gautham.shenoy, libo.chen, mgorman, mingo,
+	peterz, song.bao.hua, srikar, tglx, valentin.schneider,
+	vincent.guittot, wuyun.abel, wyes.karny, yu.c.chen, yangyicong
+
+Hints are adhered to as long as there are idle cores in the target MC
+domain. Beyond that, the default behavior is followed.
+
+- Hinting flow in the wakeup path
+
+Following is the flow with wakeup hints:
+
+o Check if the task has a wakeup hint set and whether the current
+  CPU and the CPU where the task previously ran are on two different
+  LLCs. If either is false, bail out and follow the default logic.
+o Check whether the previous CPU or the current CPU is the desired
+  CPU according to the set hint.
+o Test for idle cores in the MC domain of the hinted CPU.
+o If yes, set the desired CPU as the target for wakeup. The scheduler
+  will then look for an idle CPU withing the MC domain of the target.
+o If test_idle_cores returns false, follow the default wakeup path.
+
+PR_SCHED_HINT_WAKE_AFFINE will favor an affine wakeup if the MC where
+the waker is running advertises idle core. PR_SCHED_HINT_WAKE_HOLD will
+bias the wakeup to MC domain where the task previously ran.
+
+- Results
+
+Following are results from running hackbench with only wakeup hints on a
+dual socket Zen3 system in NPS1 mode:
+
+o Hackbench
+
+  Test:                   tip                     no-hint             wake_affine         wake_hold
+   1-groups:         4.31 (0.00 pct)         4.46 (-3.48 pct)       4.20 (2.55 pct)    4.11 (4.64 pct)
+   2-groups:         4.93 (0.00 pct)         4.85 (1.62 pct)        4.74 (3.85 pct)    5.15 (-4.46 pct)
+   4-groups:         5.38 (0.00 pct)         5.35 (0.55 pct)        5.04 (6.31 pct)    4.54 (15.61 pct)
+   8-groups:         5.59 (0.00 pct)         5.49 (1.78 pct)        5.39 (3.57 pct)    5.71 (-2.14 pct)
+  16-groups:         7.18 (0.00 pct)         7.38 (-2.78 pct)       7.24 (-0.83 pct)   7.76 (-8.07 pct)
+
+As we can observe, the hint PR_SCHED_HINT_WAKE_AFFINE helps performance
+across all hackbench configurations. PR_SCHED_HINT_WAKE_HOLD does not
+show any consistent behavior and can lead to unpredictable behavior in
+hackbench.
+
+- Shortcomings
+
+In schbench, the delay to indicate that no idle core is available in
+target MC domain leads to pileup and severe degradation in p99 latency
+
+o schbench
+
+   workers:     tip                     no-hint                 wake_affine		     wake_hold
+    1:      37.00 (0.00 pct)        38.00 (-2.70 pct)        18.00 (51.35 pct)      	 32.00 (13.51 pct)
+    2:      39.00 (0.00 pct)        36.00 (7.69 pct)         18.00 (53.84 pct)      	 36.00 (7.69 pct)
+    4:      41.00 (0.00 pct)        41.00 (0.00 pct)         21.00 (48.78 pct)      	 33.00 (19.51 pct)
+    8:      53.00 (0.00 pct)        54.00 (-1.88 pct)        31.00 (41.50 pct)      	 51.00 (3.77 pct)
+   16:      73.00 (0.00 pct)        74.00 (-1.36 pct)      2636.00 (-3510.95 pct)   	 75.00 (-2.73 pct)
+   32:     116.00 (0.00 pct)       124.00 (-6.89 pct)     15696.00 (-13431.03 pct)      124.00 (-6.89 pct)
+   64:     217.00 (0.00 pct)       215.00 (0.92 pct)      15280.00 (-6941.47 pct)       224.00 (-3.22 pct)
+  128:     477.00 (0.00 pct)       440.00 (7.75 pct)      14800.00 (-3002.72 pct)       493.00 (-3.35 pct)
+  256:     1062.00 (0.00 pct)      1026.00 (3.38 pct)     15696.00 (-1377.96 pct)      1026.00 (3.38 pct)
+  512:     47552.00 (0.00 pct)     47168.00 (0.80 pct)    60736.00 (-27.72 pct)       49856.00 (-4.84 pct)
+
+Wake hold seems to still do well by reducing the larger latency samples
+that we observe during task migration.
+
+- Potential Solution
+
+One potential solution is to atomically read nr_busy_cpus member of
+sched_domain_shared struct but the performance impact of this is yet to
+be evaluated in the wakeup path.
+
+Signed-off-by: K Prateek Nayak <kprateek.nayak@amd.com>
+---
+ kernel/sched/fair.c | 43 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index efceb670e755..90e523cd8de8 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -51,6 +51,8 @@
+ 
+ #include <linux/sched/cond_resched.h>
+ 
++#include <uapi/linux/prctl.h>
++
+ #include "sched.h"
+ #include "stats.h"
+ #include "autogroup.h"
+@@ -7031,6 +7033,10 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	int want_affine = 0;
+ 	/* SD_flags and WF_flags share the first nibble */
+ 	int sd_flag = wake_flags & 0xF;
++	bool use_hint = false;
++	unsigned int task_hint = READ_ONCE(p->hint);
++	unsigned int wakeup_hint = task_hint &
++		(PR_SCHED_HINT_WAKE_AFFINE | PR_SCHED_HINT_WAKE_HOLD);
+ 
+ 	/*
+ 	 * required for stable ->cpus_allowed
+@@ -7046,6 +7052,37 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 			new_cpu = prev_cpu;
+ 		}
+ 
++		/*
++		 * Handle the case where a hint is set and the current CPU
++		 * and the previous CPU where task ran don't share caches.
++		 */
++		if (wakeup_hint && !cpus_share_cache(cpu, prev_cpu)) {
++			/*
++			 * Start by assuming the hint is PR_SCHED_HINT_WAKE_AFFINE
++			 * setting the target_cpu to the current CPU.
++			 */
++			int target_cpu = cpu;
++
++			/*
++			 * If the hint is PR_SCHED_HINT_WAKE_HOLD
++			 * change target_cpu to the prev_cpu.
++			 */
++
++			if (wakeup_hint & PR_SCHED_HINT_WAKE_HOLD)
++				target_cpu = prev_cpu;
++
++			/*
++			 * If a wakeup hint is set, try to bias the
++			 * task placement towards the preferred node
++			 * as long as there is an idle core in the
++			 * targetted LLC.
++			 */
++			if (test_idle_cores(target_cpu, false)) {
++				use_hint = true;
++				new_cpu = target_cpu;
++			}
++		}
++
+ 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+ 	}
+ 
+@@ -7057,7 +7094,11 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 		 */
+ 		if (want_affine && (tmp->flags & SD_WAKE_AFFINE) &&
+ 		    cpumask_test_cpu(prev_cpu, sched_domain_span(tmp))) {
+-			if (cpu != prev_cpu)
++			/*
++			 * In case it is optimal to follow the hints,
++			 * do not re-evaluate the target CPU.
++			 */
++			if (cpu != prev_cpu && !use_hint)
+ 				new_cpu = wake_affine(tmp, p, cpu, prev_cpu, sync);
+ 
+ 			sd = NULL; /* Prefer wake_affine over balance flags */
+-- 
+2.25.1
+
+
+^ permalink raw reply	[flat|nested] 6+ messages in thread
+
+* [PATCH 4/5] sched/fair: Consider hints in the initial task wakeup path
+  2022-09-10 10:53 [RFC PATCH 0/5] sched: Userspace Hinting for Task Placement K Prateek Nayak
+                   ` (2 preceding siblings ...)
+  2022-09-10 10:53 ` [PATCH 3/5] sched/fair: Add support for hints in the subsequent wakeup path K Prateek Nayak
+@ 2022-09-10 10:53 ` K Prateek Nayak
+  2022-09-10 10:53 ` [PATCH 5/5] sched/fair: Add exception for hints in load balancing path K Prateek Nayak
+  4 siblings, 0 replies; 6+ messages in thread
+From: K Prateek Nayak @ 2022-09-10 10:53 UTC (permalink / raw)
+  To: linux-kernel
+  Cc: aubrey.li, efault, gautham.shenoy, libo.chen, mgorman, mingo,
+	peterz, song.bao.hua, srikar, tglx, valentin.schneider,
+	vincent.guittot, wuyun.abel, wyes.karny, yu.c.chen, yangyicong
+
+These hints influence the behavior of the initial task placement and bias
+the placement towards or away from the CPU where the task is forked.
+
+The flow is as follows:
+- When a fork time hint is set, the NUMA biases are overlooked and only
+  the sched_group's statistics computed by update_sg_wakeup_stats()
+  (Number of idle CPUs and total utilization of the group) for the local
+  group and the idlest group is considered while making initial task
+  placement decision when both groups have idle CPUs.
+- In case a bias towards local group is hinted, go for the local group as
+  long as an equivalent of idle core is present.
+  Note: The current implements assume the system running the patch is
+  SMT-2. Further optimizations can be made for systems with SMT-4,
+  SMT-8, or with no SMT.
+- If a hint for spread is set, and there is a tie in number of idle CPUs
+  in local group and idlest group, use the utilization of group as the
+  tie breaking metric.
+
+PR_SCHED_HINT_FORK_AFFINE enables consolidation until half of the local
+group is filled. PR_SCHED_HINT_FORK_SPREAD will choose the target group
+based on the utilization if there is a tie in number of idle CPUs.
+
+These hints can be set individually in addition to wakeup hints.
+
+- Results
+
+Following are results from using individual fork time hints and
+combination of fork time hints and wakeup hints on various benchmark on
+a dual socket Zen3 system:
+
+o Only fork time hint:
+
+- Hackbench
+
+Test:                   tip                     no-hint              fork_affine             fork_spread
+ 1-groups:         4.31 (0.00 pct)         4.46 (-3.48 pct)        4.27 (0.92 pct)         4.28 (0.69 pct)
+ 2-groups:         4.93 (0.00 pct)         4.85 (1.62 pct)         4.91 (0.40 pct)         5.15 (-4.46 pct)
+ 4-groups:         5.38 (0.00 pct)         5.35 (0.55 pct)         5.36 (0.37 pct)         5.31 (1.30 pct)
+ 8-groups:         5.59 (0.00 pct)         5.49 (1.78 pct)         5.51 (1.43 pct)         5.51 (1.43 pct)
+16-groups:         7.18 (0.00 pct)         7.38 (-2.78 pct)        7.31 (-1.81 pct)        7.25 (-0.97 pct)
+
+- schbench
+
+ workers:     tip                     no-hint                fork_affine
+  1:      37.00 (0.00 pct)        38.00 (-2.70 pct)       17.00 (54.05 pct)
+  2:      39.00 (0.00 pct)        36.00 (7.69 pct)        21.00 (46.15 pct)
+  4:      41.00 (0.00 pct)        41.00 (0.00 pct)        28.00 (31.70 pct)
+  8:      53.00 (0.00 pct)        54.00 (-1.88 pct)       39.00 (26.41 pct)
+ 16:      73.00 (0.00 pct)        74.00 (-1.36 pct)       68.00 (6.84 pct)
+ 32:     116.00 (0.00 pct)       124.00 (-6.89 pct)      113.00 (2.58 pct)
+ 64:     217.00 (0.00 pct)       215.00 (0.92 pct)       205.00 (5.52 pct)
+128:     477.00 (0.00 pct)       440.00 (7.75 pct)       445.00 (6.70 pct)
+256:     1062.00 (0.00 pct)      1026.00 (3.38 pct)      1007.00 (5.17 pct)
+512:     47552.00 (0.00 pct)     47168.00 (0.80 pct)     47296.00 (0.53 pct)
+
+- tbench
+
+Clients:      tip                    no-hint               fork_affine              fork_spread
+    1    573.26 (0.00 pct)       572.29 (-0.16 pct)      572.70 (-0.09 pct)      569.64 (-0.63 pct)
+    2    1131.19 (0.00 pct)      1119.57 (-1.02 pct)     1131.97 (0.06 pct)      1101.03 (-2.66 pct)
+    4    2100.07 (0.00 pct)      2070.66 (-1.40 pct)     2094.80 (-0.25 pct)     2011.64 (-4.21 pct)
+    8    3809.88 (0.00 pct)      3784.16 (-0.67 pct)     3458.94 (-9.21 pct)     3867.70 (1.51 pct)
+   16    6560.72 (0.00 pct)      6449.64 (-1.69 pct)     6342.78 (-3.32 pct)     6700.50 (2.13 pct)
+   32    12203.23 (0.00 pct)     12180.02 (-0.19 pct)    10411.44 (-14.68 pct)   13104.29 (7.38 pct)
+   64    22389.81 (0.00 pct)     23084.51 (3.10 pct)     16614.14 (-25.79 pct)   24353.76 (8.77 pct)
+  128    32449.37 (0.00 pct)     33561.28 (3.42 pct)     19971.67 (-38.45 pct)   36201.16 (11.56 pct)
+  256    58962.40 (0.00 pct)     59118.43 (0.26 pct)     26836.13 (-54.48 pct)   61721.06 (4.67 pct)
+  512    59608.71 (0.00 pct)     60246.78 (1.07 pct)     36889.55 (-38.11 pct)   59696.57 (0.14 pct)
+ 1024    58037.02 (0.00 pct)     58532.41 (0.85 pct)     39936.06 (-31.18 pct)   57445.62 (-1.01 pct)
+
+ All these benchmarks show noticeable improvements only with a slightly
+ different initial placement. A placement in line with benchmark
+ behavior improves benchmark results.
+
+o Combination of hints
+
+- Hackbench
+
+Test:                   tip                     no-hint       fork_affine + wake_affine   fork_spread + wake_hold
+ 1-groups:         4.31 (0.00 pct)         4.46 (-3.48 pct)    	  4.20 (2.55 pct)          4.81 (-11.60 pct)
+ 2-groups:         4.93 (0.00 pct)         4.85 (1.62 pct)     	  4.74 (3.85 pct)          5.09 (-3.24 pct)
+ 4-groups:         5.38 (0.00 pct)         5.35 (0.55 pct)     	  5.01 (6.87 pct)          5.62 (-4.46 pct)
+ 8-groups:         5.59 (0.00 pct)         5.49 (1.78 pct)     	  5.38 (3.75 pct)          5.69 (-1.78 pct)
+16-groups:         7.18 (0.00 pct)         7.38 (-2.78 pct)    	  7.25 (-0.97 pct)         7.97 (-11.00 pct)
+
+Hackbench improves further with pairing of correct wakeup hint with
+correct fork time hint. The regression is equally bad with wrong hints
+set.
+
+Signed-off-by: K Prateek Nayak <kprateek.nayak@amd.com>
+---
+ kernel/sched/fair.c | 34 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 90e523cd8de8..4c61bd0e93b3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9262,6 +9262,7 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 	struct sg_lb_stats local_sgs, tmp_sgs;
+ 	struct sg_lb_stats *sgs;
+ 	unsigned long imbalance;
++	unsigned int task_hint, fork_hint;
+ 	struct sg_lb_stats idlest_sgs = {
+ 			.avg_load = UINT_MAX,
+ 			.group_type = group_overloaded,
+@@ -9365,8 +9366,14 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 		break;
+ 
+ 	case group_has_spare:
++		task_hint = READ_ONCE(p->hint);
++		fork_hint = task_hint &
++			(PR_SCHED_HINT_FORK_SPREAD | PR_SCHED_HINT_FORK_AFFINE);
+ #ifdef CONFIG_NUMA
+-		if (sd->flags & SD_NUMA) {
++		/*
++		 * If a hint is set, override any NUMA preference behavior.
++		 */
++		if ((sd->flags & SD_NUMA) && !fork_hint) {
+ 			int imb_numa_nr = sd->imb_numa_nr;
+ #ifdef CONFIG_NUMA_BALANCING
+ 			int idlest_cpu;
+@@ -9406,14 +9413,37 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 		}
+ #endif /* CONFIG_NUMA */
+ 
++		/*
++		 * FIXME: Currently the system is assumed to be SMT-2
++		 * and that the number of cores in a group can be
++		 * estimated by halving the group_weight. Determine a
++		 * more generic logic for other SMT possibilities or
++		 * derive it at runtime from the topology.
++		 */
++		if ((task_hint & PR_SCHED_HINT_FORK_AFFINE) &&
++		    local_sgs.idle_cpus > local->group_weight / 2)
++			return NULL;
+ 		/*
+ 		 * Select group with highest number of idle CPUs. We could also
+ 		 * compare the utilization which is more stable but it can end
+ 		 * up that the group has less spare capacity but finally more
+ 		 * idle CPUs which means more opportunity to run task.
+ 		 */
+-		if (local_sgs.idle_cpus >= idlest_sgs.idle_cpus)
++		if (local_sgs.idle_cpus > idlest_sgs.idle_cpus)
++			return NULL;
++
++		if (local_sgs.idle_cpus == idlest_sgs.idle_cpus) {
++			/*
++			 * In case of a tie between number of idle CPUs and if
++			 * the task hints a benefit from spreading, go with the
++			 * group with the lesser utilization.
++			 */
++			if ((task_hint & PR_SCHED_HINT_FORK_SPREAD) &&
++			    local_sgs.group_util > idlest_sgs.group_util)
++				return idlest;
++
+ 			return NULL;
++		}
+ 		break;
+ 	}
+ 
+-- 
+2.25.1
+
+
+^ permalink raw reply	[flat|nested] 6+ messages in thread
+
+* [PATCH 5/5] sched/fair: Add exception for hints in load balancing path
+  2022-09-10 10:53 [RFC PATCH 0/5] sched: Userspace Hinting for Task Placement K Prateek Nayak
+                   ` (3 preceding siblings ...)
+  2022-09-10 10:53 ` [PATCH 4/5] sched/fair: Consider hints in the initial task " K Prateek Nayak
+@ 2022-09-10 10:53 ` K Prateek Nayak
+  4 siblings, 0 replies; 6+ messages in thread
+From: K Prateek Nayak @ 2022-09-10 10:53 UTC (permalink / raw)
+  To: linux-kernel
+  Cc: aubrey.li, efault, gautham.shenoy, libo.chen, mgorman, mingo,
+	peterz, song.bao.hua, srikar, tglx, valentin.schneider,
+	vincent.guittot, wuyun.abel, wyes.karny, yu.c.chen, yangyicong
+
+- Load balancing considerations
+
+If we have more tasks than the CPUs in the MC Domain, ignore the hint
+set by the user. This prevents losing the consolidation done at the
+wakeup time.
+
+- Considerations
+
+Few trial and errors were done to find a good threshold to ignore hints.
+Following are some of the wins and woes:
+
+o Ignore hint if MC domain of src CPU does not have an idle core: This
+  metric is not very accurate and led to losing consolidation early on.
+o Ignore hint if sd_shared->nr_llc_scan is 0: This too, like the
+  has_idle core metric was not always accurate.
+o An atomic read of sd_shared->nr_busy_cpus doesn't encapsulate
+  overloaded run queues.
+
+Best results were found by scanning LLC and finding the number of
+running tasks and comparing it with size of LLC. If the LLC is beyond
+fully loaded, safely ignore hint.
+
+- Possible Improvements
+
+o Consider the status of hint: If a wake affine hint was ignored in
+  the wakeup path, consider ignoring in the load balancer path as well
+  as the running LLC is not the desired LLC in fact.
+
+Signed-off-by: K Prateek Nayak <kprateek.nayak@amd.com>
+---
+ kernel/sched/fair.c | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 4c61bd0e93b3..8e1679b784fb 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7810,6 +7810,9 @@ struct lb_env {
+ 	unsigned int		loop_break;
+ 	unsigned int		loop_max;
+ 
++	/* Indicator to ignore hint if LLC is overloaded */
++	int			ignore_hint;
++
+ 	enum fbq_type		fbq_type;
+ 	enum migration_type	migration_type;
+ 	struct list_head	tasks;
+@@ -7977,6 +7980,21 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Hints are followed only if the MC Domain is still ideal
++	 * for the task.
++	 */
++	if (!env->ignore_hint) {
++		/*
++		 * Only consider the hints from the wakeup path to maintain
++		 * data locality.
++		 */
++		if (READ_ONCE(p->hint) &
++		    (PR_SCHED_HINT_WAKE_AFFINE | PR_SCHED_HINT_WAKE_HOLD))
++			return 0;
++	}
++
++
+ 	/* Record that we found at least one task that could run on dst_cpu */
+ 	env->flags &= ~LBF_ALL_PINNED;
+ 
+@@ -10182,6 +10200,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 		.cpus		= cpus,
+ 		.fbq_type	= all,
+ 		.tasks		= LIST_HEAD_INIT(env.tasks),
++		.ignore_hint	= 1,
+ 	};
+ 
+ 	cpumask_and(cpus, sched_domain_span(sd), cpu_active_mask);
+@@ -10213,6 +10232,30 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 	env.src_cpu = busiest->cpu;
+ 	env.src_rq = busiest;
+ 
++	/*
++	 * Check if the hints can be followed during
++	 * this load balancing cycle.
++	 */
++	if (!(sd->flags & SD_SHARE_PKG_RESOURCES)) {
++		struct sched_domain *src_sd_llc = rcu_dereference(per_cpu(sd_llc, env.src_cpu));
++
++		if (src_sd_llc) {
++			int cpu, nr_llc_running = 0, llc_size = per_cpu(sd_llc_size, env.src_cpu);
++
++			for_each_cpu_wrap(cpu, sched_domain_span(src_sd_llc), env.src_cpu) {
++				struct rq *rq = cpu_rq(cpu);
++				nr_llc_running += rq->nr_running - rq->cfs.idle_h_nr_running;
++			}
++
++			/*
++			 * Don't ignore hint if we can have one task
++			 * per CPU in the LLC of the src_cpu.
++			 */
++			if (nr_llc_running <= llc_size)
++				env.ignore_hint = 0;
++		}
++	}
++
+ 	ld_moved = 0;
+ 	/* Clear this flag as soon as we find a pullable task */
+ 	env.flags |= LBF_ALL_PINNED;
+@@ -10520,6 +10563,7 @@ static int active_load_balance_cpu_stop(void *data)
+ 			.src_rq		= busiest_rq,
+ 			.idle		= CPU_IDLE,
+ 			.flags		= LBF_ACTIVE_LB,
++			.ignore_hint	= sd->flags & SD_SHARE_PKG_RESOURCES,
+ 		};
+ 
+ 		schedstat_inc(sd->alb_count);
+-- 
+2.25.1
