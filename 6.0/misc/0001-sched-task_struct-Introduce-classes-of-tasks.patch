@@ -1,7 +1,169 @@
-From 8d7813be08449910b2f3405c8a380cc5c8e3f8fd Mon Sep 17 00:00:00 2001
+From 4d23203a509c221fb8868ccbb4b027c37bf5d82f Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 10 Sep 2022 14:26:11 +0200
-Subject: [PATCH] sched: Introduce classes of tasks for load balance
+Date: Mon, 12 Sep 2022 14:09:06 +0200
+Subject: [PATCH 1/2] sched/fair: Avoid unnecessary migrations within SMT
+ domains
+
+Intel processors that support Intel Turbo Boost Max 3.0 use asym_packing
+to assign higher priorities to CPUs with higher maximum frequencies. It
+artificially assigns, however, a lower priority to the higher-numbered
+SMT siblings to ensure that they are used last.
+
+This results in unnecessary task migrations within the SMT domains.
+
+On processors with a mixture of higher-frequency SMT cores and lower-
+frequency non-SMT cores (such as Intel hybrid processors), a lower-
+priority CPU pulls tasks from the higher-priority cores if more than one
+SMT sibling is busy.
+
+Do not use different priorities for each SMT sibling. Instead, tweak the
+asym_packing load balancer to recognize SMT cores with more than one
+busy sibling and let lower-priority CPUs pull tasks.
+
+Removing these artificial priorities avoids superfluous migrations and
+lets lower-priority cores inspect all SMT siblings for the busiest queue.
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/kernel/itmt.c | 23 +++++-----------------
+ kernel/sched/fair.c    | 44 ++++++++++++++++++++----------------------
+ 2 files changed, 26 insertions(+), 41 deletions(-)
+
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 9ff480e94511..6510883c5e81 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -174,32 +174,19 @@ int arch_asym_cpu_priority(int cpu)
+ 
+ /**
+  * sched_set_itmt_core_prio() - Set CPU priority based on ITMT
+- * @prio:	Priority of cpu core
+- * @core_cpu:	The cpu number associated with the core
++ * @prio:	Priority of @cpu
++ * @cpu:	The CPU number
+  *
+  * The pstate driver will find out the max boost frequency
+  * and call this function to set a priority proportional
+- * to the max boost frequency. CPU with higher boost
++ * to the max boost frequency. CPUs with higher boost
+  * frequency will receive higher priority.
+  *
+  * No need to rebuild sched domain after updating
+  * the CPU priorities. The sched domains have no
+  * dependency on CPU priorities.
+  */
+-void sched_set_itmt_core_prio(int prio, int core_cpu)
++void sched_set_itmt_core_prio(int prio, int cpu)
+ {
+-	int cpu, i = 1;
+-
+-	for_each_cpu(cpu, topology_sibling_cpumask(core_cpu)) {
+-		int smt_prio;
+-
+-		/*
+-		 * Ensure that the siblings are moved to the end
+-		 * of the priority chain and only used when
+-		 * all other high priority cpus are out of capacity.
+-		 */
+-		smt_prio = prio * smp_num_siblings / (i * i);
+-		per_cpu(sched_core_priority, cpu) = smt_prio;
+-		i++;
+-	}
++	per_cpu(sched_core_priority, cpu) = prio;
+ }
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 914096c5b1ae..0089b33ea7b8 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8732,12 +8732,10 @@ static bool asym_smt_can_pull_tasks(int dst_cpu, struct sd_lb_stats *sds,
+ 				    struct sched_group *sg)
+ {
+ #ifdef CONFIG_SCHED_SMT
+-	bool local_is_smt, sg_is_smt;
++	bool local_is_smt;
+ 	int sg_busy_cpus;
+ 
+ 	local_is_smt = sds->local->flags & SD_SHARE_CPUCAPACITY;
+-	sg_is_smt = sg->flags & SD_SHARE_CPUCAPACITY;
+-
+ 	sg_busy_cpus = sgs->group_weight - sgs->idle_cpus;
+ 
+ 	if (!local_is_smt) {
+@@ -8758,25 +8756,16 @@ static bool asym_smt_can_pull_tasks(int dst_cpu, struct sd_lb_stats *sds,
+ 		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
+ 	}
+ 
+-	/* @dst_cpu has SMT siblings. */
+-
+-	if (sg_is_smt) {
+-		int local_busy_cpus = sds->local->group_weight -
+-				      sds->local_stat.idle_cpus;
+-		int busy_cpus_delta = sg_busy_cpus - local_busy_cpus;
+-
+-		if (busy_cpus_delta == 1)
+-			return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
+-
+-		return false;
+-	}
+-
+ 	/*
+-	 * @sg does not have SMT siblings. Ensure that @sds::local does not end
+-	 * up with more than one busy SMT sibling and only pull tasks if there
+-	 * are not busy CPUs (i.e., no CPU has running tasks).
++	 * @dst_cpu has SMT siblings. When both @dst_cpu and the busiest core
++	 * have one or more busy siblings, moving tasks between them results
++	 * in the same throughput. Only if all the siblings of @dst_cpu are
++	 * idle throughput can increase.
++	 *
++	 * If the difference in the number of busy CPUs is two or more, let
++	 * find_busiest_group() take care of it.
+ 	 */
+-	if (!sds->local_stat.sum_nr_running)
++	if (sg_busy_cpus == 1 && !sds->local_stat.sum_nr_running)
+ 		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
+ 
+ 	return false;
+@@ -9901,10 +9890,14 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 		    nr_running == 1)
+ 			continue;
+ 
+-		/* Make sure we only pull tasks from a CPU of lower priority */
++		/*
++		 * Make sure we only pull tasks from a CPU of lower priority.
++		 * Except for scheduling groups composed of SMT siblings.
++		 */
+ 		if ((env->sd->flags & SD_ASYM_PACKING) &&
+ 		    sched_asym_prefer(i, env->dst_cpu) &&
+-		    nr_running == 1)
++		    nr_running == 1 &&
++		    !(group->flags & SD_SHARE_CPUCAPACITY))
+ 			continue;
+ 
+ 		switch (env->migration_type) {
+@@ -9994,9 +9987,14 @@ asym_active_balance(struct lb_env *env)
+ 	 * ASYM_PACKING needs to force migrate tasks from busy but
+ 	 * lower priority CPUs in order to pack all tasks in the
+ 	 * highest priority CPUs.
++	 *
++	 * If the busy CPU has higher priority but is an SMT sibling
++	 * in which other SMT siblings are also busy, a lower-priority
++	 * CPU in a separate core can help.
+ 	 */
+ 	return env->idle != CPU_NOT_IDLE && (env->sd->flags & SD_ASYM_PACKING) &&
+-	       sched_asym_prefer(env->dst_cpu, env->src_cpu);
++	       (sched_asym_prefer(env->dst_cpu, env->src_cpu) ||
++		!(env->sd->flags & SD_SHARE_CPUCAPACITY));
+ }
+ 
+ static inline bool
+-- 
+2.37.3
+
+
+From 28a6f5f191267be741e5bcbfc477835d1f87c8da Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 12 Sep 2022 14:13:48 +0200
+Subject: [PATCH 2/2] sched/task_struct: Introduce classes of tasks
 
 +++ Introduction
 
@@ -153,13 +315,6 @@ These patches assume that both SMT siblings of a core have the same
 priority, as proposed in [3]. Also, they rely on the existing support for
 the Hardware Feedback Interface [4].
 
-I look forward to your review and thank you in advance!
-
-These patches have been Acked-by: Len Brown <len.brown@intel.com>
-
-Thanks and BR,
-Ricardo
-
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  arch/x86/include/asm/cpufeatures.h       |   2 +
@@ -193,7 +348,7 @@ index ef4775c6db01..b5e64203c6b2 100644
  #define X86_FEATURE_USE_IBPB_FW		(11*32+16) /* "" Use IBPB during runtime firmware calls */
  #define X86_FEATURE_RSB_VMEXIT_LITE	(11*32+17) /* "" Fill RSB on VM exit when EIBRS is enabled */
 +#define X86_FEATURE_HRESET		(11*32+18) /* Hardware history reset instruction */
-
+ 
  /* Intel-defined CPU features, CPUID level 0x00000007:1 (EAX), word 12 */
  #define X86_FEATURE_AVX_VNNI		(12*32+ 4) /* AVX VNNI instructions */
 @@ -339,6 +340,7 @@
@@ -201,7 +356,7 @@ index ef4775c6db01..b5e64203c6b2 100644
  #define X86_FEATURE_HWP_PKG_REQ		(14*32+11) /* HWP Package Level Request */
  #define X86_FEATURE_HFI			(14*32+19) /* Hardware Feedback Interface */
 +#define X86_FEATURE_ITD			(14*32+23) /* Intel Thread Director */
-
+ 
  /* AMD SVM Feature Identification, CPUID level 0x8000000a (EDX), word 15 */
  #define X86_FEATURE_NPT			(15*32+ 0) /* Nested Page Table support */
 diff --git a/arch/x86/include/asm/disabled-features.h b/arch/x86/include/asm/disabled-features.h
@@ -211,7 +366,7 @@ index 33d2cd04d254..225657aff476 100644
 @@ -87,6 +87,12 @@
  # define DISABLE_TDX_GUEST	(1 << (X86_FEATURE_TDX_GUEST & 31))
  #endif
-
+ 
 +#ifdef CONFIG_INTEL_THREAD_DIRECTOR
 +# define DISABLE_ITD	0
 +#else
@@ -276,18 +431,18 @@ index 6674bdb096f3..18f741499465 100644
  #define MSR_IA32_HW_FEEDBACK_CONFIG     0x17d1
 +#define MSR_IA32_HW_FEEDBACK_THREAD_CONFIG 0x17d4
 +#define MSR_IA32_HW_FEEDBACK_CHAR	0x17d2
-
+ 
 +/* Hardware History Reset  */
 +#define MSR_IA32_HW_HRESET_ENABLE	0x17da
  #endif /* _ASM_X86_MSR_INDEX_H */
 diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
-index d86eb1ebf59f..b1065a38d24e 100644
+index 458c891a8273..2ed234104ef4 100644
 --- a/arch/x86/include/asm/topology.h
 +++ b/arch/x86/include/asm/topology.h
-@@ -228,4 +228,14 @@ void init_freq_invariance_cppc(void);
+@@ -227,4 +227,14 @@ void init_freq_invariance_cppc(void);
  #define arch_init_invariance_cppc init_freq_invariance_cppc
  #endif
-
+ 
 +#ifdef CONFIG_INTEL_THREAD_DIRECTOR
 +int intel_hfi_has_task_classes(void);
 +void intel_hfi_update_task_class(struct task_struct *curr, bool smt_siblings_idle);
@@ -314,7 +469,7 @@ index 3e508f239098..4622a0ebf8a1 100644
 @@ -411,6 +412,37 @@ static __always_inline void setup_umip(struct cpuinfo_x86 *c)
  	cr4_clear_bits(X86_CR4_UMIP);
  }
-
+ 
 +static u32 hardware_history_features __read_mostly;
 +
 +void reset_hardware_history(void)
@@ -352,14 +507,14 @@ index 3e508f239098..4622a0ebf8a1 100644
 @@ -1823,10 +1855,11 @@ static void identify_cpu(struct cpuinfo_x86 *c)
  	/* Disable the PN if appropriate */
  	squash_the_stupid_serial_number(c);
-
+ 
 -	/* Set up SMEP/SMAP/UMIP */
 +	/* Set up SMEP/SMAP/UMIP/HRESET */
  	setup_smep(c);
  	setup_smap(c);
  	setup_umip(c);
 +	setup_hreset(c);
-
+ 
  	/* Enable FSGSBASE instructions if available. */
  	if (cpu_has(c, X86_FEATURE_FSGSBASE)) {
 diff --git a/arch/x86/kernel/cpu/cpuid-deps.c b/arch/x86/kernel/cpu/cpuid-deps.c
@@ -373,7 +528,7 @@ index c881bcafba7d..f6f8a3cd4f2c 100644
 +	{ X86_FEATURE_ITD,			X86_FEATURE_HFI       },
  	{}
  };
-
+ 
 diff --git a/arch/x86/kernel/cpu/scattered.c b/arch/x86/kernel/cpu/scattered.c
 index fd44b54c90d5..7d268377b03a 100644
 --- a/arch/x86/kernel/cpu/scattered.c
@@ -396,17 +551,17 @@ index 2f314b170c9f..74d8ad83e0b3 100644
  #include <asm/resctrl.h>
 +#include <asm/hreset.h>
  #include <asm/proto.h>
-
+ 
  #include "process.h"
 @@ -214,6 +215,8 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
  	/* Load the Intel cache allocation PQR MSR. */
  	resctrl_sched_in();
-
+ 
 +	reset_hardware_history();
 +
  	return prev_p;
  }
-
+ 
 diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
 index 1962008fe743..0b175f30f359 100644
 --- a/arch/x86/kernel/process_64.c
@@ -422,12 +577,12 @@ index 1962008fe743..0b175f30f359 100644
 @@ -657,6 +658,8 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
  	/* Load the Intel cache allocation PQR MSR. */
  	resctrl_sched_in();
-
+ 
 +	reset_hardware_history();
 +
  	return prev_p;
  }
-
+ 
 diff --git a/drivers/thermal/intel/Kconfig b/drivers/thermal/intel/Kconfig
 index f0c845679250..8848bf45ffbc 100644
 --- a/drivers/thermal/intel/Kconfig
@@ -454,10 +609,10 @@ index a0640f762dc5..742b5ea3e5df 100644
 +++ b/drivers/thermal/intel/intel_hfi.c
 @@ -39,6 +39,7 @@
  #include <linux/workqueue.h>
-
+ 
  #include <asm/msr.h>
 +#include <asm/intel-family.h>
-
+ 
  #include "../thermal_core.h"
  #include "intel_hfi.h"
 @@ -49,6 +50,8 @@
@@ -466,13 +621,13 @@ index a0640f762dc5..742b5ea3e5df 100644
  #define HW_FEEDBACK_CONFIG_HFI_ENABLE_BIT	BIT(0)
 +#define HW_FEEDBACK_CONFIG_ITD_ENABLE_BIT	BIT(1)
 +#define HW_FEEDBACK_THREAD_CONFIG_ENABLE_BIT	BIT(0)
-
+ 
  /* CPUID detection and enumeration definitions for HFI */
-
+ 
 @@ -73,13 +76,33 @@ union cpuid6_edx {
  	u32 full;
  };
-
+ 
 +union cpuid6_ecx {
 +	struct {
 +		u32	dont_care0:8;
@@ -515,7 +670,7 @@ index a0640f762dc5..742b5ea3e5df 100644
  struct hfi_hdr {
  	u8	perf_updated;
 @@ -129,16 +153,21 @@ struct hfi_instance {
-
+ 
  /**
   * struct hfi_features - Supported HFI features
 + * @nr_classes:		Number of classes supported
@@ -535,11 +690,11 @@ index a0640f762dc5..742b5ea3e5df 100644
 +	unsigned int	class_stride;
  	unsigned int	hdr_size;
  };
-
+ 
 @@ -166,17 +195,155 @@ static struct workqueue_struct *hfi_updates_wq;
  #define HFI_UPDATE_INTERVAL		HZ
  #define HFI_MAX_THERM_NOTIFY_COUNT	16
-
+ 
 +#ifdef CONFIG_INTEL_THREAD_DIRECTOR
 +
 +/*
@@ -678,13 +833,13 @@ index a0640f762dc5..742b5ea3e5df 100644
  {
 +	unsigned long flags;
  	int cpu, i = 0;
-
+ 
 -	raw_spin_lock_irq(&hfi_instance->table_lock);
 +	raw_spin_lock_irqsave(&hfi_instance->table_lock, flags);
  	for_each_cpu(cpu, hfi_instance->cpus) {
  		struct hfi_cpu_data *caps;
  		s16 index;
-
+ 
  		index = per_cpu(hfi_cpu_info, cpu).index;
 +		/*
 +		 * Only report the legacy (i.e., class 0) capabilities. No need
@@ -692,15 +847,15 @@ index a0640f762dc5..742b5ea3e5df 100644
 +		 */
  		caps = hfi_instance->data + index * hfi_features.cpu_stride;
  		cpu_caps[i].cpu = cpu;
-
+ 
 @@ -189,7 +356,7 @@ static void get_hfi_caps(struct hfi_instance *hfi_instance,
-
+ 
  		++i;
  	}
 -	raw_spin_unlock_irq(&hfi_instance->table_lock);
 +	raw_spin_unlock_irqrestore(&hfi_instance->table_lock, flags);
  }
-
+ 
  /*
 @@ -252,6 +419,7 @@ void intel_hfi_process_event(__u64 pkg_therm_status_msr_val)
  	struct hfi_instance *hfi_instance;
@@ -708,29 +863,29 @@ index a0640f762dc5..742b5ea3e5df 100644
  	struct hfi_cpu_info *info;
 +	unsigned long flags;
  	u64 new_timestamp;
-
+ 
  	if (!pkg_therm_status_msr_val)
 @@ -288,7 +456,7 @@ void intel_hfi_process_event(__u64 pkg_therm_status_msr_val)
  		return;
  	}
-
+ 
 -	raw_spin_lock(&hfi_instance->table_lock);
 +	raw_spin_lock_irqsave(&hfi_instance->table_lock, flags);
-
+ 
  	/*
  	 * Copy the updated table into our local copy. This includes the new
 @@ -297,7 +465,7 @@ void intel_hfi_process_event(__u64 pkg_therm_status_msr_val)
  	memcpy(hfi_instance->local_table, hfi_instance->hw_table,
  	       hfi_features.nr_table_pages << PAGE_SHIFT);
-
+ 
 -	raw_spin_unlock(&hfi_instance->table_lock);
 +	raw_spin_unlock_irqrestore(&hfi_instance->table_lock, flags);
  	raw_spin_unlock(&hfi_instance->event_lock);
-
+ 
  	/*
 @@ -325,8 +493,8 @@ static void init_hfi_cpu_index(struct hfi_cpu_info *info)
  }
-
+ 
  /*
 - * The format of the HFI table depends on the number of capabilities that the
 - * hardware supports. Keep a data structure to navigate the table.
@@ -740,9 +895,9 @@ index a0640f762dc5..742b5ea3e5df 100644
  static void init_hfi_instance(struct hfi_instance *hfi_instance)
  {
 @@ -380,6 +548,11 @@ void intel_hfi_online(unsigned int cpu)
-
+ 
  	init_hfi_cpu_index(info);
-
+ 
 +	if (cpu_feature_enabled(X86_FEATURE_ITD)) {
 +		msr_val = HW_FEEDBACK_THREAD_CONFIG_ENABLE_BIT;
 +		wrmsrl(MSR_IA32_HW_FEEDBACK_THREAD_CONFIG, msr_val);
@@ -760,12 +915,12 @@ index a0640f762dc5..742b5ea3e5df 100644
 +		msr_val |= HW_FEEDBACK_CONFIG_ITD_ENABLE_BIT;
 +
  	wrmsrl(MSR_IA32_HW_FEEDBACK_CONFIG, msr_val);
-
+ 
  unlock:
 @@ -507,18 +684,36 @@ static __init int hfi_parse_features(void)
  	/* The number of 4KB pages required by the table */
  	hfi_features.nr_table_pages = edx.split.table_pages + 1;
-
+ 
 +	/*
 +	 * Capability fields of an HFI class are grouped together. Classes are
 +	 * contiguous in memory.  Hence, use the number of supported features to
@@ -790,7 +945,7 @@ index a0640f762dc5..742b5ea3e5df 100644
 -	hfi_features.hdr_size = DIV_ROUND_UP(nr_capabilities, 8) * 8;
 +	hfi_features.hdr_size = DIV_ROUND_UP(nr_capabilities *
 +					     hfi_features.nr_classes, 8) * 8;
-
+ 
  	/*
  	 * Data of each logical processor is also rounded up to be a multiple
  	 * of 8 bytes.
@@ -798,35 +953,35 @@ index a0640f762dc5..742b5ea3e5df 100644
 -	hfi_features.cpu_stride = DIV_ROUND_UP(nr_capabilities, 8) * 8;
 +	hfi_features.cpu_stride = DIV_ROUND_UP(nr_capabilities *
 +					       hfi_features.nr_classes, 8) * 8;
-
+ 
  	return 0;
  }
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 070b15ba2e1e..78723a210fff 100644
+index e7b2f8a5c711..6c8907622f00 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
 @@ -117,6 +117,8 @@ struct task_group;
  					 __TASK_TRACED | EXIT_DEAD | EXIT_ZOMBIE | \
  					 TASK_PARKED)
-
+ 
 +#define TASK_CLASS_UNCLASSIFIED		-1
 +
  #define task_is_running(task)		(READ_ONCE((task)->__state) == TASK_RUNNING)
-
+ 
  #define task_is_traced(task)		((READ_ONCE(task->jobctl) & JOBCTL_TRACED) != 0)
 @@ -281,7 +283,7 @@ enum {
  	TASK_COMM_LEN = 16,
  };
-
+ 
 -extern void scheduler_tick(void);
 +extern void scheduler_tick(bool user_tick);
-
+ 
  #define	MAX_SCHEDULE_TIMEOUT		LONG_MAX
-
-@@ -1517,6 +1519,21 @@ struct task_struct {
+ 
+@@ -1512,6 +1514,21 @@ struct task_struct {
  	union rv_task_monitor		rv[RV_PER_TASK_MONITORS];
  #endif
-
+ 
 +#ifdef CONFIG_SCHED_TASK_CLASSES
 +	/* Class of task that the scheduler uses for task placement decisions */
 +	short				class;
@@ -846,13 +1001,13 @@ index 070b15ba2e1e..78723a210fff 100644
  	 * New fields for task_struct should be added above here, so that
  	 * they are included in the randomized portion of task_struct.
 diff --git a/init/Kconfig b/init/Kconfig
-index 442a945ca6ae..f877faa7c985 100644
+index 532362fcfe31..edfa27f8717a 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -858,6 +858,15 @@ config UCLAMP_BUCKETS_COUNT
-
+@@ -854,6 +854,15 @@ config UCLAMP_BUCKETS_COUNT
+ 
  	  If in doubt, use the default value.
-
+ 
 +config SCHED_TASK_CLASSES
 +	bool "Classes of tasks"
 +	depends on SMP
@@ -863,13 +1018,13 @@ index 442a945ca6ae..f877faa7c985 100644
 +	  tasks.
 +
  endmenu
-
+ 
  #
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index a2b8065d8f3e..a330cac1da96 100644
+index ee28253c9ac0..5f84aae735d9 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -4338,6 +4338,11 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+@@ -4336,6 +4336,11 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
  	p->se.prev_sum_exec_runtime	= 0;
  	p->se.nr_migrations		= 0;
  	p->se.vruntime			= 0;
@@ -879,9 +1034,9 @@ index a2b8065d8f3e..a330cac1da96 100644
 +	p->class_debounce_counter	= 0;
 +#endif
  	INIT_LIST_HEAD(&p->se.group_node);
-
+ 
  #ifdef CONFIG_FAIR_GROUP_SCHED
-@@ -5436,7 +5441,7 @@ static inline u64 cpu_resched_latency(struct rq *rq) { return 0; }
+@@ -5433,7 +5438,7 @@ static inline u64 cpu_resched_latency(struct rq *rq) { return 0; }
   * This function gets called by the timer code, with HZ frequency.
   * We call it with interrupts disabled.
   */
@@ -890,24 +1045,24 @@ index a2b8065d8f3e..a330cac1da96 100644
  {
  	int cpu = smp_processor_id();
  	struct rq *rq = cpu_rq(cpu);
-@@ -5445,6 +5450,9 @@ void scheduler_tick(void)
+@@ -5442,6 +5447,9 @@ void scheduler_tick(void)
  	unsigned long thermal_pressure;
  	u64 resched_latency;
-
+ 
 +	if (sched_task_classes_enabled() && user_tick)
 +		arch_update_task_class(curr, is_core_idle(cpu));
 +
  	arch_scale_freq_tick();
  	sched_clock_tick();
-
+ 
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index f23aeaccd26d..6b743ecb6295 100644
+index 0089b33ea7b8..085b1f75d90b 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -1550,23 +1550,6 @@ struct numa_stats {
+@@ -1536,23 +1536,6 @@ struct numa_stats {
  	int idle_cpu;
  };
-
+ 
 -static inline bool is_core_idle(int cpu)
 -{
 -#ifdef CONFIG_SCHED_SMT
@@ -927,8 +1082,8 @@ index f23aeaccd26d..6b743ecb6295 100644
 -
  struct task_numa_env {
  	struct task_struct *p;
-
-@@ -8476,6 +8459,8 @@ struct sg_lb_stats {
+ 
+@@ -8422,6 +8405,8 @@ struct sg_lb_stats {
  	enum group_type group_type;
  	unsigned int group_asym_packing; /* Tasks should be moved to preferred CPU */
  	unsigned long group_misfit_task_load; /* A CPU has a task too big for its capacity */
@@ -937,10 +1092,10 @@ index f23aeaccd26d..6b743ecb6295 100644
  #ifdef CONFIG_NUMA_BALANCING
  	unsigned int nr_numa_running;
  	unsigned int nr_preferred_running;
-@@ -8757,6 +8742,175 @@ group_type group_classify(unsigned int imbalance_pct,
+@@ -8703,6 +8688,175 @@ group_type group_classify(unsigned int imbalance_pct,
  	return group_has_spare;
  }
-
+ 
 +struct sg_lb_task_class_stats {
 +	/*
 +	 * Score of the task with lowest score among the current tasks (i.e.,
@@ -1113,36 +1268,36 @@ index f23aeaccd26d..6b743ecb6295 100644
  /**
   * asym_smt_can_pull_tasks - Check whether the load balancing CPU can pull tasks
   * @dst_cpu:	Destination CPU of the load balancing
-@@ -8879,9 +9033,11 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+@@ -8814,9 +8968,11 @@ static inline void update_sg_lb_stats(struct lb_env *env,
  				      struct sg_lb_stats *sgs,
  				      int *sg_status)
  {
 +	struct sg_lb_task_class_stats class_stats;
  	int i, nr_running, local_group;
-
+ 
  	memset(sgs, 0, sizeof(*sgs));
 +	init_rq_task_classes_stats(&class_stats);
-
+ 
  	local_group = group == sds->local;
-
-@@ -8931,6 +9087,8 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 
+@@ -8866,6 +9022,8 @@ static inline void update_sg_lb_stats(struct lb_env *env,
  			if (sgs->group_misfit_task_load < load)
  				sgs->group_misfit_task_load = load;
  		}
 +
 +		update_rq_task_classes_stats(&class_stats, rq);
  	}
-
+ 
  	sgs->group_capacity = group->sgc->capacity;
-@@ -8941,6 +9099,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+@@ -8876,6 +9034,7 @@ static inline void update_sg_lb_stats(struct lb_env *env,
  	if (!local_group && env->sd->flags & SD_ASYM_PACKING &&
  	    env->idle != CPU_NOT_IDLE && sgs->sum_h_nr_running &&
  	    sched_asym(env, sds, sgs, group)) {
 +		compute_ilb_sg_task_class_scores(&class_stats, sgs, env->dst_cpu);
  		sgs->group_asym_packing = 1;
  	}
-
-@@ -9017,6 +9176,12 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+ 
+@@ -8952,6 +9111,12 @@ static bool update_sd_pick_busiest(struct lb_env *env,
  		/* Prefer to move from lowest priority CPU's work */
  		if (sched_asym_prefer(sg->asym_prefer_cpu, sds->busiest->asym_prefer_cpu))
  			return false;
@@ -1153,17 +1308,17 @@ index f23aeaccd26d..6b743ecb6295 100644
 +
 +		/* @sg has lower priority than @sds::busiest. */
  		break;
-
+ 
  	case group_misfit_task:
-@@ -9909,6 +10074,7 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+@@ -9844,6 +10009,7 @@ static struct rq *find_busiest_queue(struct lb_env *env,
  	int i;
-
+ 
  	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
 +		int busiest_class_delta_score = INT_MIN;
  		unsigned long capacity, load, util;
  		unsigned int nr_running;
  		enum fbq_type rt;
-@@ -10014,6 +10180,20 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+@@ -9953,6 +10119,20 @@ static struct rq *find_busiest_queue(struct lb_env *env,
  			if (busiest_nr < nr_running) {
  				busiest_nr = nr_running;
  				busiest = rq;
@@ -1183,15 +1338,15 @@ index f23aeaccd26d..6b743ecb6295 100644
 +				}
  			}
  			break;
-
+ 
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 6ff8afb0c574..b6631d7f344d 100644
+index e26688d387ae..2bddedc55ee9 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -2499,6 +2499,70 @@ void arch_scale_freq_tick(void)
+@@ -2510,6 +2510,70 @@ void arch_scale_freq_tick(void)
  }
  #endif
-
+ 
 +#ifdef CONFIG_SCHED_TASK_CLASSES
 +DECLARE_STATIC_KEY_FALSE(sched_task_classes);
 +
@@ -1259,10 +1414,10 @@ index 6ff8afb0c574..b6631d7f344d 100644
  #ifndef arch_scale_freq_capacity
  /**
   * arch_scale_freq_capacity - get the frequency scale factor of a given CPU.
-@@ -3152,6 +3216,23 @@ static inline bool is_per_cpu_kthread(struct task_struct *p)
+@@ -3148,6 +3212,23 @@ static inline bool is_per_cpu_kthread(struct task_struct *p)
  }
  #endif
-
+ 
 +static inline bool is_core_idle(int cpu)
 +{
 +#ifdef CONFIG_SCHED_SMT
@@ -1282,7 +1437,7 @@ index 6ff8afb0c574..b6631d7f344d 100644
 +
  extern void swake_up_all_locked(struct swait_queue_head *q);
  extern void __prepare_to_swait(struct swait_queue_head *q, struct swait_queue *wait);
-
+ 
 diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
 index 8739c2a5a54e..8d886dbe6318 100644
 --- a/kernel/sched/topology.c
@@ -1294,13 +1449,13 @@ index 8739c2a5a54e..8d886dbe6318 100644
 +#ifdef CONFIG_SCHED_TASK_CLASSES
 +DEFINE_STATIC_KEY_FALSE(sched_task_classes);
 +#endif
-
+ 
  static void update_top_cache_domain(int cpu)
  {
 @@ -2384,6 +2387,11 @@ build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *att
  	if (has_asym)
  		static_branch_inc_cpuslocked(&sched_asym_cpucapacity);
-
+ 
 +#ifdef CONFIG_SCHED_TASK_CLASSES
 +	if (arch_has_task_classes())
 +		static_branch_enable_cpuslocked(&sched_task_classes);
@@ -1322,6 +1477,6 @@ index 717fcb9fb14a..b444b6f5f585 100644
  	if (IS_ENABLED(CONFIG_POSIX_TIMERS))
  		run_posix_cpu_timers();
  }
---
+-- 
 2.37.3
 
