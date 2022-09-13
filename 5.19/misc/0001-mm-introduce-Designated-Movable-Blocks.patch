@@ -1,0 +1,1934 @@
+From ace9f873cd139b281508f313d0ab756ad5c2a207 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Wed, 14 Sep 2022 00:13:05 +0200
+Subject: [PATCH] mm: introduce Designated Movable Blocks
+
+MOTIVATION:
+Some Broadcom devices (e.g. 7445, 7278) contain multiple memory
+controllers with each mapped in a different address range within
+a Uniform Memory Architecture. Some users of these systems have
+expressed the desire to locate ZONE_MOVABLE memory on each
+memory controller to allow user space intensive processing to
+make better use of the additional memory bandwidth.
+Unfortunately, the historical monotonic layout of zones would
+mean that if the lowest addressed memory controller contains
+ZONE_MOVABLE memory then all of the memory available from
+memory controllers at higher addresses must also be in the
+ZONE_MOVABLE zone. This would force all kernel memory accesses
+onto the lowest addressed memory controller and significantly
+reduce the amount of memory available for non-movable
+allocations.
+
+The main objective of this patch set is therefore to allow a
+block of memory to be designated as part of the ZONE_MOVABLE
+zone where it will always only be used by the kernel page
+allocator to satisfy requests for movable pages. The term
+Designated Movable Block is introduced here to represent such a
+block. The favored implementation allows modification of the
+'movablecore' kernel parameter to allow specification of a base
+address and support for multiple blocks. The existing
+'movablecore' mechanisms are retained. Other mechanisms based on
+device tree are also included in this set.
+
+BACKGROUND:
+NUMA architectures support distributing movablecore memory
+across each node, but it is undesirable to introduce the
+overhead and complexities of NUMA on systems that don't have a
+Non-Uniform Memory Architecture.
+
+Commit 342332e6a925 ("mm/page_alloc.c: introduce kernelcore=mirror option")
+also depends on zone overlap to support sytems with multiple
+mirrored ranges.
+
+Commit c6f03e2903c9 ("mm, memory_hotplug: remove zone restrictions")
+embraced overlapped zones for memory hotplug.
+
+This commit set follows their lead to allow the ZONE_MOVABLE
+zone to overlap other zones while spanning the pages from the
+lowest Designated Movable Block to the end of the node.
+Designated Movable Blocks are made absent from overlapping zones
+and present within the ZONE_MOVABLE zone.
+
+I initially investigated an implementation using a Designated
+Movable migrate type in line with comments[1] made by Mel Gorman
+regarding a "sticky" MIGRATE_MOVABLE type to avoid using
+ZONE_MOVABLE. However, this approach was riskier since it was
+much more instrusive on the allocation paths. Ultimately, the
+progress made by the memory hotplug folks to expand the
+ZONE_MOVABLE functionality convinced me to follow this approach.
+
+OPPORTUNITIES:
+There have been many attempts to modify the behavior of the
+kernel page allocators use of CMA regions. This implementation
+of Designated Movable Blocks creates an opportunity to repurpose
+the CMA allocator to operate on ZONE_MOVABLE memory that the
+kernel page allocator can use more agressively, without
+affecting the existing CMA implementation. It is hoped that the
+"shared-dmb-pool" approach included here will be useful in cases
+where memory sharing is more important than allocation latency.
+
+CMA introduced a paradigm where multiple allocators could
+operate on the same region of memory, and that paradigm can be
+extended to Designated Movable Blocks as well. I was interested
+in using kernel resource management as a mechanism for exposing
+Designated Movable Block resources (e.g. /proc/iomem) that would
+be used by the kernel page allocator like any other ZONE_MOVABLE
+memory, but could be claimed by an alternative allocator (e.g.
+CMA). Unfortunately, this becomes complicated because the kernel
+resource implementation varies materially across different
+architectures and I do not require this capability so I have
+deferred that.
+
+The MEMBLOCK_MOVABLE and MEMBLOCK_HOTPLUG have a lot in common
+and could potentially be consolidated, but I chose to avoid that
+here to reduce controversy.
+
+The CMA and DMB alignment constraints are currently the same so
+the logic could be simplified, but this implementation keeps
+them distinct to facilitate independent evolution of the
+implementations if necessary.
+
+COMMITS:
+Commits 1-3 represent bug fixes that could have been submitted
+separately and should be submitted to linux-stable. They are
+included here because of later commit dependencies to facilitate
+review of the entire patch set.
+
+Commits 4-6 are enhancements of hugepage migration to support
+contiguous allocations (i.e. alloc_contig_range). These are
+potentially of value if a non-gigantic hugepage can be
+allocated through fallback from MIGRATE_CMA pageblocks or for
+the allocation of gigantic pages. Their real value is to support
+CMA from Designated Movable Blocks.
+
+Commits 7-15 make up the preferred embodiment of the concept of
+Designated Movable Block support.
+
+The remaining commits (i.e. 16-21) are examples of additional
+opportunites to use DMBs with other kernel services to achieve
+more aggressive sharing of DMB reservations with the kernel
+page allocator. It is hoped that they are of value to others,
+but they can be reviewed and evaluated separately from the other
+commits in this set if there is controversy and/or opportunites
+for improvement.
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ .../admin-guide/kernel-parameters.txt         |  17 +-
+ .../designated-movable-block.yaml             |  51 ++++
+ .../reserved-memory/shared-dma-pool.yaml      |   8 +
+ drivers/of/of_reserved_mem.c                  |  20 +-
+ include/linux/cma.h                           |  13 +-
+ include/linux/dmb.h                           |  28 +++
+ include/linux/gfp.h                           |   5 +-
+ include/linux/hugetlb.h                       |   5 +
+ include/linux/memblock.h                      |   8 +
+ kernel/dma/contiguous.c                       |  33 ++-
+ lib/show_mem.c                                |   2 +-
+ mm/Kconfig                                    |  12 +
+ mm/Makefile                                   |   1 +
+ mm/cma.c                                      |  58 +++--
+ mm/dmb.c                                      | 156 ++++++++++++
+ mm/hugetlb.c                                  | 194 +++++++++++----
+ mm/memblock.c                                 |  30 ++-
+ mm/migrate.c                                  |   1 +
+ mm/page_alloc.c                               | 225 +++++++++++++-----
+ mm/page_isolation.c                           |  75 +++---
+ mm/vmstat.c                                   |   5 +
+ 21 files changed, 765 insertions(+), 182 deletions(-)
+ create mode 100644 Documentation/devicetree/bindings/reserved-memory/designated-movable-block.yaml
+ create mode 100644 include/linux/dmb.h
+ create mode 100644 mm/dmb.c
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 0e538b3785f5..ad61fba10f30 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -1709,6 +1709,9 @@
+ 			hugepages using the CMA allocator. If enabled, the
+ 			boot-time allocation of gigantic hugepages is skipped.
+ 
++	hugetlb_dmb	[HW,CMA] Causes hugetlb_cma to use Designated Movable
++			Blocks for any CMA areas it reserves.
++
+ 	hugetlb_free_vmemmap=
+ 			[KNL] Reguires CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP
+ 			enabled.
+@@ -3267,7 +3270,7 @@
+ 			reporting absolute coordinates, such as tablets
+ 
+ 	movablecore=	[KNL,X86,IA-64,PPC]
+-			Format: nn[KMGTPE] | nn%
++			Format: nn[KMGTPE] | nn[KMGTPE]@ss[KMGTPE] | nn%
+ 			This parameter is the complement to kernelcore=, it
+ 			specifies the amount of memory used for migratable
+ 			allocations.  If both kernelcore and movablecore is
+@@ -3277,6 +3280,18 @@
+ 			that the amount of memory usable for all allocations
+ 			is not too small.
+ 
++			If @ss[KMGTPE] is included, memory within the region
++			from ss to ss+nn will be designated as a movable block
++			and included in ZONE_MOVABLE. Designated Movable Blocks
++			must be aligned to pageblock_order. Designated Movable
++			Blocks take priority over values of kernelcore= and are
++			considered part of any memory specified by more general
++			movablecore= values.
++			Multiple Designated Movable Blocks may be specified,
++			comma delimited.
++			Example:
++				movablecore=100M@2G,100M@3G,1G@1024G
++
+ 	movable_node	[KNL] Boot-time switch to make hotplugable memory
+ 			NUMA nodes to be movable. This means that the memory
+ 			of such nodes will be usable only for movable
+diff --git a/Documentation/devicetree/bindings/reserved-memory/designated-movable-block.yaml b/Documentation/devicetree/bindings/reserved-memory/designated-movable-block.yaml
+new file mode 100644
+index 000000000000..42f846069a2e
+--- /dev/null
++++ b/Documentation/devicetree/bindings/reserved-memory/designated-movable-block.yaml
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/reserved-memory/designated-movable-block.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: /reserved-memory Designated Movable Block node binding
++
++maintainers:
++  - devicetree-spec@vger.kernel.org
++
++allOf:
++  - $ref: "reserved-memory.yaml"
++
++properties:
++  compatible:
++    const: designated-movable-block
++    description:
++      This indicates a region of memory meant to be placed into
++      ZONE_MOVABLE.
++
++unevaluatedProperties: false
++
++required:
++  - compatible
++  - reusable
++
++examples:
++  - |
++      reserved-memory {
++          #address-cells = <0x2>;
++          #size-cells = <0x2>;
++
++          DMB0@10800000 {
++               compatible = "designated-movable-block";
++               reusable;
++               reg = <0x0 0x10800000 0x0 0x2d800000>;
++          };
++
++          DMB1@40000000 {
++               compatible = "designated-movable-block";
++               reusable;
++               reg = <0x0 0x40000000 0x0 0x30000000>;
++          };
++
++          DMB2@80000000 {
++               compatible = "designated-movable-block";
++               reusable;
++               reg = <0x0 0x80000000 0x0 0x2fc00000>;
++          };
++      };
+diff --git a/Documentation/devicetree/bindings/reserved-memory/shared-dma-pool.yaml b/Documentation/devicetree/bindings/reserved-memory/shared-dma-pool.yaml
+index 618105f079be..85824fe05ac9 100644
+--- a/Documentation/devicetree/bindings/reserved-memory/shared-dma-pool.yaml
++++ b/Documentation/devicetree/bindings/reserved-memory/shared-dma-pool.yaml
+@@ -22,6 +22,14 @@ properties:
+           operating system to instantiate the necessary pool management
+           subsystem if necessary.
+ 
++      - const: shared-dmb-pool
++        description: >
++          This indicates a shared-dma-pool region that is located within
++          a Designated Movable Block. The operating system is free to
++          use unallocated memory for movable allocations in this region.
++          Devices need to be tolerant of allocation latency to use this
++          pool.
++
+       - const: restricted-dma-pool
+         description: >
+           This indicates a region of memory meant to be used as a pool
+diff --git a/drivers/of/of_reserved_mem.c b/drivers/of/of_reserved_mem.c
+index 75caa6f5d36f..982659e6be14 100644
+--- a/drivers/of/of_reserved_mem.c
++++ b/drivers/of/of_reserved_mem.c
+@@ -23,6 +23,7 @@
+ #include <linux/memblock.h>
+ #include <linux/kmemleak.h>
+ #include <linux/cma.h>
++#include <linux/dmb.h>
+ 
+ #include "of_private.h"
+ 
+@@ -113,12 +114,21 @@ static int __init __reserved_mem_alloc_size(unsigned long node,
+ 
+ 	nomap = of_get_flat_dt_prop(node, "no-map", NULL) != NULL;
+ 
+-	/* Need adjust the alignment to satisfy the CMA requirement */
+-	if (IS_ENABLED(CONFIG_CMA)
+-	    && of_flat_dt_is_compatible(node, "shared-dma-pool")
+-	    && of_get_flat_dt_prop(node, "reusable", NULL)
+-	    && !nomap)
++	if (of_flat_dt_is_compatible(node, "designated-movable-block")) {
++		/* Need adjust the alignment to satisfy the DMB requirement */
++		align = max_t(phys_addr_t, align, DMB_MIN_ALIGNMENT_BYTES);
++	} else if (IS_ENABLED(CONFIG_CMA)
++		   && of_flat_dt_is_compatible(node, "shared-dma-pool")
++		   && of_get_flat_dt_prop(node, "reusable", NULL)
++		   && !nomap) {
++		/* Need adjust the alignment to satisfy the CMA requirement */
+ 		align = max_t(phys_addr_t, align, CMA_MIN_ALIGNMENT_BYTES);
++	} else if (IS_ENABLED(CONFIG_CMA)
++		   && of_flat_dt_is_compatible(node, "shared-dmb-pool")) {
++		/* Need adjust the alignment to satisfy CMA/DMB requirements */
++		align = max_t(phys_addr_t, align, CMA_MIN_ALIGNMENT_BYTES);
++		align = max_t(phys_addr_t, align, DMB_MIN_ALIGNMENT_BYTES);
++	}
+ 
+ 	prop = of_get_flat_dt_prop(node, "alloc-ranges", &len);
+ 	if (prop) {
+diff --git a/include/linux/cma.h b/include/linux/cma.h
+index 63873b93deaa..ffbb8ea2c5f8 100644
+--- a/include/linux/cma.h
++++ b/include/linux/cma.h
+@@ -31,11 +31,13 @@ extern phys_addr_t cma_get_base(const struct cma *cma);
+ extern unsigned long cma_get_size(const struct cma *cma);
+ extern const char *cma_get_name(const struct cma *cma);
+ 
+-extern int __init cma_declare_contiguous_nid(phys_addr_t base,
++extern int __init __cma_declare_contiguous_nid(phys_addr_t base,
+ 			phys_addr_t size, phys_addr_t limit,
+ 			phys_addr_t alignment, unsigned int order_per_bit,
+ 			bool fixed, const char *name, struct cma **res_cma,
+-			int nid);
++			int nid, bool in_dmb);
++#define cma_declare_contiguous_nid(b, s, l, a, o, f, n, r_c, nid)	\
++	__cma_declare_contiguous_nid(b, s, l, a, o, f, n, r_c, nid, false)
+ static inline int __init cma_declare_contiguous(phys_addr_t base,
+ 			phys_addr_t size, phys_addr_t limit,
+ 			phys_addr_t alignment, unsigned int order_per_bit,
+@@ -44,10 +46,13 @@ static inline int __init cma_declare_contiguous(phys_addr_t base,
+ 	return cma_declare_contiguous_nid(base, size, limit, alignment,
+ 			order_per_bit, fixed, name, res_cma, NUMA_NO_NODE);
+ }
+-extern int cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
++extern int __cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
+ 					unsigned int order_per_bit,
+ 					const char *name,
+-					struct cma **res_cma);
++					struct cma **res_cma,
++					bool in_dmb);
++#define cma_init_reserved_mem(base, size, order, name, res_cma)		\
++	__cma_init_reserved_mem(base, size, order, name, res_cma, 0)
+ extern struct page *cma_alloc(struct cma *cma, unsigned long count, unsigned int align,
+ 			      bool no_warn);
+ extern bool cma_pages_valid(struct cma *cma, const struct page *pages, unsigned long count);
+diff --git a/include/linux/dmb.h b/include/linux/dmb.h
+new file mode 100644
+index 000000000000..eecc90e7f884
+--- /dev/null
++++ b/include/linux/dmb.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __DMB_H__
++#define __DMB_H__
++
++#include <linux/memblock.h>
++
++/*
++ * the buddy -- especially pageblock merging and alloc_contig_range()
++ * -- can deal with only some pageblocks of a higher-order page being
++ *  MIGRATE_MOVABLE, we can use pageblock_nr_pages.
++ */
++#define DMB_MIN_ALIGNMENT_PAGES pageblock_nr_pages
++#define DMB_MIN_ALIGNMENT_BYTES (PAGE_SIZE * DMB_MIN_ALIGNMENT_PAGES)
++
++enum {
++	DMB_DISJOINT = 0,
++	DMB_INTERSECTS,
++	DMB_MIXED,
++};
++
++struct dmb;
++
++extern int dmb_reserve(phys_addr_t base, phys_addr_t size,
++		       struct dmb **res_dmb);
++extern int dmb_intersects(unsigned long spfn, unsigned long epfn);
++extern void dmb_init_region(struct memblock_region *region);
++
++#endif
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index f314be58fa77..71ed687be406 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -367,9 +367,6 @@ extern struct page *alloc_contig_pages(unsigned long nr_pages, gfp_t gfp_mask,
+ #endif
+ void free_contig_range(unsigned long pfn, unsigned long nr_pages);
+ 
+-#ifdef CONFIG_CMA
+-/* CMA stuff */
+-extern void init_cma_reserved_pageblock(struct page *page);
+-#endif
++extern void init_reserved_pageblock(struct page *page);
+ 
+ #endif /* __LINUX_GFP_H */
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 756b66ff025e..c009709e9281 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -218,6 +218,7 @@ unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
+ 
+ bool is_hugetlb_entry_migration(pte_t pte);
+ void hugetlb_unshare_all_pmds(struct vm_area_struct *vma);
++void sync_hugetlb_dissolve(void);
+ 
+ #else /* !CONFIG_HUGETLB_PAGE */
+ 
+@@ -426,6 +427,8 @@ static inline vm_fault_t hugetlb_fault(struct mm_struct *mm,
+ 
+ static inline void hugetlb_unshare_all_pmds(struct vm_area_struct *vma) { }
+ 
++static inline void sync_hugetlb_dissolve(void) { }
++
+ #endif /* !CONFIG_HUGETLB_PAGE */
+ /*
+  * hugepages at page global directory. If arch support
+@@ -567,6 +570,7 @@ enum hugetlb_page_flags {
+ 	HPG_temporary,
+ 	HPG_freed,
+ 	HPG_vmemmap_optimized,
++	HPG_dissolve,
+ 	__NR_HPAGEFLAGS,
+ };
+ 
+@@ -613,6 +617,7 @@ HPAGEFLAG(Migratable, migratable)
+ HPAGEFLAG(Temporary, temporary)
+ HPAGEFLAG(Freed, freed)
+ HPAGEFLAG(VmemmapOptimized, vmemmap_optimized)
++HPAGEFLAG(Dissolve, dissolve)
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+ 
+diff --git a/include/linux/memblock.h b/include/linux/memblock.h
+index 50ad19662a32..8eb3ca32dfa7 100644
+--- a/include/linux/memblock.h
++++ b/include/linux/memblock.h
+@@ -47,6 +47,7 @@ enum memblock_flags {
+ 	MEMBLOCK_MIRROR		= 0x2,	/* mirrored region */
+ 	MEMBLOCK_NOMAP		= 0x4,	/* don't add to kernel direct mapping */
+ 	MEMBLOCK_DRIVER_MANAGED = 0x8,	/* always detected via a driver */
++	MEMBLOCK_MOVABLE	= 0x10,	/* designated movable block */
+ };
+ 
+ /**
+@@ -125,6 +126,8 @@ int memblock_clear_hotplug(phys_addr_t base, phys_addr_t size);
+ int memblock_mark_mirror(phys_addr_t base, phys_addr_t size);
+ int memblock_mark_nomap(phys_addr_t base, phys_addr_t size);
+ int memblock_clear_nomap(phys_addr_t base, phys_addr_t size);
++int memblock_mark_movable(phys_addr_t base, phys_addr_t size);
++int memblock_clear_movable(phys_addr_t base, phys_addr_t size);
+ 
+ void memblock_free_all(void);
+ void memblock_free(void *ptr, size_t size);
+@@ -265,6 +268,11 @@ static inline bool memblock_is_driver_managed(struct memblock_region *m)
+ 	return m->flags & MEMBLOCK_DRIVER_MANAGED;
+ }
+ 
++static inline bool memblock_is_movable(struct memblock_region *m)
++{
++	return m->flags & MEMBLOCK_MOVABLE;
++}
++
+ int memblock_search_pfn_nid(unsigned long pfn, unsigned long *start_pfn,
+ 			    unsigned long  *end_pfn);
+ void __next_mem_pfn_range(int *idx, int nid, unsigned long *out_start_pfn,
+diff --git a/kernel/dma/contiguous.c b/kernel/dma/contiguous.c
+index 6ea80ae42622..65dda12752a7 100644
+--- a/kernel/dma/contiguous.c
++++ b/kernel/dma/contiguous.c
+@@ -50,6 +50,7 @@
+ #include <linux/sizes.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/cma.h>
++#include <linux/dmb.h>
+ 
+ #ifdef CONFIG_CMA_SIZE_MBYTES
+ #define CMA_SIZE_MBYTES CONFIG_CMA_SIZE_MBYTES
+@@ -397,10 +398,11 @@ static const struct reserved_mem_ops rmem_cma_ops = {
+ 	.device_release = rmem_cma_device_release,
+ };
+ 
+-static int __init rmem_cma_setup(struct reserved_mem *rmem)
++static int __init _rmem_cma_setup(struct reserved_mem *rmem, bool in_dmb)
+ {
+ 	unsigned long node = rmem->fdt_node;
+ 	bool default_cma = of_get_flat_dt_prop(node, "linux,cma-default", NULL);
++	phys_addr_t align = CMA_MIN_ALIGNMENT_BYTES;
+ 	struct cma *cma;
+ 	int err;
+ 
+@@ -414,16 +416,25 @@ static int __init rmem_cma_setup(struct reserved_mem *rmem)
+ 	    of_get_flat_dt_prop(node, "no-map", NULL))
+ 		return -EINVAL;
+ 
+-	if (!IS_ALIGNED(rmem->base | rmem->size, CMA_MIN_ALIGNMENT_BYTES)) {
++	if (in_dmb) {
++		if (default_cma) {
++			pr_err("Reserved memory: cma-default cannot be DMB\n");
++			return -EINVAL;
++		}
++		align = max_t(phys_addr_t, align, DMB_MIN_ALIGNMENT_BYTES);
++	}
++	if (!IS_ALIGNED(rmem->base | rmem->size, align)) {
+ 		pr_err("Reserved memory: incorrect alignment of CMA region\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	err = cma_init_reserved_mem(rmem->base, rmem->size, 0, rmem->name, &cma);
++	err = __cma_init_reserved_mem(rmem->base, rmem->size, 0, rmem->name,
++				      &cma, in_dmb);
+ 	if (err) {
+ 		pr_err("Reserved memory: unable to setup CMA region\n");
+ 		return err;
+ 	}
++
+ 	/* Architecture specific contiguous memory fixup. */
+ 	dma_contiguous_early_fixup(rmem->base, rmem->size);
+ 
+@@ -433,10 +444,22 @@ static int __init rmem_cma_setup(struct reserved_mem *rmem)
+ 	rmem->ops = &rmem_cma_ops;
+ 	rmem->priv = cma;
+ 
+-	pr_info("Reserved memory: created CMA memory pool at %pa, size %ld MiB\n",
+-		&rmem->base, (unsigned long)rmem->size / SZ_1M);
++	pr_info("Reserved memory: created %s memory pool at %pa, size %ld MiB\n",
++		in_dmb ? "DMB" : "CMA", &rmem->base,
++		(unsigned long)rmem->size / SZ_1M);
+ 
+ 	return 0;
+ }
++
++static int __init rmem_cma_setup(struct reserved_mem *rmem)
++{
++	return _rmem_cma_setup(rmem, false);
++}
+ RESERVEDMEM_OF_DECLARE(cma, "shared-dma-pool", rmem_cma_setup);
++
++static int __init rmem_cma_in_dmb_setup(struct reserved_mem *rmem)
++{
++	return _rmem_cma_setup(rmem, true);
++}
++RESERVEDMEM_OF_DECLARE(cma_in_dmb, "shared-dmb-pool", rmem_cma_in_dmb_setup);
+ #endif
+diff --git a/lib/show_mem.c b/lib/show_mem.c
+index 1c26c14ffbb9..337c870a5e59 100644
+--- a/lib/show_mem.c
++++ b/lib/show_mem.c
+@@ -27,7 +27,7 @@ void show_mem(unsigned int filter, nodemask_t *nodemask)
+ 			total += zone->present_pages;
+ 			reserved += zone->present_pages - zone_managed_pages(zone);
+ 
+-			if (is_highmem_idx(zoneid))
++			if (zoneid == ZONE_MOVABLE || is_highmem_idx(zoneid))
+ 				highmem += zone->present_pages;
+ 		}
+ 	}
+diff --git a/mm/Kconfig b/mm/Kconfig
+index a0f7b6e66410..f9291bcccec0 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -876,6 +876,18 @@ config CMA_AREAS
+ 
+ 	  If unsure, leave the default value "7" in UMA and "19" in NUMA.
+ 
++config DMB_COUNT
++	int "Maximum count of Designated Movable Blocks"
++	default 19 if NUMA
++	default 7
++	help
++	  Designated Movable Blocks are blocks of memory that can be used
++	  by the page allocator exclusively for movable pages. They are
++	  managed in ZONE_MOVABLE but may overlap with other zones. This
++	  parameter sets the maximum number of DMBs in the system.
++
++	  If unsure, leave the default value "7" in UMA and "19" in NUMA.
++
+ config MEM_SOFT_DIRTY
+ 	bool "Track memory changes"
+ 	depends on CHECKPOINT_RESTORE && HAVE_ARCH_SOFT_DIRTY && PROC_FS
+diff --git a/mm/Makefile b/mm/Makefile
+index 6f9ffa968a1a..567ccef36cf0 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -67,6 +67,7 @@ obj-y += page-alloc.o
+ obj-y += init-mm.o
+ obj-y += memblock.o
+ obj-y += $(memory-hotplug-y)
++obj-y += dmb.o
+ 
+ ifdef CONFIG_MMU
+ 	obj-$(CONFIG_ADVISE_SYSCALLS)	+= madvise.o
+diff --git a/mm/cma.c b/mm/cma.c
+index 4a978e09547a..4f33cd54db9e 100644
+--- a/mm/cma.c
++++ b/mm/cma.c
+@@ -31,7 +31,9 @@
+ #include <linux/highmem.h>
+ #include <linux/io.h>
+ #include <linux/kmemleak.h>
++#include <linux/page-isolation.h>
+ #include <trace/events/cma.h>
++#include <linux/dmb.h>
+ 
+ #include "cma.h"
+ 
+@@ -97,6 +99,10 @@ static void __init cma_activate_area(struct cma *cma)
+ {
+ 	unsigned long base_pfn = cma->base_pfn, pfn;
+ 	struct zone *zone;
++	int is_dmb = dmb_intersects(base_pfn, base_pfn + cma->count);
++
++	if (is_dmb == DMB_MIXED)
++		goto out_error;
+ 
+ 	cma->bitmap = bitmap_zalloc(cma_bitmap_maxno(cma), GFP_KERNEL);
+ 	if (!cma->bitmap)
+@@ -115,9 +121,18 @@ static void __init cma_activate_area(struct cma *cma)
+ 			goto not_in_zone;
+ 	}
+ 
+-	for (pfn = base_pfn; pfn < base_pfn + cma->count;
+-	     pfn += pageblock_nr_pages)
+-		init_cma_reserved_pageblock(pfn_to_page(pfn));
++	if (is_dmb == DMB_INTERSECTS) {
++		totalcma_pages -= cma->count;
++	} else {
++		for (pfn = base_pfn; pfn < base_pfn + cma->count;
++		     pfn += pageblock_nr_pages) {
++			struct page *page = pfn_to_page(pfn);
++
++			set_pageblock_migratetype(page, MIGRATE_CMA);
++			init_reserved_pageblock(page);
++			page_zone(page)->cma_pages += pageblock_nr_pages;
++		}
++	}
+ 
+ 	spin_lock_init(&cma->lock);
+ 
+@@ -133,8 +148,10 @@ static void __init cma_activate_area(struct cma *cma)
+ out_error:
+ 	/* Expose all pages to the buddy, they are useless for CMA. */
+ 	if (!cma->reserve_pages_on_error) {
+-		for (pfn = base_pfn; pfn < base_pfn + cma->count; pfn++)
+-			free_reserved_page(pfn_to_page(pfn));
++		for (pfn = base_pfn; pfn < base_pfn + cma->count;
++		     pfn += pageblock_nr_pages)
++			if (!dmb_intersects(pfn, pfn + pageblock_nr_pages))
++				init_reserved_pageblock(pfn_to_page(pfn));
+ 	}
+ 	totalcma_pages -= cma->count;
+ 	cma->count = 0;
+@@ -159,7 +176,7 @@ void __init cma_reserve_pages_on_error(struct cma *cma)
+ }
+ 
+ /**
+- * cma_init_reserved_mem() - create custom contiguous area from reserved memory
++ * __cma_init_reserved_mem() - create custom contiguous area in reserved memory
+  * @base: Base address of the reserved area
+  * @size: Size of the reserved area (in bytes),
+  * @order_per_bit: Order of pages represented by one bit on bitmap.
+@@ -167,15 +184,18 @@ void __init cma_reserve_pages_on_error(struct cma *cma)
+  *        the area will be set to "cmaN", where N is a running counter of
+  *        used areas.
+  * @res_cma: Pointer to store the created cma region.
++ * @in_dmb: Designate the reserved memory as a Designated Movable Block.
+  *
+  * This function creates custom contiguous area from already reserved memory.
+  */
+-int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
+-				 unsigned int order_per_bit,
+-				 const char *name,
+-				 struct cma **res_cma)
++int __init __cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
++				   unsigned int order_per_bit,
++				   const char *name,
++				   struct cma **res_cma,
++				   bool in_dmb)
+ {
+ 	struct cma *cma;
++	int err;
+ 
+ 	/* Sanity checks */
+ 	if (cma_area_count == ARRAY_SIZE(cma_areas)) {
+@@ -194,6 +214,14 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
+ 	if (!IS_ALIGNED(base | size, CMA_MIN_ALIGNMENT_BYTES))
+ 		return -EINVAL;
+ 
++	if (in_dmb) {
++		err = dmb_reserve(base, size, NULL);
++		if (err) {
++			pr_err("Cannot reserve DMB for CMA!\n");
++			return err;
++		}
++	}
++
+ 	/*
+ 	 * Each reserved area must be initialised later, when more kernel
+ 	 * subsystems (like slab allocator) are available.
+@@ -216,7 +244,7 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
+ }
+ 
+ /**
+- * cma_declare_contiguous_nid() - reserve custom contiguous area
++ * __cma_declare_contiguous_nid() - reserve custom contiguous area
+  * @base: Base address of the reserved area optional, use 0 for any
+  * @size: Size of the reserved area (in bytes),
+  * @limit: End address of the reserved memory (optional, 0 for any).
+@@ -226,6 +254,7 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
+  * @name: The name of the area. See function cma_init_reserved_mem()
+  * @res_cma: Pointer to store the created cma region.
+  * @nid: nid of the free area to find, %NUMA_NO_NODE for any node
++ * @in_dmb: Designate the reserved memory as a Designated Movable Block.
+  *
+  * This function reserves memory from early allocator. It should be
+  * called by arch specific code once the early allocator (memblock or bootmem)
+@@ -235,11 +264,11 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
+  * If @fixed is true, reserve contiguous area at exactly @base.  If false,
+  * reserve in range from @base to @limit.
+  */
+-int __init cma_declare_contiguous_nid(phys_addr_t base,
++int __init __cma_declare_contiguous_nid(phys_addr_t base,
+ 			phys_addr_t size, phys_addr_t limit,
+ 			phys_addr_t alignment, unsigned int order_per_bit,
+ 			bool fixed, const char *name, struct cma **res_cma,
+-			int nid)
++			int nid, bool in_dmb)
+ {
+ 	phys_addr_t memblock_end = memblock_end_of_DRAM();
+ 	phys_addr_t highmem_start;
+@@ -367,7 +396,8 @@ int __init cma_declare_contiguous_nid(phys_addr_t base,
+ 		base = addr;
+ 	}
+ 
+-	ret = cma_init_reserved_mem(base, size, order_per_bit, name, res_cma);
++	ret = __cma_init_reserved_mem(base, size, order_per_bit, name, res_cma,
++				      in_dmb);
+ 	if (ret)
+ 		goto free_mem;
+ 
+diff --git a/mm/dmb.c b/mm/dmb.c
+new file mode 100644
+index 000000000000..8132d18542a0
+--- /dev/null
++++ b/mm/dmb.c
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Designated Movable Block
++ */
++
++#define pr_fmt(fmt) "dmb: " fmt
++
++#include <linux/dmb.h>
++
++struct dmb {
++	unsigned long start_pfn;
++	unsigned long end_pfn;
++	void *owner;
++};
++
++static struct dmb dmb_areas[CONFIG_DMB_COUNT];
++static unsigned int dmb_area_count;
++
++int __init dmb_reserve(phys_addr_t base, phys_addr_t size,
++		       struct dmb **res_dmb)
++{
++	struct dmb *dmb;
++
++	/* Sanity checks */
++	if (dmb_area_count == ARRAY_SIZE(dmb_areas)) {
++		pr_warn("Not enough slots for DMB reserved regions!\n");
++		return -ENOSPC;
++	}
++
++	if (!size || !memblock_is_region_reserved(base, size))
++		return -EINVAL;
++
++	/* ensure minimal alignment required by mm core */
++	if (!IS_ALIGNED(base | size, DMB_MIN_ALIGNMENT_BYTES))
++		return -EINVAL;
++
++	/*
++	 * Each reserved area must be initialised later, when more kernel
++	 * subsystems (like slab allocator) are available.
++	 */
++	dmb = &dmb_areas[dmb_area_count++];
++
++	dmb->start_pfn = PFN_DOWN(base);
++	dmb->end_pfn = PFN_DOWN(base + size);
++	if (res_dmb)
++		*res_dmb = dmb;
++
++	memblock_mark_movable(base, size);
++	return 0;
++}
++
++int dmb_intersects(unsigned long spfn, unsigned long epfn)
++{
++	int i;
++	struct dmb *dmb;
++
++	if (spfn >= epfn)
++		return DMB_DISJOINT;
++
++	for (i = 0; i < dmb_area_count; i++) {
++		dmb = &dmb_areas[i];
++		if (spfn >= dmb->end_pfn)
++			continue;
++		if (epfn <= dmb->start_pfn)
++			return DMB_DISJOINT;
++		if (spfn >= dmb->start_pfn && epfn <= dmb->end_pfn)
++			return DMB_INTERSECTS;
++		else
++			return DMB_MIXED;
++	}
++
++	return DMB_DISJOINT;
++}
++EXPORT_SYMBOL(dmb_intersects);
++
++void __init dmb_init_region(struct memblock_region *region)
++{
++	unsigned long pfn;
++	int i;
++
++	for (pfn = memblock_region_memory_base_pfn(region);
++	     pfn < memblock_region_memory_end_pfn(region);
++	     pfn += pageblock_nr_pages) {
++		struct page *page = pfn_to_page(pfn);
++
++		for (i = 0; i < pageblock_nr_pages; i++)
++			set_page_zone(page + i, ZONE_MOVABLE);
++
++		/* free reserved pageblocks to page allocator */
++		init_reserved_pageblock(page);
++	}
++}
++
++/*
++ * Support for reserved memory regions defined in device tree
++ */
++#ifdef CONFIG_OF_RESERVED_MEM
++#include <linux/of.h>
++#include <linux/of_fdt.h>
++#include <linux/of_reserved_mem.h>
++
++#undef pr_fmt
++#define pr_fmt(fmt) fmt
++
++static int rmem_dmb_device_init(struct reserved_mem *rmem, struct device *dev)
++{
++	struct dmb *dmb;
++
++	dmb = (struct dmb *)rmem->priv;
++	if (dmb->owner)
++		return -EBUSY;
++
++	dmb->owner = dev;
++	return 0;
++}
++
++static void rmem_dmb_device_release(struct reserved_mem *rmem,
++				    struct device *dev)
++{
++	struct dmb *dmb;
++
++	dmb = (struct dmb *)rmem->priv;
++	if (dmb->owner == (void *)dev)
++		dmb->owner = NULL;
++}
++
++static const struct reserved_mem_ops rmem_dmb_ops = {
++	.device_init	= rmem_dmb_device_init,
++	.device_release = rmem_dmb_device_release,
++};
++
++static int __init rmem_dmb_setup(struct reserved_mem *rmem)
++{
++	unsigned long node = rmem->fdt_node;
++	struct dmb *dmb;
++	int err;
++
++	if (!of_get_flat_dt_prop(node, "reusable", NULL) ||
++	    of_get_flat_dt_prop(node, "no-map", NULL))
++		return -EINVAL;
++
++	err = dmb_reserve(rmem->base, rmem->size, &dmb);
++	if (err) {
++		pr_err("Reserved memory: unable to setup DMB region\n");
++		return err;
++	}
++
++	rmem->priv = dmb;
++	rmem->ops = &rmem_dmb_ops;
++	pr_info("Reserved memory: created DMB at %pa, size %ld MiB\n",
++		&rmem->base, (unsigned long)rmem->size / SZ_1M);
++
++	return 0;
++}
++RESERVEDMEM_OF_DECLARE(dmb, "designated-movable-block", rmem_dmb_setup);
++#endif
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 3ee278eb9a3c..238b0f110de4 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -33,6 +33,7 @@
+ #include <linux/migrate.h>
+ #include <linux/nospec.h>
+ #include <linux/delayacct.h>
++#include <linux/page-isolation.h>
+ 
+ #include <asm/page.h>
+ #include <asm/pgalloc.h>
+@@ -53,6 +54,7 @@ struct hstate hstates[HUGE_MAX_HSTATE];
+ #ifdef CONFIG_CMA
+ static struct cma *hugetlb_cma[MAX_NUMNODES];
+ static unsigned long hugetlb_cma_size_in_node[MAX_NUMNODES] __initdata;
++static bool hugetlb_dmb __initdata;
+ static bool hugetlb_cma_page(struct page *page, unsigned int order)
+ {
+ 	return cma_pages_valid(hugetlb_cma[page_to_nid(page)], page,
+@@ -1141,6 +1143,10 @@ static struct page *dequeue_huge_page_node_exact(struct hstate *h, int nid)
+ 		if (PageHWPoison(page))
+ 			continue;
+ 
++		/* Check head pageblock isolation */
++		if (is_migrate_isolate_page(page))
++			continue;
++
+ 		list_move(&page->lru, &h->hugepage_activelist);
+ 		set_page_refcounted(page);
+ 		ClearHPageFreed(page);
+@@ -1574,6 +1580,10 @@ static void __update_and_free_page(struct hstate *h, struct page *page)
+ 	}
+ }
+ 
++static LLIST_HEAD(hpage_dissolvelist);
++static void dissolve_hpage_workfn(struct work_struct *work);
++static DECLARE_WORK(dissolve_hpage_work, dissolve_hpage_workfn);
++
+ /*
+  * As update_and_free_page() can be called under any context, so we cannot
+  * use GFP_KERNEL to allocate vmemmap pages. However, we can defer the
+@@ -1620,6 +1630,8 @@ static inline void flush_free_hpage_work(struct hstate *h)
+ {
+ 	if (hugetlb_optimize_vmemmap_pages(h))
+ 		flush_work(&free_hpage_work);
++	if (!hstate_is_gigantic(h))
++		flush_work(&dissolve_hpage_work);
+ }
+ 
+ static void update_and_free_page(struct hstate *h, struct page *page,
+@@ -1671,7 +1683,7 @@ void free_huge_page(struct page *page)
+ 	struct hstate *h = page_hstate(page);
+ 	int nid = page_to_nid(page);
+ 	struct hugepage_subpool *spool = hugetlb_page_subpool(page);
+-	bool restore_reserve;
++	bool restore_reserve, dissolve;
+ 	unsigned long flags;
+ 
+ 	VM_BUG_ON_PAGE(page_count(page), page);
+@@ -1683,6 +1695,8 @@ void free_huge_page(struct page *page)
+ 	page->mapping = NULL;
+ 	restore_reserve = HPageRestoreReserve(page);
+ 	ClearHPageRestoreReserve(page);
++	dissolve = HPageDissolve(page);
++	ClearHPageDissolve(page);
+ 
+ 	/*
+ 	 * If HPageRestoreReserve was set on page, page allocation consumed a
+@@ -1721,6 +1735,11 @@ void free_huge_page(struct page *page)
+ 		remove_hugetlb_page(h, page, true);
+ 		spin_unlock_irqrestore(&hugetlb_lock, flags);
+ 		update_and_free_page(h, page, true);
++	} else if (dissolve) {
++		spin_unlock_irqrestore(&hugetlb_lock, flags);
++		if (llist_add((struct llist_node *)&page->mapping,
++			      &hpage_dissolvelist))
++			schedule_work(&dissolve_hpage_work);
+ 	} else {
+ 		arch_clear_hugepage_flags(page);
+ 		enqueue_huge_page(h, page);
+@@ -2705,32 +2724,22 @@ void restore_reserve_on_error(struct hstate *h, struct vm_area_struct *vma,
+ }
+ 
+ /*
+- * alloc_and_dissolve_huge_page - Allocate a new page and dissolve the old one
+- * @h: struct hstate old page belongs to
+- * @old_page: Old page to dissolve
+- * @list: List to isolate the page in case we need to
+- * Returns 0 on success, otherwise negated error.
++ * Before dissolving the page, we need to allocate a new one for the
++ * pool to remain stable.  Here, we allocate the page and 'prep' it
++ * by doing everything but actually updating counters and adding to
++ * the pool.  This simplifies and let us do most of the processing
++ * under the lock.
+  */
+-static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+-					struct list_head *list)
++static struct page *alloc_replacement_page(struct hstate *h, int nid)
+ {
+ 	gfp_t gfp_mask = htlb_alloc_mask(h) | __GFP_THISNODE;
+-	int nid = page_to_nid(old_page);
+ 	bool alloc_retry = false;
+ 	struct page *new_page;
+-	int ret = 0;
+ 
+-	/*
+-	 * Before dissolving the page, we need to allocate a new one for the
+-	 * pool to remain stable.  Here, we allocate the page and 'prep' it
+-	 * by doing everything but actually updating counters and adding to
+-	 * the pool.  This simplifies and let us do most of the processing
+-	 * under the lock.
+-	 */
+ alloc_retry:
+ 	new_page = alloc_buddy_huge_page(h, gfp_mask, nid, NULL, NULL);
+ 	if (!new_page)
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
+ 	/*
+ 	 * If all goes well, this page will be directly added to the free
+ 	 * list in the pool.  For this the ref count needs to be zero.
+@@ -2744,7 +2753,7 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ 	SetHPageTemporary(new_page);
+ 	if (!put_page_testzero(new_page)) {
+ 		if (alloc_retry)
+-			return -EBUSY;
++			return ERR_PTR(-EBUSY);
+ 
+ 		alloc_retry = true;
+ 		goto alloc_retry;
+@@ -2753,6 +2762,91 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ 
+ 	__prep_new_huge_page(h, new_page);
+ 
++	return new_page;
++}
++
++static void replace_hugepage(struct hstate *h, int nid, struct page *old_page,
++			     struct page *new_page)
++{
++	lockdep_assert_held(&hugetlb_lock);
++	/*
++	 * Ok, old_page is still a genuine free hugepage. Remove it from
++	 * the freelist and decrease the counters. These will be
++	 * incremented again when calling __prep_account_new_huge_page()
++	 * and enqueue_huge_page() for new_page. The counters will remain
++	 * stable since this happens under the lock.
++	 */
++	remove_hugetlb_page(h, old_page, false);
++
++	/*
++	 * Ref count on new page is already zero as it was dropped
++	 * earlier.  It can be directly added to the pool free list.
++	 */
++	__prep_account_new_huge_page(h, nid);
++	enqueue_huge_page(h, new_page);
++}
++
++static void dissolve_hpage_workfn(struct work_struct *work)
++{
++	struct llist_node *node;
++
++	node = llist_del_all(&hpage_dissolvelist);
++
++	while (node) {
++		struct page *oldpage, *newpage;
++		struct hstate *h;
++		int nid;
++
++		oldpage = container_of((struct address_space **)node,
++				       struct page, mapping);
++		node = node->next;
++		oldpage->mapping = NULL;
++
++		h = page_hstate(oldpage);
++		nid = page_to_nid(oldpage);
++
++		newpage = alloc_replacement_page(h, nid);
++
++		spin_lock_irq(&hugetlb_lock);
++		/* finish freeing oldpage */
++		arch_clear_hugepage_flags(oldpage);
++		enqueue_huge_page(h, oldpage);
++		if (IS_ERR(newpage)) {
++			/* cannot dissolve so just leave free */
++			spin_unlock_irq(&hugetlb_lock);
++			goto next;
++		}
++
++		replace_hugepage(h, nid, oldpage, newpage);
++
++		/*
++		 * Pages have been replaced, we can safely free the old one.
++		 */
++		spin_unlock_irq(&hugetlb_lock);
++		__update_and_free_page(h, oldpage);
++next:
++		cond_resched();
++	}
++}
++
++/*
++ * alloc_and_dissolve_huge_page - Allocate a new page and dissolve the old one
++ * @h: struct hstate old page belongs to
++ * @old_page: Old page to dissolve
++ * @list: List to isolate the page in case we need to
++ * Returns 0 on success, otherwise negated error.
++ */
++static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
++					struct list_head *list)
++{
++	int nid = page_to_nid(old_page);
++	struct page *new_page;
++	int ret = 0;
++
++	new_page = alloc_replacement_page(h, nid);
++	if (IS_ERR(new_page))
++		return PTR_ERR(new_page);
++
+ retry:
+ 	spin_lock_irq(&hugetlb_lock);
+ 	if (!PageHuge(old_page)) {
+@@ -2767,6 +2861,7 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ 		 */
+ 		spin_unlock_irq(&hugetlb_lock);
+ 		ret = isolate_hugetlb(old_page, list);
++		SetHPageDissolve(old_page);
+ 		spin_lock_irq(&hugetlb_lock);
+ 		goto free_new;
+ 	} else if (!HPageFreed(old_page)) {
+@@ -2779,21 +2874,7 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ 		cond_resched();
+ 		goto retry;
+ 	} else {
+-		/*
+-		 * Ok, old_page is still a genuine free hugepage. Remove it from
+-		 * the freelist and decrease the counters. These will be
+-		 * incremented again when calling __prep_account_new_huge_page()
+-		 * and enqueue_huge_page() for new_page. The counters will remain
+-		 * stable since this happens under the lock.
+-		 */
+-		remove_hugetlb_page(h, old_page, false);
+-
+-		/*
+-		 * Ref count on new page is already zero as it was dropped
+-		 * earlier.  It can be directly added to the pool free list.
+-		 */
+-		__prep_account_new_huge_page(h, nid);
+-		enqueue_huge_page(h, new_page);
++		replace_hugepage(h, nid, old_page, new_page);
+ 
+ 		/*
+ 		 * Pages have been replaced, we can safely free the old one.
+@@ -2842,14 +2923,21 @@ int isolate_or_dissolve_huge_page(struct page *page, struct list_head *list)
+ 	if (hstate_is_gigantic(h))
+ 		return -ENOMEM;
+ 
+-	if (page_count(head) && !isolate_hugetlb(head, list))
++	if (page_count(head) && !isolate_hugetlb(head, list)) {
++		SetHPageDissolve(head);
+ 		ret = 0;
+-	else if (!page_count(head))
++	} else if (!page_count(head)) {
+ 		ret = alloc_and_dissolve_huge_page(h, head, list);
+-
++	}
+ 	return ret;
+ }
+ 
++void sync_hugetlb_dissolve(void)
++{
++	flush_work(&free_hpage_work);
++	flush_work(&dissolve_hpage_work);
++}
++
+ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 				    unsigned long addr, int avoid_reserve)
+ {
+@@ -3418,6 +3506,7 @@ static int demote_free_huge_page(struct hstate *h, struct page *page)
+ {
+ 	int i, nid = page_to_nid(page);
+ 	struct hstate *target_hstate;
++	struct page *subpage;
+ 	int rc = 0;
+ 
+ 	target_hstate = size_to_hstate(PAGE_SIZE << h->demote_order);
+@@ -3451,15 +3540,16 @@ static int demote_free_huge_page(struct hstate *h, struct page *page)
+ 	mutex_lock(&target_hstate->resize_lock);
+ 	for (i = 0; i < pages_per_huge_page(h);
+ 				i += pages_per_huge_page(target_hstate)) {
++		subpage = mem_map_offset(page, i);
+ 		if (hstate_is_gigantic(target_hstate))
+-			prep_compound_gigantic_page_for_demote(page + i,
++			prep_compound_gigantic_page_for_demote(subpage,
+ 							target_hstate->order);
+ 		else
+-			prep_compound_page(page + i, target_hstate->order);
+-		set_page_private(page + i, 0);
+-		set_page_refcounted(page + i);
+-		prep_new_huge_page(target_hstate, page + i, nid);
+-		put_page(page + i);
++			prep_compound_page(subpage, target_hstate->order);
++		set_page_private(subpage, 0);
++		set_page_refcounted(subpage);
++		prep_new_huge_page(target_hstate, subpage, nid);
++		put_page(subpage);
+ 	}
+ 	mutex_unlock(&target_hstate->resize_lock);
+ 
+@@ -3470,7 +3560,8 @@ static int demote_free_huge_page(struct hstate *h, struct page *page)
+ 	 * based on pool changes for the demoted page.
+ 	 */
+ 	h->max_huge_pages--;
+-	target_hstate->max_huge_pages += pages_per_huge_page(h);
++	target_hstate->max_huge_pages += pages_per_huge_page(h) /
++					 pages_per_huge_page(target_hstate);
+ 
+ 	return rc;
+ }
+@@ -7172,6 +7263,14 @@ static int __init cmdline_parse_hugetlb_cma(char *p)
+ 
+ early_param("hugetlb_cma", cmdline_parse_hugetlb_cma);
+ 
++static int __init cmdline_parse_hugetlb_dmb(char *p)
++{
++	hugetlb_dmb = true;
++	return 0;
++}
++
++early_param("hugetlb_dmb", cmdline_parse_hugetlb_dmb);
++
+ void __init hugetlb_cma_reserve(int order)
+ {
+ 	unsigned long size, reserved, per_node;
+@@ -7247,10 +7346,11 @@ void __init hugetlb_cma_reserve(int order)
+ 		 * may be returned to CMA allocator in the case of
+ 		 * huge page demotion.
+ 		 */
+-		res = cma_declare_contiguous_nid(0, size, 0,
++		res = __cma_declare_contiguous_nid(0, size, 0,
+ 						PAGE_SIZE << HUGETLB_PAGE_ORDER,
+-						 0, false, name,
+-						 &hugetlb_cma[nid], nid);
++						0, false, name,
++						&hugetlb_cma[nid], nid,
++						hugetlb_dmb);
+ 		if (res) {
+ 			pr_warn("hugetlb_cma: reservation failed: err %d, node %d",
+ 				res, nid);
+diff --git a/mm/memblock.c b/mm/memblock.c
+index e4f03a6e8e56..1e4152621e0d 100644
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -16,6 +16,7 @@
+ #include <linux/kmemleak.h>
+ #include <linux/seq_file.h>
+ #include <linux/memblock.h>
++#include <linux/dmb.h>
+ 
+ #include <asm/sections.h>
+ #include <linux/io.h>
+@@ -961,6 +962,30 @@ int __init_memblock memblock_clear_nomap(phys_addr_t base, phys_addr_t size)
+ 	return memblock_setclr_flag(base, size, 0, MEMBLOCK_NOMAP);
+ }
+ 
++/**
++ * memblock_mark_movable - Mark designated movable block with MEMBLOCK_MOVABLE.
++ * @base: the base phys addr of the region
++ * @size: the size of the region
++ *
++ * Return: 0 on success, -errno on failure.
++ */
++int __init_memblock memblock_mark_movable(phys_addr_t base, phys_addr_t size)
++{
++	return memblock_setclr_flag(base, size, 1, MEMBLOCK_MOVABLE);
++}
++
++/**
++ * memblock_clear_movable - Clear flag MEMBLOCK_MOVABLE for a specified region.
++ * @base: the base phys addr of the region
++ * @size: the size of the region
++ *
++ * Return: 0 on success, -errno on failure.
++ */
++int __init_memblock memblock_clear_movable(phys_addr_t base, phys_addr_t size)
++{
++	return memblock_setclr_flag(base, size, 0, MEMBLOCK_MOVABLE);
++}
++
+ static bool should_skip_region(struct memblock_type *type,
+ 			       struct memblock_region *m,
+ 			       int nid, int flags)
+@@ -2048,13 +2073,16 @@ static void __init memmap_init_reserved_pages(void)
+ 	for_each_reserved_mem_range(i, &start, &end)
+ 		reserve_bootmem_region(start, end);
+ 
+-	/* and also treat struct pages for the NOMAP regions as PageReserved */
+ 	for_each_mem_region(region) {
++		/* treat struct pages for the NOMAP regions as PageReserved */
+ 		if (memblock_is_nomap(region)) {
+ 			start = region->base;
+ 			end = start + region->size;
+ 			reserve_bootmem_region(start, end);
+ 		}
++		/* move Designated Movable Block pages to ZONE_MOVABLE */
++		if (memblock_is_movable(region))
++			dmb_init_region(region);
+ 	}
+ }
+ 
+diff --git a/mm/migrate.c b/mm/migrate.c
+index f29a91b5dd33..9d6872e8594c 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -141,6 +141,7 @@ void putback_movable_pages(struct list_head *l)
+ 
+ 	list_for_each_entry_safe(page, page2, l, lru) {
+ 		if (unlikely(PageHuge(page))) {
++			ClearHPageDissolve(page);
+ 			putback_active_hugepage(page);
+ 			continue;
+ 		}
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 8282f65591aa..2ad1732e4326 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -75,6 +75,7 @@
+ #include <linux/khugepaged.h>
+ #include <linux/buffer_head.h>
+ #include <linux/delayacct.h>
++#include <linux/dmb.h>
+ #include <asm/sections.h>
+ #include <asm/tlbflush.h>
+ #include <asm/div64.h>
+@@ -433,7 +434,8 @@ static unsigned long required_kernelcore __initdata;
+ static unsigned long required_kernelcore_percent __initdata;
+ static unsigned long required_movablecore __initdata;
+ static unsigned long required_movablecore_percent __initdata;
+-static unsigned long zone_movable_pfn[MAX_NUMNODES] __initdata;
++static unsigned long min_dmb_pfn[MAX_NUMNODES] __initdata;
++static unsigned long zone_movable_pfn[MAX_NUMNODES];
+ static bool mirrored_kernelcore __meminitdata;
+ 
+ /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
+@@ -2161,7 +2163,7 @@ static int __init deferred_init_memmap(void *data)
+ 	}
+ zone_empty:
+ 	/* Sanity check that the next zone really is unpopulated */
+-	WARN_ON(++zid < MAX_NR_ZONES && populated_zone(++zone));
++	WARN_ON(++zid < ZONE_MOVABLE && populated_zone(++zone));
+ 
+ 	pr_info("node %d deferred pages initialised in %ums\n",
+ 		pgdat->node_id, jiffies_to_msecs(jiffies - start));
+@@ -2298,9 +2300,8 @@ void __init page_alloc_init_late(void)
+ 		set_zone_contiguous(zone);
+ }
+ 
+-#ifdef CONFIG_CMA
+-/* Free whole pageblock and set its migration type to MIGRATE_CMA. */
+-void __init init_cma_reserved_pageblock(struct page *page)
++/* Free whole pageblock */
++void __init init_reserved_pageblock(struct page *page)
+ {
+ 	unsigned i = pageblock_nr_pages;
+ 	struct page *p = page;
+@@ -2310,14 +2311,11 @@ void __init init_cma_reserved_pageblock(struct page *page)
+ 		set_page_count(p, 0);
+ 	} while (++p, --i);
+ 
+-	set_pageblock_migratetype(page, MIGRATE_CMA);
+ 	set_page_refcounted(page);
+ 	__free_pages(page, pageblock_order);
+ 
+ 	adjust_managed_page_count(page, pageblock_nr_pages);
+-	page_zone(page)->cma_pages += pageblock_nr_pages;
+ }
+-#endif
+ 
+ /*
+  * The order of subdivision here is critical for the IO subsystem.
+@@ -6897,6 +6895,10 @@ static void __init memmap_init_zone_range(struct zone *zone,
+ 	unsigned long zone_end_pfn = zone_start_pfn + zone->spanned_pages;
+ 	int nid = zone_to_nid(zone), zone_id = zone_idx(zone);
+ 
++	/* Skip overlap of ZONE_MOVABLE */
++	if (zone_id == ZONE_MOVABLE && zone_start_pfn < *hole_pfn)
++		zone_start_pfn = *hole_pfn;
++
+ 	start_pfn = clamp(start_pfn, zone_start_pfn, zone_end_pfn);
+ 	end_pfn = clamp(end_pfn, zone_start_pfn, zone_end_pfn);
+ 
+@@ -7347,6 +7349,9 @@ static unsigned long __init zone_spanned_pages_in_node(int nid,
+ 				node_start_pfn, node_end_pfn,
+ 				zone_start_pfn, zone_end_pfn);
+ 
++	if (zone_type == ZONE_MOVABLE && min_dmb_pfn[nid])
++		*zone_start_pfn = min(*zone_start_pfn, min_dmb_pfn[nid]);
++
+ 	/* Check that this node has pages within the zone's required range */
+ 	if (*zone_end_pfn < node_start_pfn || *zone_start_pfn > node_end_pfn)
+ 		return 0;
+@@ -7415,12 +7420,17 @@ static unsigned long __init zone_absent_pages_in_node(int nid,
+ 			&zone_start_pfn, &zone_end_pfn);
+ 	nr_absent = __absent_pages_in_range(nid, zone_start_pfn, zone_end_pfn);
+ 
++	if (zone_type == ZONE_MOVABLE && min_dmb_pfn[nid]) {
++		zone_start_pfn = min(zone_start_pfn, min_dmb_pfn[nid]);
++		nr_absent += zone_movable_pfn[nid] - zone_start_pfn;
++	}
++
+ 	/*
+ 	 * ZONE_MOVABLE handling.
+-	 * Treat pages to be ZONE_MOVABLE in ZONE_NORMAL as absent pages
++	 * Treat pages to be ZONE_MOVABLE in other zones as absent pages
+ 	 * and vice versa.
+ 	 */
+-	if (mirrored_kernelcore && zone_movable_pfn[nid]) {
++	if (zone_movable_pfn[nid]) {
+ 		unsigned long start_pfn, end_pfn;
+ 		struct memblock_region *r;
+ 
+@@ -7430,6 +7440,21 @@ static unsigned long __init zone_absent_pages_in_node(int nid,
+ 			end_pfn = clamp(memblock_region_memory_end_pfn(r),
+ 					zone_start_pfn, zone_end_pfn);
+ 
++			if (memblock_is_movable(r)) {
++				if (zone_type != ZONE_MOVABLE) {
++					nr_absent += end_pfn - start_pfn;
++					continue;
++				}
++
++				end_pfn = min(end_pfn, zone_movable_pfn[nid]);
++				if (start_pfn < zone_movable_pfn[nid])
++					nr_absent -=  end_pfn - start_pfn;
++				continue;
++			}
++
++			if (!mirrored_kernelcore)
++				continue;
++
+ 			if (zone_type == ZONE_MOVABLE &&
+ 			    memblock_is_mirror(r))
+ 				nr_absent += end_pfn - start_pfn;
+@@ -7447,8 +7472,17 @@ static void __init calculate_node_totalpages(struct pglist_data *pgdat,
+ 						unsigned long node_start_pfn,
+ 						unsigned long node_end_pfn)
+ {
+-	unsigned long realtotalpages = 0, totalpages = 0;
++	unsigned long realtotalpages = 0;
+ 	enum zone_type i;
++	int nid = pgdat->node_id;
++
++	/*
++	 * If Designated Movable Blocks are defined on this node, ensure that
++	 * zone_movable_pfn is also defined for this node.
++	 */
++	if (min_dmb_pfn[nid] && !zone_movable_pfn[nid])
++		zone_movable_pfn[nid] = min(node_end_pfn,
++				arch_zone_highest_possible_pfn[movable_zone]);
+ 
+ 	for (i = 0; i < MAX_NR_ZONES; i++) {
+ 		struct zone *zone = pgdat->node_zones + i;
+@@ -7456,12 +7490,12 @@ static void __init calculate_node_totalpages(struct pglist_data *pgdat,
+ 		unsigned long spanned, absent;
+ 		unsigned long size, real_size;
+ 
+-		spanned = zone_spanned_pages_in_node(pgdat->node_id, i,
++		spanned = zone_spanned_pages_in_node(nid, i,
+ 						     node_start_pfn,
+ 						     node_end_pfn,
+ 						     &zone_start_pfn,
+ 						     &zone_end_pfn);
+-		absent = zone_absent_pages_in_node(pgdat->node_id, i,
++		absent = zone_absent_pages_in_node(nid, i,
+ 						   node_start_pfn,
+ 						   node_end_pfn);
+ 
+@@ -7478,11 +7512,10 @@ static void __init calculate_node_totalpages(struct pglist_data *pgdat,
+ 		zone->present_early_pages = real_size;
+ #endif
+ 
+-		totalpages += size;
+ 		realtotalpages += real_size;
+ 	}
+ 
+-	pgdat->node_spanned_pages = totalpages;
++	pgdat->node_spanned_pages = node_end_pfn - node_start_pfn;
+ 	pgdat->node_present_pages = realtotalpages;
+ 	pr_debug("On node %d totalpages: %lu\n", pgdat->node_id, realtotalpages);
+ }
+@@ -7922,15 +7955,23 @@ unsigned long __init find_min_pfn_with_active_regions(void)
+ static unsigned long __init early_calculate_totalpages(void)
+ {
+ 	unsigned long totalpages = 0;
+-	unsigned long start_pfn, end_pfn;
+-	int i, nid;
++	struct memblock_region *r;
+ 
+-	for_each_mem_pfn_range(i, MAX_NUMNODES, &start_pfn, &end_pfn, &nid) {
+-		unsigned long pages = end_pfn - start_pfn;
++	for_each_mem_region(r) {
++		unsigned long start_pfn, end_pfn, pages;
++		int nid;
++
++		nid = memblock_get_region_node(r);
++		start_pfn = memblock_region_memory_base_pfn(r);
++		end_pfn = memblock_region_memory_end_pfn(r);
+ 
+-		totalpages += pages;
+-		if (pages)
++		pages = end_pfn - start_pfn;
++		if (pages) {
++			totalpages += pages;
+ 			node_set_state(nid, N_MEMORY);
++			if (memblock_is_movable(r) && !min_dmb_pfn[nid])
++				min_dmb_pfn[nid] = start_pfn;
++		}
+ 	}
+ 	return totalpages;
+ }
+@@ -7943,7 +7984,7 @@ static unsigned long __init early_calculate_totalpages(void)
+  */
+ static void __init find_zone_movable_pfns_for_nodes(void)
+ {
+-	int i, nid;
++	int nid;
+ 	unsigned long usable_startpfn;
+ 	unsigned long kernelcore_node, kernelcore_remaining;
+ 	/* save the state before borrow the nodemask */
+@@ -8037,13 +8078,13 @@ static void __init find_zone_movable_pfns_for_nodes(void)
+ 		corepages = totalpages - required_movablecore;
+ 
+ 		required_kernelcore = max(required_kernelcore, corepages);
++	} else if (!required_kernelcore) {
++		/* If kernelcore was not specified, there is no ZONE_MOVABLE */
++		goto out;
+ 	}
+ 
+-	/*
+-	 * If kernelcore was not specified or kernelcore size is larger
+-	 * than totalpages, there is no ZONE_MOVABLE.
+-	 */
+-	if (!required_kernelcore || required_kernelcore >= totalpages)
++	/* If kernelcore size exceeds totalpages, there is no ZONE_MOVABLE */
++	if (required_kernelcore >= totalpages)
+ 		goto out;
+ 
+ 	/* usable_startpfn is the lowest possible pfn ZONE_MOVABLE can be at */
+@@ -8071,13 +8112,24 @@ static void __init find_zone_movable_pfns_for_nodes(void)
+ 		kernelcore_remaining = kernelcore_node;
+ 
+ 		/* Go through each range of PFNs within this node */
+-		for_each_mem_pfn_range(i, nid, &start_pfn, &end_pfn, NULL) {
++		for_each_mem_region(r) {
+ 			unsigned long size_pages;
+ 
++			if (memblock_get_region_node(r) != nid)
++				continue;
++
++			start_pfn = memblock_region_memory_base_pfn(r);
++			end_pfn = memblock_region_memory_end_pfn(r);
+ 			start_pfn = max(start_pfn, zone_movable_pfn[nid]);
+ 			if (start_pfn >= end_pfn)
+ 				continue;
+ 
++			/* Skip over Designated Movable Blocks */
++			if (memblock_is_movable(r)) {
++				zone_movable_pfn[nid] = end_pfn;
++				continue;
++			}
++
+ 			/* Account for what is only usable for kernelcore */
+ 			if (start_pfn < usable_startpfn) {
+ 				unsigned long kernel_pages;
+@@ -8226,6 +8278,7 @@ void __init free_area_init(unsigned long *max_zone_pfn)
+ 	}
+ 
+ 	/* Find the PFNs that ZONE_MOVABLE begins at in each node */
++	memset(min_dmb_pfn, 0, sizeof(min_dmb_pfn));
+ 	memset(zone_movable_pfn, 0, sizeof(zone_movable_pfn));
+ 	find_zone_movable_pfns_for_nodes();
+ 
+@@ -8312,9 +8365,9 @@ void __init free_area_init(unsigned long *max_zone_pfn)
+ }
+ 
+ static int __init cmdline_parse_core(char *p, unsigned long *core,
+-				     unsigned long *percent)
++				     unsigned long *percent, bool movable)
+ {
+-	unsigned long long coremem;
++	unsigned long long coremem, address;
+ 	char *endptr;
+ 
+ 	if (!p)
+@@ -8329,6 +8382,17 @@ static int __init cmdline_parse_core(char *p, unsigned long *core,
+ 		*percent = coremem;
+ 	} else {
+ 		coremem = memparse(p, &p);
++		if (movable && *p == '@') {
++			address = memparse(++p, &p);
++			if (*p != '\0' ||
++			    !memblock_is_region_memory(address, coremem) ||
++			    memblock_is_region_reserved(address, coremem))
++				return -EINVAL;
++			memblock_reserve(address, coremem);
++			return dmb_reserve(address, coremem, NULL);
++		} else if (*p != '\0') {
++			return -EINVAL;
++		}
+ 		/* Paranoid check that UL is enough for the coremem value */
+ 		WARN_ON((coremem >> PAGE_SHIFT) > ULONG_MAX);
+ 
+@@ -8351,17 +8415,32 @@ static int __init cmdline_parse_kernelcore(char *p)
+ 	}
+ 
+ 	return cmdline_parse_core(p, &required_kernelcore,
+-				  &required_kernelcore_percent);
++				  &required_kernelcore_percent, false);
+ }
+ 
+ /*
+  * movablecore=size sets the amount of memory for use for allocations that
+- * can be reclaimed or migrated.
++ * can be reclaimed or migrated. movablecore=size@base defines a Designated
++ * Movable Block.
+  */
+ static int __init cmdline_parse_movablecore(char *p)
+ {
+-	return cmdline_parse_core(p, &required_movablecore,
+-				  &required_movablecore_percent);
++	int ret = -EINVAL;
++
++	while (p) {
++		char *k = strchr(p, ',');
++
++		if (k)
++			*k++ = 0;
++
++		ret = cmdline_parse_core(p, &required_movablecore,
++					 &required_movablecore_percent, true);
++		if (ret)
++			break;
++		p = k;
++	}
++
++	return ret;
+ }
+ 
+ early_param("kernelcore", cmdline_parse_kernelcore);
+@@ -9149,29 +9228,8 @@ int __alloc_contig_migrate_range(struct compact_control *cc,
+ 	return 0;
+ }
+ 
+-/**
+- * alloc_contig_range() -- tries to allocate given range of pages
+- * @start:	start PFN to allocate
+- * @end:	one-past-the-last PFN to allocate
+- * @migratetype:	migratetype of the underlying pageblocks (either
+- *			#MIGRATE_MOVABLE or #MIGRATE_CMA).  All pageblocks
+- *			in range must have the same migratetype and it must
+- *			be either of the two.
+- * @gfp_mask:	GFP mask to use during compaction
+- *
+- * The PFN range does not have to be pageblock aligned. The PFN range must
+- * belong to a single zone.
+- *
+- * The first thing this routine does is attempt to MIGRATE_ISOLATE all
+- * pageblocks in the range.  Once isolated, the pageblocks should not
+- * be modified by others.
+- *
+- * Return: zero on success or negative error code.  On success all
+- * pages which PFN is in [start, end) are allocated for the caller and
+- * need to be freed with free_contig_range().
+- */
+-int alloc_contig_range(unsigned long start, unsigned long end,
+-		       unsigned migratetype, gfp_t gfp_mask)
++int _alloc_contig_range(unsigned long start, unsigned long end,
++			unsigned int migratetype, gfp_t gfp_mask)
+ {
+ 	unsigned long outer_start, outer_end;
+ 	int order;
+@@ -9230,6 +9288,7 @@ int alloc_contig_range(unsigned long start, unsigned long end,
+ 	if (ret && ret != -EBUSY)
+ 		goto done;
+ 	ret = 0;
++	sync_hugetlb_dissolve();
+ 
+ 	/*
+ 	 * Pages from [start, end) are within a pageblock_nr_pages
+@@ -9294,6 +9353,46 @@ int alloc_contig_range(unsigned long start, unsigned long end,
+ 	undo_isolate_page_range(start, end, migratetype);
+ 	return ret;
+ }
++
++/**
++ * alloc_contig_range() -- tries to allocate given range of pages
++ * @start:	start PFN to allocate
++ * @end:	one-past-the-last PFN to allocate
++ * @migratetype:	migratetype of the underlying pageblocks (either
++ *			#MIGRATE_MOVABLE or #MIGRATE_CMA).  All pageblocks
++ *			in range must have the same migratetype and it must
++ *			be either of the two.
++ * @gfp_mask:	GFP mask to use during compaction
++ *
++ * The PFN range does not have to be pageblock aligned. The PFN range must
++ * belong to a single zone.
++ *
++ * The first thing this routine does is attempt to MIGRATE_ISOLATE all
++ * pageblocks in the range.  Once isolated, the pageblocks should not
++ * be modified by others.
++ *
++ * Return: zero on success or negative error code.  On success all
++ * pages which PFN is in [start, end) are allocated for the caller and
++ * need to be freed with free_contig_range().
++ */
++int alloc_contig_range(unsigned long start, unsigned long end,
++		       unsigned int migratetype, gfp_t gfp_mask)
++{
++	switch (dmb_intersects(start, end)) {
++	case DMB_DISJOINT:
++		break;
++	case DMB_INTERSECTS:
++		if (migratetype == MIGRATE_CMA)
++			migratetype = MIGRATE_MOVABLE;
++		else
++			return -EBUSY;
++		break;
++	default:
++		return -EBUSY;
++	}
++
++	return _alloc_contig_range(start, end, migratetype, gfp_mask);
++}
+ EXPORT_SYMBOL(alloc_contig_range);
+ 
+ static int __alloc_contig_pages(unsigned long start_pfn,
+@@ -9301,8 +9400,8 @@ static int __alloc_contig_pages(unsigned long start_pfn,
+ {
+ 	unsigned long end_pfn = start_pfn + nr_pages;
+ 
+-	return alloc_contig_range(start_pfn, end_pfn, MIGRATE_MOVABLE,
+-				  gfp_mask);
++	return _alloc_contig_range(start_pfn, end_pfn, MIGRATE_MOVABLE,
++				   gfp_mask);
+ }
+ 
+ static bool pfn_range_valid_contig(struct zone *z, unsigned long start_pfn,
+@@ -9311,6 +9410,9 @@ static bool pfn_range_valid_contig(struct zone *z, unsigned long start_pfn,
+ 	unsigned long i, end_pfn = start_pfn + nr_pages;
+ 	struct page *page;
+ 
++	if (dmb_intersects(start_pfn, end_pfn))
++		return false;
++
+ 	for (i = start_pfn; i < end_pfn; i++) {
+ 		page = pfn_to_online_page(i);
+ 		if (!page)
+@@ -9367,7 +9469,10 @@ struct page *alloc_contig_pages(unsigned long nr_pages, gfp_t gfp_mask,
+ 					gfp_zone(gfp_mask), nodemask) {
+ 		spin_lock_irqsave(&zone->lock, flags);
+ 
+-		pfn = ALIGN(zone->zone_start_pfn, nr_pages);
++		if (zone_idx(zone) == ZONE_MOVABLE && zone_movable_pfn[nid])
++			pfn = ALIGN(zone_movable_pfn[nid], nr_pages);
++		else
++			pfn = ALIGN(zone->zone_start_pfn, nr_pages);
+ 		while (zone_spans_last_pfn(zone, pfn, nr_pages)) {
+ 			if (pfn_range_valid_contig(zone, pfn, nr_pages)) {
+ 				/*
+diff --git a/mm/page_isolation.c b/mm/page_isolation.c
+index 9d73dc38e3d7..8e16aa22cb61 100644
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@ -286,8 +286,6 @@ __first_valid_page(unsigned long pfn, unsigned long nr_pages)
+  * @flags:			isolation flags
+  * @gfp_flags:			GFP flags used for migrating pages
+  * @isolate_before:	isolate the pageblock before the boundary_pfn
+- * @skip_isolation:	the flag to skip the pageblock isolation in second
+- *			isolate_single_pageblock()
+  *
+  * Free and in-use pages can be as big as MAX_ORDER-1 and contain more than one
+  * pageblock. When not all pageblocks within a page are isolated at the same
+@@ -302,9 +300,8 @@ __first_valid_page(unsigned long pfn, unsigned long nr_pages)
+  * the in-use page then splitting the free page.
+  */
+ static int isolate_single_pageblock(unsigned long boundary_pfn, int flags,
+-			gfp_t gfp_flags, bool isolate_before, bool skip_isolation)
++			gfp_t gfp_flags, bool isolate_before)
+ {
+-	unsigned char saved_mt;
+ 	unsigned long start_pfn;
+ 	unsigned long isolate_pageblock;
+ 	unsigned long pfn;
+@@ -328,18 +325,6 @@ static int isolate_single_pageblock(unsigned long boundary_pfn, int flags,
+ 	start_pfn  = max(ALIGN_DOWN(isolate_pageblock, MAX_ORDER_NR_PAGES),
+ 				      zone->zone_start_pfn);
+ 
+-	saved_mt = get_pageblock_migratetype(pfn_to_page(isolate_pageblock));
+-
+-	if (skip_isolation)
+-		VM_BUG_ON(!is_migrate_isolate(saved_mt));
+-	else {
+-		ret = set_migratetype_isolate(pfn_to_page(isolate_pageblock), saved_mt, flags,
+-				isolate_pageblock, isolate_pageblock + pageblock_nr_pages);
+-
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	/*
+ 	 * Bail out early when the to-be-isolated pageblock does not form
+ 	 * a free or in-use page across boundary_pfn:
+@@ -428,7 +413,7 @@ static int isolate_single_pageblock(unsigned long boundary_pfn, int flags,
+ 					ret = set_migratetype_isolate(page, page_mt,
+ 						flags, head_pfn, head_pfn + nr_pages);
+ 					if (ret)
+-						goto failed;
++						return ret;
+ 				}
+ 
+ 				ret = __alloc_contig_migrate_range(&cc, head_pfn,
+@@ -443,7 +428,7 @@ static int isolate_single_pageblock(unsigned long boundary_pfn, int flags,
+ 					unset_migratetype_isolate(page, page_mt);
+ 
+ 				if (ret)
+-					goto failed;
++					return -EBUSY;
+ 				/*
+ 				 * reset pfn to the head of the free page, so
+ 				 * that the free page handling code above can split
+@@ -459,24 +444,19 @@ static int isolate_single_pageblock(unsigned long boundary_pfn, int flags,
+ 				while (!PageBuddy(pfn_to_page(outer_pfn))) {
+ 					/* stop if we cannot find the free page */
+ 					if (++order >= MAX_ORDER)
+-						goto failed;
++						return -EBUSY;
+ 					outer_pfn &= ~0UL << order;
+ 				}
+ 				pfn = outer_pfn;
+ 				continue;
+ 			} else
+ #endif
+-				goto failed;
++				return -EBUSY;
+ 		}
+ 
+ 		pfn++;
+ 	}
+ 	return 0;
+-failed:
+-	/* restore the original migratetype */
+-	if (!skip_isolation)
+-		unset_migratetype_isolate(pfn_to_page(isolate_pageblock), saved_mt);
+-	return -EBUSY;
+ }
+ 
+ /**
+@@ -534,21 +514,30 @@ int start_isolate_page_range(unsigned long start_pfn, unsigned long end_pfn,
+ 	unsigned long isolate_start = ALIGN_DOWN(start_pfn, pageblock_nr_pages);
+ 	unsigned long isolate_end = ALIGN(end_pfn, pageblock_nr_pages);
+ 	int ret;
+-	bool skip_isolation = false;
+ 
+ 	/* isolate [isolate_start, isolate_start + pageblock_nr_pages) pageblock */
+-	ret = isolate_single_pageblock(isolate_start, flags, gfp_flags, false, skip_isolation);
++	ret = set_migratetype_isolate(pfn_to_page(isolate_start), migratetype,
++			flags, isolate_start, isolate_start + pageblock_nr_pages);
+ 	if (ret)
+ 		return ret;
+-
+-	if (isolate_start == isolate_end - pageblock_nr_pages)
+-		skip_isolation = true;
++	ret = isolate_single_pageblock(isolate_start, flags, gfp_flags, false);
++	if (ret)
++		goto unset_start_block;
+ 
+ 	/* isolate [isolate_end - pageblock_nr_pages, isolate_end) pageblock */
+-	ret = isolate_single_pageblock(isolate_end, flags, gfp_flags, true, skip_isolation);
++	pfn = isolate_end - pageblock_nr_pages;
++	if (isolate_start != pfn) {
++		ret = set_migratetype_isolate(pfn_to_page(pfn), migratetype,
++				flags, pfn, pfn + pageblock_nr_pages);
++		if (ret)
++			goto unset_start_block;
++	}
++	ret = isolate_single_pageblock(isolate_end, flags, gfp_flags, true);
+ 	if (ret) {
+-		unset_migratetype_isolate(pfn_to_page(isolate_start), migratetype);
+-		return ret;
++		if (isolate_start != pfn)
++			goto unset_end_block;
++		else
++			goto unset_start_block;
+ 	}
+ 
+ 	/* skip isolated pageblocks at the beginning and end */
+@@ -557,15 +546,21 @@ int start_isolate_page_range(unsigned long start_pfn, unsigned long end_pfn,
+ 	     pfn += pageblock_nr_pages) {
+ 		page = __first_valid_page(pfn, pageblock_nr_pages);
+ 		if (page && set_migratetype_isolate(page, migratetype, flags,
+-					start_pfn, end_pfn)) {
+-			undo_isolate_page_range(isolate_start, pfn, migratetype);
+-			unset_migratetype_isolate(
+-				pfn_to_page(isolate_end - pageblock_nr_pages),
+-				migratetype);
+-			return -EBUSY;
+-		}
++					start_pfn, end_pfn))
++			goto unset_isolated_blocks;
+ 	}
+ 	return 0;
++
++unset_isolated_blocks:
++	ret = -EBUSY;
++	undo_isolate_page_range(isolate_start + pageblock_nr_pages, pfn,
++				migratetype);
++unset_end_block:
++	unset_migratetype_isolate(pfn_to_page(isolate_end - pageblock_nr_pages),
++				  migratetype);
++unset_start_block:
++	unset_migratetype_isolate(pfn_to_page(isolate_start), migratetype);
++	return ret;
+ }
+ 
+ /*
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 373d2730fcf2..06ce4788461c 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1710,6 +1710,11 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
+ 
+ 	/* If unpopulated, no other information is useful */
+ 	if (!populated_zone(zone)) {
++		/* Show start_pfn for empty overlapped zones */
++		if (zone->spanned_pages)
++			seq_printf(m,
++				   "\n  start_pfn:           %lu",
++				   zone->zone_start_pfn);
+ 		seq_putc(m, '\n');
+ 		return;
+ 	}
+-- 
+2.37.3
+
