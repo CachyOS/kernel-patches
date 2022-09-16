@@ -1,8 +1,69 @@
-From 8c1bacb78de93b137eb1d80eb92e0e5c479328c1 Mon Sep 17 00:00:00 2001
+From f7dd56904cb3d8d9f682584faa1f50b5136631a3 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 10 Sep 2022 14:04:38 +0200
+Date: Fri, 16 Sep 2022 10:08:36 +0200
 Subject: [PATCH] Add latency priority for CFS class
 
+This patchset restarts the work about adding a latency priority to describe
+the latency tolerance of cfs tasks.
+
+The patches [1-4] have been done by Parth:
+https://lore.kernel.org/lkml/20200228090755.22829-1-parth@linux.ibm.com/
+
+I have just rebased and moved the set of latency priority outside the
+priority update. I have removed the reviewed tag because the patches
+are 2 years old.
+
+The patch [5] uses latency nice priority to define a latency offset
+and then to decide if a cfs task can preempt the current running task. The
+patch gives some tests results with cyclictests and hackbench to highlight
+the benefit of latency priority for short interactive task or
+long intensive tasks.
+
+Patch [6] adds the support of latency_offset to task group by adding a
+cpu.latency field. There were discussions for the last version about
+using a real unit for the field so I decided to expose directly the
+latency offset which reflects the time up to which we can preempt when the
+value is negative, or up to which we can defer the preemption when the
+value is positive.
+The range is [-sysctl_sched_latency:sysctl_sched_latency]
+
+Patch [7] makes sched_core taking into account the latency offset.
+
+Patch [8] adds a rb tree to cover some corner cases where the latency
+sensitive task is preempted by high priority task (RT/DL) or fails to
+preempt them. This patch ensures that tasks will have at least a
+slice of sched_min_granularity in priority at wakeup. The patch gives
+results to show the benefit in addition to patch 5
+
+I have also backported the patchset on a dragonboard RB3 with an android
+mainline kernel based on v5.18 for a quick test. I have used
+the TouchLatency app which is part of AOSP and described to be very good
+test to highlight jitter and jank frame sources of a system [1].
+In addition to the app, I have added some short running tasks waking-up
+regularly (to use the 8 cpus for 4 ms every 37777us) to stress the system
+without overloading it (and disabling EAS). The 1st results shows that the
+patchset helps to reduce the missed deadline frames from 5% to less than
+0.1% when the cpu.latency of task group are set.
+
+[1] https://source.android.com/docs/core/debug/eval_perf#touchlatency
+
+Change since v3:
+- Fix 2 compilation issues raised by kernel test robot <lkp@intel.com>
+
+Change since v2:
+- Set a latency_offset field instead of saving a weight and computing it
+  on the fly.
+- Make latency_offset available for task group: cpu.latency
+- Fix some corner cases to make latency sensitive tasks schedule first and
+  add a rb tree for latency sensitive task.
+
+Change since v1:
+- fix typo
+- move some codes in the right patch to make bisect happy
+- simplify and fixed how the weight is computed
+- added support of sched core patch 7
+
+https://lore.kernel.org/lkml/20220916080305.29574-1-vincent.guittot@linaro.org/T/#m250d99c6c11ab25ec5ececc969362cd8437413c5
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  include/linux/sched.h            |   5 +
@@ -12,9 +73,9 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/sched/core.c              |  81 +++++++++++++
  kernel/sched/debug.c             |   1 +
  kernel/sched/fair.c              | 189 ++++++++++++++++++++++++++++++-
- kernel/sched/sched.h             |  35 ++++++
+ kernel/sched/sched.h             |  37 +++++-
  tools/include/uapi/linux/sched.h |   4 +-
- 9 files changed, 332 insertions(+), 7 deletions(-)
+ 9 files changed, 333 insertions(+), 8 deletions(-)
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index 9f4bb7f16a94..b135e2f575ef 100644
@@ -300,7 +361,7 @@ index 99ecf43df031..7783fd1328f1 100644
  {
          trace_sched_update_nr_running_tp(rq, count);
 diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
-index e0e356eb038d..b49ec5e04a9b 100644
+index 13fbcd19b916..fb66512aa63c 100644
 --- a/kernel/sched/debug.c
 +++ b/kernel/sched/debug.c
 @@ -1043,6 +1043,7 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
@@ -312,7 +373,7 @@ index e0e356eb038d..b49ec5e04a9b 100644
  		P(dl.runtime);
  		P(dl.deadline);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 89ce89556ba8..27156a1c14a6 100644
+index 89ce89556ba8..ae64910662ff 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -682,7 +682,77 @@ struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
@@ -379,7 +440,7 @@ index 89ce89556ba8..27156a1c14a6 100644
 +	}
 +}
 +
-+struct sched_entity *__pick_first_latency(struct cfs_rq *cfs_rq)
++static struct sched_entity *__pick_first_latency(struct cfs_rq *cfs_rq)
 +{
 +	struct rb_node *left = rb_first_cached(&cfs_rq->latency_timeline);
 +
@@ -640,7 +701,7 @@ index 89ce89556ba8..27156a1c14a6 100644
  
  void free_fair_sched_group(struct task_group *tg) { }
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 64d18e3f766d..9ffceda7f34f 100644
+index 64d18e3f766d..39583f7f1c9d 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -124,6 +124,35 @@ extern int sched_rr_timeslice;
@@ -713,6 +774,16 @@ index 64d18e3f766d..9ffceda7f34f 100644
  
  /*
   * {de,en}queue flags:
+@@ -2426,8 +2461,8 @@ extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
+ extern const_debug unsigned int sysctl_sched_nr_migrate;
+ extern const_debug unsigned int sysctl_sched_migration_cost;
+ 
+-#ifdef CONFIG_SCHED_DEBUG
+ extern unsigned int sysctl_sched_latency;
++#ifdef CONFIG_SCHED_DEBUG
+ extern unsigned int sysctl_sched_min_granularity;
+ extern unsigned int sysctl_sched_idle_min_granularity;
+ extern unsigned int sysctl_sched_wakeup_granularity;
 diff --git a/tools/include/uapi/linux/sched.h b/tools/include/uapi/linux/sched.h
 index 3bac0a8ceab2..ecc4884bfe4b 100644
 --- a/tools/include/uapi/linux/sched.h
