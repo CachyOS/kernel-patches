@@ -1,0 +1,1622 @@
+From f071aca91c799450ec6ac11c34574beaf0231f22 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Fri, 30 Sep 2022 22:13:31 +0200
+Subject: [PATCH] PCI-Allow-BAR-movement-during-boot-and-hotplug
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ Documentation/PCI/pci.rst                     |  63 +++
+ .../admin-guide/kernel-parameters.txt         |   1 +
+ arch/powerpc/platforms/powernv/pci.c          |   2 +
+ arch/powerpc/platforms/pseries/setup.c        |   2 +
+ arch/x86/pci/acpi.c                           |  14 +
+ drivers/nvme/host/pci.c                       |  27 +-
+ drivers/pci/bus.c                             |   2 +-
+ drivers/pci/host-bridge.c                     |   2 +-
+ drivers/pci/hotplug/pciehp_pci.c              |   5 +
+ drivers/pci/iov.c                             |   2 +
+ drivers/pci/pci.c                             |  24 ++
+ drivers/pci/pci.h                             |  34 ++
+ drivers/pci/pcie/portdrv_pci.c                |   7 +
+ drivers/pci/probe.c                           | 401 +++++++++++++++++-
+ drivers/pci/setup-bus.c                       | 229 +++++++---
+ drivers/pci/setup-res.c                       | 105 ++++-
+ include/linux/pci.h                           |  16 +
+ kernel/resource.c                             |   2 +-
+ 18 files changed, 864 insertions(+), 74 deletions(-)
+
+diff --git a/Documentation/PCI/pci.rst b/Documentation/PCI/pci.rst
+index cced568d78e9..8aa121015b26 100644
+--- a/Documentation/PCI/pci.rst
++++ b/Documentation/PCI/pci.rst
+@@ -576,3 +576,66 @@ handle the PCI master abort on all platforms if the PCI device is
+ expected to not respond to a readl().  Most x86 platforms will allow
+ MMIO reads to master abort (a.k.a. "Soft Fail") and return garbage
+ (e.g. ~0). But many RISC platforms will crash (a.k.a."Hard Fail").
++
++
++Movable BARs
++============
++
++To increase the probability of finding a space for BARs of hot-added devices,
++the kernel requests the drivers to release used BARs, so they can be moved
++to free a gap for new BARs.
++
++This ability can be added to a driver by implementing the
++:c:type:`rescan_prepare()`, :c:type:`bar_fixed()` and :c:type:`rescan_done()`
++hooks from the :c:type:`struct pci_driver`.
++
++Before a PCI bus rescan the driver must pause its activity and unmap its
++BARs, here is an example of how the NVMe driver can perform this::
++
++    static struct pci_driver nvme_driver = {
++            ...
++            .bar_fixed      = nvme_bar_fixed,
++            .rescan_prepare = nvme_rescan_prepare,
++            .rescan_done    = nvme_rescan_done,
++    };
++
++    static bool nvme_bar_fixed(struct pci_dev *pdev, int resno)
++    {
++            return false;
++    }
++
++    static void nvme_rescan_prepare(struct pci_dev *pdev)
++    {
++            struct nvme_dev *dev = pci_get_drvdata(pdev);
++
++            nvme_dev_disable(dev, true);
++            nvme_dev_unmap(dev);
++            dev->bar = NULL;
++    }
++
++The NVMe driver uses a single BAR, which is movable.  After a PCI rescan,
++the driver must re-read new addresses of BARs, remap them and resume::
++
++    static void nvme_rescan_done(struct pci_dev *pdev)
++    {
++            struct nvme_dev *dev = pci_get_drvdata(pdev);
++
++            nvme_dev_map(dev);
++            nvme_reset_ctrl(&dev->ctrl);
++    }
++
++Currently there are no reliable way to determine if a driver uses BARs of
++its devices or not (their :c:type:`struct resource` don't always have a child),
++so if it doesn't explicitly support movable BARs, they are considered fixed.
++To let the PCI subsystem move unused BARs, a driver have to implement one hook::
++
++    static bool pcie_portdrv_bar_fixed(struct pci_dev *pdev, int resno)
++    {
++            return false;
++    }
++
++    static struct pci_driver pcie_portdriver = {
++    {
++            ...
++            .bar_fixed      = pcie_portdrv_bar_fixed,
++    }
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 426fa892d311..31be9405b7ba 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4295,6 +4295,7 @@
+ 		nomio		[S390] Do not use MIO instructions.
+ 		norid		[S390] ignore the RID field and force use of
+ 				one PCI domain per PCI function
++		no_movable_bars	Don't allow BARs to be moved during hotplug
+ 
+ 	pcie_aspm=	[PCIE] Forcibly enable or disable PCIe Active State Power
+ 			Management.
+diff --git a/arch/powerpc/platforms/powernv/pci.c b/arch/powerpc/platforms/powernv/pci.c
+index 233a50e65fce..0d007388dd0d 100644
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@ -822,6 +822,8 @@ void __init pnv_pci_init(void)
+ {
+ 	struct device_node *np;
+ 
++	pci_can_move_bars = false;
++
+ 	pci_add_flags(PCI_CAN_SKIP_ISA_ALIGN);
+ 
+ 	/* If we don't have OPAL, eg. in sim, just skip PCI probe */
+diff --git a/arch/powerpc/platforms/pseries/setup.c b/arch/powerpc/platforms/pseries/setup.c
+index 489f4c4df468..84a744368aa4 100644
+--- a/arch/powerpc/platforms/pseries/setup.c
++++ b/arch/powerpc/platforms/pseries/setup.c
+@@ -999,6 +999,8 @@ static void __init pseries_init(void)
+ {
+ 	pr_debug(" -> pseries_init()\n");
+ 
++	pci_can_move_bars = false;
++
+ #ifdef CONFIG_HVC_CONSOLE
+ 	if (firmware_has_feature(FW_FEATURE_LPAR))
+ 		hvc_vio_init_early();
+diff --git a/arch/x86/pci/acpi.c b/arch/x86/pci/acpi.c
+index 2f82480fd430..52a3dcaf0ddc 100644
+--- a/arch/x86/pci/acpi.c
++++ b/arch/x86/pci/acpi.c
+@@ -386,6 +386,20 @@ static int pci_acpi_root_prepare_resources(struct acpi_pci_root_info *ci)
+ 
+ 	status = acpi_pci_probe_root_resources(ci);
+ 
++	resource_list_for_each_entry(entry, &ci->resources) {
++		struct resource *res = entry->res;
++
++		if (!(res->flags & IORESOURCE_MEM) ||
++		    res->end > pci_mem_start ||
++		    res->start == 0xa0000)
++			continue;
++
++		dev_warn(&ci->root->device->dev, "Fix up PCI start address: %lx -> %llx\n",
++			 pci_mem_start, res->start);
++
++		pci_mem_start = res->start;
++	}
++
+ 	if (pci_use_crs) {
+ 		resource_list_for_each_entry_safe(entry, tmp, &ci->resources)
+ 			if (resource_is_pcicfg_ioport(entry->res))
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 98864b853eef..6bad50196935 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1796,7 +1796,7 @@ static int nvme_remap_bar(struct nvme_dev *dev, unsigned long size)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 
+-	if (size <= dev->bar_mapped_size)
++	if (dev->bar && size <= dev->bar_mapped_size)
+ 		return 0;
+ 	if (size > pci_resource_len(pdev, 0))
+ 		return -ENOMEM;
+@@ -3412,6 +3412,28 @@ static void nvme_error_resume(struct pci_dev *pdev)
+ 	flush_work(&dev->ctrl.reset_work);
+ }
+ 
++static bool nvme_bar_fixed(struct pci_dev *pdev, int resno)
++{
++	return false;
++}
++
++static void nvme_rescan_prepare(struct pci_dev *pdev)
++{
++	struct nvme_dev *dev = pci_get_drvdata(pdev);
++
++	nvme_dev_disable(dev, true);
++	nvme_dev_unmap(dev);
++	dev->bar = NULL;
++}
++
++static void nvme_rescan_done(struct pci_dev *pdev)
++{
++	struct nvme_dev *dev = pci_get_drvdata(pdev);
++
++	nvme_dev_map(dev);
++	nvme_reset_ctrl(&dev->ctrl);
++}
++
+ static const struct pci_error_handlers nvme_err_handler = {
+ 	.error_detected	= nvme_error_detected,
+ 	.slot_reset	= nvme_slot_reset,
+@@ -3557,6 +3579,9 @@ static struct pci_driver nvme_driver = {
+ #endif
+ 	.sriov_configure = pci_sriov_configure_simple,
+ 	.err_handler	= &nvme_err_handler,
++	.rescan_prepare	= nvme_rescan_prepare,
++	.rescan_done	= nvme_rescan_done,
++	.bar_fixed	= nvme_bar_fixed,
+ };
+ 
+ static int __init nvme_init(void)
+diff --git a/drivers/pci/bus.c b/drivers/pci/bus.c
+index 3cef835b375f..c716210b62c5 100644
+--- a/drivers/pci/bus.c
++++ b/drivers/pci/bus.c
+@@ -192,7 +192,7 @@ static int pci_bus_alloc_from_region(struct pci_bus *bus, struct resource *res,
+ 		 * this is an already-configured bridge window, its start
+ 		 * overrides "min".
+ 		 */
+-		if (avail.start)
++		if (min_used < avail.start)
+ 			min_used = avail.start;
+ 
+ 		max = avail.end;
+diff --git a/drivers/pci/host-bridge.c b/drivers/pci/host-bridge.c
+index afa50b446567..96868957ab78 100644
+--- a/drivers/pci/host-bridge.c
++++ b/drivers/pci/host-bridge.c
+@@ -46,7 +46,7 @@ void pci_set_host_bridge_release(struct pci_host_bridge *bridge,
+ 	bridge->release_fn = release_fn;
+ 	bridge->release_data = release_data;
+ }
+-EXPORT_SYMBOL_GPL(pci_set_host_bridge_release);
++EXPORT_SYMBOL(pci_set_host_bridge_release);
+ 
+ void pcibios_resource_to_bus(struct pci_bus *bus, struct pci_bus_region *region,
+ 			     struct resource *res)
+diff --git a/drivers/pci/hotplug/pciehp_pci.c b/drivers/pci/hotplug/pciehp_pci.c
+index d17f3bf36f70..6d4c1ef38210 100644
+--- a/drivers/pci/hotplug/pciehp_pci.c
++++ b/drivers/pci/hotplug/pciehp_pci.c
+@@ -58,6 +58,11 @@ int pciehp_configure_device(struct controller *ctrl)
+ 		goto out;
+ 	}
+ 
++	if (pci_can_move_bars) {
++		pci_rescan_bus(parent);
++		goto out;
++	}
++
+ 	for_each_pci_bridge(dev, parent)
+ 		pci_hp_add_bridge(dev);
+ 
+diff --git a/drivers/pci/iov.c b/drivers/pci/iov.c
+index 952217572113..c095ed5ab60d 100644
+--- a/drivers/pci/iov.c
++++ b/drivers/pci/iov.c
+@@ -1010,6 +1010,8 @@ resource_size_t __weak pcibios_iov_resource_alignment(struct pci_dev *dev,
+  */
+ resource_size_t pci_sriov_resource_alignment(struct pci_dev *dev, int resno)
+ {
++	if (pci_dev_bar_fixed(dev, dev->resource + resno))
++		return 1;
+ 	return pcibios_iov_resource_alignment(dev, resno);
+ }
+ 
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 73114509ddff..434c0e38d637 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -84,6 +84,8 @@ bool pci_reset_supported(struct pci_dev *dev)
+ int pci_domains_supported = 1;
+ #endif
+ 
++bool pci_can_move_bars = true;
++
+ #define DEFAULT_CARDBUS_IO_SIZE		(256)
+ #define DEFAULT_CARDBUS_MEM_SIZE	(64*1024*1024)
+ /* pci=cbmemsize=nnM,cbiosize=nn can override this */
+@@ -1947,18 +1949,37 @@ int pci_reenable_device(struct pci_dev *dev)
+ }
+ EXPORT_SYMBOL(pci_reenable_device);
+ 
++#ifdef CONFIG_PROVE_LOCKING
++static int pci_bridge_depth(struct pci_dev *dev)
++{
++	struct pci_dev *bridge = pci_upstream_bridge(dev);
++
++	if (!bridge)
++		return 0;
++
++	return 1 + pci_bridge_depth(bridge);
++}
++#endif /* CONFIG_PROVE_LOCKING */
++
+ static void pci_enable_bridge(struct pci_dev *dev)
+ {
+ 	struct pci_dev *bridge;
+ 	int retval;
+ 
++	mutex_lock_nested(&dev->enable_mutex, pci_bridge_depth(dev));
++
+ 	bridge = pci_upstream_bridge(dev);
+ 	if (bridge)
+ 		pci_enable_bridge(bridge);
+ 
+ 	if (pci_is_enabled(dev)) {
++		retval = pci_reenable_device(dev);
++		if (retval)
++			pci_err(dev, "Error reenabling bridge, continuing\n");
++
+ 		if (!dev->is_busmaster)
+ 			pci_set_master(dev);
++		mutex_unlock(&dev->enable_mutex);
+ 		return;
+ 	}
+ 
+@@ -1967,6 +1988,7 @@ static void pci_enable_bridge(struct pci_dev *dev)
+ 		pci_err(dev, "Error enabling bridge (%d), continuing\n",
+ 			retval);
+ 	pci_set_master(dev);
++	mutex_unlock(&dev->enable_mutex);
+ }
+ 
+ static int pci_enable_device_flags(struct pci_dev *dev, unsigned long flags)
+@@ -6896,6 +6918,8 @@ static int __init pci_setup(char *str)
+ 				pci_add_flags(PCI_SCAN_ALL_PCIE_DEVS);
+ 			} else if (!strncmp(str, "disable_acs_redir=", 18)) {
+ 				disable_acs_redir_param = str + 18;
++			} else if (!strncmp(str, "no_movable_bars", 15)) {
++				pci_can_move_bars = false;
+ 			} else {
+ 				pr_err("PCI: Unknown option `%s'\n", str);
+ 			}
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index 785f31086313..9af0fea5484d 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -182,6 +182,7 @@ extern unsigned long pci_hotplug_io_size;
+ extern unsigned long pci_hotplug_mmio_size;
+ extern unsigned long pci_hotplug_mmio_pref_size;
+ extern unsigned long pci_hotplug_bus_size;
++extern bool pci_hotplug_expand;
+ 
+ /**
+  * pci_match_one_device - Tell if a PCI device structure has a matching
+@@ -242,12 +243,30 @@ void __pci_bus_assign_resources(const struct pci_bus *bus,
+ 				struct list_head *realloc_head,
+ 				struct list_head *fail_head);
+ bool pci_bus_clip_resource(struct pci_dev *dev, int idx);
++void pci_bus_release_root_bridge_resources(struct pci_bus *bus);
+ 
+ void pci_reassigndev_resource_alignment(struct pci_dev *dev);
+ void pci_disable_bridge_window(struct pci_dev *dev);
+ struct pci_bus *pci_bus_get(struct pci_bus *bus);
+ void pci_bus_put(struct pci_bus *bus);
+ 
++bool pci_dev_bar_fixed(struct pci_dev *dev, struct resource *res);
++bool pci_dev_bar_enabled(const struct pci_dev *dev, int idx);
++bool pci_bus_check_bars_assigned(struct pci_bus *bus, bool complete_set);
++
++static inline void pci_set_fixed_range(struct resource *res)
++{
++	res->start = (resource_size_t)-1;
++	res->end = 0;
++}
++
++static inline bool pci_fixed_range_valid(struct resource *res)
++{
++	return res->start <= res->end;
++}
++
++extern bool pci_init_done;
++
+ /* PCIe link information from Link Capabilities 2 */
+ #define PCIE_LNKCAP2_SLS2SPEED(lnkcap2) \
+ 	((lnkcap2) & PCI_EXP_LNKCAP2_SLS_64_0GB ? PCIE_SPEED_64_0GT : \
+@@ -365,8 +384,21 @@ static inline bool pci_dev_is_disconnected(const struct pci_dev *dev)
+ 	return dev->error_state == pci_channel_io_perm_failure;
+ }
+ 
++static inline int pci_get_bridge_resource_idx(struct resource *r)
++{
++	if (r->flags & IORESOURCE_IO)
++		return 0;
++	else if (!(r->flags & IORESOURCE_PREFETCH))
++		return 1;
++	else if (r->flags & IORESOURCE_MEM_64)
++		return 2;
++
++	return 1;
++}
++
+ /* pci_dev priv_flags */
+ #define PCI_DEV_ADDED 0
++#define PCI_DEV_DISABLED_BARS 1
+ #define PCI_DPC_RECOVERED 1
+ #define PCI_DPC_RECOVERING 2
+ 
+@@ -525,6 +557,8 @@ static inline resource_size_t pci_resource_alignment(struct pci_dev *dev,
+ 	if (resno >= PCI_IOV_RESOURCES && resno <= PCI_IOV_RESOURCE_END)
+ 		return pci_sriov_resource_alignment(dev, resno);
+ #endif
++	if (pci_dev_bar_fixed(dev, res))
++		return 1;
+ 	if (dev->class >> 8 == PCI_CLASS_BRIDGE_CARDBUS)
+ 		return pci_cardbus_resource_alignment(res);
+ 	return resource_alignment(res);
+diff --git a/drivers/pci/pcie/portdrv_pci.c b/drivers/pci/pcie/portdrv_pci.c
+index 7f8788a970ae..dd9016d807ba 100644
+--- a/drivers/pci/pcie/portdrv_pci.c
++++ b/drivers/pci/pcie/portdrv_pci.c
+@@ -192,6 +192,11 @@ static const struct pci_error_handlers pcie_portdrv_err_handler = {
+ 	.mmio_enabled = pcie_portdrv_mmio_enabled,
+ };
+ 
++static bool pcie_portdrv_bar_fixed(struct pci_dev *pdev, int resno)
++{
++	return false;
++}
++
+ static struct pci_driver pcie_portdriver = {
+ 	.name		= "pcieport",
+ 	.id_table	= &port_pci_ids[0],
+@@ -204,6 +209,8 @@ static struct pci_driver pcie_portdriver = {
+ 
+ 	.driver_managed_dma = true,
+ 
++	.bar_fixed	= pcie_portdrv_bar_fixed,
++
+ 	.driver.pm	= PCIE_PORTDRV_PM_OPS,
+ };
+ 
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index c5286b027f00..5a79c45034e4 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -36,6 +36,15 @@ static struct resource busn_resource = {
+ LIST_HEAD(pci_root_buses);
+ EXPORT_SYMBOL(pci_root_buses);
+ 
++/*
++ * This flag is used during pci_rescan_bus(), protected by pci_rescan_remove_lock:
++ * it indicates which BARs should be reassigned: every one, or only those which
++ * were assigned before the rescan.
++ */
++static bool pci_try_failed_bars = true;
++bool pci_hotplug_expand = true;
++bool pci_init_done;
++
+ static LIST_HEAD(pci_domain_busn_res_list);
+ 
+ struct pci_domain_busn_res {
+@@ -44,6 +53,41 @@ struct pci_domain_busn_res {
+ 	int domain_nr;
+ };
+ 
++static void pci_dev_disable_bars(struct pci_dev *dev)
++{
++	assign_bit(PCI_DEV_DISABLED_BARS, &dev->priv_flags, true);
++}
++
++static void pci_dev_enable_bars(struct pci_dev *dev)
++{
++	assign_bit(PCI_DEV_DISABLED_BARS, &dev->priv_flags, false);
++}
++
++static bool pci_dev_bars_enabled(const struct pci_dev *dev)
++{
++	if (pci_try_failed_bars)
++		return true;
++
++	return !(test_bit(PCI_DEV_DISABLED_BARS, &dev->priv_flags));
++}
++
++bool pci_dev_bar_enabled(const struct pci_dev *dev, int idx)
++{
++	if (idx >= PCI_BRIDGE_RESOURCES)
++		return true;
++
++	if (pci_try_failed_bars)
++		return true;
++
++	if (test_bit(PCI_DEV_DISABLED_BARS, &dev->priv_flags))
++		return false;
++
++	if (!pci_dev_is_added(dev))
++		return true;
++
++	return dev->res_mask & (1 << idx);
++}
++
+ static struct resource *get_pci_domain_busn_res(int domain_nr)
+ {
+ 	struct pci_domain_busn_res *r;
+@@ -547,6 +591,7 @@ void pci_read_bridge_bases(struct pci_bus *child)
+ static struct pci_bus *pci_alloc_bus(struct pci_bus *parent)
+ {
+ 	struct pci_bus *b;
++	int idx;
+ 
+ 	b = kzalloc(sizeof(*b), GFP_KERNEL);
+ 	if (!b)
+@@ -563,6 +608,13 @@ static struct pci_bus *pci_alloc_bus(struct pci_bus *parent)
+ 	if (parent)
+ 		b->domain_nr = parent->domain_nr;
+ #endif
++	for (idx = 0; idx < PCI_BRIDGE_RESOURCE_NUM; ++idx)
++		pci_set_fixed_range(&b->fixed_range[idx]);
++
++	b->fixed_range[0].flags = IORESOURCE_IO;
++	b->fixed_range[1].flags = IORESOURCE_MEM;
++	b->fixed_range[2].flags = IORESOURCE_MEM | IORESOURCE_PREFETCH;
++
+ 	return b;
+ }
+ 
+@@ -2306,6 +2358,7 @@ struct pci_dev *pci_alloc_dev(struct pci_bus *bus)
+ 	INIT_LIST_HEAD(&dev->bus_list);
+ 	dev->dev.type = &pci_dev_type;
+ 	dev->bus = pci_bus_get(bus);
++	mutex_init(&dev->enable_mutex);
+ #ifdef CONFIG_PCI_MSI
+ 	raw_spin_lock_init(&dev->msi_lock);
+ #endif
+@@ -2536,6 +2589,11 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
+ 	/* Fix up broken headers */
+ 	pci_fixup_device(pci_fixup_header, dev);
+ 
++	if (dev->transparent && pci_can_move_bars) {
++		pci_info(dev, "Disable movable BARs in presence of a transparent bridge\n");
++		pci_can_move_bars = false;
++	}
++
+ 	pci_reassigndev_resource_alignment(dev);
+ 
+ 	dev->state_saved = false;
+@@ -3066,6 +3124,7 @@ int pci_host_probe(struct pci_host_bridge *bridge)
+ 	 * or pci_bus_assign_resources().
+ 	 */
+ 	if (pci_has_flag(PCI_PROBE_ONLY)) {
++		pci_can_move_bars = false;
+ 		pci_bus_claim_resources(bus);
+ 	} else {
+ 		pci_bus_size_bridges(bus);
+@@ -3259,6 +3318,323 @@ unsigned int pci_rescan_bus_bridge_resize(struct pci_dev *bridge)
+ 	return max;
+ }
+ 
++bool pci_dev_bar_fixed(struct pci_dev *dev, struct resource *res)
++{
++	int resno = res - dev->resource;
++
++	/* Bridge windows are never fixed */
++	if (resno >= PCI_BRIDGE_RESOURCES)
++		return false;
++
++	if (res->flags & IORESOURCE_PCI_FIXED)
++		return true;
++
++	if (res->flags & IORESOURCE_UNSET)
++		return false;
++
++	if (!pci_can_move_bars)
++		return false;
++
++	if (dev->driver && dev->driver->bar_fixed)
++		return dev->driver->bar_fixed(dev, resno);
++
++	if (res->start &&
++	    !(res->flags & IORESOURCE_IO) &&
++	    (dev->class >> 8) == PCI_CLASS_DISPLAY_VGA)
++		return true;
++
++	if (!dev->driver && !res->child)
++		return false;
++
++	return true;
++}
++
++static unsigned int pci_dev_count_res_mask(struct pci_dev *dev)
++{
++	unsigned int res_mask = 0;
++	int i;
++
++	for (i = 0; i < PCI_BRIDGE_RESOURCES; i++) {
++		struct resource *r = &dev->resource[i];
++
++		if (!r->flags || !r->parent ||
++		    (pci_init_done && (r->flags & IORESOURCE_UNSET)))
++			continue;
++
++		res_mask |= (1 << i);
++	}
++
++	return res_mask;
++}
++
++static void pci_bus_rescan_prepare(struct pci_bus *bus)
++{
++	struct pci_dev *dev;
++
++	if (bus->self) {
++		pci_config_pm_runtime_get(bus->self);
++		pm_runtime_get_sync(&bus->self->dev);
++	}
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		struct pci_bus *child = dev->subordinate;
++
++		dev->res_mask = pci_dev_count_res_mask(dev);
++		pci_dev_enable_bars(dev);
++
++		if (child)
++			pci_bus_rescan_prepare(child);
++
++		if (dev->driver &&
++		    dev->driver->rescan_prepare)
++			dev->driver->rescan_prepare(dev);
++	}
++}
++
++static void pci_bus_rescan_done(struct pci_bus *bus)
++{
++	struct pci_dev *dev;
++
++	if (bus->self && !pci_dev_is_added(bus->self))
++		return;
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		struct pci_bus *child = dev->subordinate;
++
++		if (dev->driver &&
++		    dev->driver->rescan_done)
++			dev->driver->rescan_done(dev);
++
++		if (child)
++			pci_bus_rescan_done(child);
++	}
++
++	if (bus->self) {
++		pci_save_state(bus->self);
++		pm_runtime_put(&bus->self->dev);
++		pci_config_pm_runtime_put(bus->self);
++	}
++}
++
++static void pci_setup_bridges(struct pci_bus *bus)
++{
++	struct pci_dev *dev;
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		struct pci_bus *child;
++
++		if (!pci_dev_is_added(dev))
++			continue;
++
++		child = dev->subordinate;
++		if (child)
++			pci_setup_bridges(child);
++	}
++
++	if (bus->self)
++		pci_setup_bridge(bus);
++}
++
++static void pci_bus_update_fixed_range(struct pci_bus *bus)
++{
++	struct pci_dev *dev;
++	int idx;
++	resource_size_t start, end;
++
++	for (idx = 0; idx < PCI_BRIDGE_RESOURCE_NUM; ++idx)
++		pci_set_fixed_range(&bus->fixed_range[idx]);
++
++	list_for_each_entry(dev, &bus->devices, bus_list)
++		if (dev->subordinate)
++			pci_bus_update_fixed_range(dev->subordinate);
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		int i;
++		struct pci_bus *child = dev->subordinate;
++
++		for (i = 0; i < PCI_BRIDGE_RESOURCES; ++i) {
++			struct resource *r = &dev->resource[i];
++			struct resource *fixed_range;
++
++			if (!r->flags || (r->flags & IORESOURCE_UNSET) ||
++			    !r->parent || !pci_dev_bar_fixed(dev, r))
++				continue;
++
++			idx = pci_get_bridge_resource_idx(r);
++			fixed_range = &bus->fixed_range[idx];
++			start = fixed_range->start;
++			end = fixed_range->end;
++
++			if (!pci_fixed_range_valid(fixed_range) ||
++			    start > r->start)
++				start = r->start;
++
++			if (end < r->end)
++				end = r->end;
++
++			if (fixed_range->start != start ||
++			    fixed_range->end != end) {
++				fixed_range->start = start;
++				fixed_range->end = end;
++				dev_dbg(&bus->dev, "Found fixed BAR %d %pR in %s, expand the fixed bridge window %d to %pR\n",
++					i, r, dev_name(&dev->dev), idx,
++					fixed_range);
++			}
++		}
++
++		if (child) {
++			for (idx = 0; idx < PCI_BRIDGE_RESOURCE_NUM; ++idx) {
++				struct resource *fixed_range = &bus->fixed_range[idx];
++				struct resource *child_fixed_range =
++					&child->fixed_range[idx];
++
++				if (!pci_fixed_range_valid(child_fixed_range))
++					continue;
++
++				start = fixed_range->start;
++				end = fixed_range->end;
++
++				if (!pci_fixed_range_valid(fixed_range) ||
++				    start > child_fixed_range->start)
++					start = child_fixed_range->start;
++
++				if (end < child_fixed_range->end)
++					end = child_fixed_range->end;
++
++				if (start < fixed_range->start ||
++				    end > fixed_range->end) {
++					dev_dbg(&bus->dev, "Expand the fixed bridge window %d from %s to 0x%llx-0x%llx\n",
++						idx, dev_name(&child->dev),
++						(unsigned long long)start,
++						(unsigned long long)end);
++					fixed_range->start = start;
++					fixed_range->end = end;
++				}
++			}
++		}
++	}
++}
++
++static struct pci_dev *pci_find_next_new_device(struct pci_bus *bus)
++{
++	struct pci_dev *dev;
++
++	if (!bus)
++		return NULL;
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		struct pci_bus *child_bus = dev->subordinate;
++
++		if (child_bus) {
++			struct pci_dev *next_new_dev;
++
++			next_new_dev = pci_find_next_new_device(child_bus);
++			if (next_new_dev)
++				return next_new_dev;
++		}
++
++		if (!pci_dev_is_added(dev) && pci_dev_bars_enabled(dev))
++			return dev;
++	}
++
++	return NULL;
++}
++
++/**
++ * pci_bus_check_bars_assigned - check BARs under the bridge
++ * @bus: Parent PCI bus
++ * @complete_set: check every BAR, otherwise only those assigned before
++ *
++ * Returns true if every BAR is assigned.
++ */
++bool pci_bus_check_bars_assigned(struct pci_bus *bus, bool complete_set)
++{
++	struct pci_dev *dev;
++	bool good = true;
++
++	if (!bus)
++		return false;
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		struct pci_bus *child = dev->subordinate;
++
++		if (complete_set) {
++			int i;
++
++			for (i = 0; i < PCI_BRIDGE_RESOURCES; ++i) {
++				struct resource *r = &dev->resource[i];
++
++				if (!(r->flags & IORESOURCE_UNSET))
++					continue;
++
++				pci_warn(dev, "BAR %d: requested but not assigned: %pR\n",
++					 i, r);
++				good = false;
++			}
++		} else {
++			unsigned int res_mask;
++
++			if (!pci_dev_bars_enabled(dev))
++				continue;
++
++			res_mask = pci_dev_count_res_mask(dev);
++
++			if (dev->res_mask & ~res_mask) {
++				pci_err(dev, "Non-re-enabled resources found: 0x%x -> 0x%x\n",
++					dev->res_mask, res_mask);
++				good = false;
++			}
++		}
++
++		if (child && !pci_bus_check_bars_assigned(child, complete_set))
++			good = false;
++	}
++
++	return good;
++}
++
++static void pci_reassign_root_bus_resources(struct pci_bus *root)
++{
++	do {
++		struct pci_dev *next_new_dev;
++
++		pci_assign_unassigned_root_bus_resources(root);
++
++		if (pci_bus_check_bars_assigned(root, pci_try_failed_bars))
++			break;
++
++		if (pci_hotplug_expand) {
++			dev_warn(&root->dev, "failed to assign all BARs, retry without additional window size\n");
++
++			pci_hotplug_expand = false;
++			continue;
++		}
++
++		if (pci_try_failed_bars) {
++			dev_warn(&root->dev, "failed to assign all BARs, retry without those failed before\n");
++
++			pci_bus_release_root_bridge_resources(root);
++			pci_try_failed_bars = false;
++			continue;
++		}
++
++		next_new_dev = pci_find_next_new_device(root);
++		if (!next_new_dev) {
++			dev_err(&root->dev, "failed to reassign BARs even after ignoring all the hot-added devices, reload the kernel with pci=no_movable_bars\n");
++			break;
++		}
++
++		dev_warn(&root->dev, "failed to reassign BARs, disable the next hot-added device %s and retry\n",
++			 dev_name(&next_new_dev->dev));
++
++		pci_dev_disable_bars(next_new_dev);
++		pci_bus_release_root_bridge_resources(root);
++	} while (true);
++
++	pci_try_failed_bars = true;
++	pci_hotplug_expand = true;
++}
++
+ /**
+  * pci_rescan_bus - Scan a PCI bus for devices
+  * @bus: PCI bus to scan
+@@ -3271,9 +3647,30 @@ unsigned int pci_rescan_bus_bridge_resize(struct pci_dev *bridge)
+ unsigned int pci_rescan_bus(struct pci_bus *bus)
+ {
+ 	unsigned int max;
++	struct pci_bus *root = bus, *child;
++
++	while (!pci_is_root_bus(root))
++		root = root->parent;
++
++	if (pci_can_move_bars) {
++		pci_bus_rescan_prepare(root);
++		pci_bus_update_fixed_range(root);
++
++		max = pci_scan_child_bus(root);
++
++		pci_bus_release_root_bridge_resources(root);
++		pci_reassign_root_bus_resources(root);
++
++		pci_setup_bridges(root);
++		pci_bus_rescan_done(root);
++	} else {
++		max = pci_scan_child_bus(bus);
++		pci_assign_unassigned_bus_resources(bus);
++	}
++
++	list_for_each_entry(child, &root->children, node)
++		pcie_bus_configure_settings(child);
+ 
+-	max = pci_scan_child_bus(bus);
+-	pci_assign_unassigned_bus_resources(bus);
+ 	pci_bus_add_devices(bus);
+ 
+ 	return max;
+diff --git a/drivers/pci/setup-bus.c b/drivers/pci/setup-bus.c
+index 8cb68e6f6ef9..f4a49e79b806 100644
+--- a/drivers/pci/setup-bus.c
++++ b/drivers/pci/setup-bus.c
+@@ -126,7 +126,8 @@ static resource_size_t get_res_add_align(struct list_head *head,
+ 
+ 
+ /* Sort resources by alignment */
+-static void pdev_sort_resources(struct pci_dev *dev, struct list_head *head)
++static void pdev_sort_resources(struct pci_dev *dev, struct list_head *head,
++				struct list_head *head_fixed)
+ {
+ 	int i;
+ 
+@@ -135,17 +136,27 @@ static void pdev_sort_resources(struct pci_dev *dev, struct list_head *head)
+ 		struct pci_dev_resource *dev_res, *tmp;
+ 		resource_size_t r_align;
+ 		struct list_head *n;
++		struct resource *fixed_res = NULL;
+ 
+ 		r = &dev->resource[i];
+ 
+-		if (r->flags & IORESOURCE_PCI_FIXED)
++		if (!(r->flags) || r->parent || !pci_dev_bar_enabled(dev, i))
+ 			continue;
+ 
+-		if (!(r->flags) || r->parent)
+-			continue;
++		if (i >= PCI_BRIDGE_RESOURCES &&
++		    dev->subordinate) {
++			int idx = i - PCI_BRIDGE_RESOURCES;
++
++			fixed_res = &dev->subordinate->fixed_range[idx];
++		} else if (pci_dev_bar_fixed(dev, r)) {
++			fixed_res = r;
++		}
++
++		if (fixed_res && !pci_fixed_range_valid(fixed_res))
++			fixed_res = NULL;
+ 
+ 		r_align = pci_resource_alignment(dev, r);
+-		if (!r_align) {
++		if (!r_align && !fixed_res) {
+ 			pci_warn(dev, "BAR %d: %pR has bogus alignment\n",
+ 				 i, r);
+ 			continue;
+@@ -157,6 +168,30 @@ static void pdev_sort_resources(struct pci_dev *dev, struct list_head *head)
+ 		tmp->res = r;
+ 		tmp->dev = dev;
+ 
++		if (fixed_res) {
++			n = head_fixed;
++			list_for_each_entry(dev_res, head_fixed, list) {
++				struct resource *c_fixed_res = NULL;
++				int c_resno = dev_res->res - dev_res->dev->resource;
++				int br_idx = c_resno - PCI_BRIDGE_RESOURCES;
++				struct pci_bus *cbus = dev_res->dev->subordinate;
++
++				if (br_idx >= 0)
++					c_fixed_res = &cbus->fixed_range[br_idx];
++				else
++					c_fixed_res = dev_res->res;
++
++				if (fixed_res->start < c_fixed_res->start) {
++					n = &dev_res->list;
++					break;
++				}
++			}
++			/* Insert it just before n */
++			list_add_tail(&tmp->list, n);
++
++			continue;
++		}
++
+ 		/* Fallback is smallest one or list is empty */
+ 		n = head;
+ 		list_for_each_entry(dev_res, head, list) {
+@@ -175,7 +210,8 @@ static void pdev_sort_resources(struct pci_dev *dev, struct list_head *head)
+ 	}
+ }
+ 
+-static void __dev_sort_resources(struct pci_dev *dev, struct list_head *head)
++static void __dev_sort_resources(struct pci_dev *dev, struct list_head *head,
++				 struct list_head *head_fixed)
+ {
+ 	u16 class = dev->class >> 8;
+ 
+@@ -191,7 +227,7 @@ static void __dev_sort_resources(struct pci_dev *dev, struct list_head *head)
+ 			return;
+ 	}
+ 
+-	pdev_sort_resources(dev, head);
++	pdev_sort_resources(dev, head, head_fixed);
+ }
+ 
+ static inline void reset_resource(struct resource *res)
+@@ -297,7 +333,9 @@ static void assign_requested_resources_sorted(struct list_head *head,
+ 						    0 /* don't care */,
+ 						    0 /* don't care */);
+ 			}
+-			reset_resource(res);
++			if (!pci_can_move_bars ||
++			    idx >= PCI_BRIDGE_RESOURCES)
++				reset_resource(res);
+ 		}
+ 	}
+ }
+@@ -484,8 +522,13 @@ static void pdev_assign_resources_sorted(struct pci_dev *dev,
+ 					 struct list_head *fail_head)
+ {
+ 	LIST_HEAD(head);
++	LIST_HEAD(head_fixed);
++
++	__dev_sort_resources(dev, &head, &head_fixed);
++
++	if (!list_empty(&head_fixed))
++		__assign_resources_sorted(&head_fixed, NULL, NULL);
+ 
+-	__dev_sort_resources(dev, &head);
+ 	__assign_resources_sorted(&head, add_head, fail_head);
+ 
+ }
+@@ -496,9 +539,13 @@ static void pbus_assign_resources_sorted(const struct pci_bus *bus,
+ {
+ 	struct pci_dev *dev;
+ 	LIST_HEAD(head);
++	LIST_HEAD(head_fixed);
+ 
+ 	list_for_each_entry(dev, &bus->devices, bus_list)
+-		__dev_sort_resources(dev, &head);
++		__dev_sort_resources(dev, &head, &head_fixed);
++
++	if (!list_empty(&head_fixed))
++		__assign_resources_sorted(&head_fixed, NULL, NULL);
+ 
+ 	__assign_resources_sorted(&head, realloc_head, fail_head);
+ }
+@@ -886,9 +933,15 @@ static void pbus_size_io(struct pci_bus *bus, resource_size_t min_size,
+ 	resource_size_t children_add_size = 0;
+ 	resource_size_t min_align, align;
+ 
++	struct resource *fixed_range;
++	resource_size_t fixed_size;
++
+ 	if (!b_res)
+ 		return;
+ 
++	fixed_range = &bus->fixed_range[0];
++	fixed_size = pci_fixed_range_valid(fixed_range) ? resource_size(fixed_range) : 0;
++
+ 	/* If resource is already assigned, nothing more to do */
+ 	if (b_res->parent)
+ 		return;
+@@ -901,7 +954,8 @@ static void pbus_size_io(struct pci_bus *bus, resource_size_t min_size,
+ 			struct resource *r = &dev->resource[i];
+ 			unsigned long r_size;
+ 
+-			if (r->parent || !(r->flags & IORESOURCE_IO))
++			if (r->parent || !(r->flags & IORESOURCE_IO) ||
++			    !pci_dev_bar_enabled(dev, i))
+ 				continue;
+ 			r_size = resource_size(r);
+ 
+@@ -920,6 +974,9 @@ static void pbus_size_io(struct pci_bus *bus, resource_size_t min_size,
+ 		}
+ 	}
+ 
++	if (size1 < fixed_size)
++		size1 = fixed_size;
++
+ 	size0 = calculate_iosize(size, min_size, size1, 0, 0,
+ 			resource_size(b_res), min_align);
+ 	size1 = (!realloc_head || (realloc_head && !add_size && !children_add_size)) ? size0 :
+@@ -1001,6 +1058,10 @@ static int pbus_size_mem(struct pci_bus *bus, unsigned long mask,
+ 	resource_size_t children_add_size = 0;
+ 	resource_size_t children_add_align = 0;
+ 	resource_size_t add_align = 0;
++	bool size0_can_add = pci_can_move_bars && !realloc_head;
++	int idx;
++	struct resource *fixed_range;
++	resource_size_t fixed_size;
+ 
+ 	if (!b_res)
+ 		return -ENOSPC;
+@@ -1009,6 +1070,13 @@ static int pbus_size_mem(struct pci_bus *bus, unsigned long mask,
+ 	if (b_res->parent)
+ 		return 0;
+ 
++	idx = pci_get_bridge_resource_idx(b_res);
++	fixed_range = &bus->fixed_range[idx];
++	fixed_size = pci_fixed_range_valid(fixed_range) ? resource_size(fixed_range) : 0;
++
++	if (min_size < fixed_size)
++		min_size = fixed_size;
++
+ 	memset(aligns, 0, sizeof(aligns));
+ 	max_order = 0;
+ 	size = 0;
+@@ -1020,7 +1088,8 @@ static int pbus_size_mem(struct pci_bus *bus, unsigned long mask,
+ 			struct resource *r = &dev->resource[i];
+ 			resource_size_t r_size;
+ 
+-			if (r->parent || (r->flags & IORESOURCE_PCI_FIXED) ||
++			if (r->parent ||
++			    !pci_dev_bar_enabled(dev, i) ||
+ 			    ((r->flags & mask) != type &&
+ 			     (r->flags & mask) != type2 &&
+ 			     (r->flags & mask) != type3))
+@@ -1073,7 +1142,11 @@ static int pbus_size_mem(struct pci_bus *bus, unsigned long mask,
+ 
+ 	min_align = calculate_mem_align(aligns, max_order);
+ 	min_align = max(min_align, window_alignment(bus, b_res->flags));
+-	size0 = calculate_memsize(size, min_size, 0, 0, resource_size(b_res), min_align);
++	size0 = calculate_memsize(size, min_size,
++				  size0_can_add ? add_size : 0,
++				  size0_can_add ? children_add_size : 0,
++				  resource_size(b_res), min_align);
++
+ 	add_align = max(min_align, add_align);
+ 	size1 = (!realloc_head || (realloc_head && !add_size && !children_add_size)) ? size0 :
+ 		calculate_memsize(size, min_size, add_size, children_add_size,
+@@ -1248,7 +1321,7 @@ void __pci_bus_size_bridges(struct pci_bus *bus, struct list_head *realloc_head)
+ 
+ 	case PCI_HEADER_TYPE_BRIDGE:
+ 		pci_bridge_check_ranges(bus);
+-		if (bus->self->is_hotplug_bridge) {
++		if (bus->self->is_hotplug_bridge && pci_hotplug_expand) {
+ 			additional_io_size  = pci_hotplug_io_size;
+ 			additional_mmio_size = pci_hotplug_mmio_size;
+ 			additional_mmio_pref_size = pci_hotplug_mmio_pref_size;
+@@ -1335,47 +1408,6 @@ void pci_bus_size_bridges(struct pci_bus *bus)
+ }
+ EXPORT_SYMBOL(pci_bus_size_bridges);
+ 
+-static void assign_fixed_resource_on_bus(struct pci_bus *b, struct resource *r)
+-{
+-	int i;
+-	struct resource *parent_r;
+-	unsigned long mask = IORESOURCE_IO | IORESOURCE_MEM |
+-			     IORESOURCE_PREFETCH;
+-
+-	pci_bus_for_each_resource(b, parent_r, i) {
+-		if (!parent_r)
+-			continue;
+-
+-		if ((r->flags & mask) == (parent_r->flags & mask) &&
+-		    resource_contains(parent_r, r))
+-			request_resource(parent_r, r);
+-	}
+-}
+-
+-/*
+- * Try to assign any resources marked as IORESOURCE_PCI_FIXED, as they are
+- * skipped by pbus_assign_resources_sorted().
+- */
+-static void pdev_assign_fixed_resources(struct pci_dev *dev)
+-{
+-	int i;
+-
+-	for (i = 0; i <  PCI_NUM_RESOURCES; i++) {
+-		struct pci_bus *b;
+-		struct resource *r = &dev->resource[i];
+-
+-		if (r->parent || !(r->flags & IORESOURCE_PCI_FIXED) ||
+-		    !(r->flags & (IORESOURCE_IO | IORESOURCE_MEM)))
+-			continue;
+-
+-		b = dev->bus;
+-		while (b && !r->parent) {
+-			assign_fixed_resource_on_bus(b, r);
+-			b = b->parent;
+-		}
+-	}
+-}
+-
+ void __pci_bus_assign_resources(const struct pci_bus *bus,
+ 				struct list_head *realloc_head,
+ 				struct list_head *fail_head)
+@@ -1386,8 +1418,6 @@ void __pci_bus_assign_resources(const struct pci_bus *bus,
+ 	pbus_assign_resources_sorted(bus, realloc_head, fail_head);
+ 
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+-		pdev_assign_fixed_resources(dev);
+-
+ 		b = dev->subordinate;
+ 		if (!b)
+ 			continue;
+@@ -1520,6 +1550,56 @@ static void __pci_bridge_assign_resources(const struct pci_dev *bridge,
+ 	(IORESOURCE_IO | IORESOURCE_MEM | IORESOURCE_PREFETCH |\
+ 	 IORESOURCE_MEM_64)
+ 
++/*
++ * Similar to generic release_child_resources(), but aware of fixed BARs and the
++ * STARTALIGN flag.
++ */
++static void pci_release_child_resources(struct pci_bus *bus, struct resource *r)
++{
++	struct pci_dev *dev;
++
++	if (!pci_can_move_bars)
++		return release_child_resources(r);
++
++	if (!bus || !r)
++		return;
++
++	r->child = NULL;
++
++	list_for_each_entry(dev, &bus->devices, bus_list) {
++		int i;
++
++		for (i = 0; i < PCI_NUM_RESOURCES; i++) {
++			struct resource *tmp = &dev->resource[i];
++			resource_size_t size = resource_size(tmp);
++
++			if (!tmp->flags || !tmp->parent)
++				continue;
++
++			tmp->parent = NULL;
++			tmp->sibling = NULL;
++
++			pci_release_child_resources(dev->subordinate, tmp);
++
++			tmp->flags &= ~IORESOURCE_STARTALIGN;
++			tmp->flags |= IORESOURCE_SIZEALIGN;
++
++			if (pci_dev_bar_fixed(dev, tmp)) {
++				pci_dbg(dev, "release fixed BAR %d %pR (%s), keep its flags, base and size\n",
++					i, tmp, tmp->name);
++				continue;
++			}
++
++			pci_dbg(dev, "release BAR %d %pR (%s)\n", i, tmp, tmp->name);
++
++			if (i >= PCI_BRIDGE_RESOURCES)
++				tmp->flags = 0;
++			tmp->start = 0;
++			tmp->end = size - 1;
++		}
++	}
++}
++
+ static void pci_bridge_release_resources(struct pci_bus *bus,
+ 					 unsigned long type)
+ {
+@@ -1560,20 +1640,22 @@ static void pci_bridge_release_resources(struct pci_bus *bus,
+ 		return;
+ 
+ 	/* If there are children, release them all */
+-	release_child_resources(r);
++	pci_release_child_resources(bus, r);
++
+ 	if (!release_resource(r)) {
+ 		type = old_flags = r->flags & PCI_RES_TYPE_MASK;
+ 		pci_info(dev, "resource %d %pR released\n",
+ 			 PCI_BRIDGE_RESOURCES + idx, r);
+-		/* Keep the old size */
+-		r->end = resource_size(r) - 1;
++		/* Don't keep the old size if the bridge will be recalculated */
++		r->end = pci_can_move_bars ? 0 : (resource_size(r) - 1);
+ 		r->start = 0;
+ 		r->flags = 0;
+ 
+ 		/* Avoiding touch the one without PREF */
+ 		if (type & IORESOURCE_PREFETCH)
+ 			type = IORESOURCE_PREFETCH;
+-		__pci_setup_bridge(bus, type);
++		if (!pci_can_move_bars)
++			__pci_setup_bridge(bus, type);
+ 		/* For next child res under same bridge */
+ 		r->flags = old_flags;
+ 	}
+@@ -1620,6 +1702,15 @@ static void pci_bus_release_bridge_resources(struct pci_bus *bus,
+ 		pci_bridge_release_resources(bus, type);
+ }
+ 
++void pci_bus_release_root_bridge_resources(struct pci_bus *root_bus)
++{
++	pci_bus_release_bridge_resources(root_bus, IORESOURCE_IO, whole_subtree);
++	pci_bus_release_bridge_resources(root_bus, IORESOURCE_MEM, whole_subtree);
++	pci_bus_release_bridge_resources(root_bus,
++					 IORESOURCE_MEM_64 | IORESOURCE_PREFETCH,
++					 whole_subtree);
++}
++
+ static void pci_bus_dump_res(struct pci_bus *bus)
+ {
+ 	struct resource *res;
+@@ -1762,6 +1853,13 @@ void pci_assign_unassigned_root_bus_resources(struct pci_bus *bus)
+ 	int pci_try_num = 1;
+ 	enum enable_type enable_local;
+ 
++	if (pci_can_move_bars) {
++		__pci_bus_size_bridges(bus, NULL);
++		__pci_bus_assign_resources(bus, NULL, NULL);
++
++		goto dump;
++	}
++
+ 	/* Don't realloc if asked to do so */
+ 	enable_local = pci_realloc_detect(bus, pci_realloc_enable);
+ 	if (pci_realloc_enabled(enable_local)) {
+@@ -1855,7 +1953,14 @@ void __init pci_assign_unassigned_resources(void)
+ 		/* Make sure the root bridge has a companion ACPI device */
+ 		if (ACPI_HANDLE(root_bus->bridge))
+ 			acpi_ioapic_add(ACPI_HANDLE(root_bus->bridge));
++
++		if (pci_can_move_bars && !pci_bus_check_bars_assigned(root_bus, true)) {
++			dev_err(&root_bus->dev, "Not all requested BARs are assigned, triggering a rescan with movable BARs");
++			pci_rescan_bus(root_bus);
++		}
+ 	}
++
++	pci_init_done = true;
+ }
+ 
+ static void adjust_bridge_window(struct pci_dev *bridge, struct resource *res,
+@@ -2239,4 +2344,4 @@ void pci_assign_unassigned_bus_resources(struct pci_bus *bus)
+ 	__pci_bus_assign_resources(bus, &add_list, NULL);
+ 	BUG_ON(!list_empty(&add_list));
+ }
+-EXPORT_SYMBOL_GPL(pci_assign_unassigned_bus_resources);
++EXPORT_SYMBOL(pci_assign_unassigned_bus_resources);
+diff --git a/drivers/pci/setup-res.c b/drivers/pci/setup-res.c
+index 439ac5f5907a..0fe0a458ef32 100644
+--- a/drivers/pci/setup-res.c
++++ b/drivers/pci/setup-res.c
+@@ -27,7 +27,8 @@ static void pci_std_update_resource(struct pci_dev *dev, int resno)
+ 	struct pci_bus_region region;
+ 	bool disable;
+ 	u16 cmd;
+-	u32 new, check, mask;
++	u32 new, check, mask, old;
++	u64 old_start;
+ 	int reg;
+ 	struct resource *res = dev->resource + resno;
+ 
+@@ -100,6 +101,9 @@ static void pci_std_update_resource(struct pci_dev *dev, int resno)
+ 				      cmd & ~PCI_COMMAND_MEMORY);
+ 	}
+ 
++	pci_read_config_dword(dev, reg, &old);
++	old_start = old & mask;
++
+ 	pci_write_config_dword(dev, reg, new);
+ 	pci_read_config_dword(dev, reg, &check);
+ 
+@@ -109,6 +113,9 @@ static void pci_std_update_resource(struct pci_dev *dev, int resno)
+ 	}
+ 
+ 	if (res->flags & IORESOURCE_MEM_64) {
++		pci_read_config_dword(dev, reg + 4, &old);
++		old_start |= (u64)old << 32;
++
+ 		new = region.start >> 16 >> 16;
+ 		pci_write_config_dword(dev, reg + 4, new);
+ 		pci_read_config_dword(dev, reg + 4, &check);
+@@ -120,6 +127,11 @@ static void pci_std_update_resource(struct pci_dev *dev, int resno)
+ 
+ 	if (disable)
+ 		pci_write_config_word(dev, PCI_COMMAND, cmd);
++
++	if (old_start != region.start)
++		pci_info(dev, "BAR %d updated: %#llx -> %#llx\n", resno,
++			 (unsigned long long)old_start,
++			 (unsigned long long)region.start);
+ }
+ 
+ void pci_update_resource(struct pci_dev *dev, int resno)
+@@ -143,6 +155,9 @@ int pci_claim_resource(struct pci_dev *dev, int resource)
+ 		return -EINVAL;
+ 	}
+ 
++	if (pci_dev_bar_fixed(dev, res))
++		return 0;
++
+ 	/*
+ 	 * If we have a shadow copy in RAM, the PCI device doesn't respond
+ 	 * to the shadow range, so we don't need to claim it, and upstream
+@@ -251,11 +266,27 @@ static int __pci_assign_resource(struct pci_bus *bus, struct pci_dev *dev,
+ 		int resno, resource_size_t size, resource_size_t align)
+ {
+ 	struct resource *res = dev->resource + resno;
++	struct resource *fixed_range = NULL;
+ 	resource_size_t min;
+ 	int ret;
+ 
+ 	min = (res->flags & IORESOURCE_IO) ? PCIBIOS_MIN_IO : PCIBIOS_MIN_MEM;
+ 
++	if (pci_can_move_bars && dev->subordinate && resno >= PCI_BRIDGE_RESOURCES) {
++		struct pci_bus *child_bus = dev->subordinate;
++		int win_no = resno - PCI_BRIDGE_RESOURCES;
++
++		fixed_range = &child_bus->fixed_range[win_no];
++		if (pci_fixed_range_valid(fixed_range)) {
++			if (size <= resource_size(fixed_range))
++				min = fixed_range->start;
++			else
++				min = fixed_range->end - size + 1;
++		} else {
++			fixed_range = NULL;
++		}
++	}
++
+ 	/*
+ 	 * First, try exact prefetching match.  Even if a 64-bit
+ 	 * prefetchable bridge window is below 4GB, we can't put a 32-bit
+@@ -267,7 +298,7 @@ static int __pci_assign_resource(struct pci_bus *bus, struct pci_dev *dev,
+ 				     IORESOURCE_PREFETCH | IORESOURCE_MEM_64,
+ 				     pcibios_align_resource, dev);
+ 	if (ret == 0)
+-		return 0;
++		goto check_fixed;
+ 
+ 	/*
+ 	 * If the prefetchable window is only 32 bits wide, we can put
+@@ -279,7 +310,7 @@ static int __pci_assign_resource(struct pci_bus *bus, struct pci_dev *dev,
+ 					     IORESOURCE_PREFETCH,
+ 					     pcibios_align_resource, dev);
+ 		if (ret == 0)
+-			return 0;
++			goto check_fixed;
+ 	}
+ 
+ 	/*
+@@ -292,6 +323,16 @@ static int __pci_assign_resource(struct pci_bus *bus, struct pci_dev *dev,
+ 		ret = pci_bus_alloc_resource(bus, res, size, align, min, 0,
+ 					     pcibios_align_resource, dev);
+ 
++check_fixed:
++	if (ret == 0 && fixed_range &&
++	    (res->start > fixed_range->start ||
++	     res->end < fixed_range->end)) {
++		dev_err(&bus->dev, "fixed area %pR for %s doesn't fit in the allocated %pR",
++			fixed_range, dev_name(&dev->dev), res);
++		release_resource(res);
++		return -1;
++	}
++
+ 	return ret;
+ }
+ 
+@@ -311,14 +352,51 @@ static int _pci_assign_resource(struct pci_dev *dev, int resno,
+ 	return ret;
+ }
+ 
++static int assign_fixed_resource_on_bus(struct pci_dev *dev, int resno)
++{
++	int i;
++	struct resource *parent_r;
++	unsigned long mask = IORESOURCE_TYPE_BITS;
++	struct resource *r = dev->resource + resno;
++
++	/*
++	 * If we have a shadow copy in RAM, the PCI device doesn't respond
++	 * to the shadow range
++	 */
++	if (r->flags & IORESOURCE_ROM_SHADOW)
++		return 0;
++
++	pci_bus_for_each_resource(dev->bus, parent_r, i) {
++		if (!parent_r)
++			continue;
++
++		if ((r->flags & mask) != (parent_r->flags & mask))
++			continue;
++
++		if (parent_r->flags & IORESOURCE_PREFETCH &&
++		    !(r->flags & IORESOURCE_PREFETCH))
++			continue;
++
++		if (resource_contains(parent_r, r)) {
++			if (!request_resource(parent_r, r)) {
++				pci_info(dev, "BAR %d: assigned fixed %pR\n", resno, r);
++				return 0;
++			}
++		}
++	}
++
++	pci_err(dev, "BAR %d: failed to assign fixed %pR\n", resno, r);
++	return -ENOSPC;
++}
++
+ int pci_assign_resource(struct pci_dev *dev, int resno)
+ {
+ 	struct resource *res = dev->resource + resno;
+ 	resource_size_t align, size;
+ 	int ret;
+ 
+-	if (res->flags & IORESOURCE_PCI_FIXED)
+-		return 0;
++	if (res->flags && pci_dev_bar_fixed(dev, res))
++		return assign_fixed_resource_on_bus(dev, resno);
+ 
+ 	res->flags |= IORESOURCE_UNSET;
+ 	align = pci_resource_alignment(dev, res);
+@@ -424,6 +502,9 @@ int pci_resize_resource(struct pci_dev *dev, int resno, int size)
+ 	if (host->preserve_config)
+ 		return -ENOTSUPP;
+ 
++	if (pci_dev_bar_fixed(dev, res))
++		return -EOPNOTSUPP;
++
+ 	/* Make sure the resource isn't assigned before resizing it. */
+ 	if (!(res->flags & IORESOURCE_UNSET))
+ 		return -EBUSY;
+@@ -450,7 +531,15 @@ int pci_resize_resource(struct pci_dev *dev, int resno, int size)
+ 	res->end = res->start + pci_rebar_size_to_bytes(size) - 1;
+ 
+ 	/* Check if the new config works by trying to assign everything. */
+-	if (dev->bus->self) {
++	if (pci_can_move_bars) {
++		pci_rescan_bus(dev->bus);
++
++		if (!res->flags || (res->flags & IORESOURCE_UNSET) || !res->parent) {
++			pci_err(dev, "BAR %d resize failed\n", resno);
++			ret = -1;
++			goto error_resize;
++		}
++	} else if (dev->bus->self) {
+ 		ret = pci_reassign_bridge_resources(dev->bus->self, res->flags);
+ 		if (ret)
+ 			goto error_resize;
+@@ -460,6 +549,8 @@ int pci_resize_resource(struct pci_dev *dev, int resno, int size)
+ error_resize:
+ 	pci_rebar_set_size(dev, resno, old);
+ 	res->end = res->start + pci_rebar_size_to_bytes(old) - 1;
++	if (pci_can_move_bars)
++		pci_rescan_bus(dev->bus);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(pci_resize_resource);
+@@ -484,6 +575,8 @@ int pci_enable_resources(struct pci_dev *dev, int mask)
+ 		if ((i == PCI_ROM_RESOURCE) &&
+ 				(!(r->flags & IORESOURCE_ROM_ENABLE)))
+ 			continue;
++		if (!pci_dev_bar_enabled(dev, i))
++			continue;
+ 
+ 		if (r->flags & IORESOURCE_UNSET) {
+ 			pci_err(dev, "can't enable device: BAR %d %pR not assigned\n",
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 060af91bafcd..c3f89c9ead6d 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -409,6 +409,7 @@ struct pci_dev {
+ 	 */
+ 	unsigned int	irq;
+ 	struct resource resource[DEVICE_COUNT_RESOURCE]; /* I/O and memory regions + expansion ROMs */
++	unsigned int	res_mask;		/* Bitmask of assigned resources */
+ 
+ 	bool		match_driver;		/* Skip attaching driver */
+ 
+@@ -464,6 +465,7 @@ struct pci_dev {
+ 	unsigned int	rom_bar_overlap:1;	/* ROM BAR disable broken */
+ 	pci_dev_flags_t dev_flags;
+ 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
++	struct mutex	enable_mutex;
+ 
+ 	u32		saved_config_space[16]; /* Config space saved at suspend time */
+ 	struct hlist_head saved_cap_space;
+@@ -647,6 +649,12 @@ struct pci_bus {
+ 	struct list_head resources;	/* Address space routed to this bus */
+ 	struct resource busn_res;	/* Bus numbers routed to this bus */
+ 
++	/*
++	 * If there are fixed resources in the bridge window, this range contains
++	 * the lowest start address and the highest end address of them.
++	 */
++	struct resource fixed_range[PCI_BRIDGE_RESOURCE_NUM];
++
+ 	struct pci_ops	*ops;		/* Configuration access functions */
+ 	void		*sysdata;	/* Hook for sys-specific extension */
+ 	struct proc_dir_entry *procdir;	/* Directory entry in /proc/bus/pci */
+@@ -889,6 +897,9 @@ struct module;
+  *              registers.
+  * @sriov_get_vf_total_msix: PF driver callback to get the total number of
+  *              MSI-X vectors available for distribution to the VFs.
++ * @bar_fixed:	Returns true if the driver doesn't allow to move this BAR.
++ * @rescan_prepare: Prepare to BAR movement - called before PCI rescan.
++ * @rescan_done: Remap BARs and restore after PCI rescan.
+  * @err_handler: See Documentation/PCI/pci-error-recovery.rst
+  * @groups:	Sysfs attribute groups.
+  * @dev_groups: Attributes attached to the device that will be
+@@ -915,6 +926,9 @@ struct pci_driver {
+ 	int  (*sriov_configure)(struct pci_dev *dev, int num_vfs); /* On PF */
+ 	int  (*sriov_set_msix_vec_count)(struct pci_dev *vf, int msix_vec_count); /* On PF */
+ 	u32  (*sriov_get_vf_total_msix)(struct pci_dev *pf);
++	bool (*bar_fixed)(struct pci_dev *dev, int resno);
++	void (*rescan_prepare)(struct pci_dev *dev);
++	void (*rescan_done)(struct pci_dev *dev);
+ 	const struct pci_error_handlers *err_handler;
+ 	const struct attribute_group **groups;
+ 	const struct attribute_group **dev_groups;
+@@ -1510,6 +1524,8 @@ void pci_setup_bridge(struct pci_bus *bus);
+ resource_size_t pcibios_window_alignment(struct pci_bus *bus,
+ 					 unsigned long type);
+ 
++extern bool pci_can_move_bars;
++
+ #define PCI_VGA_STATE_CHANGE_BRIDGE (1 << 0)
+ #define PCI_VGA_STATE_CHANGE_DECODES (1 << 1)
+ 
+diff --git a/kernel/resource.c b/kernel/resource.c
+index 4c5e80b92f2f..c4ce8d07e50d 100644
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@ -86,7 +86,7 @@ static void *r_next(struct seq_file *m, void *v, loff_t *pos)
+ 
+ #ifdef CONFIG_PROC_FS
+ 
+-enum { MAX_IORES_LEVEL = 5 };
++enum { MAX_IORES_LEVEL = 15 };
+ 
+ static void *r_start(struct seq_file *m, loff_t *pos)
+ 	__acquires(resource_lock)
+-- 
+2.38.0.rc2
+
