@@ -1,0 +1,179 @@
+From 4d0ec4eb9a00cfcf7ff657e9fc00d6bca2314fa1 Mon Sep 17 00:00:00 2001
+From: "Liam R. Howlett" <Liam.Howlett@Oracle.com>
+Date: Tue, 6 Sep 2022 19:48:48 +0000
+Subject: [PATCH 29/88] damon: convert __damon_va_three_regions to use the VMA
+ iterator
+
+This rather specialised walk can use the VMA iterator.  If this proves to
+be too slow, we can write a custom routine to find the two largest gaps,
+but it will be somewhat complicated, so let's see if we need it first.
+
+Update the kunit test case to use the maple tree.  This also fixes an
+issue with the kunit testcase not adding the last VMA to the list.
+
+Fixes: 17ccae8bb5c9 (mm/damon: add kunit tests)
+Signed-off-by: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Reviewed-by: SeongJae Park <sj@kernel.org>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: Alexandre Frade <kernel@xanmod.org>
+---
+ mm/damon/vaddr-test.h | 36 ++++++++++-------------------
+ mm/damon/vaddr.c      | 53 ++++++++++++++++++++++---------------------
+ 2 files changed, 39 insertions(+), 50 deletions(-)
+
+diff --git a/mm/damon/vaddr-test.h b/mm/damon/vaddr-test.h
+index d4f55f349..bce37c487 100644
+--- a/mm/damon/vaddr-test.h
++++ b/mm/damon/vaddr-test.h
+@@ -14,33 +14,19 @@
+ 
+ #include <kunit/test.h>
+ 
+-static void __link_vmas(struct vm_area_struct *vmas, ssize_t nr_vmas)
++static void __link_vmas(struct maple_tree *mt, struct vm_area_struct *vmas,
++			ssize_t nr_vmas)
+ {
+-	int i, j;
+-	unsigned long largest_gap, gap;
++	int i;
++	MA_STATE(mas, mt, 0, 0);
+ 
+ 	if (!nr_vmas)
+ 		return;
+ 
+-	for (i = 0; i < nr_vmas - 1; i++) {
+-		vmas[i].vm_next = &vmas[i + 1];
+-
+-		vmas[i].vm_rb.rb_left = NULL;
+-		vmas[i].vm_rb.rb_right = &vmas[i + 1].vm_rb;
+-
+-		largest_gap = 0;
+-		for (j = i; j < nr_vmas; j++) {
+-			if (j == 0)
+-				continue;
+-			gap = vmas[j].vm_start - vmas[j - 1].vm_end;
+-			if (gap > largest_gap)
+-				largest_gap = gap;
+-		}
+-		vmas[i].rb_subtree_gap = largest_gap;
+-	}
+-	vmas[i].vm_next = NULL;
+-	vmas[i].vm_rb.rb_right = NULL;
+-	vmas[i].rb_subtree_gap = 0;
++	mas_lock(&mas);
++	for (i = 0; i < nr_vmas; i++)
++		vma_mas_store(&vmas[i], &mas);
++	mas_unlock(&mas);
+ }
+ 
+ /*
+@@ -72,6 +58,7 @@ static void __link_vmas(struct vm_area_struct *vmas, ssize_t nr_vmas)
+  */
+ static void damon_test_three_regions_in_vmas(struct kunit *test)
+ {
++	static struct mm_struct mm;
+ 	struct damon_addr_range regions[3] = {0,};
+ 	/* 10-20-25, 200-210-220, 300-305, 307-330 */
+ 	struct vm_area_struct vmas[] = {
+@@ -83,9 +70,10 @@ static void damon_test_three_regions_in_vmas(struct kunit *test)
+ 		(struct vm_area_struct) {.vm_start = 307, .vm_end = 330},
+ 	};
+ 
+-	__link_vmas(vmas, 6);
++	mt_init_flags(&mm.mm_mt, MM_MT_FLAGS);
++	__link_vmas(&mm.mm_mt, vmas, ARRAY_SIZE(vmas));
+ 
+-	__damon_va_three_regions(&vmas[0], regions);
++	__damon_va_three_regions(&mm, regions);
+ 
+ 	KUNIT_EXPECT_EQ(test, 10ul, regions[0].start);
+ 	KUNIT_EXPECT_EQ(test, 25ul, regions[0].end);
+diff --git a/mm/damon/vaddr.c b/mm/damon/vaddr.c
+index 1d16c6c79..95769ba14 100644
+--- a/mm/damon/vaddr.c
++++ b/mm/damon/vaddr.c
+@@ -113,37 +113,38 @@ static unsigned long sz_range(struct damon_addr_range *r)
+  *
+  * Returns 0 if success, or negative error code otherwise.
+  */
+-static int __damon_va_three_regions(struct vm_area_struct *vma,
++static int __damon_va_three_regions(struct mm_struct *mm,
+ 				       struct damon_addr_range regions[3])
+ {
+-	struct damon_addr_range gap = {0}, first_gap = {0}, second_gap = {0};
+-	struct vm_area_struct *last_vma = NULL;
+-	unsigned long start = 0;
+-	struct rb_root rbroot;
+-
+-	/* Find two biggest gaps so that first_gap > second_gap > others */
+-	for (; vma; vma = vma->vm_next) {
+-		if (!last_vma) {
+-			start = vma->vm_start;
+-			goto next;
+-		}
++	struct damon_addr_range first_gap = {0}, second_gap = {0};
++	VMA_ITERATOR(vmi, mm, 0);
++	struct vm_area_struct *vma, *prev = NULL;
++	unsigned long start;
+ 
+-		if (vma->rb_subtree_gap <= sz_range(&second_gap)) {
+-			rbroot.rb_node = &vma->vm_rb;
+-			vma = rb_entry(rb_last(&rbroot),
+-					struct vm_area_struct, vm_rb);
++	/*
++	 * Find the two biggest gaps so that first_gap > second_gap > others.
++	 * If this is too slow, it can be optimised to examine the maple
++	 * tree gaps.
++	 */
++	for_each_vma(vmi, vma) {
++		unsigned long gap;
++
++		if (!prev) {
++			start = vma->vm_start;
+ 			goto next;
+ 		}
+-
+-		gap.start = last_vma->vm_end;
+-		gap.end = vma->vm_start;
+-		if (sz_range(&gap) > sz_range(&second_gap)) {
+-			swap(gap, second_gap);
+-			if (sz_range(&second_gap) > sz_range(&first_gap))
+-				swap(second_gap, first_gap);
++		gap = vma->vm_start - prev->vm_end;
++
++		if (gap > sz_range(&first_gap)) {
++			second_gap = first_gap;
++			first_gap.start = prev->vm_end;
++			first_gap.end = vma->vm_start;
++		} else if (gap > sz_range(&second_gap)) {
++			second_gap.start = prev->vm_end;
++			second_gap.end = vma->vm_start;
+ 		}
+ next:
+-		last_vma = vma;
++		prev = vma;
+ 	}
+ 
+ 	if (!sz_range(&second_gap) || !sz_range(&first_gap))
+@@ -159,7 +160,7 @@ static int __damon_va_three_regions(struct vm_area_struct *vma,
+ 	regions[1].start = ALIGN(first_gap.end, DAMON_MIN_REGION);
+ 	regions[1].end = ALIGN(second_gap.start, DAMON_MIN_REGION);
+ 	regions[2].start = ALIGN(second_gap.end, DAMON_MIN_REGION);
+-	regions[2].end = ALIGN(last_vma->vm_end, DAMON_MIN_REGION);
++	regions[2].end = ALIGN(prev->vm_end, DAMON_MIN_REGION);
+ 
+ 	return 0;
+ }
+@@ -180,7 +181,7 @@ static int damon_va_three_regions(struct damon_target *t,
+ 		return -EINVAL;
+ 
+ 	mmap_read_lock(mm);
+-	rc = __damon_va_three_regions(mm->mmap, regions);
++	rc = __damon_va_three_regions(mm, regions);
+ 	mmap_read_unlock(mm);
+ 
+ 	mmput(mm);
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
