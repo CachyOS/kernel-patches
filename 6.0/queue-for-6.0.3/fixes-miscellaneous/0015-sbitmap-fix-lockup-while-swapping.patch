@@ -1,0 +1,66 @@
+From 0881836c8bf65553f72f58b6e19e339191987479 Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Tue, 27 Sep 2022 21:07:46 -0700
+Subject: [PATCH 15/22] sbitmap: fix lockup while swapping
+
+Commit 4acb83417cad ("sbitmap: fix batched wait_cnt accounting")
+is a big improvement: without it, I had to revert to before commit
+040b83fcecfb ("sbitmap: fix possible io hung due to lost wakeup")
+to avoid the high system time and freezes which that had introduced.
+
+Now okay on the NVME laptop, but 4acb83417cad is a disaster for heavy
+swapping (kernel builds in low memory) on another: soon locking up in
+sbitmap_queue_wake_up() (into which __sbq_wake_up() is inlined), cycling
+around with waitqueue_active() but wait_cnt 0 .  Here is a backtrace,
+showing the common pattern of outer sbitmap_queue_wake_up() interrupted
+before setting wait_cnt 0 back to wake_batch (in some cases other CPUs
+are idle, in other cases they're spinning for a lock in dd_bio_merge()):
+
+sbitmap_queue_wake_up < sbitmap_queue_clear < blk_mq_put_tag <
+__blk_mq_free_request < blk_mq_free_request < __blk_mq_end_request <
+scsi_end_request < scsi_io_completion < scsi_finish_command <
+scsi_complete < blk_complete_reqs < blk_done_softirq < __do_softirq <
+__irq_exit_rcu < irq_exit_rcu < common_interrupt < asm_common_interrupt <
+_raw_spin_unlock_irqrestore < __wake_up_common_lock < __wake_up <
+sbitmap_queue_wake_up < sbitmap_queue_clear < blk_mq_put_tag <
+__blk_mq_free_request < blk_mq_free_request < dd_bio_merge <
+blk_mq_sched_bio_merge < blk_mq_attempt_bio_merge < blk_mq_submit_bio <
+__submit_bio < submit_bio_noacct_nocheck < submit_bio_noacct <
+submit_bio < __swap_writepage < swap_writepage < pageout <
+shrink_folio_list < evict_folios < lru_gen_shrink_lruvec <
+shrink_lruvec < shrink_node < do_try_to_free_pages < try_to_free_pages <
+__alloc_pages_slowpath < __alloc_pages < folio_alloc < vma_alloc_folio <
+do_anonymous_page < __handle_mm_fault < handle_mm_fault <
+do_user_addr_fault < exc_page_fault < asm_exc_page_fault
+
+See how the process-context sbitmap_queue_wake_up() has been interrupted,
+after bringing wait_cnt down to 0 (and in this example, after doing its
+wakeups), before advancing wake_index and refilling wake_cnt: an
+interrupt-context sbitmap_queue_wake_up() of the same sbq gets stuck.
+
+I have almost no grasp of all the possible sbitmap races, and their
+consequences: but __sbq_wake_up() can do nothing useful while wait_cnt 0,
+so it is better if sbq_wake_ptr() skips on to the next ws in that case:
+which fixes the lockup and shows no adverse consequence for me.
+
+Signed-off-by: Hugh Dickins <hughd@google.com>
+---
+ lib/sbitmap.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/sbitmap.c b/lib/sbitmap.c
+index 624fa7f11..a8108a962 100644
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@ -587,7 +587,7 @@ static struct sbq_wait_state *sbq_wake_ptr(struct sbitmap_queue *sbq)
+ 	for (i = 0; i < SBQ_WAIT_QUEUES; i++) {
+ 		struct sbq_wait_state *ws = &sbq->ws[wake_index];
+ 
+-		if (waitqueue_active(&ws->wait)) {
++		if (waitqueue_active(&ws->wait) && atomic_read(&ws->wait_cnt)) {
+ 			if (wake_index != atomic_read(&sbq->wake_index))
+ 				atomic_set(&sbq->wake_index, wake_index);
+ 			return ws;
+-- 
+2.38.0.rc1.6.g4fd6c5e444
+
