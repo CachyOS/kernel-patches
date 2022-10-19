@@ -1,0 +1,924 @@
+From 20d1499c01700ded8776fbe53845b549d8a2eecb Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 17 Oct 2022 22:43:44 +0200
+Subject: [PATCH 9/9] convert hugetlb_cgroup helper functions to folios - begin
+ converting hugetlb code to folios
+
+https://lore.kernel.org/lkml/20220922154207.1575343-1-sidhartha.kumar@oracle.com/#t
+
+https://lore.kernel.org/lkml/20221014031303.231740-1-sidhartha.kumar@oracle.com/T/#t
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ fs/hugetlbfs/inode.c           |  22 +++----
+ include/linux/hugetlb.h        |  59 +++++++++++++++--
+ include/linux/hugetlb_cgroup.h |  85 ++++++++++++------------
+ include/linux/mm_types.h       |  14 ++++
+ include/linux/pagemap.h        |   1 -
+ mm/folio-compat.c              |   5 --
+ mm/hugetlb.c                   | 115 ++++++++++++++++++---------------
+ mm/hugetlb_cgroup.c            |  63 +++++++++---------
+ mm/migrate.c                   |   4 +-
+ 9 files changed, 219 insertions(+), 149 deletions(-)
+
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index dd54f67e47fd..fef5165b73a5 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -364,11 +364,11 @@ static int hugetlbfs_write_end(struct file *file, struct address_space *mapping,
+ 	return -EINVAL;
+ }
+ 
+-static void hugetlb_delete_from_page_cache(struct page *page)
++static void hugetlb_delete_from_page_cache(struct folio *folio)
+ {
+-	ClearPageDirty(page);
+-	ClearPageUptodate(page);
+-	delete_from_page_cache(page);
++	folio_clear_dirty(folio);
++	folio_clear_uptodate(folio);
++	filemap_remove_folio(folio);
+ }
+ 
+ /*
+@@ -574,8 +574,8 @@ static bool remove_inode_single_folio(struct hstate *h, struct inode *inode,
+ 	 * map could fail.  Correspondingly, the subpool and global
+ 	 * reserve usage count can need to be adjusted.
+ 	 */
+-	VM_BUG_ON(HPageRestoreReserve(&folio->page));
+-	hugetlb_delete_from_page_cache(&folio->page);
++	VM_BUG_ON_FOLIO(folio_test_hugetlb_restore_reserve(folio), folio);
++	hugetlb_delete_from_page_cache(folio);
+ 	ret = true;
+ 	if (!truncate_op) {
+ 		if (unlikely(hugetlb_unreserve_pages(inode, index,
+@@ -1091,10 +1091,10 @@ static int hugetlbfs_migrate_folio(struct address_space *mapping,
+ 	if (rc != MIGRATEPAGE_SUCCESS)
+ 		return rc;
+ 
+-	if (hugetlb_page_subpool(&src->page)) {
+-		hugetlb_set_page_subpool(&dst->page,
+-					hugetlb_page_subpool(&src->page));
+-		hugetlb_set_page_subpool(&src->page, NULL);
++	if (hugetlb_folio_subpool(src)) {
++		hugetlb_set_folio_subpool(dst,
++					hugetlb_folio_subpool(src));
++		hugetlb_set_folio_subpool(src, NULL);
+ 	}
+ 
+ 	if (mode != MIGRATE_SYNC_NO_COPY)
+@@ -1114,7 +1114,7 @@ static int hugetlbfs_error_remove_page(struct address_space *mapping,
+ 	struct inode *inode = mapping->host;
+ 	pgoff_t index = page->index;
+ 
+-	hugetlb_delete_from_page_cache(page);
++	hugetlb_delete_from_page_cache(page_folio(page));
+ 	if (unlikely(hugetlb_unreserve_pages(inode, index, index + 1, 1)))
+ 		hugetlb_fix_reserve_counts(inode);
+ 
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 8b4f93e84868..72b2a47fb60b 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -184,7 +184,7 @@ int isolate_hugetlb(struct page *page, struct list_head *list);
+ int get_hwpoison_huge_page(struct page *page, bool *hugetlb);
+ int get_huge_page_for_hwpoison(unsigned long pfn, int flags);
+ void putback_active_hugepage(struct page *page);
+-void move_hugetlb_state(struct page *oldpage, struct page *newpage, int reason);
++void move_hugetlb_state(struct folio *old_folio, struct folio *new_folio, int reason);
+ void free_huge_page(struct page *page);
+ void hugetlb_fix_reserve_counts(struct inode *inode);
+ extern struct mutex *hugetlb_fault_mutex_table;
+@@ -439,8 +439,8 @@ static inline void putback_active_hugepage(struct page *page)
+ {
+ }
+ 
+-static inline void move_hugetlb_state(struct page *oldpage,
+-					struct page *newpage, int reason)
++static inline void move_hugetlb_state(struct folio *old_folio,
++					struct folio *new_folio, int reason)
+ {
+ }
+ 
+@@ -623,26 +623,50 @@ enum hugetlb_page_flags {
+  */
+ #ifdef CONFIG_HUGETLB_PAGE
+ #define TESTHPAGEFLAG(uname, flname)				\
++static __always_inline						\
++bool folio_test_hugetlb_##flname(struct folio *folio)		\
++	{	void *private = &folio->private;		\
++		return test_bit(HPG_##flname, private);		\
++	}							\
+ static inline int HPage##uname(struct page *page)		\
+ 	{ return test_bit(HPG_##flname, &(page->private)); }
+ 
+ #define SETHPAGEFLAG(uname, flname)				\
++static __always_inline						\
++void folio_set_hugetlb_##flname(struct folio *folio)		\
++	{	void *private = &folio->private;		\
++		set_bit(HPG_##flname, private);			\
++	}							\
+ static inline void SetHPage##uname(struct page *page)		\
+ 	{ set_bit(HPG_##flname, &(page->private)); }
+ 
+ #define CLEARHPAGEFLAG(uname, flname)				\
++static __always_inline						\
++void folio_clear_hugetlb_##flname(struct folio *folio)		\
++	{	void *private = &folio->private;		\
++		clear_bit(HPG_##flname, private);		\
++	}							\
+ static inline void ClearHPage##uname(struct page *page)		\
+ 	{ clear_bit(HPG_##flname, &(page->private)); }
+ #else
+ #define TESTHPAGEFLAG(uname, flname)				\
++static inline bool						\
++folio_test_hugetlb_##flname(struct folio *folio)		\
++	{ return 0; }						\
+ static inline int HPage##uname(struct page *page)		\
+ 	{ return 0; }
+ 
+ #define SETHPAGEFLAG(uname, flname)				\
++static inline void						\
++folio_set_hugetlb_##flname(struct folio *folio) 		\
++	{ }							\
+ static inline void SetHPage##uname(struct page *page)		\
+ 	{ }
+ 
+ #define CLEARHPAGEFLAG(uname, flname)				\
++static inline void						\
++folio_clear_hugetlb_##flname(struct folio *folio)		\
++	{ }							\
+ static inline void ClearHPage##uname(struct page *page)		\
+ 	{ }
+ #endif
+@@ -728,18 +752,29 @@ extern unsigned int default_hstate_idx;
+ 
+ #define default_hstate (hstates[default_hstate_idx])
+ 
++static inline struct hugepage_subpool *hugetlb_folio_subpool(struct folio *folio)
++{
++	return (void *)folio_get_private_1(folio);
++}
++
+ /*
+  * hugetlb page subpool pointer located in hpage[1].private
+  */
+ static inline struct hugepage_subpool *hugetlb_page_subpool(struct page *hpage)
+ {
+-	return (void *)page_private(hpage + SUBPAGE_INDEX_SUBPOOL);
++	return hugetlb_folio_subpool(page_folio(hpage));
++}
++
++static inline void hugetlb_set_folio_subpool(struct folio *folio,
++					struct hugepage_subpool *subpool)
++{
++	folio_set_private_1(folio, (unsigned long)subpool);
+ }
+ 
+ static inline void hugetlb_set_page_subpool(struct page *hpage,
+ 					struct hugepage_subpool *subpool)
+ {
+-	set_page_private(hpage + SUBPAGE_INDEX_SUBPOOL, (unsigned long)subpool);
++	hugetlb_set_folio_subpool(page_folio(hpage), subpool);
+ }
+ 
+ static inline struct hstate *hstate_file(struct file *f)
+@@ -823,10 +858,15 @@ static inline pte_t arch_make_huge_pte(pte_t entry, unsigned int shift,
+ }
+ #endif
+ 
++static inline struct hstate *folio_hstate(struct folio *folio)
++{
++	VM_BUG_ON_FOLIO(!folio_test_hugetlb(folio), folio);
++	return size_to_hstate(folio_size(folio));
++}
++
+ static inline struct hstate *page_hstate(struct page *page)
+ {
+-	VM_BUG_ON_PAGE(!PageHuge(page), page);
+-	return size_to_hstate(page_size(page));
++	return folio_hstate(page_folio(page));
+ }
+ 
+ static inline unsigned hstate_index_to_shift(unsigned index)
+@@ -1035,6 +1075,11 @@ static inline struct hstate *hstate_vma(struct vm_area_struct *vma)
+ 	return NULL;
+ }
+ 
++static inline struct hstate *folio_hstate(struct folio *folio)
++{
++	return NULL;
++}
++
+ static inline struct hstate *page_hstate(struct page *page)
+ {
+ 	return NULL;
+diff --git a/include/linux/hugetlb_cgroup.h b/include/linux/hugetlb_cgroup.h
+index 630cd255d0cf..c70f92fe493e 100644
+--- a/include/linux/hugetlb_cgroup.h
++++ b/include/linux/hugetlb_cgroup.h
+@@ -67,54 +67,61 @@ struct hugetlb_cgroup {
+ };
+ 
+ static inline struct hugetlb_cgroup *
+-__hugetlb_cgroup_from_page(struct page *page, bool rsvd)
++__hugetlb_cgroup_from_folio(struct folio *folio, bool rsvd)
+ {
+-	VM_BUG_ON_PAGE(!PageHuge(page), page);
++	struct page *tail;
+ 
+-	if (compound_order(page) < HUGETLB_CGROUP_MIN_ORDER)
++	VM_BUG_ON_FOLIO(!folio_test_hugetlb(folio), folio);
++	if (folio_order(folio) < HUGETLB_CGROUP_MIN_ORDER)
+ 		return NULL;
+-	if (rsvd)
+-		return (void *)page_private(page + SUBPAGE_INDEX_CGROUP_RSVD);
+-	else
+-		return (void *)page_private(page + SUBPAGE_INDEX_CGROUP);
++
++	if (rsvd) {
++		tail = folio_page(folio, SUBPAGE_INDEX_CGROUP_RSVD);
++		return (void *)page_private(tail);
++	}
++
++	else {
++		tail = folio_page(folio, SUBPAGE_INDEX_CGROUP);
++		return (void *)page_private(tail);
++	}
+ }
+ 
+-static inline struct hugetlb_cgroup *hugetlb_cgroup_from_page(struct page *page)
++static inline struct hugetlb_cgroup *hugetlb_cgroup_from_folio(struct folio *folio)
+ {
+-	return __hugetlb_cgroup_from_page(page, false);
++	return __hugetlb_cgroup_from_folio(folio, false);
+ }
+ 
+ static inline struct hugetlb_cgroup *
+-hugetlb_cgroup_from_page_rsvd(struct page *page)
++hugetlb_cgroup_from_folio_rsvd(struct folio *folio)
+ {
+-	return __hugetlb_cgroup_from_page(page, true);
++	return __hugetlb_cgroup_from_folio(folio, true);
+ }
+ 
+-static inline void __set_hugetlb_cgroup(struct page *page,
++static inline void __set_hugetlb_cgroup(struct folio *folio,
+ 				       struct hugetlb_cgroup *h_cg, bool rsvd)
+ {
+-	VM_BUG_ON_PAGE(!PageHuge(page), page);
++	VM_BUG_ON_FOLIO(!folio_test_hugetlb(folio), folio);
+ 
+-	if (compound_order(page) < HUGETLB_CGROUP_MIN_ORDER)
++	if (folio_order(folio) < HUGETLB_CGROUP_MIN_ORDER)
+ 		return;
+ 	if (rsvd)
+-		set_page_private(page + SUBPAGE_INDEX_CGROUP_RSVD,
++		set_page_private(folio_page(folio, SUBPAGE_INDEX_CGROUP_RSVD),
+ 				 (unsigned long)h_cg);
+ 	else
+-		set_page_private(page + SUBPAGE_INDEX_CGROUP,
++		set_page_private(folio_page(folio, SUBPAGE_INDEX_CGROUP),
+ 				 (unsigned long)h_cg);
+ }
+ 
+-static inline void set_hugetlb_cgroup(struct page *page,
++static inline void set_hugetlb_cgroup(struct folio *folio,
+ 				     struct hugetlb_cgroup *h_cg)
+ {
+-	__set_hugetlb_cgroup(page, h_cg, false);
++	__set_hugetlb_cgroup(folio, h_cg, false);
+ }
+ 
+-static inline void set_hugetlb_cgroup_rsvd(struct page *page,
++static inline void set_hugetlb_cgroup_rsvd(struct folio *folio,
+ 					  struct hugetlb_cgroup *h_cg)
+ {
+-	__set_hugetlb_cgroup(page, h_cg, true);
++	__set_hugetlb_cgroup(folio, h_cg, true);
+ }
+ 
+ static inline bool hugetlb_cgroup_disabled(void)
+@@ -151,10 +158,10 @@ extern void hugetlb_cgroup_commit_charge(int idx, unsigned long nr_pages,
+ extern void hugetlb_cgroup_commit_charge_rsvd(int idx, unsigned long nr_pages,
+ 					      struct hugetlb_cgroup *h_cg,
+ 					      struct page *page);
+-extern void hugetlb_cgroup_uncharge_page(int idx, unsigned long nr_pages,
+-					 struct page *page);
+-extern void hugetlb_cgroup_uncharge_page_rsvd(int idx, unsigned long nr_pages,
+-					      struct page *page);
++extern void hugetlb_cgroup_uncharge_folio(int idx, unsigned long nr_pages,
++					 struct folio *folio);
++extern void hugetlb_cgroup_uncharge_folio_rsvd(int idx, unsigned long nr_pages,
++					      struct folio *folio);
+ 
+ extern void hugetlb_cgroup_uncharge_cgroup(int idx, unsigned long nr_pages,
+ 					   struct hugetlb_cgroup *h_cg);
+@@ -170,8 +177,8 @@ extern void hugetlb_cgroup_uncharge_file_region(struct resv_map *resv,
+ 						bool region_del);
+ 
+ extern void hugetlb_cgroup_file_init(void) __init;
+-extern void hugetlb_cgroup_migrate(struct page *oldhpage,
+-				   struct page *newhpage);
++extern void hugetlb_cgroup_migrate(struct folio *old_folio,
++				   struct folio *new_folio);
+ 
+ #else
+ static inline void hugetlb_cgroup_uncharge_file_region(struct resv_map *resv,
+@@ -181,29 +188,23 @@ static inline void hugetlb_cgroup_uncharge_file_region(struct resv_map *resv,
+ {
+ }
+ 
+-static inline struct hugetlb_cgroup *hugetlb_cgroup_from_page(struct page *page)
++static inline struct hugetlb_cgroup *hugetlb_cgroup_from_folio(struct folio *folio)
+ {
+ 	return NULL;
+ }
+ 
+ static inline struct hugetlb_cgroup *
+-hugetlb_cgroup_from_page_resv(struct page *page)
++hugetlb_cgroup_from_folio_rsvd(struct folio *folio)
+ {
+ 	return NULL;
+ }
+ 
+-static inline struct hugetlb_cgroup *
+-hugetlb_cgroup_from_page_rsvd(struct page *page)
+-{
+-	return NULL;
+-}
+-
+-static inline void set_hugetlb_cgroup(struct page *page,
++static inline void set_hugetlb_cgroup(struct folio *folio,
+ 				     struct hugetlb_cgroup *h_cg)
+ {
+ }
+ 
+-static inline void set_hugetlb_cgroup_rsvd(struct page *page,
++static inline void set_hugetlb_cgroup_rsvd(struct folio *folio,
+ 					  struct hugetlb_cgroup *h_cg)
+ {
+ }
+@@ -253,14 +254,14 @@ hugetlb_cgroup_commit_charge_rsvd(int idx, unsigned long nr_pages,
+ {
+ }
+ 
+-static inline void hugetlb_cgroup_uncharge_page(int idx, unsigned long nr_pages,
+-						struct page *page)
++static inline void hugetlb_cgroup_uncharge_folio(int idx, unsigned long nr_pages,
++						struct folio *folio)
+ {
+ }
+ 
+-static inline void hugetlb_cgroup_uncharge_page_rsvd(int idx,
++static inline void hugetlb_cgroup_uncharge_folio_rsvd(int idx,
+ 						     unsigned long nr_pages,
+-						     struct page *page)
++						     struct folio *folio)
+ {
+ }
+ static inline void hugetlb_cgroup_uncharge_cgroup(int idx,
+@@ -285,8 +286,8 @@ static inline void hugetlb_cgroup_file_init(void)
+ {
+ }
+ 
+-static inline void hugetlb_cgroup_migrate(struct page *oldhpage,
+-					  struct page *newhpage)
++static inline void hugetlb_cgroup_migrate(struct folio *old_folio,
++					  struct folio *new_folio)
+ {
+ }
+ 
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 500e536796ca..2d5b1575ffe0 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -144,6 +144,7 @@ struct page {
+ 			atomic_t compound_pincount;
+ #ifdef CONFIG_64BIT
+ 			unsigned int compound_nr; /* 1 << compound_order */
++			unsigned long _private_1;
+ #endif
+ 		};
+ 		struct {	/* Second tail page of compound page */
+@@ -264,6 +265,7 @@ struct page {
+  * @_total_mapcount: Do not use directly, call folio_entire_mapcount().
+  * @_pincount: Do not use directly, call folio_maybe_dma_pinned().
+  * @_folio_nr_pages: Do not use directly, call folio_nr_pages().
++ * @_private_1: Do not use directly, call folio_get_private_1().
+  *
+  * A folio is a physically, virtually and logically contiguous set
+  * of bytes.  It is a power-of-two in size, and it is aligned to that
+@@ -311,6 +313,7 @@ struct folio {
+ #ifdef CONFIG_64BIT
+ 	unsigned int _folio_nr_pages;
+ #endif
++	unsigned long _private_1;
+ };
+ 
+ #define FOLIO_MATCH(pg, fl)						\
+@@ -338,6 +341,7 @@ FOLIO_MATCH(compound_mapcount, _total_mapcount);
+ FOLIO_MATCH(compound_pincount, _pincount);
+ #ifdef CONFIG_64BIT
+ FOLIO_MATCH(compound_nr, _folio_nr_pages);
++FOLIO_MATCH(_private_1, _private_1);
+ #endif
+ #undef FOLIO_MATCH
+ 
+@@ -383,6 +387,16 @@ static inline void *folio_get_private(struct folio *folio)
+ 	return folio->private;
+ }
+ 
++static inline void folio_set_private_1(struct folio *folio, unsigned long private)
++{
++	folio->_private_1 = private;
++}
++
++static inline unsigned long folio_get_private_1(struct folio *folio)
++{
++	return folio->_private_1;
++}
++
+ struct page_frag_cache {
+ 	void * va;
+ #if (PAGE_SIZE < PAGE_FRAG_CACHE_MAX_SIZE)
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 1da0a4fa7eb2..a1b7b3e93b28 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -1114,7 +1114,6 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
+ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
+ 		pgoff_t index, gfp_t gfp);
+ void filemap_remove_folio(struct folio *folio);
+-void delete_from_page_cache(struct page *page);
+ void __filemap_remove_folio(struct folio *folio, void *shadow);
+ void replace_page_cache_page(struct page *old, struct page *new);
+ void delete_from_page_cache_batch(struct address_space *mapping,
+diff --git a/mm/folio-compat.c b/mm/folio-compat.c
+index e1e23b4947d7..8ae39c06da62 100644
+--- a/mm/folio-compat.c
++++ b/mm/folio-compat.c
+@@ -124,11 +124,6 @@ struct page *grab_cache_page_write_begin(struct address_space *mapping,
+ }
+ EXPORT_SYMBOL(grab_cache_page_write_begin);
+ 
+-void delete_from_page_cache(struct page *page)
+-{
+-	return filemap_remove_folio(page_folio(page));
+-}
+-
+ int try_to_release_page(struct page *page, gfp_t gfp)
+ {
+ 	return filemap_release_folio(page_folio(page), gfp);
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index b586cdd75930..f97fe4951591 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1438,9 +1438,10 @@ static void __remove_hugetlb_page(struct hstate *h, struct page *page,
+ 							bool demote)
+ {
+ 	int nid = page_to_nid(page);
++	struct folio *folio = page_folio(page);
+ 
+-	VM_BUG_ON_PAGE(hugetlb_cgroup_from_page(page), page);
+-	VM_BUG_ON_PAGE(hugetlb_cgroup_from_page_rsvd(page), page);
++	VM_BUG_ON_FOLIO(hugetlb_cgroup_from_folio(folio), folio);
++	VM_BUG_ON_FOLIO(hugetlb_cgroup_from_folio_rsvd(folio), folio);
+ 
+ 	lockdep_assert_held(&hugetlb_lock);
+ 	if (hstate_is_gigantic(h) && !gigantic_page_runtime_supported())
+@@ -1695,21 +1696,22 @@ void free_huge_page(struct page *page)
+ 	 * Can't pass hstate in here because it is called from the
+ 	 * compound page destructor.
+ 	 */
+-	struct hstate *h = page_hstate(page);
+-	int nid = page_to_nid(page);
+-	struct hugepage_subpool *spool = hugetlb_page_subpool(page);
++	struct folio *folio = page_folio(page);
++	struct hstate *h = folio_hstate(folio);
++	int nid = folio_nid(folio);
++	struct hugepage_subpool *spool = hugetlb_folio_subpool(folio);
+ 	bool restore_reserve;
+ 	unsigned long flags;
+ 
+-	VM_BUG_ON_PAGE(page_count(page), page);
+-	VM_BUG_ON_PAGE(page_mapcount(page), page);
++	VM_BUG_ON_FOLIO(folio_ref_count(folio), folio);
++	VM_BUG_ON_PAGE(folio_mapcount(folio), folio);
+ 
+-	hugetlb_set_page_subpool(page, NULL);
+-	if (PageAnon(page))
+-		__ClearPageAnonExclusive(page);
+-	page->mapping = NULL;
+-	restore_reserve = HPageRestoreReserve(page);
+-	ClearHPageRestoreReserve(page);
++	hugetlb_set_folio_subpool(folio, NULL);
++	if (folio_test_anon(folio))
++		__ClearPageAnonExclusive(&folio->page);
++	folio->mapping = NULL;
++	restore_reserve = folio_test_hugetlb_restore_reserve(folio);
++	folio_clear_hugetlb_restore_reserve(folio);
+ 
+ 	/*
+ 	 * If HPageRestoreReserve was set on page, page allocation consumed a
+@@ -1731,15 +1733,15 @@ void free_huge_page(struct page *page)
+ 	}
+ 
+ 	spin_lock_irqsave(&hugetlb_lock, flags);
+-	ClearHPageMigratable(page);
+-	hugetlb_cgroup_uncharge_page(hstate_index(h),
+-				     pages_per_huge_page(h), page);
+-	hugetlb_cgroup_uncharge_page_rsvd(hstate_index(h),
+-					  pages_per_huge_page(h), page);
++	folio_clear_hugetlb_migratable(folio);
++	hugetlb_cgroup_uncharge_folio(hstate_index(h),
++				     pages_per_huge_page(h), folio);
++	hugetlb_cgroup_uncharge_folio_rsvd(hstate_index(h),
++					  pages_per_huge_page(h), folio);
+ 	if (restore_reserve)
+ 		h->resv_huge_pages++;
+ 
+-	if (HPageTemporary(page)) {
++	if (folio_test_hugetlb_temporary(folio)) {
+ 		remove_hugetlb_page(h, page, false);
+ 		spin_unlock_irqrestore(&hugetlb_lock, flags);
+ 		update_and_free_page(h, page, true);
+@@ -1765,19 +1767,21 @@ static void __prep_account_new_huge_page(struct hstate *h, int nid)
+ 	h->nr_huge_pages_node[nid]++;
+ }
+ 
+-static void __prep_new_huge_page(struct hstate *h, struct page *page)
++static void __prep_new_hugetlb_folio(struct hstate *h, struct folio *folio)
+ {
+-	hugetlb_vmemmap_optimize(h, page);
+-	INIT_LIST_HEAD(&page->lru);
+-	set_compound_page_dtor(page, HUGETLB_PAGE_DTOR);
+-	hugetlb_set_page_subpool(page, NULL);
+-	set_hugetlb_cgroup(page, NULL);
+-	set_hugetlb_cgroup_rsvd(page, NULL);
++	hugetlb_vmemmap_optimize(h, &folio->page);
++	INIT_LIST_HEAD(&folio->lru);
++	folio->_folio_dtor = HUGETLB_PAGE_DTOR;
++	hugetlb_set_folio_subpool(folio, NULL);
++	set_hugetlb_cgroup(folio, NULL);
++	set_hugetlb_cgroup_rsvd(folio, NULL);
+ }
+ 
+ static void prep_new_huge_page(struct hstate *h, struct page *page, int nid)
+ {
+-	__prep_new_huge_page(h, page);
++	struct folio *folio = page_folio(page);
++
++	__prep_new_hugetlb_folio(h, folio);
+ 	spin_lock_irq(&hugetlb_lock);
+ 	__prep_account_new_huge_page(h, nid);
+ 	spin_unlock_irq(&hugetlb_lock);
+@@ -2737,8 +2741,10 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ 					struct list_head *list)
+ {
+ 	gfp_t gfp_mask = htlb_alloc_mask(h) | __GFP_THISNODE;
+-	int nid = page_to_nid(old_page);
++	struct folio *old_folio = page_folio(old_page);
++	int nid = folio_nid(old_folio);
+ 	struct page *new_page;
++	struct folio *new_folio;
+ 	int ret = 0;
+ 
+ 	/*
+@@ -2751,16 +2757,17 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ 	new_page = alloc_buddy_huge_page(h, gfp_mask, nid, NULL, NULL);
+ 	if (!new_page)
+ 		return -ENOMEM;
+-	__prep_new_huge_page(h, new_page);
++	new_folio = page_folio(new_page);
++	__prep_new_hugetlb_folio(h, new_folio);
+ 
+ retry:
+ 	spin_lock_irq(&hugetlb_lock);
+-	if (!PageHuge(old_page)) {
++	if (!folio_test_hugetlb(old_folio)) {
+ 		/*
+ 		 * Freed from under us. Drop new_page too.
+ 		 */
+ 		goto free_new;
+-	} else if (page_count(old_page)) {
++	} else if (folio_ref_count(old_folio)) {
+ 		/*
+ 		 * Someone has grabbed the page, try to isolate it here.
+ 		 * Fail with -EBUSY if not possible.
+@@ -2769,7 +2776,7 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ 		ret = isolate_hugetlb(old_page, list);
+ 		spin_lock_irq(&hugetlb_lock);
+ 		goto free_new;
+-	} else if (!HPageFreed(old_page)) {
++	} else if (!folio_test_hugetlb(old_folio)) {
+ 		/*
+ 		 * Page's refcount is 0 but it has not been enqueued in the
+ 		 * freelist yet. Race window is small, so we can succeed here if
+@@ -2807,7 +2814,7 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ free_new:
+ 	spin_unlock_irq(&hugetlb_lock);
+ 	/* Page has a zero ref count, but needs a ref to be freed */
+-	set_page_refcounted(new_page);
++	folio_ref_unfreeze(new_folio, 1);
+ 	update_and_free_page(h, new_page, false);
+ 
+ 	return ret;
+@@ -2816,7 +2823,7 @@ static int alloc_and_dissolve_huge_page(struct hstate *h, struct page *old_page,
+ int isolate_or_dissolve_huge_page(struct page *page, struct list_head *list)
+ {
+ 	struct hstate *h;
+-	struct page *head;
++	struct folio *folio = page_folio(page);
+ 	int ret = -EBUSY;
+ 
+ 	/*
+@@ -2825,9 +2832,8 @@ int isolate_or_dissolve_huge_page(struct page *page, struct list_head *list)
+ 	 * Return success when racing as if we dissolved the page ourselves.
+ 	 */
+ 	spin_lock_irq(&hugetlb_lock);
+-	if (PageHuge(page)) {
+-		head = compound_head(page);
+-		h = page_hstate(head);
++	if (folio_test_hugetlb(folio)) {
++		h = folio_hstate(folio);
+ 	} else {
+ 		spin_unlock_irq(&hugetlb_lock);
+ 		return 0;
+@@ -2842,10 +2848,10 @@ int isolate_or_dissolve_huge_page(struct page *page, struct list_head *list)
+ 	if (hstate_is_gigantic(h))
+ 		return -ENOMEM;
+ 
+-	if (page_count(head) && !isolate_hugetlb(head, list))
++	if (folio_ref_count(folio) && !isolate_hugetlb(&folio->page, list))
+ 		ret = 0;
+-	else if (!page_count(head))
+-		ret = alloc_and_dissolve_huge_page(h, head, list);
++	else if (!folio_ref_count(folio))
++		ret = alloc_and_dissolve_huge_page(h, &folio->page, list);
+ 
+ 	return ret;
+ }
+@@ -2856,6 +2862,7 @@ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 	struct hugepage_subpool *spool = subpool_vma(vma);
+ 	struct hstate *h = hstate_vma(vma);
+ 	struct page *page;
++	struct folio *folio;
+ 	long map_chg, map_commit;
+ 	long gbl_chg;
+ 	int ret, idx;
+@@ -2919,6 +2926,7 @@ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 	 * a reservation exists for the allocation.
+ 	 */
+ 	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, gbl_chg);
++
+ 	if (!page) {
+ 		spin_unlock_irq(&hugetlb_lock);
+ 		page = alloc_buddy_huge_page_with_mpol(h, vma, addr);
+@@ -2933,6 +2941,7 @@ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 		set_page_refcounted(page);
+ 		/* Fall through */
+ 	}
++	folio = page_folio(page);
+ 	hugetlb_cgroup_commit_charge(idx, pages_per_huge_page(h), h_cg, page);
+ 	/* If allocation is not consuming a reservation, also store the
+ 	 * hugetlb_cgroup pointer on the page.
+@@ -2962,8 +2971,8 @@ struct page *alloc_huge_page(struct vm_area_struct *vma,
+ 		rsv_adjust = hugepage_subpool_put_pages(spool, 1);
+ 		hugetlb_acct_memory(h, -rsv_adjust);
+ 		if (deferred_reserve)
+-			hugetlb_cgroup_uncharge_page_rsvd(hstate_index(h),
+-					pages_per_huge_page(h), page);
++			hugetlb_cgroup_uncharge_folio_rsvd(hstate_index(h),
++					pages_per_huge_page(h), folio);
+ 	}
+ 	return page;
+ 
+@@ -7354,15 +7363,15 @@ void putback_active_hugepage(struct page *page)
+ 	put_page(page);
+ }
+ 
+-void move_hugetlb_state(struct page *oldpage, struct page *newpage, int reason)
++void move_hugetlb_state(struct folio *old_folio, struct folio *new_folio, int reason)
+ {
+-	struct hstate *h = page_hstate(oldpage);
++	struct hstate *h = folio_hstate(old_folio);
+ 
+-	hugetlb_cgroup_migrate(oldpage, newpage);
+-	set_page_owner_migrate_reason(newpage, reason);
++	hugetlb_cgroup_migrate(old_folio, new_folio);
++	set_page_owner_migrate_reason(&new_folio->page, reason);
+ 
+ 	/*
+-	 * transfer temporary state of the new huge page. This is
++	 * transfer temporary state of the new hugetlb folio. This is
+ 	 * reverse to other transitions because the newpage is going to
+ 	 * be final while the old one will be freed so it takes over
+ 	 * the temporary status.
+@@ -7371,12 +7380,14 @@ void move_hugetlb_state(struct page *oldpage, struct page *newpage, int reason)
+ 	 * here as well otherwise the global surplus count will not match
+ 	 * the per-node's.
+ 	 */
+-	if (HPageTemporary(newpage)) {
+-		int old_nid = page_to_nid(oldpage);
+-		int new_nid = page_to_nid(newpage);
++	if (folio_test_hugetlb_temporary(new_folio)) {
++		int old_nid = folio_nid(old_folio);
++		int new_nid = folio_nid(new_folio);
++
++
++		folio_set_hugetlb_temporary(old_folio);
++		folio_clear_hugetlb_temporary(new_folio);
+ 
+-		SetHPageTemporary(oldpage);
+-		ClearHPageTemporary(newpage);
+ 
+ 		/*
+ 		 * There is no need to transfer the per-node surplus state
+diff --git a/mm/hugetlb_cgroup.c b/mm/hugetlb_cgroup.c
+index f61d132df52b..d9e4425d81ac 100644
+--- a/mm/hugetlb_cgroup.c
++++ b/mm/hugetlb_cgroup.c
+@@ -191,8 +191,9 @@ static void hugetlb_cgroup_move_parent(int idx, struct hugetlb_cgroup *h_cg,
+ 	struct page_counter *counter;
+ 	struct hugetlb_cgroup *page_hcg;
+ 	struct hugetlb_cgroup *parent = parent_hugetlb_cgroup(h_cg);
++	struct folio *folio = page_folio(page);
+ 
+-	page_hcg = hugetlb_cgroup_from_page(page);
++	page_hcg = hugetlb_cgroup_from_folio(folio);
+ 	/*
+ 	 * We can have pages in active list without any cgroup
+ 	 * ie, hugepage with less than 3 pages. We can safely
+@@ -211,7 +212,7 @@ static void hugetlb_cgroup_move_parent(int idx, struct hugetlb_cgroup *h_cg,
+ 	/* Take the pages off the local counter */
+ 	page_counter_cancel(counter, nr_pages);
+ 
+-	set_hugetlb_cgroup(page, parent);
++	set_hugetlb_cgroup(folio, parent);
+ out:
+ 	return;
+ }
+@@ -309,21 +310,21 @@ int hugetlb_cgroup_charge_cgroup_rsvd(int idx, unsigned long nr_pages,
+ /* Should be called with hugetlb_lock held */
+ static void __hugetlb_cgroup_commit_charge(int idx, unsigned long nr_pages,
+ 					   struct hugetlb_cgroup *h_cg,
+-					   struct page *page, bool rsvd)
++					   struct folio *folio, bool rsvd)
+ {
+ 	if (hugetlb_cgroup_disabled() || !h_cg)
+ 		return;
+ 
+-	__set_hugetlb_cgroup(page, h_cg, rsvd);
++	__set_hugetlb_cgroup(folio, h_cg, rsvd);
+ 	if (!rsvd) {
+ 		unsigned long usage =
+-			h_cg->nodeinfo[page_to_nid(page)]->usage[idx];
++			h_cg->nodeinfo[folio_nid(folio)]->usage[idx];
+ 		/*
+ 		 * This write is not atomic due to fetching usage and writing
+ 		 * to it, but that's fine because we call this with
+ 		 * hugetlb_lock held anyway.
+ 		 */
+-		WRITE_ONCE(h_cg->nodeinfo[page_to_nid(page)]->usage[idx],
++		WRITE_ONCE(h_cg->nodeinfo[folio_nid(folio)]->usage[idx],
+ 			   usage + nr_pages);
+ 	}
+ }
+@@ -332,31 +333,35 @@ void hugetlb_cgroup_commit_charge(int idx, unsigned long nr_pages,
+ 				  struct hugetlb_cgroup *h_cg,
+ 				  struct page *page)
+ {
+-	__hugetlb_cgroup_commit_charge(idx, nr_pages, h_cg, page, false);
++	struct folio *folio = page_folio(page);
++
++	__hugetlb_cgroup_commit_charge(idx, nr_pages, h_cg, folio, false);
+ }
+ 
+ void hugetlb_cgroup_commit_charge_rsvd(int idx, unsigned long nr_pages,
+ 				       struct hugetlb_cgroup *h_cg,
+ 				       struct page *page)
+ {
+-	__hugetlb_cgroup_commit_charge(idx, nr_pages, h_cg, page, true);
++	struct folio *folio = page_folio(page);
++
++	__hugetlb_cgroup_commit_charge(idx, nr_pages, h_cg, folio, true);
+ }
+ 
+ /*
+  * Should be called with hugetlb_lock held
+  */
+-static void __hugetlb_cgroup_uncharge_page(int idx, unsigned long nr_pages,
+-					   struct page *page, bool rsvd)
++static void __hugetlb_cgroup_uncharge_folio(int idx, unsigned long nr_pages,
++					   struct folio *folio, bool rsvd)
+ {
+ 	struct hugetlb_cgroup *h_cg;
+ 
+ 	if (hugetlb_cgroup_disabled())
+ 		return;
+ 	lockdep_assert_held(&hugetlb_lock);
+-	h_cg = __hugetlb_cgroup_from_page(page, rsvd);
++	h_cg = __hugetlb_cgroup_from_folio(folio, rsvd);
+ 	if (unlikely(!h_cg))
+ 		return;
+-	__set_hugetlb_cgroup(page, NULL, rsvd);
++	__set_hugetlb_cgroup(folio, NULL, rsvd);
+ 
+ 	page_counter_uncharge(__hugetlb_cgroup_counter_from_cgroup(h_cg, idx,
+ 								   rsvd),
+@@ -366,27 +371,27 @@ static void __hugetlb_cgroup_uncharge_page(int idx, unsigned long nr_pages,
+ 		css_put(&h_cg->css);
+ 	else {
+ 		unsigned long usage =
+-			h_cg->nodeinfo[page_to_nid(page)]->usage[idx];
++			h_cg->nodeinfo[folio_nid(folio)]->usage[idx];
+ 		/*
+ 		 * This write is not atomic due to fetching usage and writing
+ 		 * to it, but that's fine because we call this with
+ 		 * hugetlb_lock held anyway.
+ 		 */
+-		WRITE_ONCE(h_cg->nodeinfo[page_to_nid(page)]->usage[idx],
++		WRITE_ONCE(h_cg->nodeinfo[folio_nid(folio)]->usage[idx],
+ 			   usage - nr_pages);
+ 	}
+ }
+ 
+-void hugetlb_cgroup_uncharge_page(int idx, unsigned long nr_pages,
+-				  struct page *page)
++void hugetlb_cgroup_uncharge_folio(int idx, unsigned long nr_pages,
++				  struct folio *folio)
+ {
+-	__hugetlb_cgroup_uncharge_page(idx, nr_pages, page, false);
++	__hugetlb_cgroup_uncharge_folio(idx, nr_pages, folio, false);
+ }
+ 
+-void hugetlb_cgroup_uncharge_page_rsvd(int idx, unsigned long nr_pages,
+-				       struct page *page)
++void hugetlb_cgroup_uncharge_folio_rsvd(int idx, unsigned long nr_pages,
++				       struct folio *folio)
+ {
+-	__hugetlb_cgroup_uncharge_page(idx, nr_pages, page, true);
++	__hugetlb_cgroup_uncharge_folio(idx, nr_pages, folio, true);
+ }
+ 
+ static void __hugetlb_cgroup_uncharge_cgroup(int idx, unsigned long nr_pages,
+@@ -883,25 +888,25 @@ void __init hugetlb_cgroup_file_init(void)
+  * hugetlb_lock will make sure a parallel cgroup rmdir won't happen
+  * when we migrate hugepages
+  */
+-void hugetlb_cgroup_migrate(struct page *oldhpage, struct page *newhpage)
++void hugetlb_cgroup_migrate(struct folio *old_folio, struct folio *new_folio)
+ {
+ 	struct hugetlb_cgroup *h_cg;
+ 	struct hugetlb_cgroup *h_cg_rsvd;
+-	struct hstate *h = page_hstate(oldhpage);
++	struct hstate *h = folio_hstate(old_folio);
+ 
+ 	if (hugetlb_cgroup_disabled())
+ 		return;
+ 
+ 	spin_lock_irq(&hugetlb_lock);
+-	h_cg = hugetlb_cgroup_from_page(oldhpage);
+-	h_cg_rsvd = hugetlb_cgroup_from_page_rsvd(oldhpage);
+-	set_hugetlb_cgroup(oldhpage, NULL);
+-	set_hugetlb_cgroup_rsvd(oldhpage, NULL);
++	h_cg = hugetlb_cgroup_from_folio(old_folio);
++	h_cg_rsvd = hugetlb_cgroup_from_folio_rsvd(old_folio);
++	set_hugetlb_cgroup(old_folio, NULL);
++	set_hugetlb_cgroup_rsvd(old_folio, NULL);
+ 
+ 	/* move the h_cg details to new cgroup */
+-	set_hugetlb_cgroup(newhpage, h_cg);
+-	set_hugetlb_cgroup_rsvd(newhpage, h_cg_rsvd);
+-	list_move(&newhpage->lru, &h->hugepage_activelist);
++	set_hugetlb_cgroup(new_folio, h_cg);
++	set_hugetlb_cgroup_rsvd(new_folio, h_cg_rsvd);
++	list_move(&new_folio->lru, &h->hugepage_activelist);
+ 	spin_unlock_irq(&hugetlb_lock);
+ 	return;
+ }
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 1379e1912772..8e5eb6ed9da2 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1348,7 +1348,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 		put_anon_vma(anon_vma);
+ 
+ 	if (rc == MIGRATEPAGE_SUCCESS) {
+-		move_hugetlb_state(hpage, new_hpage, reason);
++		move_hugetlb_state(src, dst, reason);
+ 		put_new_page = NULL;
+ 	}
+ 
+@@ -1613,7 +1613,7 @@ struct page *alloc_migration_target(struct page *page, unsigned long private)
+ 		nid = folio_nid(folio);
+ 
+ 	if (folio_test_hugetlb(folio)) {
+-		struct hstate *h = page_hstate(&folio->page);
++		struct hstate *h = folio_hstate(folio);
+ 
+ 		gfp_mask = htlb_modify_alloc_mask(h, gfp_mask);
+ 		return alloc_huge_page_nodemask(h, nid, mtc->nmask, gfp_mask);
+-- 
+2.38.1
+
