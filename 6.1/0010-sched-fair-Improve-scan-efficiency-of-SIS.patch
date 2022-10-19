@@ -1,0 +1,384 @@
+From b79c0cf1462c990d16bad9d80aab59d2c214f8ee Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Wed, 19 Oct 2022 17:57:16 +0200
+Subject: [PATCH] sched/fair: Improve scan efficiency of SIS
+
+https://lore.kernel.org/lkml/20221019122859.18399-1-wuyun.abel@bytedance.com/T/#m9f20e8b462c3fec21b74542e4ee38051e94f8a78
+
+This patchset tries to improve SIS scan efficiency by recording idle
+cpus in a cpumask for each LLC which will be used as a target cpuset
+in the domain scan. The cpus are recorded at CORE granule to avoid
+tasks being stack on same core.
+
+v5 -> v6:
+ - Rename SIS_FILTER to SIS_CORE as it can only be activated when
+   SMT is enabled and better describes the behavior of CORE granule
+   update & load delivery.
+ - Removed the part of limited scan for idle cores since it might be
+   better to open another thread to discuss the strategies such as
+   limited or scaled depth. But keep the part of full scan for idle
+   cores when LLC is overloaded because SIS_CORE can greatly reduce
+   the overhead of full scan in such case.
+ - Removed the state of sd_is_busy which indicates an LLC is fully
+   busy and we can safely skip the SIS domain scan. I would prefer
+   leave this to SIS_UTIL.
+ - The filter generation mechanism is replaced by in-place updates
+   during domain scan to better deal with partial scan failures.
+ - Collect Reviewed-bys from Tim Chen
+
+v4 -> v5:
+ - Add limited scan for idle cores when overloaded, suggested by Mel
+ - Split out several patches since they are irrelevant to this scope
+ - Add quick check on ttwu_pending before core update
+ - Wrap the filter into SIS_FILTER feature, suggested by Chen Yu
+ - Move the main filter logic to the idle path, because the newidle
+   balance can bail out early if rq->avg_idle is small enough and
+   lose chances to update the filter.
+
+v3 -> v4:
+ - Update filter in load_balance rather than in the tick
+ - Now the filter contains unoccupied cpus rather than overloaded ones
+ - Added mechanisms to deal with the false positive cases
+
+v2 -> v3:
+ - Removed sched-idle balance feature and focus on SIS
+ - Take non-CFS tasks into consideration
+ - Several fixes/improvement suggested by Josh Don
+
+v1 -> v2:
+ - Several optimizations on sched-idle balancing
+ - Ignore asym topos in can_migrate_task
+ - Add more benchmarks including SIS efficiency
+ - Re-organize patch as suggested by Mel Gorman
+
+Abel Wu (4):
+  sched/fair: Skip core update if task pending
+  sched/fair: Ignore SIS_UTIL when has_idle_core
+  sched/fair: Introduce SIS_CORE
+  sched/fair: Deal with SIS scan failures
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ include/linux/sched/topology.h |  15 ++++
+ kernel/sched/fair.c            | 122 +++++++++++++++++++++++++++++----
+ kernel/sched/features.h        |   7 ++
+ kernel/sched/sched.h           |   3 +
+ kernel/sched/topology.c        |   8 ++-
+ 5 files changed, 141 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index 816df6cc444e..ac2162f33ada 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -82,6 +82,16 @@ struct sched_domain_shared {
+ 	atomic_t	nr_busy_cpus;
+ 	int		has_idle_cores;
+ 	int		nr_idle_scan;
++
++	/*
++	 * Used by sched feature SIS_CORE to record idle cpus at core
++	 * granule to improve efficiency of SIS domain scan.
++	 *
++	 * NOTE: this field is variable length. (Allocated dynamically
++	 * by attaching extra space to the end of the structure,
++	 * depending on how many CPUs the kernel has booted up with)
++	 */
++	unsigned long	icpus[];
+ };
+ 
+ struct sched_domain {
+@@ -167,6 +177,11 @@ static inline struct cpumask *sched_domain_span(struct sched_domain *sd)
+ 	return to_cpumask(sd->span);
+ }
+ 
++static inline struct cpumask *sched_domain_icpus(struct sched_domain *sd)
++{
++	return to_cpumask(sd->shared->icpus);
++}
++
+ extern void partition_sched_domains_locked(int ndoms_new,
+ 					   cpumask_var_t doms_new[],
+ 					   struct sched_domain_attr *dattr_new);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 4f3f24de9132..8d283fea97d0 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6475,6 +6475,43 @@ static inline bool test_idle_cores(int cpu)
+ 	return false;
+ }
+ 
++/*
++ * To honor the rule of CORE granule update, set this cpu to the LLC idle
++ * cpumask only if there is no cpu of this core showed up in the cpumask.
++ */
++static void update_idle_cpu(int cpu)
++{
++	struct sched_domain_shared *sds;
++
++	if (!sched_feat(SIS_CORE))
++		return;
++
++	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++	if (sds) {
++		struct cpumask *icpus = to_cpumask(sds->icpus);
++
++		/*
++		 * This is racy against clearing in select_idle_cpu(),
++		 * and can lead to idle cpus miss the chance to be set to
++		 * the idle cpumask, thus the idle cpus are temporarily
++		 * out of reach in SIS domain scan. But it should be rare
++		 * and we still have ILB to kick them working.
++		 */
++		if (!cpumask_intersects(cpu_smt_mask(cpu), icpus))
++			cpumask_set_cpu(cpu, icpus);
++	}
++}
++
++static inline bool should_scan_sibling(int cpu)
++{
++	return cmpxchg(&cpu_rq(cpu)->sis_scan_sibling, 1, 0);
++}
++
++static inline void set_scan_sibling(int cpu)
++{
++	WRITE_ONCE(cpu_rq(cpu)->sis_scan_sibling, 1);
++}
++
+ /*
+  * Scans the local SMT mask to see if the entire core is idle, and records this
+  * information in sd_llc_shared->has_idle_cores.
+@@ -6487,7 +6524,11 @@ void __update_idle_core(struct rq *rq)
+ 	int core = cpu_of(rq);
+ 	int cpu;
+ 
++	if (rq->ttwu_pending)
++		return;
++
+ 	rcu_read_lock();
++	update_idle_cpu(core);
+ 	if (test_idle_cores(core))
+ 		goto unlock;
+ 
+@@ -6533,24 +6574,33 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
+ 	if (idle)
+ 		return core;
+ 
+-	cpumask_andnot(cpus, cpus, cpu_smt_mask(core));
++	/*
++	 * It is unlikely that more than one cpu of a core show up
++	 * in the @cpus if SIS_CORE enabled.
++	 */
++	if (!sched_feat(SIS_CORE))
++		cpumask_andnot(cpus, cpus, cpu_smt_mask(core));
++
+ 	return -1;
+ }
+ 
+ /*
+  * Scan the local SMT mask for idle CPUs.
+  */
+-static int select_idle_smt(struct task_struct *p, int target)
++static int select_idle_smt(struct task_struct *p, int core, struct cpumask *cpus, int exclude)
+ {
+ 	int cpu;
+ 
+-	for_each_cpu_and(cpu, cpu_smt_mask(target), p->cpus_ptr) {
+-		if (cpu == target)
++	for_each_cpu_and(cpu, cpu_smt_mask(core), p->cpus_ptr) {
++		if (exclude && cpu == core)
+ 			continue;
+ 		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
+ 			return cpu;
+ 	}
+ 
++	if (cpus)
++		cpumask_clear_cpu(core, cpus);
++
+ 	return -1;
+ }
+ 
+@@ -6565,12 +6615,21 @@ static inline bool test_idle_cores(int cpu)
+ 	return false;
+ }
+ 
++static inline bool should_scan_sibling(int cpu)
++{
++	return false;
++}
++
++static inline void set_scan_sibling(int cpu)
++{
++}
++
+ static inline int select_idle_core(struct task_struct *p, int core, struct cpumask *cpus, int *idle_cpu)
+ {
+ 	return __select_idle_cpu(core, p);
+ }
+ 
+-static inline int select_idle_smt(struct task_struct *p, int target)
++static inline int select_idle_smt(struct task_struct *p, int core, struct cpumask *cpus, int exclude)
+ {
+ 	return -1;
+ }
+@@ -6584,16 +6643,15 @@ static inline int select_idle_smt(struct task_struct *p, int target)
+  */
+ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)
+ {
+-	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
++	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask), *icpus = NULL;
+ 	int i, cpu, idle_cpu = -1, nr = INT_MAX;
+ 	struct sched_domain_shared *sd_share;
+ 	struct rq *this_rq = this_rq();
+ 	int this = smp_processor_id();
+ 	struct sched_domain *this_sd = NULL;
++	bool scan_sibling = false;
+ 	u64 time = 0;
+ 
+-	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+-
+ 	if (sched_feat(SIS_PROP) && !has_idle_core) {
+ 		u64 avg_cost, avg_idle, span_avg;
+ 		unsigned long now = jiffies;
+@@ -6626,7 +6684,7 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 		time = cpu_clock(this);
+ 	}
+ 
+-	if (sched_feat(SIS_UTIL)) {
++	if (sched_feat(SIS_UTIL) && !has_idle_core) {
+ 		sd_share = rcu_dereference(per_cpu(sd_llc_shared, target));
+ 		if (sd_share) {
+ 			/* because !--nr is the condition to stop scan */
+@@ -6637,15 +6695,31 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 		}
+ 	}
+ 
++	if (sched_feat(SIS_CORE) && sched_smt_active()) {
++		/*
++		 * Due to the nature of idle core scanning, has_idle_core
++		 * hint should also consume the scan_sibling flag even
++		 * though it doesn't use the flag when scanning.
++		 */
++		scan_sibling = should_scan_sibling(target);
++		icpus = sched_domain_icpus(sd);
++	}
++
++	cpumask_and(cpus, icpus ? icpus : sched_domain_span(sd), p->cpus_ptr);
++
+ 	for_each_cpu_wrap(cpu, cpus, target + 1) {
++		if (!--nr)
++			break;
++
+ 		if (has_idle_core) {
+ 			i = select_idle_core(p, cpu, cpus, &idle_cpu);
+ 			if ((unsigned int)i < nr_cpumask_bits)
+ 				return i;
+-
++		} else if (scan_sibling) {
++			idle_cpu = select_idle_smt(p, cpu, icpus, 0);
++			if ((unsigned int)idle_cpu < nr_cpumask_bits)
++				break;
+ 		} else {
+-			if (!--nr)
+-				return -1;
+ 			idle_cpu = __select_idle_cpu(cpu, p);
+ 			if ((unsigned int)idle_cpu < nr_cpumask_bits)
+ 				break;
+@@ -6655,6 +6729,28 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 	if (has_idle_core)
+ 		set_idle_cores(target, false);
+ 
++	if (icpus && idle_cpu == -1) {
++		if (nr > 0 && (has_idle_core || scan_sibling)) {
++			/*
++			 * Reset the idle cpu mask if a full scan fails,
++			 * but ignore the !has_idle_core case which should
++			 * have already been fixed during scan.
++			 */
++			if (has_idle_core)
++				cpumask_clear(icpus);
++		} else {
++			/*
++			 * As for partial scan failures, it will probably
++			 * fail again next time scanning from the same cpu.
++			 * Due to the SIS_CORE rule of CORE granule update,
++			 * some idle cpus can be missed in the mask. So it
++			 * would be reasonable to scan SMT siblings as well
++			 * if the scan is fail-prone.
++			 */
++			set_scan_sibling(target);
++		}
++	}
++
+ 	if (sched_feat(SIS_PROP) && this_sd && !has_idle_core) {
+ 		time = cpu_clock(this) - time;
+ 
+@@ -6804,7 +6900,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		has_idle_core = test_idle_cores(target);
+ 
+ 		if (!has_idle_core && cpus_share_cache(prev, target)) {
+-			i = select_idle_smt(p, prev);
++			i = select_idle_smt(p, prev, NULL, 1);
+ 			if ((unsigned int)i < nr_cpumask_bits)
+ 				return i;
+ 		}
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index ee7f23c76bd3..bf3cae94caa6 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -63,6 +63,13 @@ SCHED_FEAT(TTWU_QUEUE, true)
+ SCHED_FEAT(SIS_PROP, false)
+ SCHED_FEAT(SIS_UTIL, true)
+ 
++/*
++ * Record idle cpus at core granule for each LLC to improve efficiency of
++ * SIS domain scan. Combine with the above features of limiting scan depth
++ * to better deal with the scalability issue.
++ */
++SCHED_FEAT(SIS_CORE, true)
++
+ /*
+  * Issue a WARN when we do multiple update_rq_clock() calls
+  * in a single rq->lock section. Default disabled because the
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index fe28bcc7da00..67fef06657ab 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -971,6 +971,9 @@ struct rq {
+ 
+ #ifdef CONFIG_SMP
+ 	unsigned int		ttwu_pending;
++#ifdef CONFIG_SCHED_SMT
++	int			sis_scan_sibling;
++#endif
+ #endif
+ 	u64			nr_switches;
+ 
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 8739c2a5a54e..a2bb0091c10d 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1641,6 +1641,12 @@ sd_init(struct sched_domain_topology_level *tl,
+ 		sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
+ 		atomic_inc(&sd->shared->ref);
+ 		atomic_set(&sd->shared->nr_busy_cpus, sd_weight);
++
++		/*
++		 * This will temporarily break the rule of CORE granule,
++		 * but will be fixed after SIS scan failures.
++		 */
++		cpumask_copy(sched_domain_icpus(sd), sd_span);
+ 	}
+ 
+ 	sd->private = sdd;
+@@ -2106,7 +2112,7 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
+ 
+ 			*per_cpu_ptr(sdd->sd, j) = sd;
+ 
+-			sds = kzalloc_node(sizeof(struct sched_domain_shared),
++			sds = kzalloc_node(sizeof(struct sched_domain_shared) + cpumask_size(),
+ 					GFP_KERNEL, cpu_to_node(j));
+ 			if (!sds)
+ 				return -ENOMEM;
+-- 
+2.38.1
+
