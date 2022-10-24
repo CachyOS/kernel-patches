@@ -1,0 +1,916 @@
+From 9de3466a21984e75782d0ed4e3fde105dfeff22c Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Wed, 21 Sep 2022 23:42:46 +0200
+Subject: [PATCH] NEST
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/kernel/cpu/aperfmperf.c |   2 +
+ include/linux/sched.h            |  14 ++
+ include/linux/sched/topology.h   |   2 +
+ kernel/sched/core.c              |  86 ++++++++-
+ kernel/sched/fair.c              | 299 ++++++++++++++++++++++++++++++-
+ kernel/sched/idle.c              |  20 +++
+ kernel/sched/sched.h             |  49 +++++
+ 7 files changed, 457 insertions(+), 15 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/aperfmperf.c b/arch/x86/kernel/cpu/aperfmperf.c
+index 1f60a2b27936..3c992adbe3cf 100644
+--- a/arch/x86/kernel/cpu/aperfmperf.c
++++ b/arch/x86/kernel/cpu/aperfmperf.c
+@@ -383,6 +383,8 @@ void arch_scale_freq_tick(void)
+ 	acnt = aperf - s->aperf;
+ 	mcnt = mperf - s->mperf;
+ 
++	trace_printk("freq %lld\n", div64_u64((cpu_khz * acnt), mcnt));
++
+ 	s->aperf = aperf;
+ 	s->mperf = mperf;
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 070b15ba2e1e..08edb1420a2b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -724,6 +724,17 @@ struct kmap_ctrl {
+ #endif
+ };
+ 
++struct expand_mask {
++	spinlock_t			lock;
++	cpumask_t			expand_mask, reserve_mask;
++	int				start;
++	int				count;
++};
++
++extern void init_expand_mask(void);
++extern void clear_expand_mask(int cpu);
++extern void reset_expand_mask(int cpu);
++
+ struct task_struct {
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/*
+@@ -767,6 +778,9 @@ struct task_struct {
+ 	 */
+ 	int				recent_used_cpu;
+ 	int				wake_cpu;
++	int				use_expand_mask;
++	int				patience;
++	int				attached;
+ #endif
+ 	int				on_rq;
+ 
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index 816df6cc444e..54e577ef83bb 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -82,6 +82,8 @@ struct sched_domain_shared {
+ 	atomic_t	nr_busy_cpus;
+ 	int		has_idle_cores;
+ 	int		nr_idle_scan;
++	int		has_idle_threads;
++	int		left_off;
+ };
+ 
+ struct sched_domain {
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index e9f0ec6c9aeb..88cf113d89b0 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2600,6 +2600,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
+ 
+ void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+ {
++	p->use_expand_mask = 0;
+ 	__do_set_cpus_allowed(p, new_mask, 0);
+ }
+ 
+@@ -3513,8 +3514,11 @@ int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
+ 	 * [ this allows ->select_task() to simply return task_cpu(p) and
+ 	 *   not worry about this generic constraint ]
+ 	 */
+-	if (unlikely(!is_cpu_allowed(p, cpu)))
++	if (unlikely(!is_cpu_allowed(p, cpu))) {
++		if (p->use_expand_mask)
++			atomic_set(&cpu_rq(p->thread_info.cpu)->taken,0);
+ 		cpu = select_fallback_rq(task_cpu(p), p);
++	}
+ 
+ 	return cpu;
+ }
+@@ -3740,13 +3744,6 @@ void sched_ttwu_pending(void *arg)
+ 	if (!llist)
+ 		return;
+ 
+-	/*
+-	 * rq::ttwu_pending racy indication of out-standing wakeups.
+-	 * Races such that false-negatives are possible, since they
+-	 * are shorter lived that false-positives would be.
+-	 */
+-	WRITE_ONCE(rq->ttwu_pending, 0);
+-
+ 	rq_lock_irqsave(rq, &rf);
+ 	update_rq_clock(rq);
+ 
+@@ -3761,6 +3758,13 @@ void sched_ttwu_pending(void *arg)
+ 	}
+ 
+ 	rq_unlock_irqrestore(rq, &rf);
++
++	/*
++	 * rq::ttwu_pending racy indication of out-standing wakeups.
++	 * Races such that false-negatives are possible, since they
++	 * are shorter lived that false-positives would be.
++	 */
++	WRITE_ONCE(rq->ttwu_pending, 0);
+ }
+ 
+ void send_call_function_single_ipi(int cpu)
+@@ -4211,6 +4215,8 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ #endif /* CONFIG_SMP */
+ 
+ 	ttwu_queue(p, cpu, wake_flags);
++	if (p->use_expand_mask)
++		atomic_set(&cpu_rq(cpu)->taken,0);
+ unlock:
+ 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+ out:
+@@ -4671,7 +4677,7 @@ unsigned long to_ratio(u64 period, u64 runtime)
+ void wake_up_new_task(struct task_struct *p)
+ {
+ 	struct rq_flags rf;
+-	struct rq *rq;
++	struct rq *rq = cpu_rq(smp_processor_id());
+ 
+ 	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
+ 	WRITE_ONCE(p->__state, TASK_RUNNING);
+@@ -4686,12 +4692,16 @@ void wake_up_new_task(struct task_struct *p)
+ 	 */
+ 	p->recent_used_cpu = task_cpu(p);
+ 	rseq_migrate(p);
++	p->attached = -1;
++	p->patience = INIT_PATIENCE/*cpumask_weight(&p->expand_cpus_mask->mask)*/ + 1;
+ 	__set_task_cpu(p, select_task_rq(p, task_cpu(p), WF_FORK));
+ #endif
+ 	rq = __task_rq_lock(p, &rf);
+ 	update_rq_clock(rq);
+ 	post_init_entity_util_avg(p);
+ 
++	if (p->use_expand_mask)
++		atomic_set(&cpu_rq(p->thread_info.cpu)->taken,0);
+ 	activate_task(rq, p, ENQUEUE_NOCLOCK);
+ 	trace_sched_wakeup_new(p);
+ 	check_preempt_curr(rq, p, WF_FORK);
+@@ -5002,6 +5012,21 @@ static inline void
+ prepare_task_switch(struct rq *rq, struct task_struct *prev,
+ 		    struct task_struct *next)
+ {
++	if (prev->use_expand_mask && next->pid == 0) {
++		smp_mb__before_atomic();
++		start_spinning(rq->cpu);
++		atomic_set(&rq->drop_expand_ctr, EXPAND_DELAY); // drop_expand is 0
++		atomic_set(&rq->drop_reserve_ctr, RESERVE_DELAY); // drop_reserve is 0
++		smp_mb__after_atomic();
++	}
++	if (next->use_expand_mask) {
++		smp_mb__before_atomic();
++		atomic_set(&rq->drop_expand_ctr,0);
++		atomic_set(&rq->drop_reserve_ctr,0);
++		smp_mb__after_atomic();
++		rq->drop_expand = 0;
++		rq->drop_reserve = 0;
++	}
+ 	kcov_prepare_switch(prev);
+ 	sched_info_switch(rq, prev, next);
+ 	perf_event_task_sched_out(prev, next);
+@@ -5480,6 +5505,15 @@ void scheduler_tick(void)
+ 	perf_event_task_tick();
+ 
+ #ifdef CONFIG_SMP
++	smp_mb__before_atomic();
++	atomic_dec_if_positive(&rq->should_spin);
++	if (atomic_fetch_add_unless(&rq->drop_expand_ctr,-1,0) == 1) {
++		trace_printk("counter %d, so changing %d to 1\n", atomic_read(&rq->drop_expand_ctr), rq->drop_expand);
++		rq->drop_expand = 1;
++	}
++	if (atomic_fetch_add_unless(&rq->drop_reserve_ctr,-1,0) == 1)
++		rq->drop_reserve = 1;
++	smp_mb__after_atomic();
+ 	rq->idle_balance = idle_cpu(cpu);
+ 	trigger_load_balance(rq);
+ #endif
+@@ -6506,6 +6540,17 @@ static void __sched notrace __schedule(unsigned int sched_mode)
+ 
+ 		trace_sched_switch(sched_mode & SM_MASK_PREEMPT, prev, next, prev_state);
+ 
++		if (prev->use_expand_mask && prev_state & TASK_DEAD && available_idle_cpu(cpu)) {
++			smp_mb__before_atomic();
++			atomic_set(&rq->should_spin,0); // clean up early
++			atomic_set(&rq->drop_expand_ctr,0);
++			atomic_set(&rq->drop_reserve_ctr,0);
++			smp_mb__after_atomic();
++			rq->drop_expand = 0; // prepare for next time
++			rq->drop_reserve = 0; // prepare for next time
++			trace_printk("%d terminated so clear core %d\n",prev->pid,cpu);
++			clear_expand_mask(cpu);
++		}
+ 		/* Also unlocks the rq: */
+ 		rq = context_switch(rq, prev, next, &rf);
+ 	} else {
+@@ -8201,14 +8246,30 @@ SYSCALL_DEFINE3(sched_setaffinity, pid_t, pid, unsigned int, len,
+ 		unsigned long __user *, user_mask_ptr)
+ {
+ 	cpumask_var_t new_mask;
++	cpumask_t tmp;
++	struct task_struct *p;
+ 	int retval;
+ 
++	rcu_read_lock();
++	p = find_process_by_pid(pid);
++	if (!p) {
++		rcu_read_unlock();
++		return -ESRCH;
++	}
++	rcu_read_unlock();
+ 	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+ 	retval = get_user_cpu_mask(user_mask_ptr, len, new_mask);
+ 	if (retval == 0)
+ 		retval = sched_setaffinity(pid, new_mask);
++
++	cpumask_xor(&tmp,new_mask,cpu_possible_mask);
++	if (cpumask_weight(&tmp) == 0) {
++		int cpu = task_cpu(p);
++		reset_expand_mask(cpu);
++		p->use_expand_mask = 1;
++	}
+ 	free_cpumask_var(new_mask);
+ 	return retval;
+ }
+@@ -9697,6 +9758,7 @@ void __init sched_init(void)
+ 	autogroup_init(&init_task);
+ #endif /* CONFIG_CGROUP_SCHED */
+ 
++	init_expand_mask();
+ 	for_each_possible_cpu(i) {
+ 		struct rq *rq;
+ 
+@@ -9753,6 +9815,12 @@ void __init sched_init(void)
+ 		rq->wake_avg_idle = rq->avg_idle;
+ 		rq->max_idle_balance_cost = sysctl_sched_migration_cost;
+ 
++		atomic_set(&rq->should_spin,0);
++		atomic_set(&rq->taken,0);
++		atomic_set(&rq->drop_expand_ctr,0);
++		atomic_set(&rq->drop_reserve_ctr,0);
++		rq->drop_expand = 0;
++		rq->drop_reserve = 0;
+ 		INIT_LIST_HEAD(&rq->cfs_tasks);
+ 
+ 		rq_attach_root(rq, &def_root_domain);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 74d773040b54..7ef06fd29d0f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3467,6 +3467,61 @@ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
+  * caller only guarantees p->pi_lock is held; no other assumptions,
+  * including the state of rq->lock, should be made.
+  */
++
++static struct expand_mask expand_mask;
++
++void init_expand_mask(void) {
++	spin_lock_init(&expand_mask.lock);
++}
++
++static inline void set_expand_mask(int cpu) {
++	spin_lock(&expand_mask.lock);
++	cpumask_set_cpu(cpu, &expand_mask.expand_mask);
++	if (cpumask_test_cpu(cpu,&expand_mask.reserve_mask)) {
++		cpumask_clear_cpu(cpu, &expand_mask.reserve_mask);
++		expand_mask.count--;
++	}
++	spin_unlock(&expand_mask.lock);
++}
++
++void clear_expand_mask(int cpu) { // cpu is set in expand mask
++	spin_lock(&expand_mask.lock);
++	cpumask_clear_cpu(cpu, &expand_mask.expand_mask);
++	if (!cpumask_test_cpu(cpu,&expand_mask.reserve_mask) && expand_mask.count < RESERVE_MAX) {
++		cpumask_set_cpu(cpu, &expand_mask.reserve_mask);
++		expand_mask.count++;
++	}
++	spin_unlock(&expand_mask.lock);
++}
++
++static inline void set_reserve_mask(int cpu) {
++	spin_lock(&expand_mask.lock);
++	if (!cpumask_test_cpu(cpu,&expand_mask.expand_mask) && !cpumask_test_cpu(cpu,&expand_mask.reserve_mask) && expand_mask.count < RESERVE_MAX) {
++		cpumask_set_cpu(cpu, &expand_mask.reserve_mask);
++		expand_mask.count++;
++	}
++	spin_unlock(&expand_mask.lock);
++}
++
++static inline void clear_reserve_mask(int cpu) { // cpu is set in reserve mask
++	spin_lock(&expand_mask.lock);
++	if (expand_mask.count > RESERVE_MAX) {
++		cpumask_clear_cpu(cpu, &expand_mask.reserve_mask);
++		expand_mask.count--;
++	}
++	spin_unlock(&expand_mask.lock);
++}
++
++void reset_expand_mask(int cpu) {
++	spin_lock(&expand_mask.lock);
++	cpumask_clear(&expand_mask.expand_mask);
++	cpumask_set_cpu(cpu, &expand_mask.expand_mask);
++	cpumask_clear(&expand_mask.reserve_mask);
++	expand_mask.start = cpu;
++	expand_mask.count = 0;
++	spin_unlock(&expand_mask.lock);
++}
++
+ void set_task_rq_fair(struct sched_entity *se,
+ 		      struct cfs_rq *prev, struct cfs_rq *next)
+ {
+@@ -6289,6 +6344,46 @@ static inline bool test_idle_cores(int cpu, bool def)
+ 	return def;
+ }
+ 
++static inline void set_idle_threads(int cpu, int val)
++{
++	struct sched_domain_shared *sds;
++
++	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++	if (sds)
++		WRITE_ONCE(sds->has_idle_threads, val);
++}
++
++static inline bool test_idle_threads(int cpu, bool def)
++{
++	struct sched_domain_shared *sds;
++
++	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++	if (sds)
++		return READ_ONCE(sds->has_idle_threads);
++
++	return def;
++}
++
++static inline void set_left_off(int cpu, int val)
++{
++	struct sched_domain_shared *sds;
++
++	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++	if (sds)
++		WRITE_ONCE(sds->left_off, val);
++}
++
++static inline int get_left_off(int cpu, int def)
++{
++	struct sched_domain_shared *sds;
++
++	sds = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++	if (sds)
++		return READ_ONCE(sds->left_off);
++
++	return def;
++}
++
+ /*
+  * Scans the local SMT mask to see if the entire core is idle, and records this
+  * information in sd_llc_shared->has_idle_cores.
+@@ -6305,6 +6400,9 @@ void __update_idle_core(struct rq *rq)
+ 	if (test_idle_cores(core, true))
+ 		goto unlock;
+ 
++	if (!test_idle_cores(core, true))
++		set_idle_threads(core, 1);
++
+ 	for_each_cpu(cpu, cpu_smt_mask(core)) {
+ 		if (cpu == core)
+ 			continue;
+@@ -6403,7 +6501,7 @@ static inline int select_idle_smt(struct task_struct *p, struct sched_domain *sd
+ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool has_idle_core, int target)
+ {
+ 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
+-	int i, cpu, idle_cpu = -1, nr = INT_MAX;
++	int i, cpu, idle_cpu = -1, nr = INT_MAX, newtarget;
+ 	struct sched_domain_shared *sd_share;
+ 	struct rq *this_rq = this_rq();
+ 	int this = smp_processor_id();
+@@ -6455,23 +6553,29 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 		}
+ 	}
+ 
+-	for_each_cpu_wrap(cpu, cpus, target + 1) {
++	newtarget = get_left_off(this, target);
++	for_each_cpu_wrap(cpu, cpus, newtarget) {
+ 		if (has_idle_core) {
+ 			i = select_idle_core(p, cpu, cpus, &idle_cpu);
+ 			if ((unsigned int)i < nr_cpumask_bits)
+ 				return i;
+ 
+ 		} else {
+-			if (!--nr)
++			if (!--nr) {
++				set_left_off(this, cpu);
+ 				return -1;
++			}
+ 			idle_cpu = __select_idle_cpu(cpu, p);
+ 			if ((unsigned int)idle_cpu < nr_cpumask_bits)
+ 				break;
+ 		}
+ 	}
+ 
+-	if (has_idle_core)
++	if (has_idle_core) {
+ 		set_idle_cores(target, false);
++		if (idle_cpu == -1)
++			set_idle_threads(target, false);
++	}
+ 
+ 	if (sched_feat(SIS_PROP) && !has_idle_core) {
+ 		time = cpu_clock(this) - time;
+@@ -6536,9 +6640,11 @@ static inline bool asym_fits_capacity(unsigned long task_util, int cpu)
+ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ {
+ 	bool has_idle_core = false;
+-	struct sched_domain *sd;
++	struct sched_domain *sd, *sd1;
++	struct sched_group *group, *group0;
+ 	unsigned long task_util;
+ 	int i, recent_used_cpu;
++	int otarget = target;
+ 
+ 	/*
+ 	 * On asymmetric system, update task utilization because we will check
+@@ -6632,7 +6738,41 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+ 
+-	return target;
++	if (!sd->parent) goto abort;
++	group0 = group = sd->parent->groups;
++	do {
++		struct cpumask *m = sched_group_span(group);
++
++		if (cpumask_test_cpu(otarget, m))
++			goto next;
++
++		sd1 = rcu_dereference(per_cpu(sd_llc, cpumask_first(sched_group_span(group))));
++		if (!sd1 || !READ_ONCE(sd1->shared->has_idle_threads))
++			goto next;
++
++		target = cpumask_next_wrap(otarget,m,otarget,true);
++
++		if (sched_smt_active()) {
++			has_idle_core = test_idle_cores(target, false);
++
++			if (!has_idle_core && cpus_share_cache(prev, target)) {
++				i = select_idle_smt(p, sd1, prev);
++				if ((unsigned int)i < nr_cpumask_bits)
++					return i;
++			}
++		}
++
++		i = select_idle_cpu(p, sd1, has_idle_core, target);
++		if ((unsigned)i < nr_cpumask_bits)
++			return i;
++
++next:
++		group = group->next;
++	} while (group != group0);
++
++
++abort:
++	return otarget;
+ }
+ 
+ /*
+@@ -7036,6 +7176,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	int cpu = smp_processor_id();
+ 	int new_cpu = prev_cpu;
+ 	int want_affine = 0;
++	int impatient = 0;
+ 	/* SD_flags and WF_flags share the first nibble */
+ 	int sd_flag = wake_flags & 0xF;
+ 
+@@ -7057,6 +7198,144 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	}
+ 
+ 	rcu_read_lock();
++
++	if (p->use_expand_mask) {
++		struct sched_domain *this_sd;
++		cpumask_t *mask_sd;
++		int i;
++		if (sd_flag & SD_BALANCE_EXEC) {
++			new_cpu = prev_cpu; // why move???
++			goto out;
++		}
++
++		if (p->attached >= 0) {
++			if (cpumask_test_cpu(p->attached,&expand_mask.expand_mask) && cpumask_test_cpu(p->attached,p->cpus_ptr) && available_idle_cpu(p->attached) && !atomic_cmpxchg(&cpu_rq(p->attached)->taken,0,1)) {
++				new_cpu = p->attached;
++				//trace_printk("attached\n");
++				if (new_cpu == prev_cpu)
++					p->patience = INIT_PATIENCE;
++				goto out;
++			}
++			if (p->attached != prev_cpu || !cpumask_test_cpu(p->attached,&expand_mask.expand_mask))
++				p->attached = -1;
++		}
++		// if the thread is not attached somewhere and it is placed outside the mask, then this is a good core for the thread and the core should be in the mask
++		else
++		if (!cpumask_test_cpu(prev_cpu,&expand_mask.expand_mask) && cpumask_test_cpu(prev_cpu,p->cpus_ptr) && available_idle_cpu(prev_cpu) && !atomic_cmpxchg(&cpu_rq(prev_cpu)->taken,0,1)) {
++			p->attached = new_cpu = prev_cpu;
++			p->patience = INIT_PATIENCE;
++			set_expand_mask(prev_cpu);
++			goto out;
++		}
++		this_sd = rcu_dereference(*per_cpu_ptr(&sd_llc,prev_cpu));
++		mask_sd = sched_domain_span(this_sd);
++		for_each_cpu_wrap(i, &expand_mask.expand_mask, prev_cpu) {
++			if (
++				cpumask_test_cpu(i,mask_sd) &&
++				cpumask_test_cpu(i,p->cpus_ptr) && available_idle_cpu(i)) {
++				struct rq *rq = cpu_rq(i);
++				if (rq->drop_expand) {
++					//trace_printk("dropping %d from expand mask (same socket)\n",i);
++					clear_expand_mask(i);
++					rq->drop_expand = 0;
++					smp_mb__before_atomic();
++					atomic_set(&rq->drop_expand_ctr,0);
++					smp_mb__after_atomic();
++					continue;
++				}
++				if (!atomic_cmpxchg(&cpu_rq(i)->taken,0,1)) {
++					new_cpu = i;
++					//trace_printk("in mask same socket\n");
++					if (new_cpu == prev_cpu) {
++						p->attached = new_cpu;
++						p->patience = INIT_PATIENCE;
++					}
++					goto out;
++				}
++			}
++			if (i == prev_cpu) {
++				if (p->patience)
++					p->patience--;
++				else { // leave expand mask - too small
++					impatient = 1;
++					p->patience = INIT_PATIENCE;
++					//trace_printk("impatient\n");
++					goto reserve;
++				}
++			}
++		}
++		for_each_cpu_wrap(i, &expand_mask.expand_mask, prev_cpu) {
++			if (!cpumask_test_cpu(i,mask_sd) && cpumask_test_cpu(i,p->cpus_ptr) && available_idle_cpu(i)) {
++				struct rq *rq = cpu_rq(i);
++				if (rq->drop_expand) {
++					//trace_printk("dropping %d from expand mask (other socket)\n",i);
++					clear_expand_mask(i);
++					rq->drop_expand = 0;
++					smp_mb__before_atomic();
++					atomic_set(&rq->drop_expand_ctr,0);
++					smp_mb__after_atomic();
++					continue;
++				}
++				if (!atomic_cmpxchg(&cpu_rq(i)->taken,0,1)) {
++					new_cpu = i;
++					//trace_printk("in mask other socket\n");
++					if (new_cpu == prev_cpu) {
++						p->attached = new_cpu;
++						p->patience = INIT_PATIENCE;
++					}
++					goto out;
++				}
++			}
++		}
++reserve:
++		for_each_cpu_wrap(i, &expand_mask.reserve_mask, expand_mask.start) {
++			if (cpumask_test_cpu(i,mask_sd) && cpumask_test_cpu(i,p->cpus_ptr) && available_idle_cpu(i)) {
++				struct rq *rq = cpu_rq(i);
++				if (rq->drop_reserve) {
++					clear_reserve_mask(i);
++					rq->drop_reserve = 0;
++					smp_mb__before_atomic();
++					atomic_set(&rq->drop_reserve_ctr,0);
++					smp_mb__after_atomic();
++					continue;
++				}
++				if (!atomic_cmpxchg(&cpu_rq(i)->taken,0,1)) {
++					new_cpu = i;
++					//trace_printk("reserve same socket\n");
++					if (new_cpu == prev_cpu) {
++						p->attached = new_cpu;
++						p->patience = INIT_PATIENCE;
++					}
++					set_expand_mask(new_cpu);
++					goto out;
++				}
++			}
++		}
++		for_each_cpu_wrap(i, &expand_mask.reserve_mask, expand_mask.start) {
++			if (!cpumask_test_cpu(i,mask_sd) && cpumask_test_cpu(i,p->cpus_ptr) && available_idle_cpu(i)) {
++				struct rq *rq = cpu_rq(i);
++				if (rq->drop_reserve) {
++					clear_reserve_mask(i);
++					rq->drop_reserve = 0;
++					smp_mb__before_atomic();
++					atomic_set(&rq->drop_reserve_ctr,0);
++					smp_mb__after_atomic();
++					continue;
++				}
++				if (!atomic_cmpxchg(&cpu_rq(i)->taken,0,1)) {
++					new_cpu = i;
++					//trace_printk("reserve other socket\n");
++					if (new_cpu == prev_cpu) {
++						p->attached = new_cpu;
++						p->patience = INIT_PATIENCE;
++					}
++					set_expand_mask(new_cpu);
++					goto out;
++				}
++			}
++		}
++	}
++
+ 	for_each_domain(cpu, tmp) {
+ 		/*
+ 		 * If both 'cpu' and 'prev_cpu' are part of this domain,
+@@ -7089,6 +7368,14 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 		/* Fast path */
+ 		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
+ 	}
++	if (p->use_expand_mask) {
++		if (impatient)
++			set_expand_mask(new_cpu);
++		else
++			set_reserve_mask(new_cpu);
++	}
++
++out:
+ 	rcu_read_unlock();
+ 
+ 	return new_cpu;
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index f26ab2675f7d..ae8239719026 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -259,6 +259,26 @@ static void do_idle(void)
+ {
+ 	int cpu = smp_processor_id();
+ 
++	if (atomic_read(&cpu_rq(cpu)->should_spin)) {
++		int sibling, spinning = 1;
++		const cpumask_t *m = cpu_smt_mask(cpu);
++		struct rq *rq = cpu_rq(cpu);
++		while (!tif_need_resched() && atomic_read(&rq->should_spin)) {
++			for_each_cpu(sibling, m)
++				if (sibling != cpu && cpu_rq(sibling)->nr_running) {
++					atomic_set(&rq->should_spin,0);
++					spinning = 0;
++					break;
++				}
++		}
++		if (tif_need_resched()) {
++			if (spinning)
++				atomic_set(&rq->should_spin,0);
++			schedule_idle();
++			return;
++		}
++	}
++
+ 	/*
+ 	 * Check if we need to update blocked load
+ 	 */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index e26688d387ae..a584c63abbc7 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -986,6 +986,8 @@ struct rq {
+ 
+ #ifdef CONFIG_SMP
+ 	unsigned int		ttwu_pending;
++	atomic_t		should_spin, drop_expand_ctr, drop_reserve_ctr, taken;
++	int			drop_expand, drop_reserve;
+ #endif
+ 	u64			nr_switches;
+ 
+@@ -1407,6 +1409,53 @@ DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+ #define cpu_curr(cpu)		(cpu_rq(cpu)->curr)
+ #define raw_rq()		raw_cpu_ptr(&runqueues)
+ 
++#ifndef NO_NEST_SPIN_DELAY
++#define SPIN_DELAY 2  // nest value
++#else
++#ifndef NO_NEST_SPIN_DELAY_T10
++#define SPIN_DELAY 4
++#else
++#define SPIN_DELAY 20
++#endif
++#endif
++#ifndef NO_NEST_EXPAND_DELAY
++#define EXPAND_DELAY 2  // nest value
++#else
++#ifndef NO_NEST_EXPAND_DELAY_T10
++#define EXPAND_DELAY 4
++#else
++#define EXPAND_DELAY 20
++#endif
++#endif
++#define RESERVE_DELAY 20
++#ifndef NO_NEST_INIT_PATIENCE
++#define INIT_PATIENCE 2  // nest value
++#else
++#ifndef NO_NEST_INIT_PATIENCE_T10
++#define INIT_PATIENCE 4
++#else
++#define INIT_PATIENCE 20
++#endif
++#endif
++#ifndef NO_NEST_RESERVE_MAX
++#define RESERVE_MAX 5
++#else
++#ifndef NO_NEST_RESERVE_MAX_T10
++#define RESERVE_MAX 10
++#else
++#define RESERVE_MAX 50
++#endif
++#endif
++
++static void inline start_spinning(int cpu) {
++	int sibling;
++
++	for_each_cpu(sibling, cpu_smt_mask(cpu))
++		if (sibling != cpu && (!available_idle_cpu(sibling) || atomic_read(&cpu_rq(sibling)->should_spin)))
++			return;
++	atomic_set(&cpu_rq(cpu)->should_spin,SPIN_DELAY);
++}
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ static inline struct task_struct *task_of(struct sched_entity *se)
+ {
+-- 
+2.37.3
+
+
+From fde7d8305dc152b80b3f654a5b82757f024840da Mon Sep 17 00:00:00 2001
+From: Masahito S <firelzrd@gmail.com>
+Date: Tue, 25 Oct 2022 04:29:51 +0900
+Subject: [PATCH] NEST global switch - attempt 8
+
+---
+ include/linux/sched/sysctl.h |  2 ++
+ kernel/sched/core.c          | 37 ++++++++++++++++++------------------
+ kernel/sched/fair.c          |  6 ++++--
+ kernel/sysctl.c              |  9 +++++++++
+ 4 files changed, 34 insertions(+), 20 deletions(-)
+
+diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
+index e65094681..2cc984d04 100644
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@ -21,6 +21,8 @@ enum sched_tunable_scaling {
+ 	SCHED_TUNABLESCALING_END,
+ };
+ 
++extern unsigned int sysctl_sched_nest;
++
+ #define NUMA_BALANCING_DISABLED		0x0
+ #define NUMA_BALANCING_NORMAL		0x1
+ #define NUMA_BALANCING_MEMORY_TIERING	0x2
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 6a99e9578..dd320b255 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3503,7 +3503,7 @@ int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
+ 	 *   not worry about this generic constraint ]
+ 	 */
+ 	if (unlikely(!is_cpu_allowed(p, cpu))) {
+-		if (p->use_expand_mask)
++		if (sysctl_sched_nest)
+ 			atomic_set(&cpu_rq(p->thread_info.cpu)->taken,0);
+ 		cpu = select_fallback_rq(task_cpu(p), p);
+ 	}
+@@ -4199,7 +4199,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ #endif /* CONFIG_SMP */
+ 
+ 	ttwu_queue(p, cpu, wake_flags);
+-	if (p->use_expand_mask)
++	if (sysctl_sched_nest)
+ 		atomic_set(&cpu_rq(cpu)->taken,0);
+ unlock:
+ 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+@@ -4652,7 +4652,7 @@ void wake_up_new_task(struct task_struct *p)
+ 	update_rq_clock(rq);
+ 	post_init_entity_util_avg(p);
+ 
+-	if (p->use_expand_mask)
++	if (sysctl_sched_nest)
+ 		atomic_set(&cpu_rq(p->thread_info.cpu)->taken,0);
+ 	activate_task(rq, p, ENQUEUE_NOCLOCK);
+ 	trace_sched_wakeup_new(p);
+@@ -4964,20 +4964,21 @@ static inline void
+ prepare_task_switch(struct rq *rq, struct task_struct *prev,
+ 		    struct task_struct *next)
+ {
+-	if (prev->use_expand_mask && next->pid == 0) {
+-		smp_mb__before_atomic();
+-		start_spinning(rq->cpu);
+-		atomic_set(&rq->drop_expand_ctr, EXPAND_DELAY); // drop_expand is 0
+-		atomic_set(&rq->drop_reserve_ctr, RESERVE_DELAY); // drop_reserve is 0
+-		smp_mb__after_atomic();
+-	}
+-	if (next->use_expand_mask) {
+-		smp_mb__before_atomic();
+-		atomic_set(&rq->drop_expand_ctr,0);
+-		atomic_set(&rq->drop_reserve_ctr,0);
+-		smp_mb__after_atomic();
+-		rq->drop_expand = 0;
+-		rq->drop_reserve = 0;
++	if (sysctl_sched_nest) {
++		if (next->pid == 0) {
++			smp_mb__before_atomic();
++			start_spinning(rq->cpu);
++			atomic_set(&rq->drop_expand_ctr, EXPAND_DELAY); // drop_expand is 0
++			atomic_set(&rq->drop_reserve_ctr, RESERVE_DELAY); // drop_reserve is 0
++			smp_mb__after_atomic();
++		} else {
++			smp_mb__before_atomic();
++			atomic_set(&rq->drop_expand_ctr,0);
++			atomic_set(&rq->drop_reserve_ctr,0);
++			smp_mb__after_atomic();
++			rq->drop_expand = 0;
++			rq->drop_reserve = 0;
++		}
+ 	}
+ 	kcov_prepare_switch(prev);
+ 	sched_info_switch(rq, prev, next);
+@@ -6496,7 +6497,7 @@ static void __sched notrace __schedule(unsigned int sched_mode)
+ 
+ 		trace_sched_switch(sched_mode & SM_MASK_PREEMPT, prev, next, prev_state);
+ 
+-		if (prev->use_expand_mask && prev_state & TASK_DEAD && available_idle_cpu(cpu)) {
++		if (sysctl_sched_nest && prev_state & TASK_DEAD && available_idle_cpu(cpu)) {
+ 			smp_mb__before_atomic();
+ 			atomic_set(&rq->should_spin,0); // clean up early
+ 			atomic_set(&rq->drop_expand_ctr,0);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index a1f4b6eaa..8c3bc2563 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -149,6 +149,8 @@ unsigned int __read_mostly sched_burst_granularity   = 5;
+ unsigned int __read_mostly sched_burst_reduction     = 3;
+ #endif // CONFIG_SCHED_BORE
+ 
++unsigned int __read_mostly sysctl_sched_nest = 0;
++
+ int sched_thermal_decay_shift;
+ static int __init setup_sched_thermal_decay_shift(char *str)
+ {
+@@ -7280,7 +7282,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 
+ 	rcu_read_lock();
+ 
+-	if (p->use_expand_mask) {
++	if (sysctl_sched_nest) {
+ 		struct sched_domain *this_sd;
+ 		cpumask_t *mask_sd;
+ 		int i;
+@@ -7449,7 +7451,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 		/* Fast path */
+ 		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
+ 	}
+-	if (p->use_expand_mask) {
++	if (sysctl_sched_nest) {
+ 		if (impatient)
+ 			set_expand_mask(new_cpu);
+ 		else
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index ed0db840a..f9a300992 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -2040,6 +2040,15 @@ static struct ctl_table kern_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_ONE,
+ 	},
++	{
++		.procname	= "sched_nest",
++		.data		= &sysctl_sched_nest,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
+ #if defined(CONFIG_TREE_RCU)
+ 	{
+ 		.procname	= "panic_on_rcu_stall",
+-- 
+2.30.2
+
