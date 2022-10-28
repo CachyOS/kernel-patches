@@ -3,4 +3,5 @@
   <br/>
   <h1 align="center">CachyOS</h1>
 </div>
-##### Patches for [CachyOS Kernels](https://github.com/CachyOS/linux-cachyos).
+
+## Patches for [CachyOS Kernels](https://github.com/CachyOS/linux-cachyos).
