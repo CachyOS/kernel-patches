@@ -1,0 +1,102 @@
+From 938ebd726b896056bec9db2fe8f47c5758bac5c1 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Wed, 17 Aug 2022 12:22:43 +0100
+Subject: [PATCH 17/32] btrfs: search for last logged dir index if it's not
+ cached in the inode
+
+The key offset of the last dir index item that was logged is stored in
+the inode's last_dir_index_offset field. However that field is not
+persisted in the inode item or elsewhere, so if the inode gets evicted
+and reloaded, it gets a value of (u64)-1, so that when we are logging
+dir index items we check if they were logged before, to avoid attempts
+to insert duplicated keys and fallback to a transaction commit.
+
+Improve on this by searching for the last dir index that was logged when
+we start logging a directory if the inode's last_dir_index_offset is not
+set (has a value of (u64)-1) and it was not logged before. This avoids
+checking if each dir index item we find was already logged before.
+
+This will also be needed for an incoming change where we start logging
+delayed items directly, without flushing them first.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/tree-log.c | 54 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index c8ee776dd..6d9604f77 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -4135,6 +4135,56 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
+ 	return err;
+ }
+ 
++/*
++ * If the inode was logged before and it was evicted, then its
++ * last_dir_index_offset is (u64)-1, so we don't the value of the last index
++ * key offset. If that's the case, search for it and update the inode. This
++ * is to avoid lookups in the log tree every time we try to insert a dir index
++ * key from a leaf changed in the current transaction, and to allow us to always
++ * do batch insertions of dir index keys.
++ */
++static int update_last_dir_index_offset(struct btrfs_inode *inode,
++					struct btrfs_path *path,
++					const struct btrfs_log_ctx *ctx)
++{
++	const u64 ino = btrfs_ino(inode);
++	struct btrfs_key key;
++	int ret;
++
++	lockdep_assert_held(&inode->log_mutex);
++
++	if (inode->last_dir_index_offset != (u64)-1)
++		return 0;
++
++	if (!ctx->logged_before) {
++		inode->last_dir_index_offset = BTRFS_DIR_START_INDEX - 1;
++		return 0;
++	}
++
++	key.objectid = ino;
++	key.type = BTRFS_DIR_INDEX_KEY;
++	key.offset = (u64)-1;
++
++	ret = btrfs_search_slot(NULL, inode->root->log_root, &key, path, 0, 0);
++	if (ret <= 0)
++		goto out;
++
++	ret = 0;
++	inode->last_dir_index_offset = BTRFS_DIR_START_INDEX - 1;
++
++	if (path->slots[0] == 0)
++		goto out;
++
++	btrfs_item_key_to_cpu(path->nodes[0], &key, path->slots[0] - 1);
++	if (key.objectid == ino && key.type == BTRFS_DIR_INDEX_KEY)
++		inode->last_dir_index_offset = key.offset;
++
++out:
++	btrfs_release_path(path);
++
++	return ret;
++}
++
+ /*
+  * logging directories is very similar to logging inodes, We find all the items
+  * from the current transaction and write them to the log.
+@@ -4157,6 +4207,10 @@ static noinline int log_directory_changes(struct btrfs_trans_handle *trans,
+ 	u64 max_key;
+ 	int ret;
+ 
++	ret = update_last_dir_index_offset(inode, path, ctx);
++	if (ret)
++		return ret;
++
+ 	min_key = BTRFS_DIR_START_INDEX;
+ 	max_key = 0;
+ 	ctx->last_dir_item_offset = inode->last_dir_index_offset;
+-- 
+2.38.1.385.g3b08839926
+

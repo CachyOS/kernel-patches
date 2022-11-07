@@ -1,0 +1,159 @@
+From b9b17e86a5b6956f995f69eec947004b7cbe4f47 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Wed, 17 Aug 2022 12:22:47 +0100
+Subject: [PATCH 21/32] btrfs: skip logging parent dir when conflicting inode
+ is not a dir
+
+When we find a conflicting inode (an inode that had the same name and
+parent directory as the inode we are logging now) that was deleted in the
+current transaction, we always end up logging its parent directory.
+
+This is to deal with the case where the conflicting inode corresponds to
+a deleted subvolume/snapshot or a directory that had subvolumes/snapshots
+(or some subdirectory inside it had subvolumes/snapshots, etc), because
+we can't deal with dropping subvolumes/snapshots during log replay. So
+if we log the parent directory, and if we are dealing with these special
+cases, then we fallback to a transaction commit when logging the parent,
+because its last_unlink_trans will match the current transaction (which
+gets set and propagated when a subvolume/snapshot is deleted).
+
+This change skips the logging of the parent directory when the conflicting
+inode is not a directory (or a subvolume/snapshot). This is ok because in
+this case logging the current inode is enough to trigger an unlink of the
+conflicting inode during log replay.
+
+So for a case like this:
+
+  $ mkdir /mnt/dir
+  $ echo -n "first foo data" > /mnt/dir/foo
+
+  $ sync
+
+  $ rm -f /mnt/dir/foo
+  $ echo -n "second foo data" > /mnt/dir/foo
+  $ xfs_io -c "fsync" /mnt/dir/foo
+
+We avoid logging parent directory "dir" when logging the new file "foo".
+In other cases it avoids falling back to a transaction commit, when the
+parent directory has a last_unlink_trans value that matches the current
+transaction, due to moving a file from it to some other directory.
+
+This is a case that happens frequently with dbench for example, where a
+new file that has the name/parent of another file that was deleted in the
+current transaction, is fsynced.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/tree-log.c | 72 ++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 62 insertions(+), 10 deletions(-)
+
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index 7a34a5371..1641e9c58 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -5672,8 +5672,46 @@ static void free_conflicting_inodes(struct btrfs_log_ctx *ctx)
+ 	}
+ }
+ 
++static int conflicting_inode_is_dir(struct btrfs_root *root, u64 ino,
++				    struct btrfs_path *path)
++{
++	struct btrfs_key key;
++	int ret;
++
++	key.objectid = ino;
++	key.type = BTRFS_INODE_ITEM_KEY;
++	key.offset = 0;
++
++	path->search_commit_root = 1;
++	path->skip_locking = 1;
++
++	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
++	if (WARN_ON_ONCE(ret > 0)) {
++		/*
++		 * We have previously found the inode through the commit root
++		 * so this should not happen. If it does, just error out and
++		 * fallback to a transaction commit.
++		 */
++		ret = -ENOENT;
++	} else if (ret == 0) {
++		struct btrfs_inode_item *item;
++
++		item = btrfs_item_ptr(path->nodes[0], path->slots[0],
++				      struct btrfs_inode_item);
++		if (S_ISDIR(btrfs_inode_mode(path->nodes[0], item)))
++			ret = 1;
++	}
++
++	btrfs_release_path(path);
++	path->search_commit_root = 0;
++	path->skip_locking = 0;
++
++	return ret;
++}
++
+ static int add_conflicting_inode(struct btrfs_trans_handle *trans,
+ 				 struct btrfs_root *root,
++				 struct btrfs_path *path,
+ 				 u64 ino, u64 parent,
+ 				 struct btrfs_log_ctx *ctx)
+ {
+@@ -5693,15 +5731,23 @@ static int add_conflicting_inode(struct btrfs_trans_handle *trans,
+ 	inode = btrfs_iget(root->fs_info->sb, ino, root);
+ 	/*
+ 	 * If the other inode that had a conflicting dir entry was deleted in
+-	 * the current transaction, we need to log its parent directory.
+-	 * We can't simply ignore it and let the current inode's reference cause
+-	 * an unlink of the conflicting inode when replaying the log - because
+-	 * the conflicting inode may be a deleted subvolume/snapshot or it may
+-	 * be a directory that had subvolumes/snapshots inside it (or had one
+-	 * or more subdirectories with subvolumes/snapshots, etc). If that's the
+-	 * case, then when logging the parent directory we will fallback to a
+-	 * transaction commit because the parent directory will have a
+-	 * last_unlink_trans that matches the current transaction.
++	 * the current transaction then we either:
++	 *
++	 * 1) Log the parent directory (later after adding it to the list) if
++	 *    the inode is a directory. This is because it may be a deleted
++	 *    subvolume/snapshot or it may be a regular directory that had
++	 *    deleted subvolumes/snapshots (or subdirectories that had them),
++	 *    and at the moment we can't deal with dropping subvolumes/snapshots
++	 *    during log replay. So we just log the parent, which will result in
++	 *    a fallback to a transaction commit if we are dealing with those
++	 *    cases (last_unlink_trans will match the current transaction);
++	 *
++	 * 2) Do nothing if it's not a directory. During log replay we simply
++	 *    unlink the conflicting dentry from the parent directory and then
++	 *    add the dentry for our inode. Like this we can avoid logging the
++	 *    parent directory (and maybe fallback to a transaction commit in
++	 *    case it has a last_unlink_trans == trans->transid, due to moving
++	 *    some inode from it to some other directory).
+ 	 */
+ 	if (IS_ERR(inode)) {
+ 		int ret = PTR_ERR(inode);
+@@ -5709,6 +5755,12 @@ static int add_conflicting_inode(struct btrfs_trans_handle *trans,
+ 		if (ret != -ENOENT)
+ 			return ret;
+ 
++		ret = conflicting_inode_is_dir(root, ino, path);
++		/* Not a directory or we got an error. */
++		if (ret <= 0)
++			return ret;
++
++		/* Conflicting inode is a directory, so we'll log its parent. */
+ 		ino_elem = kmalloc(sizeof(*ino_elem), GFP_NOFS);
+ 		if (!ino_elem)
+ 			return -ENOMEM;
+@@ -5947,7 +5999,7 @@ static int copy_inode_items_to_log(struct btrfs_trans_handle *trans,
+ 				ins_nr = 0;
+ 
+ 				btrfs_release_path(path);
+-				ret = add_conflicting_inode(trans, root,
++				ret = add_conflicting_inode(trans, root, path,
+ 							    other_ino,
+ 							    other_parent, ctx);
+ 				if (ret)
+-- 
+2.38.1.385.g3b08839926
+

@@ -1,0 +1,285 @@
+From acd31e7f4a54e56cc5502aaaac63d592621bb64f Mon Sep 17 00:00:00 2001
+From: Ioannis Angelakopoulos <iangelak@fb.com>
+Date: Mon, 25 Jul 2022 15:11:52 -0700
+Subject: [PATCH 04/32] btrfs: add lockdep annotations for transaction states
+ wait events
+
+Add lockdep annotations for the transaction states that have wait
+events;
+
+  1) TRANS_STATE_COMMIT_START
+  2) TRANS_STATE_UNBLOCKED
+  3) TRANS_STATE_SUPER_COMMITTED
+  4) TRANS_STATE_COMPLETED
+
+The new macros introduced here to annotate the transaction states wait
+events have the same effect as the generic lockdep annotation macros.
+
+With the exception of the lockdep annotation for TRANS_STATE_COMMIT_START
+the transaction thread has to acquire the lockdep maps for the
+transaction states as reader after the lockdep map for num_writers is
+released so that lockdep does not complain.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Ioannis Angelakopoulos <iangelak@fb.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/ctree.h       | 32 +++++++++++++++++++++++++
+ fs/btrfs/disk-io.c     |  8 +++++++
+ fs/btrfs/transaction.c | 53 ++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 83 insertions(+), 10 deletions(-)
+
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index d3a5d17eb..85fc79ecf 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1098,6 +1098,7 @@ struct btrfs_fs_info {
+ 	 */
+ 	struct lockdep_map btrfs_trans_num_writers_map;
+ 	struct lockdep_map btrfs_trans_num_extwriters_map;
++	struct lockdep_map btrfs_state_change_map[4];
+ 
+ #ifdef CONFIG_BTRFS_FS_REF_VERIFY
+ 	spinlock_t ref_verify_lock;
+@@ -1181,6 +1182,13 @@ enum {
+ 	BTRFS_ROOT_RESET_LOCKDEP_CLASS,
+ };
+ 
++enum btrfs_lockdep_trans_states {
++	BTRFS_LOCKDEP_TRANS_COMMIT_START,
++	BTRFS_LOCKDEP_TRANS_UNBLOCKED,
++	BTRFS_LOCKDEP_TRANS_SUPER_COMMITTED,
++	BTRFS_LOCKDEP_TRANS_COMPLETED,
++};
++
+ /*
+  * Lockdep annotation for wait events.
+  *
+@@ -1219,6 +1227,22 @@ enum {
+ #define btrfs_lockdep_release(owner, lock)					\
+ 	rwsem_release(&owner->lock##_map, _THIS_IP_)
+ 
++/*
++ * Macros for the transaction states wait events, similar to the generic wait
++ * event macros.
++ */
++#define btrfs_might_wait_for_state(owner, i)					\
++	do {									\
++		rwsem_acquire(&owner->btrfs_state_change_map[i], 0, 0, _THIS_IP_); \
++		rwsem_release(&owner->btrfs_state_change_map[i], _THIS_IP_);	\
++	} while (0)
++
++#define btrfs_trans_state_lockdep_acquire(owner, i)				\
++	rwsem_acquire_read(&owner->btrfs_state_change_map[i], 0, 0, _THIS_IP_)
++
++#define btrfs_trans_state_lockdep_release(owner, i)				\
++	rwsem_release(&owner->btrfs_state_change_map[i], _THIS_IP_)
++
+ /* Initialization of the lockdep map */
+ #define btrfs_lockdep_init_map(owner, lock)					\
+ 	do {									\
+@@ -1226,6 +1250,14 @@ enum {
+ 		lockdep_init_map(&owner->lock##_map, #lock, &lock##_key, 0);	\
+ 	} while (0)
+ 
++/* Initialization of the transaction states lockdep maps. */
++#define btrfs_state_lockdep_init_map(owner, lock, state)			\
++	do {									\
++		static struct lock_class_key lock##_key;			\
++		lockdep_init_map(&owner->btrfs_state_change_map[state], #lock,	\
++				 &lock##_key, 0);				\
++	} while (0)
++
+ static inline void btrfs_wake_unfinished_drop(struct btrfs_fs_info *fs_info)
+ {
+ 	clear_and_wake_up_bit(BTRFS_FS_UNFINISHED_DROPS, &fs_info->flags);
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 811d743e2..68c6cb4e9 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -2992,6 +2992,14 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
+ 
+ 	btrfs_lockdep_init_map(fs_info, btrfs_trans_num_writers);
+ 	btrfs_lockdep_init_map(fs_info, btrfs_trans_num_extwriters);
++	btrfs_state_lockdep_init_map(fs_info, btrfs_trans_commit_start,
++				     BTRFS_LOCKDEP_TRANS_COMMIT_START);
++	btrfs_state_lockdep_init_map(fs_info, btrfs_trans_unblocked,
++				     BTRFS_LOCKDEP_TRANS_UNBLOCKED);
++	btrfs_state_lockdep_init_map(fs_info, btrfs_trans_super_committed,
++				     BTRFS_LOCKDEP_TRANS_SUPER_COMMITTED);
++	btrfs_state_lockdep_init_map(fs_info, btrfs_trans_completed,
++				     BTRFS_LOCKDEP_TRANS_COMPLETED);
+ 
+ 	INIT_LIST_HEAD(&fs_info->dirty_cowonly_roots);
+ 	INIT_LIST_HEAD(&fs_info->space_info);
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index 44e47db4c..d3576f840 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -550,6 +550,7 @@ static void wait_current_trans(struct btrfs_fs_info *fs_info)
+ 		refcount_inc(&cur_trans->use_count);
+ 		spin_unlock(&fs_info->trans_lock);
+ 
++		btrfs_might_wait_for_state(fs_info, BTRFS_LOCKDEP_TRANS_UNBLOCKED);
+ 		wait_event(fs_info->transaction_wait,
+ 			   cur_trans->state >= TRANS_STATE_UNBLOCKED ||
+ 			   TRANS_ABORTED(cur_trans));
+@@ -868,6 +869,15 @@ static noinline void wait_for_commit(struct btrfs_transaction *commit,
+ 	u64 transid = commit->transid;
+ 	bool put = false;
+ 
++	/*
++	 * At the moment this function is called with min_state either being
++	 * TRANS_STATE_COMPLETED or TRANS_STATE_SUPER_COMMITTED.
++	 */
++	if (min_state == TRANS_STATE_COMPLETED)
++		btrfs_might_wait_for_state(fs_info, BTRFS_LOCKDEP_TRANS_COMPLETED);
++	else
++		btrfs_might_wait_for_state(fs_info, BTRFS_LOCKDEP_TRANS_SUPER_COMMITTED);
++
+ 	while (1) {
+ 		wait_event(commit->commit_wait, commit->state >= min_state);
+ 		if (put)
+@@ -1980,6 +1990,7 @@ void btrfs_commit_transaction_async(struct btrfs_trans_handle *trans)
+ 	 * Wait for the current transaction commit to start and block
+ 	 * subsequent transaction joins
+ 	 */
++	btrfs_might_wait_for_state(fs_info, BTRFS_LOCKDEP_TRANS_COMMIT_START);
+ 	wait_event(fs_info->transaction_blocked_wait,
+ 		   cur_trans->state >= TRANS_STATE_COMMIT_START ||
+ 		   TRANS_ABORTED(cur_trans));
+@@ -2137,12 +2148,12 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 	ktime_t interval;
+ 
+ 	ASSERT(refcount_read(&trans->use_count) == 1);
++	btrfs_trans_state_lockdep_acquire(fs_info, BTRFS_LOCKDEP_TRANS_COMMIT_START);
+ 
+ 	/* Stop the commit early if ->aborted is set */
+ 	if (TRANS_ABORTED(cur_trans)) {
+ 		ret = cur_trans->aborted;
+-		btrfs_end_transaction(trans);
+-		return ret;
++		goto lockdep_trans_commit_start_release;
+ 	}
+ 
+ 	btrfs_trans_release_metadata(trans);
+@@ -2159,10 +2170,8 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 		 * Any running threads may add more while we are here.
+ 		 */
+ 		ret = btrfs_run_delayed_refs(trans, 0);
+-		if (ret) {
+-			btrfs_end_transaction(trans);
+-			return ret;
+-		}
++		if (ret)
++			goto lockdep_trans_commit_start_release;
+ 	}
+ 
+ 	btrfs_create_pending_block_groups(trans);
+@@ -2191,10 +2200,8 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 
+ 		if (run_it) {
+ 			ret = btrfs_start_dirty_block_groups(trans);
+-			if (ret) {
+-				btrfs_end_transaction(trans);
+-				return ret;
+-			}
++			if (ret)
++				goto lockdep_trans_commit_start_release;
+ 		}
+ 	}
+ 
+@@ -2209,6 +2216,9 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 
+ 		if (trans->in_fsync)
+ 			want_state = TRANS_STATE_SUPER_COMMITTED;
++
++		btrfs_trans_state_lockdep_release(fs_info,
++						  BTRFS_LOCKDEP_TRANS_COMMIT_START);
+ 		ret = btrfs_end_transaction(trans);
+ 		wait_for_commit(cur_trans, want_state);
+ 
+@@ -2222,6 +2232,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 
+ 	cur_trans->state = TRANS_STATE_COMMIT_START;
+ 	wake_up(&fs_info->transaction_blocked_wait);
++	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_COMMIT_START);
+ 
+ 	if (cur_trans->list.prev != &fs_info->trans_list) {
+ 		enum btrfs_trans_state want_state = TRANS_STATE_COMPLETED;
+@@ -2323,6 +2334,16 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 	wait_event(cur_trans->writer_wait,
+ 		   atomic_read(&cur_trans->num_writers) == 1);
+ 
++	/*
++	 * Make lockdep happy by acquiring the state locks after
++	 * btrfs_trans_num_writers is released. If we acquired the state locks
++	 * before releasing the btrfs_trans_num_writers lock then lockdep would
++	 * complain because we did not follow the reverse order unlocking rule.
++	 */
++	btrfs_trans_state_lockdep_acquire(fs_info, BTRFS_LOCKDEP_TRANS_COMPLETED);
++	btrfs_trans_state_lockdep_acquire(fs_info, BTRFS_LOCKDEP_TRANS_SUPER_COMMITTED);
++	btrfs_trans_state_lockdep_acquire(fs_info, BTRFS_LOCKDEP_TRANS_UNBLOCKED);
++
+ 	/*
+ 	 * We've started the commit, clear the flag in case we were triggered to
+ 	 * do an async commit but somebody else started before the transaction
+@@ -2332,6 +2353,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 
+ 	if (TRANS_ABORTED(cur_trans)) {
+ 		ret = cur_trans->aborted;
++		btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_UNBLOCKED);
+ 		goto scrub_continue;
+ 	}
+ 	/*
+@@ -2466,6 +2488,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 	mutex_unlock(&fs_info->reloc_mutex);
+ 
+ 	wake_up(&fs_info->transaction_wait);
++	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_UNBLOCKED);
+ 
+ 	ret = btrfs_write_and_wait_transaction(trans);
+ 	if (ret) {
+@@ -2497,6 +2520,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 	 */
+ 	cur_trans->state = TRANS_STATE_SUPER_COMMITTED;
+ 	wake_up(&cur_trans->commit_wait);
++	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_SUPER_COMMITTED);
+ 
+ 	btrfs_finish_extent_commit(trans);
+ 
+@@ -2510,6 +2534,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 	 */
+ 	cur_trans->state = TRANS_STATE_COMPLETED;
+ 	wake_up(&cur_trans->commit_wait);
++	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_COMPLETED);
+ 
+ 	spin_lock(&fs_info->trans_lock);
+ 	list_del_init(&cur_trans->list);
+@@ -2538,7 +2563,10 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 
+ unlock_reloc:
+ 	mutex_unlock(&fs_info->reloc_mutex);
++	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_UNBLOCKED);
+ scrub_continue:
++	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_SUPER_COMMITTED);
++	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_COMPLETED);
+ 	btrfs_scrub_continue(fs_info);
+ cleanup_transaction:
+ 	btrfs_trans_release_metadata(trans);
+@@ -2556,6 +2584,11 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 	btrfs_lockdep_release(fs_info, btrfs_trans_num_extwriters);
+ 	btrfs_lockdep_release(fs_info, btrfs_trans_num_writers);
+ 	goto cleanup_transaction;
++
++lockdep_trans_commit_start_release:
++	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_COMMIT_START);
++	btrfs_end_transaction(trans);
++	return ret;
+ }
+ 
+ /*
+-- 
+2.38.1.385.g3b08839926
+
