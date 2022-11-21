@@ -1,7 +1,7 @@
-From 7dd619d5331e6f733a9e260042cfbb4a6af00193 Mon Sep 17 00:00:00 2001
+From 32cc442f451d6b2f37b14c726bfa260d5ba4317d Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 14 Nov 2022 19:34:05 +0100
-Subject: [PATCH 18/18] folio
+Date: Mon, 21 Nov 2022 01:42:58 +0100
+Subject: [PATCH 16/16] folio
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -10,6 +10,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/ceph/addr.c             |  58 +++++----
  fs/cifs/file.c             |  32 ++++-
  fs/ext4/inode.c            |  55 ++++----
+ fs/ext4/move_extent.c      |  52 +++++---
  fs/f2fs/checkpoint.c       |  49 +++----
  fs/f2fs/compress.c         |  13 +-
  fs/f2fs/data.c             |  69 +++++-----
@@ -23,17 +24,18 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  include/linux/highmem.h    |  40 ++++++
  include/linux/mm.h         |  49 ++++---
  include/linux/page-flags.h |  99 ++++++++-------
- include/linux/pagemap.h    |  39 ++++--
+ include/linux/pagemap.h    |  40 +++---
  include/linux/pagevec.h    |   8 --
  include/linux/swap.h       |   1 -
  include/linux/vmalloc.h    |   6 +-
  mm/filemap.c               | 136 ++++++++++----------
- mm/folio-compat.c          |   8 +-
+ mm/folio-compat.c          |  14 +-
  mm/huge_memory.c           |  18 +--
  mm/hugetlb.c               |  53 ++++----
- mm/khugepaged.c            |  11 +-
+ mm/khugepaged.c            |  34 ++---
  mm/madvise.c               |   6 +-
  mm/memcontrol.c            |  12 +-
+ mm/memory-failure.c        |   5 +-
  mm/memory.c                |  25 ++--
  mm/migrate.c               | 253 +++++++++++++++++++------------------
  mm/mincore.c               |  10 +-
@@ -46,7 +48,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  mm/userfaultfd.c           |   6 +-
  mm/vmalloc.c               |  73 ++++++++---
  mm/workingset.c            |   2 +-
- 41 files changed, 940 insertions(+), 771 deletions(-)
+ 43 files changed, 986 insertions(+), 812 deletions(-)
 
 diff --git a/fs/afs/write.c b/fs/afs/write.c
 index 9ebdd36eaf2f..c17dbd82a38c 100644
@@ -642,6 +644,128 @@ index 2b5ef1b64249..69a0708c8e87 100644
  	return err;
  }
  
+diff --git a/fs/ext4/move_extent.c b/fs/ext4/move_extent.c
+index 044e34cd835c..8dbb87edf24c 100644
+--- a/fs/ext4/move_extent.c
++++ b/fs/ext4/move_extent.c
+@@ -253,6 +253,7 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ {
+ 	struct inode *orig_inode = file_inode(o_filp);
+ 	struct page *pagep[2] = {NULL, NULL};
++	struct folio *folio[2] = {NULL, NULL};
+ 	handle_t *handle;
+ 	ext4_lblk_t orig_blk_offset, donor_blk_offset;
+ 	unsigned long blocksize = orig_inode->i_sb->s_blocksize;
+@@ -313,6 +314,13 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ 	 * hold page's lock, if it is still the case data copy is not
+ 	 * necessary, just swap data blocks between orig and donor.
+ 	 */
++	folio[0] = page_folio(pagep[0]);
++	folio[1] = page_folio(pagep[1]);
++
++	VM_BUG_ON_FOLIO(folio_test_large(folio[0]), folio[0]);
++	VM_BUG_ON_FOLIO(folio_test_large(folio[1]), folio[1]);
++	VM_BUG_ON_FOLIO(folio_nr_pages(folio[0]) != folio_nr_pages(folio[1]), folio[1]);
++
+ 	if (unwritten) {
+ 		ext4_double_down_write_data_sem(orig_inode, donor_inode);
+ 		/* If any of extents in range became initialized we have to
+@@ -331,10 +339,10 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ 			ext4_double_up_write_data_sem(orig_inode, donor_inode);
+ 			goto data_copy;
+ 		}
+-		if ((page_has_private(pagep[0]) &&
+-		     !try_to_release_page(pagep[0], 0)) ||
+-		    (page_has_private(pagep[1]) &&
+-		     !try_to_release_page(pagep[1], 0))) {
++		if ((folio_has_private(folio[0]) &&
++		     !filemap_release_folio(folio[0], 0)) ||
++		    (folio_has_private(folio[1]) &&
++		     !filemap_release_folio(folio[1], 0))) {
+ 			*err = -EBUSY;
+ 			goto drop_data_sem;
+ 		}
+@@ -344,19 +352,21 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ 						   block_len_in_page, 1, err);
+ 	drop_data_sem:
+ 		ext4_double_up_write_data_sem(orig_inode, donor_inode);
+-		goto unlock_pages;
++		goto unlock_folios;
+ 	}
+ data_copy:
+-	*err = mext_page_mkuptodate(pagep[0], from, from + replaced_size);
++	*err = mext_page_mkuptodate(&folio[0]->page, from, from + replaced_size);
+ 	if (*err)
+-		goto unlock_pages;
++		goto unlock_folios;
+ 
+ 	/* At this point all buffers in range are uptodate, old mapping layout
+ 	 * is no longer required, try to drop it now. */
+-	if ((page_has_private(pagep[0]) && !try_to_release_page(pagep[0], 0)) ||
+-	    (page_has_private(pagep[1]) && !try_to_release_page(pagep[1], 0))) {
++	if ((folio_has_private(folio[0]) &&
++		!filemap_release_folio(folio[0], 0)) ||
++	    (folio_has_private(folio[1]) &&
++		!filemap_release_folio(folio[1], 0))) {
+ 		*err = -EBUSY;
+-		goto unlock_pages;
++		goto unlock_folios;
+ 	}
+ 	ext4_double_down_write_data_sem(orig_inode, donor_inode);
+ 	replaced_count = ext4_swap_extents(handle, orig_inode, donor_inode,
+@@ -369,13 +379,13 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ 			replaced_size =
+ 				block_len_in_page << orig_inode->i_blkbits;
+ 		} else
+-			goto unlock_pages;
++			goto unlock_folios;
+ 	}
+ 	/* Perform all necessary steps similar write_begin()/write_end()
+ 	 * but keeping in mind that i_size will not change */
+-	if (!page_has_buffers(pagep[0]))
+-		create_empty_buffers(pagep[0], 1 << orig_inode->i_blkbits, 0);
+-	bh = page_buffers(pagep[0]);
++	if (!folio_buffers(folio[0]))
++		create_empty_buffers(&folio[0]->page, 1 << orig_inode->i_blkbits, 0);
++	bh = folio_buffers(folio[0]);
+ 	for (i = 0; i < data_offset_in_page; i++)
+ 		bh = bh->b_this_page;
+ 	for (i = 0; i < block_len_in_page; i++) {
+@@ -385,7 +395,7 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ 		bh = bh->b_this_page;
+ 	}
+ 	if (!*err)
+-		*err = block_commit_write(pagep[0], from, from + replaced_size);
++		*err = block_commit_write(&folio[0]->page, from, from + replaced_size);
+ 
+ 	if (unlikely(*err < 0))
+ 		goto repair_branches;
+@@ -395,11 +405,11 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ 	*err = ext4_jbd2_inode_add_write(handle, orig_inode,
+ 			(loff_t)orig_page_offset << PAGE_SHIFT, replaced_size);
+ 
+-unlock_pages:
+-	unlock_page(pagep[0]);
+-	put_page(pagep[0]);
+-	unlock_page(pagep[1]);
+-	put_page(pagep[1]);
++unlock_folios:
++	folio_unlock(folio[0]);
++	folio_put(folio[0]);
++	folio_unlock(folio[1]);
++	folio_put(folio[1]);
+ stop_journal:
+ 	ext4_journal_stop(handle);
+ 	if (*err == -ENOSPC &&
+@@ -430,7 +440,7 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ 		*err = -EIO;
+ 	}
+ 	replaced_count = 0;
+-	goto unlock_pages;
++	goto unlock_folios;
+ }
+ 
+ /**
 diff --git a/fs/f2fs/checkpoint.c b/fs/f2fs/checkpoint.c
 index 0c82dae082aa..82eb26f471c5 100644
 --- a/fs/f2fs/checkpoint.c
@@ -2187,7 +2311,7 @@ index 0b0ae5084e60..ee6604fcc1d1 100644
  	return page_has_private(&folio->page);
  }
 diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
-index 0a11325c35fa..284a1abd29de 100644
+index 0a11325c35fa..94d5dec1bd2e 100644
 --- a/include/linux/pagemap.h
 +++ b/include/linux/pagemap.h
 @@ -504,9 +504,8 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
@@ -2248,7 +2372,7 @@ index 0a11325c35fa..284a1abd29de 100644
  
  struct page *grab_cache_page_write_begin(struct address_space *mapping,
  			pgoff_t index);
-@@ -1104,7 +1115,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
+@@ -1104,10 +1115,9 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
  void filemap_remove_folio(struct folio *folio);
  void delete_from_page_cache(struct page *page);
  void __filemap_remove_folio(struct folio *folio, void *shadow);
@@ -2256,7 +2380,10 @@ index 0a11325c35fa..284a1abd29de 100644
 +void replace_page_cache_folio(struct folio *old, struct folio *new);
  void delete_from_page_cache_batch(struct address_space *mapping,
  				  struct folio_batch *fbatch);
- int try_to_release_page(struct page *page, gfp_t gfp);
+-int try_to_release_page(struct page *page, gfp_t gfp);
+ bool filemap_release_folio(struct folio *folio, gfp_t gfp);
+ loff_t mapping_seek_hole_data(struct address_space *, loff_t start, loff_t end,
+ 		int whence);
 diff --git a/include/linux/pagevec.h b/include/linux/pagevec.h
 index 215eb6c3bdc9..a520632297ac 100644
 --- a/include/linux/pagevec.h
@@ -2533,7 +2660,7 @@ index 08341616ae7a..e352883c0ef1 100644
  /*
   * CD/DVDs are error prone. When a medium error occurs, the driver may fail
 diff --git a/mm/folio-compat.c b/mm/folio-compat.c
-index e1e23b4947d7..7b5be913b4d3 100644
+index e1e23b4947d7..d83378d425bc 100644
 --- a/mm/folio-compat.c
 +++ b/mm/folio-compat.c
 @@ -82,12 +82,6 @@ bool redirty_page_for_writepage(struct writeback_control *wbc,
@@ -2558,6 +2685,19 @@ index e1e23b4947d7..7b5be913b4d3 100644
  		return &folio->page;
  	return folio_file_page(folio, index);
  }
+@@ -129,12 +123,6 @@ void delete_from_page_cache(struct page *page)
+ 	return filemap_remove_folio(page_folio(page));
+ }
+ 
+-int try_to_release_page(struct page *page, gfp_t gfp)
+-{
+-	return filemap_release_folio(page_folio(page), gfp);
+-}
+-EXPORT_SYMBOL(try_to_release_page);
+-
+ int isolate_lru_page(struct page *page)
+ {
+ 	if (WARN_RATELIMIT(PageTail(page), "trying to isolate tail page"))
 diff --git a/mm/huge_memory.c b/mm/huge_memory.c
 index 9f2f15d8e02e..ee4a219ab3f3 100644
 --- a/mm/huge_memory.c
@@ -2716,10 +2856,73 @@ index e48f8ef45b17..2208d989b925 100644
  }
  
 diff --git a/mm/khugepaged.c b/mm/khugepaged.c
-index 4734315f7940..e432d5279043 100644
+index 4734315f7940..38d273130f8f 100644
 --- a/mm/khugepaged.c
 +++ b/mm/khugepaged.c
-@@ -1970,6 +1970,7 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
+@@ -1747,6 +1747,7 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
+ 	xas_set(&xas, start);
+ 	for (index = start; index < end; index++) {
+ 		struct page *page = xas_next(&xas);
++		struct folio *folio;
+ 
+ 		VM_BUG_ON(index != xas.xa_index);
+ 		if (is_shmem) {
+@@ -1773,8 +1774,6 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
+ 			}
+ 
+ 			if (xa_is_value(page) || !PageUptodate(page)) {
+-				struct folio *folio;
+-
+ 				xas_unlock_irq(&xas);
+ 				/* swap in or instantiate fallocated page */
+ 				if (shmem_get_folio(mapping->host, index,
+@@ -1862,13 +1861,15 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
+ 			goto out_unlock;
+ 		}
+ 
+-		if (page_mapping(page) != mapping) {
++		folio = page_folio(page);
++
++		if (folio_mapping(folio) != mapping) {
+ 			result = SCAN_TRUNCATED;
+ 			goto out_unlock;
+ 		}
+ 
+-		if (!is_shmem && (PageDirty(page) ||
+-				  PageWriteback(page))) {
++		if (!is_shmem && (folio_test_dirty(folio) ||
++				  folio_test_writeback(folio))) {
+ 			/*
+ 			 * khugepaged only works on read-only fd, so this
+ 			 * page is dirty because it hasn't been flushed
+@@ -1878,20 +1879,20 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
+ 			goto out_unlock;
+ 		}
+ 
+-		if (isolate_lru_page(page)) {
++		if (folio_isolate_lru(folio)) {
+ 			result = SCAN_DEL_PAGE_LRU;
+ 			goto out_unlock;
+ 		}
+ 
+-		if (page_has_private(page) &&
+-		    !try_to_release_page(page, GFP_KERNEL)) {
++		if (folio_has_private(folio) &&
++		    !filemap_release_folio(folio, GFP_KERNEL)) {
+ 			result = SCAN_PAGE_HAS_PRIVATE;
+-			putback_lru_page(page);
++			folio_putback_lru(folio);
+ 			goto out_unlock;
+ 		}
+ 
+-		if (page_mapped(page))
+-			try_to_unmap(page_folio(page),
++		if (folio_mapped(folio))
++			try_to_unmap(folio,
+ 					TTU_IGNORE_MLOCK | TTU_BATCH_FLUSH);
+ 
+ 		xas_lock_irq(&xas);
+@@ -1970,6 +1971,7 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
  
  	if (result == SCAN_SUCCEED) {
  		struct page *page, *tmp;
@@ -2727,7 +2930,7 @@ index 4734315f7940..e432d5279043 100644
  
  		/*
  		 * Replacing old pages with new one has succeeded, now we
-@@ -1997,11 +1998,13 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
+@@ -1997,11 +1999,13 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
  			index++;
  		}
  
@@ -2798,8 +3001,28 @@ index 2d8549ae1b30..2e6e8bce1f60 100644
  }
  
  /**
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index bead6bccc7f2..9dd81e739b6f 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -827,12 +827,13 @@ static int truncate_error_page(struct page *p, unsigned long pfn,
+ 	int ret = MF_FAILED;
+ 
+ 	if (mapping->a_ops->error_remove_page) {
++		struct folio *folio = page_folio(p);
+ 		int err = mapping->a_ops->error_remove_page(mapping, p);
+ 
+ 		if (err != 0) {
+ 			pr_info("%#lx: Failed to punch page: %d\n", pfn, err);
+-		} else if (page_has_private(p) &&
+-			   !try_to_release_page(p, GFP_NOIO)) {
++		} else if (folio_has_private(folio) &&
++			   !filemap_release_folio(folio, GFP_NOIO)) {
+ 			pr_info("%#lx: failed to release buffers\n", pfn);
+ 		} else {
+ 			ret = MF_RECOVERED;
 diff --git a/mm/memory.c b/mm/memory.c
-index f88c351aecd4..8b58281c0371 100644
+index f88c351aecd4..6eec96ac4978 100644
 --- a/mm/memory.c
 +++ b/mm/memory.c
 @@ -1341,15 +1341,6 @@ copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
@@ -2835,7 +3058,7 @@ index f88c351aecd4..8b58281c0371 100644
 +void zap_page_range_single(struct vm_area_struct *vma, unsigned long address,
  		unsigned long size, struct zap_details *details)
  {
-+	unsigned long end = address + size;
++	const unsigned long end = address + size;
  	struct mmu_notifier_range range;
  	struct mmu_gather tlb;
  
@@ -3716,5 +3939,5 @@ index ae7e984b23c6..25844171b72d 100644
  		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file, nr);
  	}
 -- 
-2.38.1.420.g319605f8f0
+2.38.1.436.geea7033409
 
