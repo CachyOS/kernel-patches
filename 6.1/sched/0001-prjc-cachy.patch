@@ -1,6 +1,6 @@
-From 7d2db060c13f2d2417a5639a2007d9b316922497 Mon Sep 17 00:00:00 2001
+From 50a61df2bf1374a3870fea9e6dfbd0e12bce65ac Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sun, 27 Nov 2022 23:28:50 +0100
+Date: Mon, 28 Nov 2022 15:28:34 +0100
 Subject: [PATCH] prjc-cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -23,13 +23,13 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/exit.c                                 |    4 +-
  kernel/locking/rtmutex.c                      |   16 +-
  kernel/sched/Makefile                         |    5 +
- kernel/sched/alt_core.c                       | 7949 +++++++++++++++++
+ kernel/sched/alt_core.c                       | 7971 +++++++++++++++++
  kernel/sched/alt_debug.c                      |   31 +
  kernel/sched/alt_sched.h                      |  658 ++
  kernel/sched/bmq.h                            |  110 +
  kernel/sched/build_policy.c                   |    8 +-
  kernel/sched/build_utility.c                  |    3 +-
- kernel/sched/cpufreq_schedutil.c              |   40 +-
+ kernel/sched/cpufreq_schedutil.c              |   10 +
  kernel/sched/cputime.c                        |   10 +-
  kernel/sched/debug.c                          |   10 +
  kernel/sched/idle.c                           |    2 +
@@ -44,7 +44,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/time/hrtimer.c                         |    2 +
  kernel/time/posix-cpu-timers.c                |   10 +-
  kernel/trace/trace_selftest.c                 |    5 +
- 39 files changed, 9285 insertions(+), 38 deletions(-)
+ 39 files changed, 9292 insertions(+), 23 deletions(-)
  create mode 100644 Documentation/scheduler/sched-BMQ.txt
  create mode 100644 kernel/sched/alt_core.c
  create mode 100644 kernel/sched/alt_debug.c
@@ -686,10 +686,10 @@ index 976092b7bd45..31d587c16ec1 100644
  obj-y += build_utility.o
 diff --git a/kernel/sched/alt_core.c b/kernel/sched/alt_core.c
 new file mode 100644
-index 000000000000..ed8c8f101ed7
+index 000000000000..d3f6f2e1badd
 --- /dev/null
 +++ b/kernel/sched/alt_core.c
-@@ -0,0 +1,7949 @@
+@@ -0,0 +1,7971 @@
 +/*
 + *  kernel/sched/alt_core.c
 + *
@@ -760,7 +760,7 @@ index 000000000000..ed8c8f101ed7
 +#define sched_feat(x)	(0)
 +#endif /* CONFIG_SCHED_DEBUG */
 +
-+#define ALT_SCHED_VERSION "v6.1rc-r0-CachyOS"
++#define ALT_SCHED_VERSION "v6.1-r0-CachyOS"
 +
 +/* rt_prio(prio) defined in include/linux/sched/rt.h */
 +#define rt_task(p)		rt_prio((p)->prio)
@@ -3113,13 +3113,6 @@ index 000000000000..ed8c8f101ed7
 +	if (!llist)
 +		return;
 +
-+	/*
-+	 * rq::ttwu_pending racy indication of out-standing wakeups.
-+	 * Races such that false-negatives are possible, since they
-+	 * are shorter lived that false-positives would be.
-+	 */
-+	WRITE_ONCE(rq->ttwu_pending, 0);
-+
 +	rq_lock_irqsave(rq, &rf);
 +	update_rq_clock(rq);
 +
@@ -3133,6 +3126,17 @@ index 000000000000..ed8c8f101ed7
 +		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0);
 +	}
 +
++	/*
++	 * Must be after enqueueing at least once task such that
++	 * idle_cpu() does not observe a false-negative -- if it does,
++	 * it is possible for select_idle_siblings() to stack a number
++	 * of tasks on this CPU during that window.
++	 *
++	 * It is ok to clear ttwu_pending when another task pending.
++	 * We will receive IPI after local irq enabled and then enqueue it.
++	 * Since now nr_running > 0, idle_cpu() will always get correct result.
++	 */
++	WRITE_ONCE(rq->ttwu_pending, 0);
 +	rq_unlock_irqrestore(rq, &rf);
 +}
 +
@@ -3603,6 +3607,40 @@ index 000000000000..ed8c8f101ed7
 +	return success;
 +}
 +
++static bool __task_needs_rq_lock(struct task_struct *p)
++{
++	unsigned int state = READ_ONCE(p->__state);
++
++	/*
++	 * Since pi->lock blocks try_to_wake_up(), we don't need rq->lock when
++	 * the task is blocked. Make sure to check @state since ttwu() can drop
++	 * locks at the end, see ttwu_queue_wakelist().
++	 */
++	if (state == TASK_RUNNING || state == TASK_WAKING)
++		return true;
++
++	/*
++	 * Ensure we load p->on_rq after p->__state, otherwise it would be
++	 * possible to, falsely, observe p->on_rq == 0.
++	 *
++	 * See try_to_wake_up() for a longer comment.
++	 */
++	smp_rmb();
++	if (p->on_rq)
++		return true;
++
++#ifdef CONFIG_SMP
++	/*
++	 * Ensure the task has finished __schedule() and will not be referenced
++	 * anymore. Again, see try_to_wake_up() for a longer comment.
++	 */
++	smp_rmb();
++	smp_cond_load_acquire(&p->on_cpu, !VAL);
++#endif
++
++	return false;
++}
++
 +/**
 + * task_call_func - Invoke a function on task in fixed state
 + * @p: Process for which the function is to be invoked, can be @current.
@@ -3620,28 +3658,12 @@ index 000000000000..ed8c8f101ed7
 +int task_call_func(struct task_struct *p, task_call_f func, void *arg)
 +{
 +	struct rq *rq = NULL;
-+	unsigned int state;
 +	struct rq_flags rf;
 +	int ret;
 +
 +	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
 +
-+	state = READ_ONCE(p->__state);
-+
-+	/*
-+	 * Ensure we load p->on_rq after p->__state, otherwise it would be
-+	 * possible to, falsely, observe p->on_rq == 0.
-+	 *
-+	 * See try_to_wake_up() for a longer comment.
-+	 */
-+	smp_rmb();
-+
-+	/*
-+	 * Since pi->lock blocks try_to_wake_up(), we don't need rq->lock when
-+	 * the task is blocked. Make sure to check @state since ttwu() can drop
-+	 * locks at the end, see ttwu_queue_wakelist().
-+	 */
-+	if (state == TASK_RUNNING || state == TASK_WAKING || p->on_rq)
++	if (__task_needs_rq_lock(p))
 +		rq = __task_rq_lock(p, &rf);
 +
 +	/*
@@ -9504,32 +9526,13 @@ index 99bdd96f454f..bc17d5a6fc41 100644
  #endif
  
 diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
-index 1207c78f85c1..723a2e575087 100644
+index 1207c78f85c1..f66b715e4287 100644
 --- a/kernel/sched/cpufreq_schedutil.c
 +++ b/kernel/sched/cpufreq_schedutil.c
-@@ -25,6 +25,9 @@ struct sugov_policy {
- 	unsigned int		next_freq;
- 	unsigned int		cached_raw_freq;
- 
-+	/* max CPU capacity, which is equal for all CPUs in freq. domain */
-+	unsigned long		max;
-+
- 	/* The next fields are only needed if fast switch cannot be used: */
- 	struct			irq_work irq_work;
- 	struct			kthread_work work;
-@@ -48,7 +51,6 @@ struct sugov_cpu {
- 
- 	unsigned long		util;
- 	unsigned long		bw_dl;
--	unsigned long		max;
- 
- 	/* The field below is for single-CPU policies only: */
- #ifdef CONFIG_NO_HZ_COMMON
-@@ -158,10 +160,14 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu)
- {
+@@ -159,9 +159,14 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu)
  	struct rq *rq = cpu_rq(sg_cpu->cpu);
  
--	sg_cpu->max = arch_scale_cpu_capacity(sg_cpu->cpu);
+ 	sg_cpu->max = arch_scale_cpu_capacity(sg_cpu->cpu);
 +#ifndef CONFIG_SCHED_ALT
  	sg_cpu->bw_dl = cpu_bw_dl(rq);
  	sg_cpu->util = effective_cpu_util(sg_cpu->cpu, cpu_util_cfs(sg_cpu->cpu),
@@ -9541,25 +9544,7 @@ index 1207c78f85c1..723a2e575087 100644
  }
  
  /**
-@@ -253,6 +259,7 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
-  */
- static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
- {
-+	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
- 	unsigned long boost;
- 
- 	/* No boost currently required */
-@@ -280,7 +287,8 @@ static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
- 	 * sg_cpu->util is already in capacity scale; convert iowait_boost
- 	 * into the same scale so we can compare.
- 	 */
--	boost = (sg_cpu->iowait_boost * sg_cpu->max) >> SCHED_CAPACITY_SHIFT;
-+	boost = sg_cpu->iowait_boost * sg_policy->max;
-+	boost >>= SCHED_CAPACITY_SHIFT;
- 	boost = uclamp_rq_util_with(cpu_rq(sg_cpu->cpu), boost, NULL);
- 	if (sg_cpu->util < boost)
- 		sg_cpu->util = boost;
-@@ -305,8 +313,10 @@ static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu) { return false; }
+@@ -305,8 +310,10 @@ static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu) { return false; }
   */
  static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
  {
@@ -9570,63 +9555,7 @@ index 1207c78f85c1..723a2e575087 100644
  }
  
  static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
-@@ -337,7 +347,7 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
- 	if (!sugov_update_single_common(sg_cpu, time, flags))
- 		return;
- 
--	next_f = get_next_freq(sg_policy, sg_cpu->util, sg_cpu->max);
-+	next_f = get_next_freq(sg_policy, sg_cpu->util, sg_policy->max);
- 	/*
- 	 * Do not reduce the frequency if the CPU has not been idle
- 	 * recently, as the reduction is likely to be premature then.
-@@ -373,6 +383,7 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
- 				     unsigned int flags)
- {
- 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
-+	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
- 	unsigned long prev_util = sg_cpu->util;
- 
- 	/*
-@@ -399,7 +410,8 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
- 		sg_cpu->util = prev_util;
- 
- 	cpufreq_driver_adjust_perf(sg_cpu->cpu, map_util_perf(sg_cpu->bw_dl),
--				   map_util_perf(sg_cpu->util), sg_cpu->max);
-+				   map_util_perf(sg_cpu->util),
-+				   sg_policy->max);
- 
- 	sg_cpu->sg_policy->last_freq_update_time = time;
- }
-@@ -408,25 +420,19 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
- {
- 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
- 	struct cpufreq_policy *policy = sg_policy->policy;
--	unsigned long util = 0, max = 1;
-+	unsigned long util = 0;
- 	unsigned int j;
- 
- 	for_each_cpu(j, policy->cpus) {
- 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
--		unsigned long j_util, j_max;
- 
- 		sugov_get_util(j_sg_cpu);
- 		sugov_iowait_apply(j_sg_cpu, time);
--		j_util = j_sg_cpu->util;
--		j_max = j_sg_cpu->max;
- 
--		if (j_util * max > j_max * util) {
--			util = j_util;
--			max = j_max;
--		}
-+		util = max(j_sg_cpu->util, util);
- 	}
- 
--	return get_next_freq(sg_policy, util, max);
-+	return get_next_freq(sg_policy, util, sg_policy->max);
- }
- 
- static void
-@@ -606,6 +612,7 @@ static int sugov_kthread_create(struct sugov_policy *sg_policy)
+@@ -606,6 +613,7 @@ static int sugov_kthread_create(struct sugov_policy *sg_policy)
  	}
  
  	ret = sched_setattr_nocheck(thread, &attr);
@@ -9634,23 +9563,6 @@ index 1207c78f85c1..723a2e575087 100644
  	if (ret) {
  		kthread_stop(thread);
  		pr_warn("%s: failed to set SCHED_DEADLINE\n", __func__);
-@@ -752,7 +759,7 @@ static int sugov_start(struct cpufreq_policy *policy)
- {
- 	struct sugov_policy *sg_policy = policy->governor_data;
- 	void (*uu)(struct update_util_data *data, u64 time, unsigned int flags);
--	unsigned int cpu;
-+	unsigned int cpu = cpumask_first(policy->cpus);
- 
- 	sg_policy->freq_update_delay_ns	= sg_policy->tunables->rate_limit_us * NSEC_PER_USEC;
- 	sg_policy->last_freq_update_time	= 0;
-@@ -760,6 +767,7 @@ static int sugov_start(struct cpufreq_policy *policy)
- 	sg_policy->work_in_progress		= false;
- 	sg_policy->limits_changed		= false;
- 	sg_policy->cached_raw_freq		= 0;
-+	sg_policy->max				= arch_scale_cpu_capacity(cpu);
- 
- 	sg_policy->need_freq_update = cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
- 
 @@ -838,7 +846,9 @@ cpufreq_governor_init(schedutil_gov);
  #ifdef CONFIG_ENERGY_MODEL
  static void rebuild_sd_workfn(struct work_struct *work)
@@ -10266,5 +10178,5 @@ index a2d301f58ced..2ccdede8585c 100644
  	struct wakeup_test_data *x = data;
  
 -- 
-2.39.0.rc0
+2.39.0.rc0.33.g815c1e8202
 
