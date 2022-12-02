@@ -1,6 +1,6 @@
-From 1b92b584b9292b47b767d54ef80d324e3eabd320 Mon Sep 17 00:00:00 2001
+From 2140f82990b853b582909df1fe42711662ead795 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Wed, 16 Nov 2022 11:19:19 +0100
+Date: Fri, 2 Dec 2022 20:07:09 +0100
 Subject: [PATCH 10/19] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -17,6 +17,12 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  arch/x86/net/bpf_jit_comp.c                   |    4 +-
  arch/x86/purgatory/purgatory.c                |    7 +
  drivers/gpu/drm/amd/amdgpu/amdgpu_vm_sdma.c   |    9 +-
+ .../gpu/drm/i915/gem/i915_gem_execbuffer.c    |   25 +-
+ drivers/gpu/drm/i915/gem/i915_gem_mman.c      |    2 +-
+ drivers/gpu/drm/i915/i915_gem_evict.c         |   37 +-
+ drivers/gpu/drm/i915/i915_gem_evict.h         |    4 +-
+ drivers/gpu/drm/i915/i915_vma.c               |    2 +-
+ .../gpu/drm/i915/selftests/i915_gem_evict.c   |    4 +-
  drivers/gpu/drm/scheduler/sched_entity.c      |    3 +-
  drivers/leds/trigger/Kconfig                  |    9 +
  drivers/leds/trigger/Makefile                 |    1 +
@@ -26,17 +32,19 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  include/linux/pageblock-flags.h               |    2 +-
  include/net/bluetooth/rfcomm.h                |    3 +
  include/uapi/linux/kexec.h                    |    2 +
+ kernel/futex/core.c                           |   26 +-
  kernel/kexec.c                                |   19 +-
  kernel/kexec_core.c                           |   16 +-
  kernel/kexec_file.c                           |   20 +-
- lib/vdso/Makefile                             |    2 +-
+ kernel/padata.c                               |    4 +-
  net/bluetooth/rfcomm/core.c                   |    2 +
  net/bluetooth/rfcomm/sock.c                   |   34 +-
  scripts/Makefile.lib                          |    5 +
+ scripts/mod/modpost.c                         |    4 +-
  tools/objtool/check.c                         |    3 -
  tools/objtool/elf.c                           |   27 +-
  tools/objtool/include/objtool/elf.h           |    2 +
- 31 files changed, 1663 insertions(+), 59 deletions(-)
+ 39 files changed, 1739 insertions(+), 89 deletions(-)
  create mode 100644 Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
  create mode 100644 Documentation/leds/ledtrig-blkdev.rst
  create mode 100644 drivers/leds/trigger/ledtrig-blkdev.c
@@ -579,6 +587,215 @@ index 718db7d98e5a..25ad3c7fa24b 100644
 +	}
  	dma_fence_put(f);
  	return 0;
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index cd75b0ca2555..885fe8855718 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -741,25 +741,44 @@ static int eb_reserve(struct i915_execbuffer *eb)
+ 	 *
+ 	 * Defragmenting is skipped if all objects are pinned at a fixed location.
+ 	 */
+-	for (pass = 0; pass <= 2; pass++) {
++	for (pass = 0; pass <= 3; pass++) {
+ 		int pin_flags = PIN_USER | PIN_VALIDATE;
+ 
+ 		if (pass == 0)
+ 			pin_flags |= PIN_NONBLOCK;
+ 
+ 		if (pass >= 1)
+-			unpinned = eb_unbind(eb, pass == 2);
++			unpinned = eb_unbind(eb, pass >= 2);
+ 
+ 		if (pass == 2) {
+ 			err = mutex_lock_interruptible(&eb->context->vm->mutex);
+ 			if (!err) {
+-				err = i915_gem_evict_vm(eb->context->vm, &eb->ww);
++				err = i915_gem_evict_vm(eb->context->vm, &eb->ww, NULL);
+ 				mutex_unlock(&eb->context->vm->mutex);
+ 			}
+ 			if (err)
+ 				return err;
+ 		}
+ 
++		if (pass == 3) {
++retry:
++			err = mutex_lock_interruptible(&eb->context->vm->mutex);
++			if (!err) {
++				struct drm_i915_gem_object *busy_bo = NULL;
++
++				err = i915_gem_evict_vm(eb->context->vm, &eb->ww, &busy_bo);
++				mutex_unlock(&eb->context->vm->mutex);
++				if (err && busy_bo) {
++					err = i915_gem_object_lock(busy_bo, &eb->ww);
++					i915_gem_object_put(busy_bo);
++					if (!err)
++						goto retry;
++				}
++			}
++			if (err)
++				return err;
++		}
++
+ 		list_for_each_entry(ev, &eb->unbound, bind_link) {
+ 			err = eb_reserve_vma(eb, ev, pin_flags);
+ 			if (err)
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_mman.c b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+index 0c5c43852e24..6f579cb8f2ff 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_mman.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+@@ -369,7 +369,7 @@ static vm_fault_t vm_fault_gtt(struct vm_fault *vmf)
+ 		if (vma == ERR_PTR(-ENOSPC)) {
+ 			ret = mutex_lock_interruptible(&ggtt->vm.mutex);
+ 			if (!ret) {
+-				ret = i915_gem_evict_vm(&ggtt->vm, &ww);
++				ret = i915_gem_evict_vm(&ggtt->vm, &ww, NULL);
+ 				mutex_unlock(&ggtt->vm.mutex);
+ 			}
+ 			if (ret)
+diff --git a/drivers/gpu/drm/i915/i915_gem_evict.c b/drivers/gpu/drm/i915/i915_gem_evict.c
+index f025ee4fa526..a4b4d9b7d26c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -416,6 +416,11 @@ int i915_gem_evict_for_node(struct i915_address_space *vm,
+  * @vm: Address space to cleanse
+  * @ww: An optional struct i915_gem_ww_ctx. If not NULL, i915_gem_evict_vm
+  * will be able to evict vma's locked by the ww as well.
++ * @busy_bo: Optional pointer to struct drm_i915_gem_object. If not NULL, then
++ * in the event i915_gem_evict_vm() is unable to trylock an object for eviction,
++ * then @busy_bo will point to it. -EBUSY is also returned. The caller must drop
++ * the vm->mutex, before trying again to acquire the contended lock. The caller
++ * also owns a reference to the object.
+  *
+  * This function evicts all vmas from a vm.
+  *
+@@ -425,7 +430,8 @@ int i915_gem_evict_for_node(struct i915_address_space *vm,
+  * To clarify: This is for freeing up virtual address space, not for freeing
+  * memory in e.g. the shrinker.
+  */
+-int i915_gem_evict_vm(struct i915_address_space *vm, struct i915_gem_ww_ctx *ww)
++int i915_gem_evict_vm(struct i915_address_space *vm, struct i915_gem_ww_ctx *ww,
++		      struct drm_i915_gem_object **busy_bo)
+ {
+ 	int ret = 0;
+ 
+@@ -457,15 +463,22 @@ int i915_gem_evict_vm(struct i915_address_space *vm, struct i915_gem_ww_ctx *ww)
+ 			 * the resv is shared among multiple objects, we still
+ 			 * need the object ref.
+ 			 */
+-			if (dying_vma(vma) ||
++			if (!i915_gem_object_get_rcu(vma->obj) ||
+ 			    (ww && (dma_resv_locking_ctx(vma->obj->base.resv) == &ww->ctx))) {
+ 				__i915_vma_pin(vma);
+ 				list_add(&vma->evict_link, &locked_eviction_list);
+ 				continue;
+ 			}
+ 
+-			if (!i915_gem_object_trylock(vma->obj, ww))
++			if (!i915_gem_object_trylock(vma->obj, ww)) {
++				if (busy_bo) {
++					*busy_bo = vma->obj; /* holds ref */
++					ret = -EBUSY;
++					break;
++				}
++				i915_gem_object_put(vma->obj);
+ 				continue;
++			}
+ 
+ 			__i915_vma_pin(vma);
+ 			list_add(&vma->evict_link, &eviction_list);
+@@ -473,25 +486,29 @@ int i915_gem_evict_vm(struct i915_address_space *vm, struct i915_gem_ww_ctx *ww)
+ 		if (list_empty(&eviction_list) && list_empty(&locked_eviction_list))
+ 			break;
+ 
+-		ret = 0;
+ 		/* Unbind locked objects first, before unlocking the eviction_list */
+ 		list_for_each_entry_safe(vma, vn, &locked_eviction_list, evict_link) {
+ 			__i915_vma_unpin(vma);
+ 
+-			if (ret == 0)
++			if (ret == 0) {
+ 				ret = __i915_vma_unbind(vma);
+-			if (ret != -EINTR) /* "Get me out of here!" */
+-				ret = 0;
++				if (ret != -EINTR) /* "Get me out of here!" */
++					ret = 0;
++			}
++			if (!dying_vma(vma))
++				i915_gem_object_put(vma->obj);
+ 		}
+ 
+ 		list_for_each_entry_safe(vma, vn, &eviction_list, evict_link) {
+ 			__i915_vma_unpin(vma);
+-			if (ret == 0)
++			if (ret == 0) {
+ 				ret = __i915_vma_unbind(vma);
+-			if (ret != -EINTR) /* "Get me out of here!" */
+-				ret = 0;
++				if (ret != -EINTR) /* "Get me out of here!" */
++					ret = 0;
++			}
+ 
+ 			i915_gem_object_unlock(vma->obj);
++			i915_gem_object_put(vma->obj);
+ 		}
+ 	} while (ret == 0);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_evict.h b/drivers/gpu/drm/i915/i915_gem_evict.h
+index e593c530f9bd..bf0ee0e4fe60 100644
+--- a/drivers/gpu/drm/i915/i915_gem_evict.h
++++ b/drivers/gpu/drm/i915/i915_gem_evict.h
+@@ -11,6 +11,7 @@
+ struct drm_mm_node;
+ struct i915_address_space;
+ struct i915_gem_ww_ctx;
++struct drm_i915_gem_object;
+ 
+ int __must_check i915_gem_evict_something(struct i915_address_space *vm,
+ 					  struct i915_gem_ww_ctx *ww,
+@@ -23,6 +24,7 @@ int __must_check i915_gem_evict_for_node(struct i915_address_space *vm,
+ 					 struct drm_mm_node *node,
+ 					 unsigned int flags);
+ int i915_gem_evict_vm(struct i915_address_space *vm,
+-		      struct i915_gem_ww_ctx *ww);
++		      struct i915_gem_ww_ctx *ww,
++		      struct drm_i915_gem_object **busy_bo);
+ 
+ #endif /* __I915_GEM_EVICT_H__ */
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index 373582cfd8f3..240b7b8ed281 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -1569,7 +1569,7 @@ static int __i915_ggtt_pin(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
+ 			 * locked objects when called from execbuf when pinning
+ 			 * is removed. This would probably regress badly.
+ 			 */
+-			i915_gem_evict_vm(vm, NULL);
++			i915_gem_evict_vm(vm, NULL, NULL);
+ 			mutex_unlock(&vm->mutex);
+ 		}
+ 	} while (1);
+diff --git a/drivers/gpu/drm/i915/selftests/i915_gem_evict.c b/drivers/gpu/drm/i915/selftests/i915_gem_evict.c
+index 8c6517d29b8e..37068542aafe 100644
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_evict.c
+@@ -344,7 +344,7 @@ static int igt_evict_vm(void *arg)
+ 
+ 	/* Everything is pinned, nothing should happen */
+ 	mutex_lock(&ggtt->vm.mutex);
+-	err = i915_gem_evict_vm(&ggtt->vm, NULL);
++	err = i915_gem_evict_vm(&ggtt->vm, NULL, NULL);
+ 	mutex_unlock(&ggtt->vm.mutex);
+ 	if (err) {
+ 		pr_err("i915_gem_evict_vm on a full GGTT returned err=%d]\n",
+@@ -356,7 +356,7 @@ static int igt_evict_vm(void *arg)
+ 
+ 	for_i915_gem_ww(&ww, err, false) {
+ 		mutex_lock(&ggtt->vm.mutex);
+-		err = i915_gem_evict_vm(&ggtt->vm, &ww);
++		err = i915_gem_evict_vm(&ggtt->vm, &ww, NULL);
+ 		mutex_unlock(&ggtt->vm.mutex);
+ 	}
  
 diff --git a/drivers/gpu/drm/scheduler/sched_entity.c b/drivers/gpu/drm/scheduler/sched_entity.c
 index 7ef1a086a6fb..4b913dbb7d7b 100644
@@ -1962,6 +2179,66 @@ index 981016e05cfa..c29011eb7fc2 100644
  
  /* These values match the ELF architecture values.
   * Unless there is a good reason that should continue to be the case.
+diff --git a/kernel/futex/core.c b/kernel/futex/core.c
+index b22ef1efe751..514e4582b863 100644
+--- a/kernel/futex/core.c
++++ b/kernel/futex/core.c
+@@ -638,6 +638,7 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+ 			      bool pi, bool pending_op)
+ {
+ 	u32 uval, nval, mval;
++	pid_t owner;
+ 	int err;
+ 
+ 	/* Futex address must be 32bit aligned */
+@@ -659,6 +660,10 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+ 	 * 2. A woken up waiter is killed before it can acquire the
+ 	 *    futex in user space.
+ 	 *
++	 * In the second case, the wake up notification could be generated
++	 * by the unlock path in user space after setting the futex value
++	 * to zero or by the kernel after setting the OWNER_DIED bit below.
++	 *
+ 	 * In both cases the TID validation below prevents a wakeup of
+ 	 * potential waiters which can cause these waiters to block
+ 	 * forever.
+@@ -667,24 +672,27 @@ static int handle_futex_death(u32 __user *uaddr, struct task_struct *curr,
+ 	 *
+ 	 *	1) task->robust_list->list_op_pending != NULL
+ 	 *	   @pending_op == true
+-	 *	2) User space futex value == 0
++	 *	2) The owner part of user space futex value == 0
+ 	 *	3) Regular futex: @pi == false
+ 	 *
+ 	 * If these conditions are met, it is safe to attempt waking up a
+ 	 * potential waiter without touching the user space futex value and
+-	 * trying to set the OWNER_DIED bit. The user space futex value is
+-	 * uncontended and the rest of the user space mutex state is
+-	 * consistent, so a woken waiter will just take over the
+-	 * uncontended futex. Setting the OWNER_DIED bit would create
+-	 * inconsistent state and malfunction of the user space owner died
+-	 * handling.
++	 * trying to set the OWNER_DIED bit. If the futex value is zero,
++	 * the rest of the user space mutex state is consistent, so a woken
++	 * waiter will just take over the uncontended futex. Setting the
++	 * OWNER_DIED bit would create inconsistent state and malfunction
++	 * of the user space owner died handling. Otherwise, the OWNER_DIED
++	 * bit is already set, and the woken waiter is expected to deal with
++	 * this.
+ 	 */
+-	if (pending_op && !pi && !uval) {
++	owner = uval & FUTEX_TID_MASK;
++
++	if (pending_op && !pi && !owner) {
+ 		futex_wake(uaddr, 1, 1, FUTEX_BITSET_MATCH_ANY);
+ 		return 0;
+ 	}
+ 
+-	if ((uval & FUTEX_TID_MASK) != task_pid_vnr(curr))
++	if (owner != task_pid_vnr(curr))
+ 		return 0;
+ 
+ 	/*
 diff --git a/kernel/kexec.c b/kernel/kexec.c
 index b5e40f069768..0d9ea52c81c1 100644
 --- a/kernel/kexec.c
@@ -2125,18 +2402,28 @@ index 1d546dc97c50..63c3d71753b7 100644
  		return walk_iomem_res_desc(crashk_res.desc,
  					   IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY,
  					   crashk_res.start, crashk_res.end,
-diff --git a/lib/vdso/Makefile b/lib/vdso/Makefile
-index c415a685d61b..e814061d6aa0 100644
---- a/lib/vdso/Makefile
-+++ b/lib/vdso/Makefile
-@@ -17,6 +17,6 @@ $(error ARCH_REL_TYPE_ABS is not set)
- endif
+diff --git a/kernel/padata.c b/kernel/padata.c
+index e5819bb8bd1d..c2271d7e446d 100644
+--- a/kernel/padata.c
++++ b/kernel/padata.c
+@@ -45,7 +45,7 @@ struct padata_mt_job_state {
+ };
  
- quiet_cmd_vdso_check = VDSOCHK $@
--      cmd_vdso_check = if $(OBJDUMP) -R $@ | egrep -h "$(ARCH_REL_TYPE_ABS)"; \
-+      cmd_vdso_check = if $(OBJDUMP) -R $@ | grep -E -h "$(ARCH_REL_TYPE_ABS)"; \
- 		       then (echo >&2 "$@: dynamic relocations are not supported"; \
- 			     rm -f $@; /bin/false); fi
+ static void padata_free_pd(struct parallel_data *pd);
+-static void __init padata_mt_helper(struct work_struct *work);
++static void padata_mt_helper(struct work_struct *work);
+ 
+ static int padata_index_to_cpu(struct parallel_data *pd, int cpu_index)
+ {
+@@ -425,7 +425,7 @@ static int padata_setup_cpumasks(struct padata_instance *pinst)
+ 	return err;
+ }
+ 
+-static void __init padata_mt_helper(struct work_struct *w)
++static void padata_mt_helper(struct work_struct *w)
+ {
+ 	struct padata_work *pw = container_of(w, struct padata_work, pw_work);
+ 	struct padata_mt_job_state *ps = pw->pw_data;
 diff --git a/net/bluetooth/rfcomm/core.c b/net/bluetooth/rfcomm/core.c
 index 7324764384b6..c6494e85cd68 100644
 --- a/net/bluetooth/rfcomm/core.c
@@ -2235,6 +2522,23 @@ index f62770a0a84f..2dda88a30554 100644
  
  # U-Boot mkimage
  # ---------------------------------------------------------------------------
+diff --git a/scripts/mod/modpost.c b/scripts/mod/modpost.c
+index 2c80da0220c3..c861beabc128 100644
+--- a/scripts/mod/modpost.c
++++ b/scripts/mod/modpost.c
+@@ -823,10 +823,10 @@ static void check_section(const char *modname, struct elf_info *elf,
+ #define ALL_EXIT_SECTIONS EXIT_SECTIONS, ALL_XXXEXIT_SECTIONS
+ 
+ #define DATA_SECTIONS ".data", ".data.rel"
+-#define TEXT_SECTIONS ".text", ".text.unlikely", ".sched.text", \
++#define TEXT_SECTIONS ".text", ".text.*", ".sched.text", \
+ 		".kprobes.text", ".cpuidle.text", ".noinstr.text"
+ #define OTHER_TEXT_SECTIONS ".ref.text", ".head.text", ".spinlock.text", \
+-		".fixup", ".entry.text", ".exception.text", ".text.*", \
++		".fixup", ".entry.text", ".exception.text", \
+ 		".coldtext", ".softirqentry.text"
+ 
+ #define INIT_SECTIONS      ".init.*"
 diff --git a/tools/objtool/check.c b/tools/objtool/check.c
 index e55fdf952a3a..445741f36d6d 100644
 --- a/tools/objtool/check.c
@@ -2346,5 +2650,5 @@ index 16f4067b82ae..2b893f8bc1bc 100644
  	unsigned int type;
  	s64 addend;
 -- 
-2.39.0.rc0
+2.39.0.rc1
 
