@@ -1,0 +1,195 @@
+From a8e0ce2ccfc5505b495c030c88798506629f2947 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 5 Dec 2022 12:53:22 +0100
+Subject: [PATCH 08/19] fs-patches
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ fs/btrfs/block-group.c | 111 +++++++++++++++++++++++++++++++----------
+ fs/btrfs/block-group.h |   6 +++
+ 2 files changed, 91 insertions(+), 26 deletions(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index deebc8ddbd93..adb8ae1b472e 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -1527,6 +1527,30 @@ static inline bool btrfs_should_reclaim(struct btrfs_fs_info *fs_info)
+ 	return true;
+ }
+ 
++static bool should_reclaim_block_group(struct btrfs_block_group *bg, u64 bytes_freed)
++{
++	const struct btrfs_space_info *space_info = bg->space_info;
++	const int reclaim_thresh = READ_ONCE(space_info->bg_reclaim_threshold);
++	const u64 new_val = bg->used;
++	const u64 old_val = new_val + bytes_freed;
++	u64 thresh;
++
++	if (reclaim_thresh == 0)
++		return false;
++
++	thresh = div_factor_fine(bg->length, reclaim_thresh);
++
++	/*
++	 * If we were below the threshold before don't reclaim, we are likely a
++	 * brand new block group and we don't want to relocate new block groups.
++	 */
++	if (old_val < thresh)
++		return false;
++	if (new_val >= thresh)
++		return false;
++	return true;
++}
++
+ void btrfs_reclaim_bgs_work(struct work_struct *work)
+ {
+ 	struct btrfs_fs_info *fs_info =
+@@ -1594,6 +1618,40 @@ void btrfs_reclaim_bgs_work(struct work_struct *work)
+ 			up_write(&space_info->groups_sem);
+ 			goto next;
+ 		}
++		if (bg->used == 0) {
++			/*
++			 * It is possible that we trigger relocation on a block
++			 * group as its extents are deleted and it first goes
++			 * below the threshold, then shortly after goes empty.
++			 *
++			 * In this case, relocating it does delete it, but has
++			 * some overhead in relocation specific metadata, looking
++			 * for the non-existent extents and running some extra
++			 * transactions, which we can avoid by using one of the
++			 * other mechanisms for dealing with empty block groups.
++			 */
++			if (!btrfs_test_opt(fs_info, DISCARD_ASYNC))
++				btrfs_mark_bg_unused(bg);
++			spin_unlock(&bg->lock);
++			up_write(&space_info->groups_sem);
++			goto next;
++
++		}
++		/*
++		 * The block group might no longer meet the reclaim condition by
++		 * the time we get around to reclaiming it, so to avoid
++		 * reclaiming overly full block_groups, skip reclaiming them.
++		 *
++		 * Since the decision making process also depends on the amount
++		 * being freed, pass in a fake giant value to skip that extra
++		 * check, which is more meaningful when adding to the list in
++		 * the first place.
++		 */
++		if (!should_reclaim_block_group(bg, bg->length)) {
++			spin_unlock(&bg->lock);
++			up_write(&space_info->groups_sem);
++			goto next;
++		}
+ 		spin_unlock(&bg->lock);
+ 
+ 		/* Get out fast, in case we're unmounting the filesystem */
+@@ -2001,6 +2059,7 @@ static int read_one_block_group(struct btrfs_fs_info *info,
+ 
+ 	cache->length = key->offset;
+ 	cache->used = btrfs_stack_block_group_used(bgi);
++	cache->commit_used = cache->used;
+ 	cache->flags = btrfs_stack_block_group_flags(bgi);
+ 	cache->global_root_id = btrfs_stack_block_group_chunk_objectid(bgi);
+ 
+@@ -2692,6 +2751,25 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 	struct extent_buffer *leaf;
+ 	struct btrfs_block_group_item bgi;
+ 	struct btrfs_key key;
++	u64 old_commit_used;
++	u64 used;
++
++	/*
++	 * Block group items update can be triggered out of commit transaction
++	 * critical section, thus we need a consistent view of used bytes.
++	 * We cannot use cache->used directly outside of the spin lock, as it
++	 * may be changed.
++	 */
++	spin_lock(&cache->lock);
++	old_commit_used = cache->commit_used;
++	used = cache->used;
++	/* No change in used bytes, can safely skip it. */
++	if (cache->commit_used == used) {
++		spin_unlock(&cache->lock);
++		return 0;
++	}
++	cache->commit_used = used;
++	spin_unlock(&cache->lock);
+ 
+ 	key.objectid = cache->start;
+ 	key.type = BTRFS_BLOCK_GROUP_ITEM_KEY;
+@@ -2706,7 +2784,7 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 
+ 	leaf = path->nodes[0];
+ 	bi = btrfs_item_ptr_offset(leaf, path->slots[0]);
+-	btrfs_set_stack_block_group_used(&bgi, cache->used);
++	btrfs_set_stack_block_group_used(&bgi, used);
+ 	btrfs_set_stack_block_group_chunk_objectid(&bgi,
+ 						   cache->global_root_id);
+ 	btrfs_set_stack_block_group_flags(&bgi, cache->flags);
+@@ -2714,6 +2792,12 @@ static int update_block_group_item(struct btrfs_trans_handle *trans,
+ 	btrfs_mark_buffer_dirty(leaf);
+ fail:
+ 	btrfs_release_path(path);
++	/* We didn't update the block group item, need to revert @commit_used. */
++	if (ret < 0) {
++		spin_lock(&cache->lock);
++		cache->commit_used = old_commit_used;
++		spin_unlock(&cache->lock);
++	}
+ 	return ret;
+ 
+ }
+@@ -3211,31 +3295,6 @@ int btrfs_write_dirty_block_groups(struct btrfs_trans_handle *trans)
+ 	return ret;
+ }
+ 
+-static inline bool should_reclaim_block_group(struct btrfs_block_group *bg,
+-					      u64 bytes_freed)
+-{
+-	const struct btrfs_space_info *space_info = bg->space_info;
+-	const int reclaim_thresh = READ_ONCE(space_info->bg_reclaim_threshold);
+-	const u64 new_val = bg->used;
+-	const u64 old_val = new_val + bytes_freed;
+-	u64 thresh;
+-
+-	if (reclaim_thresh == 0)
+-		return false;
+-
+-	thresh = div_factor_fine(bg->length, reclaim_thresh);
+-
+-	/*
+-	 * If we were below the threshold before don't reclaim, we are likely a
+-	 * brand new block group and we don't want to relocate new block groups.
+-	 */
+-	if (old_val < thresh)
+-		return false;
+-	if (new_val >= thresh)
+-		return false;
+-	return true;
+-}
+-
+ int btrfs_update_block_group(struct btrfs_trans_handle *trans,
+ 			     u64 bytenr, u64 num_bytes, bool alloc)
+ {
+diff --git a/fs/btrfs/block-group.h b/fs/btrfs/block-group.h
+index 8fb14b99a1d1..e83eef195a89 100644
+--- a/fs/btrfs/block-group.h
++++ b/fs/btrfs/block-group.h
+@@ -99,6 +99,12 @@ struct btrfs_block_group {
+ 	u64 cache_generation;
+ 	u64 global_root_id;
+ 
++	/*
++	 * The last committed used bytes of this block group, if the above @used
++	 * is still the same as @commit_used, we don't need to update block
++	 * group item of this block group.
++	 */
++	u64 commit_used;
+ 	/*
+ 	 * If the free space extent count exceeds this number, convert the block
+ 	 * group to bitmaps.
+-- 
+2.39.0.rc1
+
