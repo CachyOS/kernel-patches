@@ -1,0 +1,384 @@
+From 78a4a8c4979ff62ce641f55da2272d1443c33943 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 22 Nov 2022 21:58:22 +0100
+Subject: [PATCH 1/2] x86/sched: Avoid unnecessary migrations within SMT
+ domains
+
+This v2 of this patchset. V1 can be found here [1]. In this version I took
+the suggestion of Peter to teach arch_asym_cpu_priority() the CPU state.
+Also, I reworded the cover letter to explain better the intent.
+
+---
+
+asym_packing load balancing is used to balance load among physical cores
+with SMT (e.g., Intel processors that support Intel Turbo Boost Max 3.0 and
+hybrid processors) and among SMT siblings of a physical cores (e.g.,
+Power7).
+
+The current implementation is sufficient for the latter case as it favors
+higher-priority SMT siblings. In the former case, however, we must consider
+the fact that the throughput of a CPU degrades if one or more of its SMT
+siblings are busy. Hence, a lower-priority CPU that is fully idle is more
+desirable than a high-priority CPU with busy SMT siblings.
+
+To fit the current implementation of asym_packing, x86 artificially assigns
+a lower priority to the higher-numbered SMT siblings. In reality, there is
+no difference between any of the SMT siblings of a core.
+
+Do not use different priorities for each SMT sibling. Instead, tweak the
+asym_packing load balancing logic to consider the idle state of the SMT
+siblings of a CPU.
+
+Removing these artificial priorities avoids superfluous migrations and let
+lower-priority cores inspect all SMT siblings for the busiest queue. The
+latter is also necessary to support IPC classes of tasks [2], as the
+destination CPU will need to inspect the tasks running on CPUs of equal
+priority.
+
+This patchset should not break Power7 SMT8. Functionality does not change
+for architectures that do not implement the new check_smt parameter of
+sched_prefer_asym().
+
+These patches apply cleanly on today's tip tree.
+
+Changes since v1:
+ * Tweaked arch_asym_cpu_priority() and sched_asym_prefer() to handle
+   the idle state of the SMT siblings of a CPU. (PeterZ)
+ * Expose functionality of the scheduler that determines the idle state
+   of the SMT siblings of a CPU.
+ * Addressed concerns from Peter about SMT2 assumptions and breaking
+   Power7.
+ * Removed the SD_ASYM_PACKING flag from the "SMT" domain in x86.
+ * Reworked x86's arch_asym_cpu_priority() to consider the idle state
+   of the SMT siblings of a CPU.
+
+[1]. https://lore.kernel.org/lkml/20220825225529.26465-1-ricardo.neri-calderon@linux.intel.com/
+[2]. https://lore.kernel.org/lkml/20220909231205.14009-1-ricardo.neri-calderon@linux.intel.com/
+
+Ricardo Neri (7):
+  sched/fair: Generalize asym_packing logic for SMT local sched group
+  sched: Prepare sched_asym_prefer() to handle idle state of SMT
+    siblings
+  sched: Teach arch_asym_cpu_priority() the idle state of SMT siblings
+  sched/fair: Introduce sched_smt_siblings_idle()
+  x86/sched: Remove SD_ASYM_PACKING from the "SMT" domain
+  x86/sched/itmt: Give all SMT siblings of a core the same priority
+  x86/sched/itmt: Consider the idle state of SMT siblings
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/kernel/itmt.c         | 30 ++++--------
+ arch/x86/kernel/smpboot.c      |  2 +-
+ include/linux/sched.h          |  2 +
+ include/linux/sched/topology.h |  2 +-
+ kernel/sched/fair.c            | 90 +++++++++++++++++-----------------
+ kernel/sched/sched.h           | 11 +++--
+ kernel/sched/topology.c        |  6 ++-
+ 7 files changed, 72 insertions(+), 71 deletions(-)
+
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 9ff480e94511..cb22944969a1 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -167,39 +167,29 @@ void sched_clear_itmt_support(void)
+ 	mutex_unlock(&itmt_update_mutex);
+ }
+ 
+-int arch_asym_cpu_priority(int cpu)
++int arch_asym_cpu_priority(int cpu, bool check_smt)
+ {
+-	return per_cpu(sched_core_priority, cpu);
++	if (!check_smt || sched_smt_siblings_idle(cpu))
++		return per_cpu(sched_core_priority, cpu);
++
++	return 0;
+ }
+ 
+ /**
+  * sched_set_itmt_core_prio() - Set CPU priority based on ITMT
+- * @prio:	Priority of cpu core
+- * @core_cpu:	The cpu number associated with the core
++ * @prio:	Priority of @cpu
++ * @cpu:	The CPU number
+  *
+  * The pstate driver will find out the max boost frequency
+  * and call this function to set a priority proportional
+- * to the max boost frequency. CPU with higher boost
++ * to the max boost frequency. CPUs with higher boost
+  * frequency will receive higher priority.
+  *
+  * No need to rebuild sched domain after updating
+  * the CPU priorities. The sched domains have no
+  * dependency on CPU priorities.
+  */
+-void sched_set_itmt_core_prio(int prio, int core_cpu)
++void sched_set_itmt_core_prio(int prio, int cpu)
+ {
+-	int cpu, i = 1;
+-
+-	for_each_cpu(cpu, topology_sibling_cpumask(core_cpu)) {
+-		int smt_prio;
+-
+-		/*
+-		 * Ensure that the siblings are moved to the end
+-		 * of the priority chain and only used when
+-		 * all other high priority cpus are out of capacity.
+-		 */
+-		smt_prio = prio * smp_num_siblings / (i * i);
+-		per_cpu(sched_core_priority, cpu) = smt_prio;
+-		i++;
+-	}
++	per_cpu(sched_core_priority, cpu) = prio;
+ }
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 3f3ea0287f69..c3de98224cb4 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -545,7 +545,7 @@ static int x86_core_flags(void)
+ #ifdef CONFIG_SCHED_SMT
+ static int x86_smt_flags(void)
+ {
+-	return cpu_smt_flags() | x86_sched_itmt_flags();
++	return cpu_smt_flags();
+ }
+ #endif
+ #ifdef CONFIG_SCHED_CLUSTER
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ffb6eb55cd13..0d01c64ac737 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2426,4 +2426,6 @@ static inline void sched_core_fork(struct task_struct *p) { }
+ 
+ extern void sched_set_stop_task(int cpu, struct task_struct *stop);
+ 
++extern bool sched_smt_siblings_idle(int cpu);
++
+ #endif
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index 816df6cc444e..87b64b9776f6 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -63,7 +63,7 @@ static inline int cpu_numa_flags(void)
+ }
+ #endif
+ 
+-extern int arch_asym_cpu_priority(int cpu);
++extern int arch_asym_cpu_priority(int cpu, bool check_smt);
+ 
+ struct sched_domain_attr {
+ 	int relax_domain_level;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index e4a0b8bd941c..9517c48df50e 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -142,8 +142,11 @@ __setup("sched_thermal_decay_shift=", setup_sched_thermal_decay_shift);
+ #ifdef CONFIG_SMP
+ /*
+  * For asym packing, by default the lower numbered CPU has higher priority.
++ *
++ * When doing ASYM_PACKING at the "MC" or higher domains, architectures may
++ * want to check the idle state of the SMT siblngs of @cpu.
+  */
+-int __weak arch_asym_cpu_priority(int cpu)
++int __weak arch_asym_cpu_priority(int cpu, bool check_smt)
+ {
+ 	return -cpu;
+ }
+@@ -1049,6 +1052,28 @@ update_stats_curr_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
+  * Scheduling class queueing methods:
+  */
+ 
++static inline bool is_core_idle(int cpu)
++{
++#ifdef CONFIG_SCHED_SMT
++	int sibling;
++
++	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
++		if (cpu == sibling)
++			continue;
++
++		if (!idle_cpu(sibling))
++			return false;
++	}
++#endif
++
++	return true;
++}
++
++bool sched_smt_siblings_idle(int cpu)
++{
++	return is_core_idle(cpu);
++}
++
+ #ifdef CONFIG_NUMA
+ #define NUMA_IMBALANCE_MIN 2
+ 
+@@ -1688,23 +1713,6 @@ struct numa_stats {
+ 	int idle_cpu;
+ };
+ 
+-static inline bool is_core_idle(int cpu)
+-{
+-#ifdef CONFIG_SCHED_SMT
+-	int sibling;
+-
+-	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
+-		if (cpu == sibling)
+-			continue;
+-
+-		if (!idle_cpu(sibling))
+-			return false;
+-	}
+-#endif
+-
+-	return true;
+-}
+-
+ struct task_numa_env {
+ 	struct task_struct *p;
+ 
+@@ -8900,12 +8908,10 @@ static bool asym_smt_can_pull_tasks(int dst_cpu, struct sd_lb_stats *sds,
+ 				    struct sched_group *sg)
+ {
+ #ifdef CONFIG_SCHED_SMT
+-	bool local_is_smt, sg_is_smt;
++	bool local_is_smt;
+ 	int sg_busy_cpus;
+ 
+ 	local_is_smt = sds->local->flags & SD_SHARE_CPUCAPACITY;
+-	sg_is_smt = sg->flags & SD_SHARE_CPUCAPACITY;
+-
+ 	sg_busy_cpus = sgs->group_weight - sgs->idle_cpus;
+ 
+ 	if (!local_is_smt) {
+@@ -8923,29 +8929,20 @@ static bool asym_smt_can_pull_tasks(int dst_cpu, struct sd_lb_stats *sds,
+ 		 * can help if it has higher priority and is idle (i.e.,
+ 		 * it has no running tasks).
+ 		 */
+-		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
+-	}
+-
+-	/* @dst_cpu has SMT siblings. */
+-
+-	if (sg_is_smt) {
+-		int local_busy_cpus = sds->local->group_weight -
+-				      sds->local_stat.idle_cpus;
+-		int busy_cpus_delta = sg_busy_cpus - local_busy_cpus;
+-
+-		if (busy_cpus_delta == 1)
+-			return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
+-
+-		return false;
++		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu, false);
+ 	}
+ 
+ 	/*
+-	 * @sg does not have SMT siblings. Ensure that @sds::local does not end
+-	 * up with more than one busy SMT sibling and only pull tasks if there
+-	 * are not busy CPUs (i.e., no CPU has running tasks).
++	 * @dst_cpu has SMT siblings. Do asym_packing load balancing only if
++	 * all its siblings are idle (moving tasks between physical cores in
++	 * which some SMT siblings are busy results in the same throughput).
++	 *
++	 * If the difference in the number of busy CPUs is two or more, let
++	 * find_busiest_group() take care of it. We only care if @sg has
++	 * exactly one busy CPU. This covers SMT and non-SMT sched groups.
+ 	 */
+-	if (!sds->local_stat.sum_nr_running)
+-		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
++	if (sg_busy_cpus == 1 && !sds->local_stat.sum_nr_running)
++		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu, false);
+ 
+ 	return false;
+ #else
+@@ -8963,7 +8960,8 @@ sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs
+ 	    (group->flags & SD_SHARE_CPUCAPACITY))
+ 		return asym_smt_can_pull_tasks(env->dst_cpu, sds, sgs, group);
+ 
+-	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
++	/* Neither env::dst_cpu nor group::asym_prefer_cpu have SMT siblings. */
++	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu, false);
+ }
+ 
+ static inline bool
+@@ -9129,7 +9127,9 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+ 
+ 	case group_asym_packing:
+ 		/* Prefer to move from lowest priority CPU's work */
+-		if (sched_asym_prefer(sg->asym_prefer_cpu, sds->busiest->asym_prefer_cpu))
++		if (sched_asym_prefer(sg->asym_prefer_cpu,
++				      sds->busiest->asym_prefer_cpu,
++				      false))
+ 			return false;
+ 		break;
+ 
+@@ -10071,7 +10071,7 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 
+ 		/* Make sure we only pull tasks from a CPU of lower priority */
+ 		if ((env->sd->flags & SD_ASYM_PACKING) &&
+-		    sched_asym_prefer(i, env->dst_cpu) &&
++		    sched_asym_prefer(i, env->dst_cpu, true) &&
+ 		    nr_running == 1)
+ 			continue;
+ 
+@@ -10164,7 +10164,7 @@ asym_active_balance(struct lb_env *env)
+ 	 * highest priority CPUs.
+ 	 */
+ 	return env->idle != CPU_NOT_IDLE && (env->sd->flags & SD_ASYM_PACKING) &&
+-	       sched_asym_prefer(env->dst_cpu, env->src_cpu);
++	       sched_asym_prefer(env->dst_cpu, env->src_cpu, true);
+ }
+ 
+ static inline bool
+@@ -10900,7 +10900,7 @@ static void nohz_balancer_kick(struct rq *rq)
+ 		 * around.
+ 		 */
+ 		for_each_cpu_and(i, sched_domain_span(sd), nohz.idle_cpus_mask) {
+-			if (sched_asym_prefer(i, cpu)) {
++			if (sched_asym_prefer(i, cpu, true)) {
+ 				flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
+ 				goto unlock;
+ 			}
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index a4a20046e586..e5e52c2e82de 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -795,10 +795,15 @@ static inline long se_weight(struct sched_entity *se)
+ 	return scale_load_down(se->load.weight);
+ }
+ 
+-
+-static inline bool sched_asym_prefer(int a, int b)
++/*
++ * Used to compare specific CPUs. Also when comparing the preferred CPU of a
++ * sched group or building the sched domains; in such cases checking the state
++ * of SMT siblings, if any, is not needed.
++ */
++static inline bool sched_asym_prefer(int a, int b, bool check_smt)
+ {
+-	return arch_asym_cpu_priority(a) > arch_asym_cpu_priority(b);
++	return arch_asym_cpu_priority(a, check_smt) >
++	       arch_asym_cpu_priority(b, check_smt);
+ }
+ 
+ struct perf_domain {
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 8739c2a5a54e..8154ef590b9f 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1282,7 +1282,11 @@ static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
+ 		for_each_cpu(cpu, sched_group_span(sg)) {
+ 			if (max_cpu < 0)
+ 				max_cpu = cpu;
+-			else if (sched_asym_prefer(cpu, max_cpu))
++			/*
++			 * We want the CPU priorities unaffected by the idle
++			 * state of its SMT siblings, if any.
++			 */
++			else if (sched_asym_prefer(cpu, max_cpu, false))
+ 				max_cpu = cpu;
+ 		}
+ 		sg->asym_prefer_cpu = max_cpu;
+-- 
+2.39.0.rc2
+
