@@ -1,0 +1,1189 @@
+From f28874055031be2e1058ce78ec7102d81280f1d7 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 11 Oct 2022 23:12:15 +0200
+Subject: [PATCH 16/20] THP Shrinker
+
+https://lore.kernel.org/lkml/cover.1664323311.git.alexlzhu@fb.com/
+
+Transparent Hugepages use a larger page size of 2MB in comparison to
+normal sized pages that are 4kb. A larger page size allows for fewer TLB
+cache misses and thus more efficient use of the CPU. Using a larger page
+size also results in more memory waste, which can hurt performance in some
+use cases. THPs are currently enabled in the Linux Kernel by applications
+in limited virtual address ranges via the madvise system call.  The THP
+shrinker tries to find a balance between increased use of THPs, and
+increased use of memory. It shrinks the size of memory by removing the
+underutilized THPs that are identified by the thp_utilization scanner.
+
+In our experiments we have noticed that the least utilized THPs are almost
+entirely unutilized.
+
+Sample Output:
+
+Utilized[0-50]: 1331 680884
+Utilized[51-101]: 9 3983
+Utilized[102-152]: 3 1187
+Utilized[153-203]: 0 0
+Utilized[204-255]: 2 539
+Utilized[256-306]: 5 1135
+Utilized[307-357]: 1 192
+Utilized[358-408]: 0 0
+Utilized[409-459]: 1 57
+Utilized[460-512]: 400 13
+Last Scan Time: 223.98s
+Last Scan Duration: 70.65s
+
+Above is a sample obtained from one of our test machines when THP is always
+enabled. Of the 1331 THPs in this thp_utilization sample that have from
+0-50 utilized subpages, we see that there are 680884 free pages. This
+comes out to 680884 / (512 * 1331) = 99.91% zero pages in the least
+utilized bucket. This represents 680884 * 4KB = 2.7GB memory waste.
+
+Also note that the vast majority of pages are either in the least utilized
+[0-50] or most utilized [460-512] buckets. The least utilized THPs are
+responsible for almost all of the memory waste when THP is always
+enabled. Thus by clearing out THPs in the lowest utilization bucket
+we extract most of the improvement in CPU efficiency. We have seen
+similar results on our production hosts.
+
+This patchset introduces the THP shrinker we have developed to identify
+and split the least utilized THPs. It includes the thp_utilization
+changes that groups anonymous THPs into buckets, the split_huge_page()
+changes that identify and zap zero 4KB pages within THPs and the shrinker
+changes. It should be noted that the split_huge_page() changes are based
+off previous work done by Yu Zhao.
+
+In the future, we intend to allow additional tuning to the shrinker
+based on workload depending on CPU/IO/Memory pressure and the
+amount of anonymous memory. The long term goal is to eventually always
+enable THP for all applications and deprecate madvise entirely.
+
+In production we thus far have observed 2-3% reduction in overall cpu
+usage on stateless web servers when THP is always enabled.
+
+Alexander Zhu (3):
+  mm: add thp_utilization metrics to debugfs
+  mm: changes to split_huge_page() to free zero filled tail pages
+  mm: THP low utilization shrinker
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ Documentation/admin-guide/mm/transhuge.rst    |   9 +
+ include/linux/huge_mm.h                       |  10 +
+ include/linux/list_lru.h                      |  24 ++
+ include/linux/mm_types.h                      |   5 +
+ include/linux/rmap.h                          |   2 +-
+ include/linux/vm_event_item.h                 |   3 +
+ mm/huge_memory.c                              | 342 +++++++++++++++++-
+ mm/list_lru.c                                 |  49 +++
+ mm/migrate.c                                  |  72 +++-
+ mm/migrate_device.c                           |   4 +-
+ mm/page_alloc.c                               |   6 +
+ mm/vmstat.c                                   |   3 +
+ .../selftests/vm/split_huge_page_test.c       | 113 +++++-
+ tools/testing/selftests/vm/vm_util.c          |  23 ++
+ tools/testing/selftests/vm/vm_util.h          |   1 +
+ 15 files changed, 648 insertions(+), 18 deletions(-)
+
+diff --git a/Documentation/admin-guide/mm/transhuge.rst b/Documentation/admin-guide/mm/transhuge.rst
+index c9c37f16eef8..d883ff9fddc7 100644
+--- a/Documentation/admin-guide/mm/transhuge.rst
++++ b/Documentation/admin-guide/mm/transhuge.rst
+@@ -297,6 +297,15 @@ To identify what applications are mapping file transparent huge pages, it
+ is necessary to read ``/proc/PID/smaps`` and count the FileHugeMapped fields
+ for each mapping.
+ 
++The utilization of transparent hugepages can be viewed by reading
++``/sys/kernel/debug/thp_utilization``. The utilization of a THP is defined
++as the ratio of non zero filled 4kb pages to the total number of pages in a
++THP. The buckets are labelled by the range of total utilized 4kb pages with
++one line per utilization bucket. Each line contains the total number of
++THPs in that bucket and the total number of zero filled 4kb pages summed
++over all THPs in that bucket. The last two lines show the timestamp and
++duration respectively of the most recent scan over all of physical memory.
++
+ Note that reading the smaps file is expensive and reading it
+ frequently will incur overhead.
+ 
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index 768e5261fdae..d6e55bf67625 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -179,6 +179,9 @@ bool hugepage_vma_check(struct vm_area_struct *vma,
+ unsigned long thp_get_unmapped_area(struct file *filp, unsigned long addr,
+ 		unsigned long len, unsigned long pgoff, unsigned long flags);
+ 
++int thp_number_utilized_pages(struct page *page);
++int thp_utilization_bucket(int num_utilized_pages);
++
+ void prep_transhuge_page(struct page *page);
+ void free_transhuge_page(struct page *page);
+ 
+@@ -190,6 +193,8 @@ static inline int split_huge_page(struct page *page)
+ }
+ void deferred_split_huge_page(struct page *page);
+ 
++void add_underutilized_thp(struct page *page);
++
+ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long address, bool freeze, struct folio *folio);
+ 
+@@ -300,6 +305,11 @@ static inline struct list_head *page_deferred_list(struct page *page)
+ 	return &page[2].deferred_list;
+ }
+ 
++static inline struct list_head *page_underutilized_thp_list(struct page *page)
++{
++       return &page[3].underutilized_thp_list;
++}
++
+ #else /* CONFIG_TRANSPARENT_HUGEPAGE */
+ #define HPAGE_PMD_SHIFT ({ BUILD_BUG(); 0; })
+ #define HPAGE_PMD_MASK ({ BUILD_BUG(); 0; })
+diff --git a/include/linux/list_lru.h b/include/linux/list_lru.h
+index b35968ee9fb5..c2cf146ea880 100644
+--- a/include/linux/list_lru.h
++++ b/include/linux/list_lru.h
+@@ -89,6 +89,18 @@ void memcg_reparent_list_lrus(struct mem_cgroup *memcg, struct mem_cgroup *paren
+  */
+ bool list_lru_add(struct list_lru *lru, struct list_head *item);
+ 
++/**
++ * list_lru_add_page: add an element to the lru list's tail
++ * @list_lru: the lru pointer
++ * @page: the page containing the item
++ * @item: the item to be deleted.
++ *
++ * This function works the same as list_lru_add in terms of list
++ * manipulation. Used for non slab objects contained in the page.
++ *
++ * Return value: true if the list was updated, false otherwise
++ */
++bool list_lru_add_page(struct list_lru *lru, struct page *page, struct list_head *item);
+ /**
+  * list_lru_del: delete an element to the lru list
+  * @list_lru: the lru pointer
+@@ -102,6 +114,18 @@ bool list_lru_add(struct list_lru *lru, struct list_head *item);
+  */
+ bool list_lru_del(struct list_lru *lru, struct list_head *item);
+ 
++/**
++ * list_lru_del_page: delete an element to the lru list
++ * @list_lru: the lru pointer
++ * @page: the page containing the item
++ * @item: the item to be deleted.
++ *
++ * This function works the same as list_lru_del in terms of list
++ * manipulation. Used for non slab objects contained in the page.
++ *
++ * Return value: true if the list was updated, false otherwise
++ */
++bool list_lru_del_page(struct list_lru *lru, struct page *page, struct list_head *item);
+ /**
+  * list_lru_count_one: return the number of objects currently held by @lru
+  * @lru: the lru pointer.
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 41935c55a438..99f6a749bab7 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -152,6 +152,11 @@ struct page {
+ 			/* For both global and memcg */
+ 			struct list_head deferred_list;
+ 		};
++		struct { /* Third tail page of compound page */
++			unsigned long _compound_pad_3; /* compound_head */
++			unsigned long _compound_pad_4;
++			struct list_head underutilized_thp_list;
++		};
+ 		struct {	/* Page table pages */
+ 			unsigned long _pt_pad_1;	/* compound_head */
+ 			pgtable_t pmd_huge_pte; /* protected by page->ptl */
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index b89b4b86951f..f7d5d5639dea 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -372,7 +372,7 @@ int folio_mkclean(struct folio *);
+ int pfn_mkclean_range(unsigned long pfn, unsigned long nr_pages, pgoff_t pgoff,
+ 		      struct vm_area_struct *vma);
+ 
+-void remove_migration_ptes(struct folio *src, struct folio *dst, bool locked);
++void remove_migration_ptes(struct folio *src, struct folio *dst, bool locked, bool unmap_clean);
+ 
+ int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma);
+ 
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index 3518dba1e02f..3618b10ddec9 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -111,6 +111,9 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ #ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
+ 		THP_SPLIT_PUD,
+ #endif
++		THP_SPLIT_FREE,
++		THP_SPLIT_UNMAP,
++		THP_SPLIT_REMAP_READONLY_ZERO_PAGE,
+ 		THP_ZERO_PAGE_ALLOC,
+ 		THP_ZERO_PAGE_ALLOC_FAILED,
+ 		THP_SWPOUT,
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index d326301ac9ee..6b01a2c8b054 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -46,6 +46,16 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/thp.h>
+ 
++/*
++ * The number of utilization buckets THPs will be grouped in
++ * under /sys/kernel/debug/thp_utilization.
++ */
++#define THP_UTIL_BUCKET_NR 10
++/*
++ * The number of PFNs (and hence hugepages) to scan through on each periodic
++ * run of the scanner that generates /sys/kernel/debug/thp_utilization.
++ */
++#define THP_UTIL_SCAN_SIZE 256
+ /*
+  * By default, transparent hugepage support is disabled in order to avoid
+  * risking an increased memory footprint for applications that are not
+@@ -71,6 +81,27 @@ static atomic_t huge_zero_refcount;
+ struct page *huge_zero_page __read_mostly;
+ unsigned long huge_zero_pfn __read_mostly = ~0UL;
+ 
++struct list_lru huge_low_util_page_lru;
++
++static void thp_utilization_workfn(struct work_struct *work);
++static DECLARE_DELAYED_WORK(thp_utilization_work, thp_utilization_workfn);
++
++struct thp_scan_info_bucket {
++	int nr_thps;
++	int nr_zero_pages;
++};
++
++struct thp_scan_info {
++	struct thp_scan_info_bucket buckets[THP_UTIL_BUCKET_NR];
++	struct zone *scan_zone;
++	struct timespec64 last_scan_duration;
++	struct timespec64 last_scan_time;
++	unsigned long pfn;
++};
++
++static struct thp_scan_info thp_scan_debugfs;
++static struct thp_scan_info thp_scan;
++
+ bool hugepage_vma_check(struct vm_area_struct *vma,
+ 			unsigned long vm_flags,
+ 			bool smaps, bool in_pf)
+@@ -236,6 +267,51 @@ static struct shrinker huge_zero_page_shrinker = {
+ 	.seeks = DEFAULT_SEEKS,
+ };
+ 
++static enum lru_status low_util_free_page(struct list_head *item,
++					  struct list_lru_one *lru,
++					  spinlock_t *lock,
++					  void *cb_arg)
++{
++	int bucket, num_utilized_pages;
++	struct page *head = compound_head(list_entry(item,
++									struct page,
++									underutilized_thp_list));
++
++	if (get_page_unless_zero(head)) {
++		lock_page(head);
++		list_lru_isolate(lru, item);
++		num_utilized_pages = thp_number_utilized_pages(head);
++		bucket = thp_utilization_bucket(num_utilized_pages);
++		if (bucket < THP_UTIL_BUCKET_NR - 1)
++			split_huge_page(head);
++		unlock_page(head);
++		put_page(head);
++	}
++
++	return LRU_REMOVED_RETRY;
++}
++
++static unsigned long shrink_huge_low_util_page_count(struct shrinker *shrink,
++						     struct shrink_control *sc)
++{
++	return HPAGE_PMD_NR * list_lru_shrink_count(&huge_low_util_page_lru, sc);
++}
++
++static unsigned long shrink_huge_low_util_page_scan(struct shrinker *shrink,
++						    struct shrink_control *sc)
++{
++	return HPAGE_PMD_NR * list_lru_shrink_walk(&huge_low_util_page_lru,
++							sc, low_util_free_page, NULL);
++}
++
++static struct shrinker huge_low_util_page_shrinker = {
++	.count_objects = shrink_huge_low_util_page_count,
++	.scan_objects = shrink_huge_low_util_page_scan,
++	.seeks = DEFAULT_SEEKS,
++	.flags = SHRINKER_NUMA_AWARE | SHRINKER_MEMCG_AWARE |
++		SHRINKER_NONSLAB,
++};
++
+ #ifdef CONFIG_SYSFS
+ static ssize_t enabled_show(struct kobject *kobj,
+ 			    struct kobj_attribute *attr, char *buf)
+@@ -487,13 +563,19 @@ static int __init hugepage_init(void)
+ 	if (err)
+ 		goto err_slab;
+ 
++	schedule_delayed_work(&thp_utilization_work, HZ);
++	err = register_shrinker(&huge_low_util_page_shrinker, "thp-low-util");
++	if (err)
++		goto err_low_util_shrinker;
+ 	err = register_shrinker(&huge_zero_page_shrinker, "thp-zero");
+ 	if (err)
+ 		goto err_hzp_shrinker;
+ 	err = register_shrinker(&deferred_split_shrinker, "thp-deferred_split");
+ 	if (err)
+ 		goto err_split_shrinker;
+-
++	err = list_lru_init_memcg(&huge_low_util_page_lru, &huge_low_util_page_shrinker);
++	if (err)
++		goto err_low_util_list_lru;
+ 	/*
+ 	 * By default disable transparent hugepages on smaller systems,
+ 	 * where the extra memory used could hurt more than TLB overhead
+@@ -509,11 +591,16 @@ static int __init hugepage_init(void)
+ 		goto err_khugepaged;
+ 
+ 	return 0;
++
+ err_khugepaged:
++	list_lru_destroy(&huge_low_util_page_lru);
++err_low_util_list_lru:
+ 	unregister_shrinker(&deferred_split_shrinker);
+ err_split_shrinker:
+ 	unregister_shrinker(&huge_zero_page_shrinker);
+ err_hzp_shrinker:
++	unregister_shrinker(&huge_low_util_page_shrinker);
++err_low_util_shrinker:
+ 	khugepaged_destroy();
+ err_slab:
+ 	hugepage_exit_sysfs(hugepage_kobj);
+@@ -588,6 +675,7 @@ void prep_transhuge_page(struct page *page)
+ 	 */
+ 
+ 	INIT_LIST_HEAD(page_deferred_list(page));
++	INIT_LIST_HEAD(page_underutilized_thp_list(page));
+ 	set_compound_page_dtor(page, TRANSHUGE_PAGE_DTOR);
+ }
+ 
+@@ -601,6 +689,11 @@ static inline bool is_transparent_hugepage(struct page *page)
+ 	       page[1].compound_dtor == TRANSHUGE_PAGE_DTOR;
+ }
+ 
++static inline bool is_anon_transparent_hugepage(struct page *page)
++{
++	return PageAnon(page) && is_transparent_hugepage(page);
++}
++
+ static unsigned long __thp_get_unmapped_area(struct file *filp,
+ 		unsigned long addr, unsigned long len,
+ 		loff_t off, unsigned long flags, unsigned long size)
+@@ -651,6 +744,49 @@ unsigned long thp_get_unmapped_area(struct file *filp, unsigned long addr,
+ }
+ EXPORT_SYMBOL_GPL(thp_get_unmapped_area);
+ 
++int thp_number_utilized_pages(struct page *page)
++{
++	struct folio *folio;
++	unsigned long page_offset, value;
++	int thp_nr_utilized_pages = HPAGE_PMD_NR;
++	int step_size = sizeof(unsigned long);
++	bool is_all_zeroes;
++	void *kaddr;
++	int i;
++
++	if (!page || !is_anon_transparent_hugepage(page))
++		return -1;
++
++	folio = page_folio(page);
++	for (i = 0; i < folio_nr_pages(folio); i++) {
++		kaddr = kmap_local_folio(folio, i);
++		is_all_zeroes = true;
++		for (page_offset = 0; page_offset < PAGE_SIZE; page_offset += step_size) {
++			value = *(unsigned long *)(kaddr + page_offset);
++			if (value != 0) {
++				is_all_zeroes = false;
++				break;
++			}
++		}
++		if (is_all_zeroes)
++			thp_nr_utilized_pages--;
++
++		kunmap_local(kaddr);
++	}
++	return thp_nr_utilized_pages;
++}
++
++int thp_utilization_bucket(int num_utilized_pages)
++{
++	int bucket;
++
++	if (num_utilized_pages < 0 || num_utilized_pages > HPAGE_PMD_NR)
++		return -1;
++	/* Group THPs into utilization buckets */
++	bucket = num_utilized_pages * THP_UTIL_BUCKET_NR / HPAGE_PMD_NR;
++	return min(bucket, THP_UTIL_BUCKET_NR - 1);
++}
++
+ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+ 			struct page *page, gfp_t gfp)
+ {
+@@ -2365,7 +2501,7 @@ static void unmap_page(struct page *page)
+ 		try_to_unmap(folio, ttu_flags | TTU_IGNORE_MLOCK);
+ }
+ 
+-static void remap_page(struct folio *folio, unsigned long nr)
++static void remap_page(struct folio *folio, unsigned long nr, bool unmap_clean)
+ {
+ 	int i = 0;
+ 
+@@ -2373,7 +2509,7 @@ static void remap_page(struct folio *folio, unsigned long nr)
+ 	if (!folio_test_anon(folio))
+ 		return;
+ 	for (;;) {
+-		remove_migration_ptes(folio, folio, true);
++		remove_migration_ptes(folio, folio, true, unmap_clean);
+ 		i += folio_nr_pages(folio);
+ 		if (i >= nr)
+ 			break;
+@@ -2443,8 +2579,7 @@ static void __split_huge_page_tail(struct page *head, int tail,
+ 			 LRU_GEN_MASK | LRU_REFS_MASK));
+ 
+ 	/* ->mapping in first tail page is compound_mapcount */
+-	VM_BUG_ON_PAGE(tail > 2 && page_tail->mapping != TAIL_MAPPING,
+-			page_tail);
++	VM_BUG_ON_PAGE(tail > 3 && page_tail->mapping != TAIL_MAPPING, page_tail);
+ 	page_tail->mapping = head->mapping;
+ 	page_tail->index = head->index + tail;
+ 
+@@ -2497,6 +2632,8 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 	struct address_space *swap_cache = NULL;
+ 	unsigned long offset = 0;
+ 	unsigned int nr = thp_nr_pages(head);
++	LIST_HEAD(pages_to_free);
++	int nr_pages_to_free = 0;
+ 	int i;
+ 
+ 	/* complete memcg works before add pages to LRU */
+@@ -2559,7 +2696,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 	}
+ 	local_irq_enable();
+ 
+-	remap_page(folio, nr);
++	remap_page(folio, nr, PageAnon(head));
+ 
+ 	if (PageSwapCache(head)) {
+ 		swp_entry_t entry = { .val = page_private(head) };
+@@ -2573,6 +2710,33 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 			continue;
+ 		unlock_page(subpage);
+ 
++		/*
++		 * If a tail page has only two references left, one inherited
++		 * from the isolation of its head and the other from
++		 * lru_add_page_tail() which we are about to drop, it means this
++		 * tail page was concurrently zapped. Then we can safely free it
++		 * and save page reclaim or migration the trouble of trying it.
++		 */
++		if (list && page_ref_freeze(subpage, 2)) {
++			VM_BUG_ON_PAGE(PageLRU(subpage), subpage);
++			VM_BUG_ON_PAGE(PageCompound(subpage), subpage);
++			VM_BUG_ON_PAGE(page_mapped(subpage), subpage);
++
++			ClearPageActive(subpage);
++			ClearPageUnevictable(subpage);
++			list_move(&subpage->lru, &pages_to_free);
++			nr_pages_to_free++;
++			continue;
++		}
++		/*
++		 * If a tail page has only one reference left, it will be freed
++		 * by the call to free_page_and_swap_cache below. Since zero
++		 * subpages are no longer remapped, there will only be one
++		 * reference left in cases outside of reclaim or migration.
++		 */
++		if (page_ref_count(subpage) == 1)
++			nr_pages_to_free++;
++
+ 		/*
+ 		 * Subpages may be freed if there wasn't any mapping
+ 		 * like if add_to_swap() is running on a lru page that
+@@ -2582,6 +2746,13 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 		 */
+ 		free_page_and_swap_cache(subpage);
+ 	}
++
++	if (!nr_pages_to_free)
++		return;
++
++	mem_cgroup_uncharge_list(&pages_to_free);
++	free_unref_page_list(&pages_to_free);
++	count_vm_events(THP_SPLIT_FREE, nr_pages_to_free);
+ }
+ 
+ /* Racy check whether the huge page can be split */
+@@ -2624,6 +2795,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 	struct folio *folio = page_folio(page);
+ 	struct page *head = &folio->page;
+ 	struct deferred_split *ds_queue = get_deferred_split_queue(head);
++	struct list_head *underutilized_thp_list = page_underutilized_thp_list(head);
+ 	XA_STATE(xas, &head->mapping->i_pages, head->index);
+ 	struct anon_vma *anon_vma = NULL;
+ 	struct address_space *mapping = NULL;
+@@ -2722,6 +2894,8 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 			list_del(page_deferred_list(head));
+ 		}
+ 		spin_unlock(&ds_queue->split_queue_lock);
++		if (!list_empty(underutilized_thp_list))
++			list_lru_del_page(&huge_low_util_page_lru, head, underutilized_thp_list);
+ 		if (mapping) {
+ 			int nr = thp_nr_pages(head);
+ 
+@@ -2744,7 +2918,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 		if (mapping)
+ 			xas_unlock(&xas);
+ 		local_irq_enable();
+-		remap_page(folio, folio_nr_pages(folio));
++		remap_page(folio, folio_nr_pages(folio), false);
+ 		ret = -EBUSY;
+ 	}
+ 
+@@ -2764,6 +2938,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ void free_transhuge_page(struct page *page)
+ {
+ 	struct deferred_split *ds_queue = get_deferred_split_queue(page);
++	struct list_head *underutilized_thp_list = page_underutilized_thp_list(page);
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+@@ -2772,6 +2947,12 @@ void free_transhuge_page(struct page *page)
+ 		list_del(page_deferred_list(page));
+ 	}
+ 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
++	if (!list_empty(underutilized_thp_list))
++		list_lru_del_page(&huge_low_util_page_lru, page, underutilized_thp_list);
++
++	if (PageLRU(page))
++		__clear_page_lru_flags(page);
++
+ 	free_compound_page(page);
+ }
+ 
+@@ -2812,6 +2993,26 @@ void deferred_split_huge_page(struct page *page)
+ 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
+ }
+ 
++void add_underutilized_thp(struct page *page)
++{
++	VM_BUG_ON_PAGE(!PageTransHuge(page), page);
++
++	if (PageSwapCache(page))
++		return;
++
++	/*
++	 * Need to take a reference on the page to prevent the page from getting free'd from
++	 * under us while we are adding the THP to the shrinker.
++	 */
++	if (!get_page_unless_zero(page))
++		return;
++
++	if (!is_huge_zero_page(page) && is_anon_transparent_hugepage(page))
++		list_lru_add_page(&huge_low_util_page_lru, page, page_underutilized_thp_list(page));
++
++	put_page(page);
++}
++
+ static unsigned long deferred_split_count(struct shrinker *shrink,
+ 		struct shrink_control *sc)
+ {
+@@ -3166,6 +3367,42 @@ static int __init split_huge_pages_debugfs(void)
+ 	return 0;
+ }
+ late_initcall(split_huge_pages_debugfs);
++
++static int thp_utilization_show(struct seq_file *seqf, void *pos)
++{
++	int i;
++	int start;
++	int end;
++
++	for (i = 0; i < THP_UTIL_BUCKET_NR; i++) {
++		start = i * HPAGE_PMD_NR / THP_UTIL_BUCKET_NR;
++		end = (i + 1 == THP_UTIL_BUCKET_NR)
++			   ? HPAGE_PMD_NR
++			   : ((i + 1) * HPAGE_PMD_NR / THP_UTIL_BUCKET_NR - 1);
++		/* The last bucket will need to contain 100 */
++		seq_printf(seqf, "Utilized[%d-%d]: %d %d\n", start, end,
++			   thp_scan_debugfs.buckets[i].nr_thps,
++			   thp_scan_debugfs.buckets[i].nr_zero_pages);
++	}
++	seq_printf(seqf, "Last Scan Time: %lu.%02lus\n",
++		   (unsigned long)thp_scan_debugfs.last_scan_time.tv_sec,
++		   (thp_scan_debugfs.last_scan_time.tv_nsec / (NSEC_PER_SEC / 100)));
++
++	seq_printf(seqf, "Last Scan Duration: %lu.%02lus\n",
++		   (unsigned long)thp_scan_debugfs.last_scan_duration.tv_sec,
++		   (thp_scan_debugfs.last_scan_duration.tv_nsec / (NSEC_PER_SEC / 100)));
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(thp_utilization);
++
++static int __init thp_utilization_debugfs(void)
++{
++	debugfs_create_file("thp_utilization", 0200, NULL, NULL,
++			    &thp_utilization_fops);
++	return 0;
++}
++late_initcall(thp_utilization_debugfs);
+ #endif
+ 
+ #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+@@ -3251,3 +3488,94 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
+ 	trace_remove_migration_pmd(address, pmd_val(pmde));
+ }
+ #endif
++
++static void thp_scan_next_zone(void)
++{
++	struct timespec64 current_time;
++	int i;
++	bool update_debugfs;
++	/*
++	 * THP utilization worker thread has reached the end
++	 * of the memory zone. Proceed to the next zone.
++	 */
++	thp_scan.scan_zone = next_zone(thp_scan.scan_zone);
++	update_debugfs = !thp_scan.scan_zone;
++	thp_scan.scan_zone = update_debugfs ? (first_online_pgdat())->node_zones
++			: thp_scan.scan_zone;
++	thp_scan.pfn = (thp_scan.scan_zone->zone_start_pfn + HPAGE_PMD_NR - 1)
++			& ~(HPAGE_PMD_SIZE - 1);
++	if (!update_debugfs)
++		return;
++	/*
++	 * If the worker has scanned through all of physical
++	 * memory. Then update information displayed in /sys/kernel/debug/thp_utilization
++	 */
++	ktime_get_ts64(&current_time);
++	thp_scan_debugfs.last_scan_duration = timespec64_sub(current_time,
++							     thp_scan_debugfs.last_scan_time);
++	thp_scan_debugfs.last_scan_time = current_time;
++
++	for (i = 0; i < THP_UTIL_BUCKET_NR; i++) {
++		thp_scan_debugfs.buckets[i].nr_thps = thp_scan.buckets[i].nr_thps;
++		thp_scan_debugfs.buckets[i].nr_zero_pages = thp_scan.buckets[i].nr_zero_pages;
++		thp_scan.buckets[i].nr_thps = 0;
++		thp_scan.buckets[i].nr_zero_pages = 0;
++	}
++}
++
++static void thp_util_scan(unsigned long pfn_end)
++{
++	struct page *page = NULL;
++	int bucket, num_utilized_pages, current_pfn;
++	int i;
++	/*
++	 * Scan through each memory zone in chunks of THP_UTIL_SCAN_SIZE
++	 * PFNs every second looking for anonymous THPs.
++	 */
++	for (i = 0; i < THP_UTIL_SCAN_SIZE; i++) {
++		current_pfn = thp_scan.pfn;
++		thp_scan.pfn += HPAGE_PMD_NR;
++		if (current_pfn >= pfn_end)
++			return;
++
++		if (!pfn_valid(current_pfn))
++			continue;
++
++		page = pfn_to_page(current_pfn);
++		num_utilized_pages = thp_number_utilized_pages(page);
++		bucket = thp_utilization_bucket(num_utilized_pages);
++		if (bucket < 0)
++			continue;
++
++		if (bucket < THP_UTIL_BUCKET_NR - 1)
++			add_underutilized_thp(page);
++
++		thp_scan.buckets[bucket].nr_thps++;
++		thp_scan.buckets[bucket].nr_zero_pages += (HPAGE_PMD_NR - num_utilized_pages);
++	}
++}
++
++static void thp_utilization_workfn(struct work_struct *work)
++{
++	unsigned long pfn_end;
++
++	if (!thp_scan.scan_zone)
++		thp_scan.scan_zone = (first_online_pgdat())->node_zones;
++	/*
++	 * Worker function that scans through all of physical memory
++	 * for anonymous THPs.
++	 */
++	pfn_end = (thp_scan.scan_zone->zone_start_pfn +
++			thp_scan.scan_zone->spanned_pages + HPAGE_PMD_NR - 1)
++			& ~(HPAGE_PMD_SIZE - 1);
++	/* If we have reached the end of the zone or end of physical memory
++	 * move on to the next zone. Otherwise, scan the next PFNs in the
++	 * current zone.
++	 */
++	if (!populated_zone(thp_scan.scan_zone) || thp_scan.pfn >= pfn_end)
++		thp_scan_next_zone();
++	else
++		thp_util_scan(pfn_end);
++
++	schedule_delayed_work(&thp_utilization_work, HZ);
++}
+diff --git a/mm/list_lru.c b/mm/list_lru.c
+index a05e5bef3b40..7e8b324cc840 100644
+--- a/mm/list_lru.c
++++ b/mm/list_lru.c
+@@ -140,6 +140,32 @@ bool list_lru_add(struct list_lru *lru, struct list_head *item)
+ }
+ EXPORT_SYMBOL_GPL(list_lru_add);
+ 
++bool list_lru_add_page(struct list_lru *lru, struct page *page, struct list_head *item)
++{
++	int nid = page_to_nid(page);
++	struct list_lru_node *nlru = &lru->node[nid];
++	struct list_lru_one *l;
++	struct mem_cgroup *memcg;
++
++	spin_lock(&nlru->lock);
++	if (list_empty(item)) {
++		memcg = page_memcg(page);
++		memcg_list_lru_alloc(memcg, lru, GFP_KERNEL);
++		l = list_lru_from_memcg_idx(lru, nid, memcg_kmem_id(memcg));
++		list_add_tail(item, &l->list);
++		/* Set shrinker bit if the first element was added */
++		if (!l->nr_items++)
++			set_shrinker_bit(memcg, nid,
++					 lru_shrinker_id(lru));
++		nlru->nr_items++;
++		spin_unlock(&nlru->lock);
++		return true;
++	}
++	spin_unlock(&nlru->lock);
++	return false;
++}
++EXPORT_SYMBOL_GPL(list_lru_add_page);
++
+ bool list_lru_del(struct list_lru *lru, struct list_head *item)
+ {
+ 	int nid = page_to_nid(virt_to_page(item));
+@@ -160,6 +186,29 @@ bool list_lru_del(struct list_lru *lru, struct list_head *item)
+ }
+ EXPORT_SYMBOL_GPL(list_lru_del);
+ 
++bool list_lru_del_page(struct list_lru *lru, struct page *page, struct list_head *item)
++{
++	int nid = page_to_nid(page);
++	struct list_lru_node *nlru = &lru->node[nid];
++	struct list_lru_one *l;
++	struct mem_cgroup *memcg;
++
++	spin_lock(&nlru->lock);
++	if (!list_empty(item)) {
++		memcg = page_memcg(page);
++		memcg_list_lru_alloc(memcg, lru, GFP_KERNEL);
++		l = list_lru_from_memcg_idx(lru, nid, memcg_kmem_id(memcg));
++		list_del_init(item);
++		l->nr_items--;
++		nlru->nr_items--;
++		spin_unlock(&nlru->lock);
++		return true;
++	}
++	spin_unlock(&nlru->lock);
++	return false;
++}
++EXPORT_SYMBOL_GPL(list_lru_del_page);
++
+ void list_lru_isolate(struct list_lru_one *list, struct list_head *item)
+ {
+ 	list_del_init(item);
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 322a9de99d84..943648787899 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -168,13 +168,62 @@ void putback_movable_pages(struct list_head *l)
+ 	}
+ }
+ 
++static bool try_to_unmap_clean(struct page_vma_mapped_walk *pvmw, struct page *page)
++{
++	void *addr;
++	bool dirty;
++	pte_t newpte;
++
++	VM_BUG_ON_PAGE(PageCompound(page), page);
++	VM_BUG_ON_PAGE(!PageAnon(page), page);
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(pte_present(*pvmw->pte), page);
++
++	if (PageMlocked(page) || (pvmw->vma->vm_flags & VM_LOCKED))
++		return false;
++
++	/*
++	 * The pmd entry mapping the old thp was flushed and the pte mapping
++	 * this subpage has been non present. Therefore, this subpage is
++	 * inaccessible. We don't need to remap it if it contains only zeros.
++	 */
++	addr = kmap_local_page(page);
++	dirty = memchr_inv(addr, 0, PAGE_SIZE);
++	kunmap_local(addr);
++
++	if (dirty)
++		return false;
++
++	pte_clear_not_present_full(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, false);
++
++	if (userfaultfd_armed(pvmw->vma)) {
++		newpte = pte_mkspecial(pfn_pte(page_to_pfn(ZERO_PAGE(pvmw->address)),
++					       pvmw->vma->vm_page_prot));
++		ptep_clear_flush(pvmw->vma, pvmw->address, pvmw->pte);
++		set_pte_at(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, newpte);
++		dec_mm_counter(pvmw->vma->vm_mm, MM_ANONPAGES);
++		count_vm_event(THP_SPLIT_REMAP_READONLY_ZERO_PAGE);
++		return true;
++	}
++
++	dec_mm_counter(pvmw->vma->vm_mm, mm_counter(page));
++	count_vm_event(THP_SPLIT_UNMAP);
++	return true;
++}
++
++struct rmap_walk_arg {
++	struct folio *folio;
++	bool unmap_clean;
++};
++
+ /*
+  * Restore a potential migration pte to a working pte entry
+  */
+ static bool remove_migration_pte(struct folio *folio,
+-		struct vm_area_struct *vma, unsigned long addr, void *old)
++		struct vm_area_struct *vma, unsigned long addr, void *arg)
+ {
+-	DEFINE_FOLIO_VMA_WALK(pvmw, old, vma, addr, PVMW_SYNC | PVMW_MIGRATION);
++	struct rmap_walk_arg *rmap_walk_arg = arg;
++	DEFINE_FOLIO_VMA_WALK(pvmw, rmap_walk_arg->folio, vma, addr, PVMW_SYNC | PVMW_MIGRATION);
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
+ 		rmap_t rmap_flags = RMAP_NONE;
+@@ -197,6 +246,8 @@ static bool remove_migration_pte(struct folio *folio,
+ 			continue;
+ 		}
+ #endif
++		if (rmap_walk_arg->unmap_clean && try_to_unmap_clean(&pvmw, new))
++			continue;
+ 
+ 		folio_get(folio);
+ 		pte = pte_mkold(mk_pte(new, READ_ONCE(vma->vm_page_prot)));
+@@ -268,13 +319,20 @@ static bool remove_migration_pte(struct folio *folio,
+  * Get rid of all migration entries and replace them by
+  * references to the indicated page.
+  */
+-void remove_migration_ptes(struct folio *src, struct folio *dst, bool locked)
++void remove_migration_ptes(struct folio *src, struct folio *dst, bool locked, bool unmap_clean)
+ {
++	struct rmap_walk_arg rmap_walk_arg = {
++		.folio = src,
++		.unmap_clean = unmap_clean,
++	};
++
+ 	struct rmap_walk_control rwc = {
+ 		.rmap_one = remove_migration_pte,
+-		.arg = src,
++		.arg = &rmap_walk_arg,
+ 	};
+ 
++	VM_BUG_ON_FOLIO(unmap_clean && src != dst, src);
++
+ 	if (locked)
+ 		rmap_walk_locked(dst, &rwc);
+ 	else
+@@ -850,7 +908,7 @@ static int writeout(struct address_space *mapping, struct folio *folio)
+ 	 * At this point we know that the migration attempt cannot
+ 	 * be successful.
+ 	 */
+-	remove_migration_ptes(folio, folio, false);
++	remove_migration_ptes(folio, folio, false, false);
+ 
+ 	rc = mapping->a_ops->writepage(&folio->page, &wbc);
+ 
+@@ -1109,7 +1167,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 
+ 	if (page_was_mapped)
+ 		remove_migration_ptes(folio,
+-			rc == MIGRATEPAGE_SUCCESS ? dst : folio, false);
++			rc == MIGRATEPAGE_SUCCESS ? dst : folio, false, false);
+ 
+ out_unlock_both:
+ 	unlock_page(newpage);
+@@ -1319,7 +1377,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 
+ 	if (page_was_mapped)
+ 		remove_migration_ptes(src,
+-			rc == MIGRATEPAGE_SUCCESS ? dst : src, false);
++			rc == MIGRATEPAGE_SUCCESS ? dst : src, false, false);
+ 
+ unlock_put_anon:
+ 	unlock_page(new_hpage);
+diff --git a/mm/migrate_device.c b/mm/migrate_device.c
+index dbf6c7a7a7c9..518aacc914c9 100644
+--- a/mm/migrate_device.c
++++ b/mm/migrate_device.c
+@@ -413,7 +413,7 @@ static void migrate_vma_unmap(struct migrate_vma *migrate)
+ 			continue;
+ 
+ 		folio = page_folio(page);
+-		remove_migration_ptes(folio, folio, false);
++		remove_migration_ptes(folio, folio, false, false);
+ 
+ 		migrate->src[i] = 0;
+ 		folio_unlock(folio);
+@@ -789,7 +789,7 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
+ 
+ 		src = page_folio(page);
+ 		dst = page_folio(newpage);
+-		remove_migration_ptes(src, dst, false);
++		remove_migration_ptes(src, dst, false, false);
+ 		folio_unlock(src);
+ 
+ 		if (is_zone_device_page(page))
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 3fd0a43ecbf9..86d0cef64862 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1328,6 +1328,12 @@ static int free_tail_pages_check(struct page *head_page, struct page *page)
+ 		 * deferred_list.next -- ignore value.
+ 		 */
+ 		break;
++	case 3:
++		/*
++		 * the third tail page: ->mapping is
++		 * underutilized_thp_list.next -- ignore value.
++		 */
++		break;
+ 	default:
+ 		if (page->mapping != TAIL_MAPPING) {
+ 			bad_page(page, "corrupted mapping in tail page");
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 33091a67627e..f6c5d0e97499 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1369,6 +1369,9 @@ const char * const vmstat_text[] = {
+ #ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
+ 	"thp_split_pud",
+ #endif
++	"thp_split_free",
++	"thp_split_unmap",
++	"thp_split_remap_readonly_zero_page",
+ 	"thp_zero_page_alloc",
+ 	"thp_zero_page_alloc_failed",
+ 	"thp_swpout",
+diff --git a/tools/testing/selftests/vm/split_huge_page_test.c b/tools/testing/selftests/vm/split_huge_page_test.c
+index 6aa2b8253aed..2c669aadbfd0 100644
+--- a/tools/testing/selftests/vm/split_huge_page_test.c
++++ b/tools/testing/selftests/vm/split_huge_page_test.c
+@@ -16,6 +16,9 @@
+ #include <sys/mount.h>
+ #include <malloc.h>
+ #include <stdbool.h>
++#include <sys/syscall.h> /* Definition of SYS_* constants */
++#include <linux/userfaultfd.h>
++#include <sys/ioctl.h>
+ #include "vm_util.h"
+ 
+ uint64_t pagesize;
+@@ -88,6 +91,113 @@ static void write_debugfs(const char *fmt, ...)
+ 	}
+ }
+ 
++static char *allocate_zero_filled_hugepage(size_t len)
++{
++	char *result;
++	size_t i;
++
++	result = memalign(pmd_pagesize, len);
++	if (!result) {
++		printf("Fail to allocate memory\n");
++		exit(EXIT_FAILURE);
++	}
++	madvise(result, len, MADV_HUGEPAGE);
++
++	for (i = 0; i < len; i++)
++		result[i] = (char)0;
++
++	return result;
++}
++
++static void verify_rss_anon_split_huge_page_all_zeroes(char *one_page, size_t len)
++{
++	uint64_t thp_size, rss_anon_before, rss_anon_after;
++	size_t i;
++
++	thp_size = check_huge(one_page);
++	if (!thp_size) {
++		printf("No THP is allocated\n");
++		exit(EXIT_FAILURE);
++	}
++
++	rss_anon_before = rss_anon();
++	if (!rss_anon_before) {
++		printf("No RssAnon is allocated before split\n");
++		exit(EXIT_FAILURE);
++	}
++	/* split all THPs */
++	write_debugfs(PID_FMT, getpid(), (uint64_t)one_page,
++		      (uint64_t)one_page + len);
++
++	for (i = 0; i < len; i++)
++		if (one_page[i] != (char)0) {
++			printf("%ld byte corrupted\n", i);
++			exit(EXIT_FAILURE);
++		}
++
++	thp_size = check_huge(one_page);
++	if (thp_size) {
++		printf("Still %ld kB AnonHugePages not split\n", thp_size);
++		exit(EXIT_FAILURE);
++	}
++
++	rss_anon_after = rss_anon();
++	if (rss_anon_after >= rss_anon_before) {
++		printf("Incorrect RssAnon value. Before: %ld After: %ld\n",
++		       rss_anon_before, rss_anon_after);
++		exit(EXIT_FAILURE);
++	}
++}
++
++void split_pmd_zero_pages(void)
++{
++	char *one_page;
++	size_t len = 4 * pmd_pagesize;
++
++	one_page = allocate_zero_filled_hugepage(len);
++	verify_rss_anon_split_huge_page_all_zeroes(one_page, len);
++	printf("Split zero filled huge pages successful\n");
++	free(one_page);
++}
++
++void split_pmd_zero_pages_uffd(void)
++{
++	char *one_page;
++	size_t len = 4 * pmd_pagesize;
++	long uffd; /* userfaultfd file descriptor */
++	struct uffdio_api uffdio_api;
++	struct uffdio_register uffdio_register;
++
++	/* Create and enable userfaultfd object. */
++
++	uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
++	if (uffd == -1) {
++		perror("userfaultfd");
++		exit(1);
++	}
++
++	uffdio_api.api = UFFD_API;
++	uffdio_api.features = 0;
++	if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1) {
++		perror("ioctl-UFFDIO_API");
++		exit(1);
++	}
++
++	one_page = allocate_zero_filled_hugepage(len);
++
++	uffdio_register.range.start = (unsigned long)one_page;
++	uffdio_register.range.len = len;
++	uffdio_register.mode = UFFDIO_REGISTER_MODE_WP;
++	if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1) {
++		perror("ioctl-UFFDIO_REGISTER");
++		exit(1);
++	}
++
++	verify_rss_anon_split_huge_page_all_zeroes(one_page, len);
++	printf("Split zero filled huge pages with uffd successful\n");
++	free(one_page);
++}
++
+ void split_pmd_thp(void)
+ {
+ 	char *one_page;
+@@ -123,7 +233,6 @@ void split_pmd_thp(void)
+ 			exit(EXIT_FAILURE);
+ 		}
+ 
+-
+ 	thp_size = check_huge(one_page);
+ 	if (thp_size) {
+ 		printf("Still %ld kB AnonHugePages not split\n", thp_size);
+@@ -305,6 +414,8 @@ int main(int argc, char **argv)
+ 	pageshift = ffs(pagesize) - 1;
+ 	pmd_pagesize = read_pmd_pagesize();
+ 
++	split_pmd_zero_pages();
++	split_pmd_zero_pages_uffd();
+ 	split_pmd_thp();
+ 	split_pte_mapped_thp();
+ 	split_file_backed_thp();
+diff --git a/tools/testing/selftests/vm/vm_util.c b/tools/testing/selftests/vm/vm_util.c
+index b58ab11a7a30..c6a785a67fc9 100644
+--- a/tools/testing/selftests/vm/vm_util.c
++++ b/tools/testing/selftests/vm/vm_util.c
+@@ -6,6 +6,7 @@
+ 
+ #define PMD_SIZE_FILE_PATH "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size"
+ #define SMAP_FILE_PATH "/proc/self/smaps"
++#define STATUS_FILE_PATH "/proc/self/status"
+ #define MAX_LINE_LENGTH 500
+ 
+ uint64_t pagemap_get_entry(int fd, char *start)
+@@ -72,6 +73,28 @@ uint64_t read_pmd_pagesize(void)
+ 	return strtoul(buf, NULL, 10);
+ }
+ 
++uint64_t rss_anon(void)
++{
++	uint64_t rss_anon = 0;
++	int ret;
++	FILE *fp;
++	char buffer[MAX_LINE_LENGTH];
++
++	fp = fopen(STATUS_FILE_PATH, "r");
++	if (!fp)
++		ksft_exit_fail_msg("%s: Failed to open file %s\n", __func__, STATUS_FILE_PATH);
++
++	if (!check_for_pattern(fp, "RssAnon:", buffer))
++		goto err_out;
++
++	if (sscanf(buffer, "RssAnon:%10ld kB", &rss_anon) != 1)
++		ksft_exit_fail_msg("Reading status error\n");
++
++err_out:
++	fclose(fp);
++	return rss_anon;
++}
++
+ uint64_t check_huge(void *addr)
+ {
+ 	uint64_t thp = 0;
+diff --git a/tools/testing/selftests/vm/vm_util.h b/tools/testing/selftests/vm/vm_util.h
+index 2e512bd57ae1..00b92ccef20d 100644
+--- a/tools/testing/selftests/vm/vm_util.h
++++ b/tools/testing/selftests/vm/vm_util.h
+@@ -6,4 +6,5 @@ uint64_t pagemap_get_entry(int fd, char *start);
+ bool pagemap_is_softdirty(int fd, char *start);
+ void clear_softdirty(void);
+ uint64_t read_pmd_pagesize(void);
++uint64_t rss_anon(void);
+ uint64_t check_huge(void *addr);
+-- 
+2.39.0.rc2
+

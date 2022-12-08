@@ -1,0 +1,1122 @@
+From ea7446fd2dd1a1711e7cc5a4da719207c90d783f Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 4 Oct 2022 14:06:15 +0200
+Subject: [PATCH 14/20] clr
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/include/asm/topology.h          |  1 +
+ arch/x86/kernel/cpu/intel_epb.c          |  4 ++
+ arch/x86/kernel/itmt.c                   | 43 +++++++++++++++++++-
+ arch/x86/kernel/tsc.c                    |  3 ++
+ arch/x86/mm/fault.c                      |  4 +-
+ drivers/cpufreq/intel_pstate.c           |  7 ++++
+ drivers/idle/intel_idle.c                | 50 ++++++++++++------------
+ drivers/input/serio/i8042.c              | 10 ++---
+ drivers/net/dummy.c                      |  2 +-
+ drivers/nvme/host/core.c                 |  2 +-
+ drivers/pci/pci.c                        |  2 +-
+ drivers/powercap/intel_rapl_common.c     |  2 +-
+ drivers/thermal/intel/intel_powerclamp.c | 10 +++++
+ fs/xattr.c                               | 15 +++----
+ include/linux/ipc_namespace.h            |  5 ++-
+ include/linux/jbd2.h                     |  2 +-
+ include/linux/page_counter.h             |  1 +
+ include/linux/percpu_counter.h           | 32 +++++++++++++++
+ include/linux/wait.h                     |  2 +
+ include/uapi/linux/if_bonding.h          |  2 +-
+ init/do_mounts.c                         | 16 +++++++-
+ ipc/msg.c                                | 44 ++++++++++++++-------
+ ipc/namespace.c                          |  5 ++-
+ ipc/util.h                               |  4 +-
+ kernel/locking/rwsem.c                   |  4 +-
+ kernel/sched/fair.c                      | 19 +++++++++
+ kernel/sched/wait.c                      | 24 ++++++++++++
+ kernel/watchdog.c                        |  2 +-
+ lib/raid6/algos.c                        |  4 +-
+ mm/ksm.c                                 | 11 ++++--
+ mm/memcontrol.c                          |  2 +-
+ mm/page_alloc.c                          |  5 ++-
+ net/ipv4/inet_connection_sock.c          |  2 +-
+ net/ipv4/tcp.c                           |  4 +-
+ 34 files changed, 266 insertions(+), 79 deletions(-)
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 458c891a8273..d86eb1ebf59f 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -175,6 +175,7 @@ extern unsigned int __read_mostly sysctl_sched_itmt_enabled;
+ 
+ /* Interface to set priority of a cpu */
+ void sched_set_itmt_core_prio(int prio, int core_cpu);
++void sched_set_itmt_power_ratio(int power_ratio, int core_cpu);
+ 
+ /* Interface to notify scheduler that system supports ITMT */
+ int sched_set_itmt_support(void);
+diff --git a/arch/x86/kernel/cpu/intel_epb.c b/arch/x86/kernel/cpu/intel_epb.c
+index fbaf12e43f41..c8c2d6f1a8ac 100644
+--- a/arch/x86/kernel/cpu/intel_epb.c
++++ b/arch/x86/kernel/cpu/intel_epb.c
+@@ -166,6 +166,10 @@ static ssize_t energy_perf_bias_store(struct device *dev,
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* update the ITMT scheduler logic to use the power policy data */
++	/* scale the val up by 2 so the range is 224 - 256 */
++	sched_set_itmt_power_ratio(256 - val * 2, cpu);
++
+ 	return count;
+ }
+ 
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 9ff480e94511..596fd7fb7847 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -25,6 +25,7 @@
+ 
+ static DEFINE_MUTEX(itmt_update_mutex);
+ DEFINE_PER_CPU_READ_MOSTLY(int, sched_core_priority);
++DEFINE_PER_CPU_READ_MOSTLY(int, sched_power_ratio);
+ 
+ /* Boolean to track if system has ITMT capabilities */
+ static bool __read_mostly sched_itmt_capable;
+@@ -169,9 +170,19 @@ void sched_clear_itmt_support(void)
+ 
+ int arch_asym_cpu_priority(int cpu)
+ {
+-	return per_cpu(sched_core_priority, cpu);
++	int power_ratio = per_cpu(sched_power_ratio, cpu);
++
++	/* a power ratio of 0 (uninitialized) is assumed to be maximum */
++	if (power_ratio == 0)
++		power_ratio = 256 - 2 * 6;
++	return per_cpu(sched_core_priority, cpu) * power_ratio / 256;
+ }
+ 
++extern int best_core;
++extern int second_best_core;
++static int best_core_score;
++static int second_best_core_score;
++
+ /**
+  * sched_set_itmt_core_prio() - Set CPU priority based on ITMT
+  * @prio:	Priority of cpu core
+@@ -201,5 +212,35 @@ void sched_set_itmt_core_prio(int prio, int core_cpu)
+ 		smt_prio = prio * smp_num_siblings / (i * i);
+ 		per_cpu(sched_core_priority, cpu) = smt_prio;
+ 		i++;
++
++		if (smt_prio > best_core_score) {
++			best_core = cpu;
++			best_core_score = smt_prio;
++		} else
++		if (smt_prio > second_best_core_score) {
++			second_best_core = cpu;
++			second_best_core_score = smt_prio;
++		}
++	}
++}
++
++/**
++ * sched_set_itmt_power_ratio() - Set CPU priority based on ITMT
++ * @power_ratio:	The power scaling ratio [1..256] for the core
++ * @core_cpu:		The cpu number associated with the core
++ *
++ * Set a scaling to the cpu performance based on long term power
++ * settings (like EPB).
++ *
++ * Note this is for the policy not for the actual dynamic frequency;
++ * the frequency will increase itself as workloads run on a core.
++ */
++
++void sched_set_itmt_power_ratio(int power_ratio, int core_cpu)
++{
++	int cpu;
++
++	for_each_cpu(cpu, topology_sibling_cpumask(core_cpu)) {
++		per_cpu(sched_power_ratio, cpu) = power_ratio;
+ 	}
+ }
+diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+index cafacb2e58cc..c2f80184fd33 100644
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@ -1569,6 +1569,9 @@ unsigned long calibrate_delay_is_known(void)
+ 	if (!constant_tsc || !mask)
+ 		return 0;
+ 
++	if (cpu != 0)
++		return cpu_data(0).loops_per_jiffy;
++
+ 	sibling = cpumask_any_but(mask, cpu);
+ 	if (sibling < nr_cpu_ids)
+ 		return cpu_data(sibling).loops_per_jiffy;
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index fa71a5d12e87..c4bbd8c66134 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -776,9 +776,9 @@ show_signal_msg(struct pt_regs *regs, unsigned long error_code,
+ 	if (!printk_ratelimit())
+ 		return;
+ 
+-	printk("%s%s[%d]: segfault at %lx ip %px sp %px error %lx",
++	printk("%s%s[%d]: segfault at %lx ip %px sp %px error %lx cpu %i",
+ 		loglvl, tsk->comm, task_pid_nr(tsk), address,
+-		(void *)regs->ip, (void *)regs->sp, error_code);
++		(void *)regs->ip, (void *)regs->sp, error_code, raw_smp_processor_id());
+ 
+ 	print_vma_addr(KERN_CONT " in ", regs->ip);
+ 
+diff --git a/drivers/cpufreq/intel_pstate.c b/drivers/cpufreq/intel_pstate.c
+index 6ff73c30769f..46516074bfd0 100644
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@ -365,6 +365,13 @@ static void intel_pstate_set_itmt_prio(int cpu)
+ 	 * update them at any time after it has been called.
+ 	 */
+ 	sched_set_itmt_core_prio(cppc_perf.highest_perf, cpu);
++	/*
++	 * On some systems with overclocking enabled, CPPC.highest_perf is hardcoded to 0xff.
++	 * In this case we can't use CPPC.highest_perf to enable ITMT.
++	 * In this case we can look at MSR_HWP_CAPABILITIES bits [8:0] to decide.
++	 */
++	if (cppc_perf.highest_perf == 0xff)
++		cppc_perf.highest_perf = HWP_HIGHEST_PERF(READ_ONCE(all_cpu_data[cpu]->hwp_cap_cached));
+ 
+ 	if (max_highest_perf <= min_highest_perf) {
+ 		if (cppc_perf.highest_perf > max_highest_perf)
+diff --git a/drivers/idle/intel_idle.c b/drivers/idle/intel_idle.c
+index 3e101719689a..82fc489a6fbe 100644
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@ -578,7 +578,7 @@ static struct cpuidle_state hsw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x01",
+ 		.flags = MWAIT2flg(0x01) | CPUIDLE_FLAG_ALWAYS_ENABLE,
+ 		.exit_latency = 10,
+-		.target_residency = 20,
++		.target_residency = 120,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -586,7 +586,7 @@ static struct cpuidle_state hsw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x10",
+ 		.flags = MWAIT2flg(0x10) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 33,
+-		.target_residency = 100,
++		.target_residency = 900,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -594,7 +594,7 @@ static struct cpuidle_state hsw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x20",
+ 		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 133,
+-		.target_residency = 400,
++		.target_residency = 1000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -602,7 +602,7 @@ static struct cpuidle_state hsw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x32",
+ 		.flags = MWAIT2flg(0x32) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 166,
+-		.target_residency = 500,
++		.target_residency = 1500,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -610,7 +610,7 @@ static struct cpuidle_state hsw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x40",
+ 		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 300,
+-		.target_residency = 900,
++		.target_residency = 2000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -618,7 +618,7 @@ static struct cpuidle_state hsw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x50",
+ 		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 600,
+-		.target_residency = 1800,
++		.target_residency = 5000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -626,7 +626,7 @@ static struct cpuidle_state hsw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x60",
+ 		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 2600,
+-		.target_residency = 7700,
++		.target_residency = 9000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -646,7 +646,7 @@ static struct cpuidle_state bdw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x01",
+ 		.flags = MWAIT2flg(0x01) | CPUIDLE_FLAG_ALWAYS_ENABLE,
+ 		.exit_latency = 10,
+-		.target_residency = 20,
++		.target_residency = 120,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -654,7 +654,7 @@ static struct cpuidle_state bdw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x10",
+ 		.flags = MWAIT2flg(0x10) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 40,
+-		.target_residency = 100,
++		.target_residency = 1000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -662,7 +662,7 @@ static struct cpuidle_state bdw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x20",
+ 		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 133,
+-		.target_residency = 400,
++		.target_residency = 1000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -670,7 +670,7 @@ static struct cpuidle_state bdw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x32",
+ 		.flags = MWAIT2flg(0x32) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 166,
+-		.target_residency = 500,
++		.target_residency = 2000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -678,7 +678,7 @@ static struct cpuidle_state bdw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x40",
+ 		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 300,
+-		.target_residency = 900,
++		.target_residency = 4000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -686,7 +686,7 @@ static struct cpuidle_state bdw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x50",
+ 		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 600,
+-		.target_residency = 1800,
++		.target_residency = 7000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -694,7 +694,7 @@ static struct cpuidle_state bdw_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x60",
+ 		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 2600,
+-		.target_residency = 7700,
++		.target_residency = 9000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -715,7 +715,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x01",
+ 		.flags = MWAIT2flg(0x01) | CPUIDLE_FLAG_ALWAYS_ENABLE,
+ 		.exit_latency = 10,
+-		.target_residency = 20,
++		.target_residency = 120,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -723,7 +723,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x10",
+ 		.flags = MWAIT2flg(0x10) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 70,
+-		.target_residency = 100,
++		.target_residency = 1000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -731,7 +731,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x20",
+ 		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 85,
+-		.target_residency = 200,
++		.target_residency = 600,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -739,7 +739,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x33",
+ 		.flags = MWAIT2flg(0x33) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 124,
+-		.target_residency = 800,
++		.target_residency = 3000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -747,7 +747,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x40",
+ 		.flags = MWAIT2flg(0x40) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 200,
+-		.target_residency = 800,
++		.target_residency = 3200,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -755,7 +755,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x50",
+ 		.flags = MWAIT2flg(0x50) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 480,
+-		.target_residency = 5000,
++		.target_residency = 9000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -763,7 +763,7 @@ static struct cpuidle_state skl_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x60",
+ 		.flags = MWAIT2flg(0x60) | CPUIDLE_FLAG_TLB_FLUSHED | CPUIDLE_FLAG_IBRS,
+ 		.exit_latency = 890,
+-		.target_residency = 5000,
++		.target_residency = 9000,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -784,7 +784,7 @@ static struct cpuidle_state skx_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x01",
+ 		.flags = MWAIT2flg(0x01) | CPUIDLE_FLAG_ALWAYS_ENABLE,
+ 		.exit_latency = 10,
+-		.target_residency = 20,
++		.target_residency = 300,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -813,7 +813,7 @@ static struct cpuidle_state icx_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x01",
+ 		.flags = MWAIT2flg(0x01) | CPUIDLE_FLAG_ALWAYS_ENABLE,
+ 		.exit_latency = 4,
+-		.target_residency = 4,
++		.target_residency = 40,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -821,7 +821,7 @@ static struct cpuidle_state icx_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x20",
+ 		.flags = MWAIT2flg(0x20) | CPUIDLE_FLAG_TLB_FLUSHED,
+ 		.exit_latency = 170,
+-		.target_residency = 600,
++		.target_residency = 900,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+@@ -942,7 +942,7 @@ static struct cpuidle_state spr_cstates[] __initdata = {
+ 		.desc = "MWAIT 0x01",
+ 		.flags = MWAIT2flg(0x01) | CPUIDLE_FLAG_ALWAYS_ENABLE,
+ 		.exit_latency = 2,
+-		.target_residency = 4,
++		.target_residency = 40,
+ 		.enter = &intel_idle,
+ 		.enter_s2idle = intel_idle_s2idle, },
+ 	{
+diff --git a/drivers/input/serio/i8042.c b/drivers/input/serio/i8042.c
+index f132d6dfc25e..c8fac96ed0d1 100644
+--- a/drivers/input/serio/i8042.c
++++ b/drivers/input/serio/i8042.c
+@@ -621,7 +621,7 @@ static int i8042_enable_kbd_port(void)
+ 	if (i8042_command(&i8042_ctr, I8042_CMD_CTL_WCTR)) {
+ 		i8042_ctr &= ~I8042_CTR_KBDINT;
+ 		i8042_ctr |= I8042_CTR_KBDDIS;
+-		pr_err("Failed to enable KBD port\n");
++		pr_info("Failed to enable KBD port\n");
+ 		return -EIO;
+ 	}
+ 
+@@ -640,7 +640,7 @@ static int i8042_enable_aux_port(void)
+ 	if (i8042_command(&i8042_ctr, I8042_CMD_CTL_WCTR)) {
+ 		i8042_ctr &= ~I8042_CTR_AUXINT;
+ 		i8042_ctr |= I8042_CTR_AUXDIS;
+-		pr_err("Failed to enable AUX port\n");
++		pr_info("Failed to enable AUX port\n");
+ 		return -EIO;
+ 	}
+ 
+@@ -732,7 +732,7 @@ static int i8042_check_mux(void)
+ 	i8042_ctr &= ~I8042_CTR_AUXINT;
+ 
+ 	if (i8042_command(&i8042_ctr, I8042_CMD_CTL_WCTR)) {
+-		pr_err("Failed to disable AUX port, can't use MUX\n");
++		pr_info("Failed to disable AUX port, can't use MUX\n");
+ 		return -EIO;
+ 	}
+ 
+@@ -955,7 +955,7 @@ static int i8042_controller_selftest(void)
+ 	do {
+ 
+ 		if (i8042_command(&param, I8042_CMD_CTL_TEST)) {
+-			pr_err("i8042 controller selftest timeout\n");
++			pr_info("i8042 controller selftest timeout\n");
+ 			return -ENODEV;
+ 		}
+ 
+@@ -977,7 +977,7 @@ static int i8042_controller_selftest(void)
+ 	pr_info("giving up on controller selftest, continuing anyway...\n");
+ 	return 0;
+ #else
+-	pr_err("i8042 controller selftest failed\n");
++	pr_info("i8042 controller selftest failed\n");
+ 	return -EIO;
+ #endif
+ }
+diff --git a/drivers/net/dummy.c b/drivers/net/dummy.c
+index f82ad7419508..5e8faa70aad6 100644
+--- a/drivers/net/dummy.c
++++ b/drivers/net/dummy.c
+@@ -43,7 +43,7 @@
+ 
+ #define DRV_NAME	"dummy"
+ 
+-static int numdummies = 1;
++static int numdummies = 0;
+ 
+ /* fake multicast ability */
+ static void set_multicast_list(struct net_device *dev)
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index f612a0ba64d0..237c2dde795d 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -58,7 +58,7 @@ static u8 nvme_max_retries = 5;
+ module_param_named(max_retries, nvme_max_retries, byte, 0644);
+ MODULE_PARM_DESC(max_retries, "max number of retries a command may have");
+ 
+-static unsigned long default_ps_max_latency_us = 100000;
++static unsigned long default_ps_max_latency_us = 200;
+ module_param(default_ps_max_latency_us, ulong, 0644);
+ MODULE_PARM_DESC(default_ps_max_latency_us,
+ 		 "max power saving latency for new devices; use PM QOS to change per device");
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 95bc329e74c0..73114509ddff 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -62,7 +62,7 @@ struct pci_pme_device {
+ 	struct pci_dev *dev;
+ };
+ 
+-#define PME_TIMEOUT 1000 /* How long between PME checks */
++#define PME_TIMEOUT 4000 /* How long between PME checks */
+ 
+ static void pci_dev_d3_sleep(struct pci_dev *dev)
+ {
+diff --git a/drivers/powercap/intel_rapl_common.c b/drivers/powercap/intel_rapl_common.c
+index 33a3ca35cda0..046e0b19a8b3 100644
+--- a/drivers/powercap/intel_rapl_common.c
++++ b/drivers/powercap/intel_rapl_common.c
+@@ -1517,7 +1517,7 @@ static int __init rapl_init(void)
+ 
+ 	id = x86_match_cpu(rapl_ids);
+ 	if (!id) {
+-		pr_err("driver does not support CPU family %d model %d\n",
++		pr_info("driver does not support CPU family %d model %d\n",
+ 		       boot_cpu_data.x86, boot_cpu_data.x86_model);
+ 
+ 		return -ENODEV;
+diff --git a/drivers/thermal/intel/intel_powerclamp.c b/drivers/thermal/intel/intel_powerclamp.c
+index bf3e4edeceda..d069c2587718 100644
+--- a/drivers/thermal/intel/intel_powerclamp.c
++++ b/drivers/thermal/intel/intel_powerclamp.c
+@@ -642,6 +642,11 @@ static const struct thermal_cooling_device_ops powerclamp_cooling_ops = {
+ 	.set_cur_state = powerclamp_set_cur_state,
+ };
+ 
++static const struct x86_cpu_id amd_cpu[] = {
++	{ X86_VENDOR_AMD },
++	{},
++};
++
+ static const struct x86_cpu_id __initconst intel_powerclamp_ids[] = {
+ 	X86_MATCH_VENDOR_FEATURE(INTEL, X86_FEATURE_MWAIT, NULL),
+ 	{}
+@@ -651,6 +656,11 @@ MODULE_DEVICE_TABLE(x86cpu, intel_powerclamp_ids);
+ static int __init powerclamp_probe(void)
+ {
+ 
++	if (x86_match_cpu(amd_cpu)){
++		pr_info("Intel PowerClamp does not support AMD CPUs\n");
++		return -ENODEV;
++	}
++
+ 	if (!x86_match_cpu(intel_powerclamp_ids)) {
+ 		pr_err("CPU does not support MWAIT\n");
+ 		return -ENODEV;
+diff --git a/fs/xattr.c b/fs/xattr.c
+index a1f4998bc6be..020e0b5ea5c6 100644
+--- a/fs/xattr.c
++++ b/fs/xattr.c
+@@ -122,16 +122,17 @@ xattr_permission(struct user_namespace *mnt_userns, struct inode *inode,
+ 	}
+ 
+ 	/*
+-	 * In the user.* namespace, only regular files and directories can have
+-	 * extended attributes. For sticky directories, only the owner and
+-	 * privileged users can write attributes.
++	 * In the user.* namespace, only regular files, symbolic links, and
++	 * directories can have extended attributes. For symbolic links and
++	 * sticky directories, only the owner and privileged users can write
++	 * attributes.
+ 	 */
+ 	if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN)) {
+-		if (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
++		if (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode) && !S_ISLNK(inode->i_mode))
+ 			return (mask & MAY_WRITE) ? -EPERM : -ENODATA;
+-		if (S_ISDIR(inode->i_mode) && (inode->i_mode & S_ISVTX) &&
+-		    (mask & MAY_WRITE) &&
+-		    !inode_owner_or_capable(mnt_userns, inode))
++		if (((S_ISDIR(inode->i_mode) && (inode->i_mode & S_ISVTX))
++		        || S_ISLNK(inode->i_mode)) && (mask & MAY_WRITE)
++		    && !inode_owner_or_capable(mnt_userns, inode))
+ 			return -EPERM;
+ 	}
+ 
+diff --git a/include/linux/ipc_namespace.h b/include/linux/ipc_namespace.h
+index e3e8c8662b49..e8240cf2611a 100644
+--- a/include/linux/ipc_namespace.h
++++ b/include/linux/ipc_namespace.h
+@@ -11,6 +11,7 @@
+ #include <linux/refcount.h>
+ #include <linux/rhashtable-types.h>
+ #include <linux/sysctl.h>
++#include <linux/percpu_counter.h>
+ 
+ struct user_namespace;
+ 
+@@ -36,8 +37,8 @@ struct ipc_namespace {
+ 	unsigned int	msg_ctlmax;
+ 	unsigned int	msg_ctlmnb;
+ 	unsigned int	msg_ctlmni;
+-	atomic_t	msg_bytes;
+-	atomic_t	msg_hdrs;
++	struct percpu_counter percpu_msg_bytes;
++	struct percpu_counter percpu_msg_hdrs;
+ 
+ 	size_t		shm_ctlmax;
+ 	size_t		shm_ctlall;
+diff --git a/include/linux/jbd2.h b/include/linux/jbd2.h
+index 0b7242370b56..16b8fc483b3d 100644
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -45,7 +45,7 @@
+ /*
+  * The default maximum commit age, in seconds.
+  */
+-#define JBD2_DEFAULT_MAX_COMMIT_AGE 5
++#define JBD2_DEFAULT_MAX_COMMIT_AGE 30
+ 
+ #ifdef CONFIG_JBD2_DEBUG
+ /*
+diff --git a/include/linux/page_counter.h b/include/linux/page_counter.h
+index 679591301994..685193470d64 100644
+--- a/include/linux/page_counter.h
++++ b/include/linux/page_counter.h
+@@ -8,6 +8,7 @@
+ 
+ struct page_counter {
+ 	atomic_long_t usage;
++	unsigned long padding[7];
+ 	unsigned long min;
+ 	unsigned long low;
+ 	unsigned long high;
+diff --git a/include/linux/percpu_counter.h b/include/linux/percpu_counter.h
+index 01861eebed79..8ed5fba6d156 100644
+--- a/include/linux/percpu_counter.h
++++ b/include/linux/percpu_counter.h
+@@ -15,6 +15,9 @@
+ #include <linux/types.h>
+ #include <linux/gfp.h>
+ 
++/* percpu_counter batch for local add or sub */
++#define PERCPU_COUNTER_LOCAL_BATCH	INT_MAX
++
+ #ifdef CONFIG_SMP
+ 
+ struct percpu_counter {
+@@ -56,6 +59,22 @@ static inline void percpu_counter_add(struct percpu_counter *fbc, s64 amount)
+ 	percpu_counter_add_batch(fbc, amount, percpu_counter_batch);
+ }
+ 
++/*
++ * With percpu_counter_add_local() and percpu_counter_sub_local(), counts
++ * are accumulated in local per cpu counter and not in fbc->count until
++ * local count overflows PERCPU_COUNTER_LOCAL_BATCH. This makes counter
++ * write efficient.
++ * But percpu_counter_sum(), instead of percpu_counter_read(), needs to be
++ * used to add up the counts from each CPU to account for all the local
++ * counts. So percpu_counter_add_local() and percpu_counter_sub_local()
++ * should be used when a counter is updated frequently and read rarely.
++ */
++static inline void
++percpu_counter_add_local(struct percpu_counter *fbc, s64 amount)
++{
++	percpu_counter_add_batch(fbc, amount, PERCPU_COUNTER_LOCAL_BATCH);
++}
++
+ static inline s64 percpu_counter_sum_positive(struct percpu_counter *fbc)
+ {
+ 	s64 ret = __percpu_counter_sum(fbc);
+@@ -138,6 +157,13 @@ percpu_counter_add(struct percpu_counter *fbc, s64 amount)
+ 	preempt_enable();
+ }
+ 
++/* non-SMP percpu_counter_add_local is the same with percpu_counter_add */
++static inline void
++percpu_counter_add_local(struct percpu_counter *fbc, s64 amount)
++{
++	percpu_counter_add(fbc, amount);
++}
++
+ static inline void
+ percpu_counter_add_batch(struct percpu_counter *fbc, s64 amount, s32 batch)
+ {
+@@ -193,4 +219,10 @@ static inline void percpu_counter_sub(struct percpu_counter *fbc, s64 amount)
+ 	percpu_counter_add(fbc, -amount);
+ }
+ 
++static inline void
++percpu_counter_sub_local(struct percpu_counter *fbc, s64 amount)
++{
++	percpu_counter_add_local(fbc, -amount);
++}
++
+ #endif /* _LINUX_PERCPU_COUNTER_H */
+diff --git a/include/linux/wait.h b/include/linux/wait.h
+index 58cfbf81447c..d5664b5ae3e1 100644
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@ -165,6 +165,7 @@ static inline bool wq_has_sleeper(struct wait_queue_head *wq_head)
+ 
+ extern void add_wait_queue(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
+ extern void add_wait_queue_exclusive(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
++extern void add_wait_queue_exclusive_lifo(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
+ extern void add_wait_queue_priority(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
+ extern void remove_wait_queue(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
+ 
+@@ -1164,6 +1165,7 @@ do {										\
+  */
+ void prepare_to_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state);
+ bool prepare_to_wait_exclusive(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state);
++void prepare_to_wait_exclusive_lifo(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state);
+ long prepare_to_wait_event(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state);
+ void finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
+ long wait_woken(struct wait_queue_entry *wq_entry, unsigned mode, long timeout);
+diff --git a/include/uapi/linux/if_bonding.h b/include/uapi/linux/if_bonding.h
+index d174914a837d..bf8e2af101a3 100644
+--- a/include/uapi/linux/if_bonding.h
++++ b/include/uapi/linux/if_bonding.h
+@@ -82,7 +82,7 @@
+ #define BOND_STATE_ACTIVE       0   /* link is active */
+ #define BOND_STATE_BACKUP       1   /* link is backup */
+ 
+-#define BOND_DEFAULT_MAX_BONDS  1   /* Default maximum number of devices to support */
++#define BOND_DEFAULT_MAX_BONDS  0   /* Default maximum number of devices to support */
+ 
+ #define BOND_DEFAULT_TX_QUEUES 16   /* Default number of tx queues per device */
+ 
+diff --git a/init/do_mounts.c b/init/do_mounts.c
+index 7058e14ad5f7..ce4e841ea705 100644
+--- a/init/do_mounts.c
++++ b/init/do_mounts.c
+@@ -283,8 +283,18 @@ dev_t name_to_dev_t(const char *name)
+ 	if (strcmp(name, "/dev/ram") == 0)
+ 		return Root_RAM0;
+ #ifdef CONFIG_BLOCK
+-	if (strncmp(name, "PARTUUID=", 9) == 0)
+-		return devt_from_partuuid(name + 9);
++	if (strncmp(name, "PARTUUID=", 9) == 0) {
++		dev_t res;
++		int  needtowait = 40<<1;
++		res = devt_from_partuuid(name + 9);
++		while (!res && needtowait) {
++			/* waiting 0.5 sec */
++			msleep(500);
++			res = devt_from_partuuid(name + 9);
++			needtowait--;
++		}
++		return res;
++	}
+ 	if (strncmp(name, "PARTLABEL=", 10) == 0)
+ 		return devt_from_partlabel(name + 10);
+ 	if (strncmp(name, "/dev/", 5) == 0)
+@@ -612,7 +622,9 @@ void __init prepare_namespace(void)
+ 	 * For example, it is not atypical to wait 5 seconds here
+ 	 * for the touchpad of a laptop to initialize.
+ 	 */
++	async_synchronize_full();
+ 	wait_for_device_probe();
++	async_synchronize_full();
+ 
+ 	md_run_setup();
+ 
+diff --git a/ipc/msg.c b/ipc/msg.c
+index a0d05775af2c..f2bb4c193ecf 100644
+--- a/ipc/msg.c
++++ b/ipc/msg.c
+@@ -39,6 +39,7 @@
+ #include <linux/nsproxy.h>
+ #include <linux/ipc_namespace.h>
+ #include <linux/rhashtable.h>
++#include <linux/percpu_counter.h>
+ 
+ #include <asm/current.h>
+ #include <linux/uaccess.h>
+@@ -285,10 +286,10 @@ static void freeque(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp)
+ 	rcu_read_unlock();
+ 
+ 	list_for_each_entry_safe(msg, t, &msq->q_messages, m_list) {
+-		atomic_dec(&ns->msg_hdrs);
++		percpu_counter_sub_local(&ns->percpu_msg_hdrs, 1);
+ 		free_msg(msg);
+ 	}
+-	atomic_sub(msq->q_cbytes, &ns->msg_bytes);
++	percpu_counter_sub_local(&ns->percpu_msg_bytes, msq->q_cbytes);
+ 	ipc_update_pid(&msq->q_lspid, NULL);
+ 	ipc_update_pid(&msq->q_lrpid, NULL);
+ 	ipc_rcu_putref(&msq->q_perm, msg_rcu_free);
+@@ -495,17 +496,18 @@ static int msgctl_info(struct ipc_namespace *ns, int msqid,
+ 	msginfo->msgssz = MSGSSZ;
+ 	msginfo->msgseg = MSGSEG;
+ 	down_read(&msg_ids(ns).rwsem);
+-	if (cmd == MSG_INFO) {
++	if (cmd == MSG_INFO)
+ 		msginfo->msgpool = msg_ids(ns).in_use;
+-		msginfo->msgmap = atomic_read(&ns->msg_hdrs);
+-		msginfo->msgtql = atomic_read(&ns->msg_bytes);
++	max_idx = ipc_get_maxidx(&msg_ids(ns));
++	up_read(&msg_ids(ns).rwsem);
++	if (cmd == MSG_INFO) {
++		msginfo->msgmap = percpu_counter_sum(&ns->percpu_msg_hdrs);
++		msginfo->msgtql = percpu_counter_sum(&ns->percpu_msg_bytes);
+ 	} else {
+ 		msginfo->msgmap = MSGMAP;
+ 		msginfo->msgpool = MSGPOOL;
+ 		msginfo->msgtql = MSGTQL;
+ 	}
+-	max_idx = ipc_get_maxidx(&msg_ids(ns));
+-	up_read(&msg_ids(ns).rwsem);
+ 	return (max_idx < 0) ? 0 : max_idx;
+ }
+ 
+@@ -935,8 +937,8 @@ static long do_msgsnd(int msqid, long mtype, void __user *mtext,
+ 		list_add_tail(&msg->m_list, &msq->q_messages);
+ 		msq->q_cbytes += msgsz;
+ 		msq->q_qnum++;
+-		atomic_add(msgsz, &ns->msg_bytes);
+-		atomic_inc(&ns->msg_hdrs);
++		percpu_counter_add_local(&ns->percpu_msg_bytes, msgsz);
++		percpu_counter_add_local(&ns->percpu_msg_hdrs, 1);
+ 	}
+ 
+ 	err = 0;
+@@ -1159,8 +1161,8 @@ static long do_msgrcv(int msqid, void __user *buf, size_t bufsz, long msgtyp, in
+ 			msq->q_rtime = ktime_get_real_seconds();
+ 			ipc_update_pid(&msq->q_lrpid, task_tgid(current));
+ 			msq->q_cbytes -= msg->m_ts;
+-			atomic_sub(msg->m_ts, &ns->msg_bytes);
+-			atomic_dec(&ns->msg_hdrs);
++			percpu_counter_sub_local(&ns->percpu_msg_bytes, msg->m_ts);
++			percpu_counter_sub_local(&ns->percpu_msg_hdrs, 1);
+ 			ss_wakeup(msq, &wake_q, false);
+ 
+ 			goto out_unlock0;
+@@ -1297,20 +1299,34 @@ COMPAT_SYSCALL_DEFINE5(msgrcv, int, msqid, compat_uptr_t, msgp,
+ }
+ #endif
+ 
+-void msg_init_ns(struct ipc_namespace *ns)
++int msg_init_ns(struct ipc_namespace *ns)
+ {
++	int ret;
++
+ 	ns->msg_ctlmax = MSGMAX;
+ 	ns->msg_ctlmnb = MSGMNB;
+ 	ns->msg_ctlmni = MSGMNI;
+ 
+-	atomic_set(&ns->msg_bytes, 0);
+-	atomic_set(&ns->msg_hdrs, 0);
++	ret = percpu_counter_init(&ns->percpu_msg_bytes, 0, GFP_KERNEL);
++	if (ret)
++		goto fail_msg_bytes;
++	ret = percpu_counter_init(&ns->percpu_msg_hdrs, 0, GFP_KERNEL);
++	if (ret)
++		goto fail_msg_hdrs;
+ 	ipc_init_ids(&ns->ids[IPC_MSG_IDS]);
++	return 0;
++
++	fail_msg_hdrs:
++		percpu_counter_destroy(&ns->percpu_msg_bytes);
++	fail_msg_bytes:
++		return ret;
+ }
+ 
+ #ifdef CONFIG_IPC_NS
+ void msg_exit_ns(struct ipc_namespace *ns)
+ {
++	percpu_counter_destroy(&ns->percpu_msg_bytes);
++	percpu_counter_destroy(&ns->percpu_msg_hdrs);
+ 	free_ipcs(ns, &msg_ids(ns), freeque);
+ 	idr_destroy(&ns->ids[IPC_MSG_IDS].ipcs_idr);
+ 	rhashtable_destroy(&ns->ids[IPC_MSG_IDS].key_ht);
+diff --git a/ipc/namespace.c b/ipc/namespace.c
+index e1fcaedba4fa..8316ea585733 100644
+--- a/ipc/namespace.c
++++ b/ipc/namespace.c
+@@ -66,8 +66,11 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
+ 	if (!setup_ipc_sysctls(ns))
+ 		goto fail_mq;
+ 
++	err = msg_init_ns(ns);
++	if (err)
++		goto fail_put;
++
+ 	sem_init_ns(ns);
+-	msg_init_ns(ns);
+ 	shm_init_ns(ns);
+ 
+ 	return ns;
+diff --git a/ipc/util.h b/ipc/util.h
+index 2dd7ce0416d8..1b0086c6346f 100644
+--- a/ipc/util.h
++++ b/ipc/util.h
+@@ -64,7 +64,7 @@ static inline void mq_put_mnt(struct ipc_namespace *ns) { }
+ 
+ #ifdef CONFIG_SYSVIPC
+ void sem_init_ns(struct ipc_namespace *ns);
+-void msg_init_ns(struct ipc_namespace *ns);
++int msg_init_ns(struct ipc_namespace *ns);
+ void shm_init_ns(struct ipc_namespace *ns);
+ 
+ void sem_exit_ns(struct ipc_namespace *ns);
+@@ -72,7 +72,7 @@ void msg_exit_ns(struct ipc_namespace *ns);
+ void shm_exit_ns(struct ipc_namespace *ns);
+ #else
+ static inline void sem_init_ns(struct ipc_namespace *ns) { }
+-static inline void msg_init_ns(struct ipc_namespace *ns) { }
++static inline int msg_init_ns(struct ipc_namespace *ns) { return 0;}
+ static inline void shm_init_ns(struct ipc_namespace *ns) { }
+ 
+ static inline void sem_exit_ns(struct ipc_namespace *ns) { }
+diff --git a/kernel/locking/rwsem.c b/kernel/locking/rwsem.c
+index 65f0262f635e..8a8f77930818 100644
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@ -747,6 +747,7 @@ rwsem_spin_on_owner(struct rw_semaphore *sem)
+ 	struct task_struct *new, *owner;
+ 	unsigned long flags, new_flags;
+ 	enum owner_state state;
++	int i = 0;
+ 
+ 	lockdep_assert_preemption_disabled();
+ 
+@@ -783,7 +784,8 @@ rwsem_spin_on_owner(struct rw_semaphore *sem)
+ 			break;
+ 		}
+ 
+-		cpu_relax();
++		if (i++ > 1000)
++			cpu_relax();
+ 	}
+ 
+ 	return state;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index f7899278e979..e25a1e31ebb3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7039,6 +7039,10 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+  *
+  * Returns the target CPU number.
+  */
++
++int best_core = -1;
++int second_best_core = -1;
++
+ static int
+ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ {
+@@ -7067,6 +7071,21 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, p->cpus_ptr);
+ 	}
+ 
++	if (prev_cpu != best_core && prev_cpu != second_best_core &&
++		       cpu_rq(prev_cpu)->nr_running != 0) {
++		if (second_best_core != -1 && cpu_rq(second_best_core)->nr_running == 0 &&
++			       nr_iowait_cpu(second_best_core) < 2 && cpu_to_node(prev_cpu) == cpu_to_node(second_best_core))
++			prev_cpu = second_best_core;
++		if (best_core != -1 && cpu_rq(best_core)->nr_running == 0 &&
++			       nr_iowait_cpu(best_core) < 2  && cpu_to_node(prev_cpu) == cpu_to_node(best_core))
++			prev_cpu = best_core;
++	}
++/*
++	if (prev_cpu > 0 && cpu_rq(prev_cpu)->nr_running != 0 && cpu_rq(prev_cpu - 1)->nr_running == 0)
++		prev_cpu = prev_cpu - 1;
++*/
++
++
+ 	rcu_read_lock();
+ 	for_each_domain(cpu, tmp) {
+ 		/*
+diff --git a/kernel/sched/wait.c b/kernel/sched/wait.c
+index 9860bb9a847c..c7f045873a5f 100644
+--- a/kernel/sched/wait.c
++++ b/kernel/sched/wait.c
+@@ -47,6 +47,17 @@ void add_wait_queue_priority(struct wait_queue_head *wq_head, struct wait_queue_
+ }
+ EXPORT_SYMBOL_GPL(add_wait_queue_priority);
+ 
++void add_wait_queue_exclusive_lifo(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
++{
++	unsigned long flags;
++
++	wq_entry->flags |= WQ_FLAG_EXCLUSIVE;
++	spin_lock_irqsave(&wq_head->lock, flags);
++	__add_wait_queue(wq_head, wq_entry);
++	spin_unlock_irqrestore(&wq_head->lock, flags);
++}
++EXPORT_SYMBOL(add_wait_queue_exclusive_lifo);
++
+ void remove_wait_queue(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
+ {
+ 	unsigned long flags;
+@@ -289,6 +300,19 @@ prepare_to_wait_exclusive(struct wait_queue_head *wq_head, struct wait_queue_ent
+ }
+ EXPORT_SYMBOL(prepare_to_wait_exclusive);
+ 
++void prepare_to_wait_exclusive_lifo(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state)
++{
++	unsigned long flags;
++
++	wq_entry->flags |= WQ_FLAG_EXCLUSIVE;
++	spin_lock_irqsave(&wq_head->lock, flags);
++	if (list_empty(&wq_entry->entry))
++		__add_wait_queue(wq_head, wq_entry);
++	set_current_state(state);
++	spin_unlock_irqrestore(&wq_head->lock, flags);
++}
++EXPORT_SYMBOL(prepare_to_wait_exclusive_lifo);
++
+ void init_wait_entry(struct wait_queue_entry *wq_entry, int flags)
+ {
+ 	wq_entry->flags = flags;
+diff --git a/kernel/watchdog.c b/kernel/watchdog.c
+index 8e61f21e7e33..be1439d38f26 100644
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@ -41,7 +41,7 @@ unsigned long __read_mostly watchdog_enabled;
+ int __read_mostly watchdog_user_enabled = 1;
+ int __read_mostly nmi_watchdog_user_enabled = NMI_WATCHDOG_DEFAULT;
+ int __read_mostly soft_watchdog_user_enabled = 1;
+-int __read_mostly watchdog_thresh = 10;
++int __read_mostly watchdog_thresh = 40;
+ static int __read_mostly nmi_watchdog_available;
+ 
+ struct cpumask watchdog_cpumask __read_mostly;
+diff --git a/lib/raid6/algos.c b/lib/raid6/algos.c
+index 39b74221f4a7..ec3eab8cd6b1 100644
+--- a/lib/raid6/algos.c
++++ b/lib/raid6/algos.c
+@@ -128,8 +128,10 @@ static inline const struct raid6_recov_calls *raid6_choose_recov(void)
+ 
+ 	for (best = NULL, algo = raid6_recov_algos; *algo; algo++)
+ 		if (!best || (*algo)->priority > best->priority)
+-			if (!(*algo)->valid || (*algo)->valid())
++			if (!(*algo)->valid || (*algo)->valid()) {
+ 				best = *algo;
++				break;
++			}
+ 
+ 	if (best) {
+ 		raid6_2data_recov = best->data2;
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 63b4b9d71597..123b74d0b94f 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -2431,9 +2431,14 @@ static int ksm_scan_thread(void *nothing)
+ 
+ 		if (ksmd_should_run()) {
+ 			sleep_ms = READ_ONCE(ksm_thread_sleep_millisecs);
+-			wait_event_interruptible_timeout(ksm_iter_wait,
+-				sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs),
+-				msecs_to_jiffies(sleep_ms));
++			if (sleep_ms >= 1000)
++				wait_event_interruptible_timeout(ksm_iter_wait,
++					sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs),
++					msecs_to_jiffies(round_jiffies_relative(sleep_ms)));
++			else
++				wait_event_interruptible_timeout(ksm_iter_wait,
++					sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs),
++					msecs_to_jiffies(sleep_ms));
+ 		} else {
+ 			wait_event_freezable(ksm_thread_wait,
+ 				ksmd_should_run() || kthread_should_stop());
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 1bfbe3ac28e6..0de718ef4388 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -635,7 +635,7 @@ static inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)
+ 	cgroup_rstat_updated(memcg->css.cgroup, smp_processor_id());
+ 
+ 	x = __this_cpu_add_return(stats_updates, abs(val));
+-	if (x > MEMCG_CHARGE_BATCH) {
++	if (x > MEMCG_CHARGE_BATCH * 128) {
+ 		/*
+ 		 * If stats_flush_threshold exceeds the threshold
+ 		 * (>num_online_cpus()), cgroup stats update will be triggered
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 29c450f50bac..3fd0a43ecbf9 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -7031,11 +7031,11 @@ static int zone_batchsize(struct zone *zone)
+ 
+ 	/*
+ 	 * The number of pages to batch allocate is either ~0.1%
+-	 * of the zone or 1MB, whichever is smaller. The batch
++	 * of the zone or 4MB, whichever is smaller. The batch
+ 	 * size is striking a balance between allocation latency
+ 	 * and zone lock contention.
+ 	 */
+-	batch = min(zone_managed_pages(zone) >> 10, (1024 * 1024) / PAGE_SIZE);
++	batch = min(zone_managed_pages(zone) >> 10, 4 * (1024 * 1024) / PAGE_SIZE);
+ 	batch /= 4;		/* We effectively *= 4 below */
+ 	if (batch < 1)
+ 		batch = 1;
+@@ -7113,6 +7113,7 @@ static int zone_highsize(struct zone *zone, int batch, int cpu_online)
+ 	 * historical relationship between high and batch.
+ 	 */
+ 	high = max(high, batch << 2);
++	high = max(high, 1024);
+ 
+ 	return high;
+ #else
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+index eb31c7158b39..8cefa0b62fb9 100644
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -445,7 +445,7 @@ static int inet_csk_wait_for_connect(struct sock *sk, long timeo)
+ 	 * having to remove and re-insert us on the wait queue.
+ 	 */
+ 	for (;;) {
+-		prepare_to_wait_exclusive(sk_sleep(sk), &wait,
++		prepare_to_wait_exclusive_lifo(sk_sleep(sk), &wait,
+ 					  TASK_INTERRUPTIBLE);
+ 		release_sock(sk);
+ 		if (reqsk_queue_empty(&icsk->icsk_accept_queue))
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 7f591bdcae9e..2e7860b7dd6c 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -4799,8 +4799,8 @@ void __init tcp_init(void)
+ 	tcp_init_mem();
+ 	/* Set per-socket limits to no more than 1/128 the pressure threshold */
+ 	limit = nr_free_buffer_pages() << (PAGE_SHIFT - 7);
+-	max_wshare = min(4UL*1024*1024, limit);
+-	max_rshare = min(6UL*1024*1024, limit);
++	max_wshare = min(16UL*1024*1024, limit);
++	max_rshare = min(16UL*1024*1024, limit);
+ 
+ 	init_net.ipv4.sysctl_tcp_wmem[0] = PAGE_SIZE;
+ 	init_net.ipv4.sysctl_tcp_wmem[1] = 16*1024;
+-- 
+2.39.0.rc2
+
