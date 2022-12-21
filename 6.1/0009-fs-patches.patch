@@ -1,7 +1,7 @@
-From ee6c9b7f7f0011a92d3ad3f354593b1f7979537a Mon Sep 17 00:00:00 2001
+From d1ba077b5a92f49533f73f3075aed0cd4ca63ac9 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Tue, 13 Dec 2022 12:20:35 +0100
-Subject: [PATCH 08/19] fs-patches
+Date: Fri, 16 Dec 2022 14:24:11 +0100
+Subject: [PATCH 09/21] fs-patches
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -12,7 +12,6 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/btrfs/super.c               |   2 +
  fs/btrfs/volumes.c             |   3 +
  fs/btrfs/volumes.h             |   2 +
- fs/dax.c                       | 221 +++++++++++++++++++---------
  fs/iomap/buffered-io.c         | 254 ++++++++++++++++++++++++++++++++-
  fs/iomap/direct-io.c           |   3 +-
  fs/iomap/iter.c                |  19 ++-
@@ -50,26 +49,20 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/xfs/xfs_fsmap.c             |   4 +-
  fs/xfs/xfs_icache.c            |   6 +
  fs/xfs/xfs_inode.c             |   2 +-
- fs/xfs/xfs_ioctl.c             |   4 -
- fs/xfs/xfs_iomap.c             | 191 +++++++++++++++----------
+ fs/xfs/xfs_iomap.c             | 185 +++++++++++++++---------
  fs/xfs/xfs_iomap.h             |   6 +-
- fs/xfs/xfs_iops.c              |   4 -
  fs/xfs/xfs_log.c               |  46 ++++--
  fs/xfs/xfs_mount.c             |  15 ++
  fs/xfs/xfs_pnfs.c              |   6 +-
  fs/xfs/xfs_qm.c                |  16 ++-
- fs/xfs/xfs_reflink.c           |   8 +-
  fs/xfs/xfs_rtalloc.c           |  60 +++++++-
  fs/xfs/xfs_super.c             |   2 +-
  fs/xfs/xfs_trace.c             |   2 +
  fs/xfs/xfs_trace.h             |  86 +++++++++++
  fs/xfs/xfs_trans_ail.c         |   4 +-
  fs/xfs/xfs_xattr.c             |   2 +-
- include/linux/dax.h            |   2 +
  include/linux/iomap.h          |  47 ++++--
- include/linux/mm_types.h       |   5 +-
- include/linux/page-flags.h     |   2 +-
- 64 files changed, 1598 insertions(+), 426 deletions(-)
+ 57 files changed, 1431 insertions(+), 341 deletions(-)
 
 diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
 index deebc8ddbd93..adb8ae1b472e 100644
@@ -335,415 +328,6 @@ index 099def5613b8..a20ee7d57831 100644
  
  	struct btrfs_fs_info *fs_info;
  	/* sysfs kobjects */
-diff --git a/fs/dax.c b/fs/dax.c
-index 1c6867810cbd..c48a3a93ab29 100644
---- a/fs/dax.c
-+++ b/fs/dax.c
-@@ -334,35 +334,41 @@ static unsigned long dax_end_pfn(void *entry)
- 	for (pfn = dax_to_pfn(entry); \
- 			pfn < dax_end_pfn(entry); pfn++)
- 
--static inline bool dax_mapping_is_cow(struct address_space *mapping)
-+static inline bool dax_page_is_shared(struct page *page)
- {
--	return (unsigned long)mapping == PAGE_MAPPING_DAX_COW;
-+	return page->mapping == PAGE_MAPPING_DAX_SHARED;
- }
- 
- /*
-- * Set the page->mapping with FS_DAX_MAPPING_COW flag, increase the refcount.
-+ * Set the page->mapping with PAGE_MAPPING_DAX_SHARED flag, increase the
-+ * refcount.
-  */
--static inline void dax_mapping_set_cow(struct page *page)
-+static inline void dax_page_share_get(struct page *page)
- {
--	if ((uintptr_t)page->mapping != PAGE_MAPPING_DAX_COW) {
-+	if (page->mapping != PAGE_MAPPING_DAX_SHARED) {
- 		/*
- 		 * Reset the index if the page was already mapped
- 		 * regularly before.
- 		 */
- 		if (page->mapping)
--			page->index = 1;
--		page->mapping = (void *)PAGE_MAPPING_DAX_COW;
-+			page->share = 1;
-+		page->mapping = PAGE_MAPPING_DAX_SHARED;
- 	}
--	page->index++;
-+	page->share++;
-+}
-+
-+static inline unsigned long dax_page_share_put(struct page *page)
-+{
-+	return --page->share;
- }
- 
- /*
-- * When it is called in dax_insert_entry(), the cow flag will indicate that
-+ * When it is called in dax_insert_entry(), the shared flag will indicate that
-  * whether this entry is shared by multiple files.  If so, set the page->mapping
-- * FS_DAX_MAPPING_COW, and use page->index as refcount.
-+ * PAGE_MAPPING_DAX_SHARED, and use page->share as refcount.
-  */
- static void dax_associate_entry(void *entry, struct address_space *mapping,
--		struct vm_area_struct *vma, unsigned long address, bool cow)
-+		struct vm_area_struct *vma, unsigned long address, bool shared)
- {
- 	unsigned long size = dax_entry_size(entry), pfn, index;
- 	int i = 0;
-@@ -374,8 +380,8 @@ static void dax_associate_entry(void *entry, struct address_space *mapping,
- 	for_each_mapped_pfn(entry, pfn) {
- 		struct page *page = pfn_to_page(pfn);
- 
--		if (cow) {
--			dax_mapping_set_cow(page);
-+		if (shared) {
-+			dax_page_share_get(page);
- 		} else {
- 			WARN_ON_ONCE(page->mapping);
- 			page->mapping = mapping;
-@@ -396,9 +402,9 @@ static void dax_disassociate_entry(void *entry, struct address_space *mapping,
- 		struct page *page = pfn_to_page(pfn);
- 
- 		WARN_ON_ONCE(trunc && page_ref_count(page) > 1);
--		if (dax_mapping_is_cow(page->mapping)) {
--			/* keep the CoW flag if this page is still shared */
--			if (page->index-- > 0)
-+		if (dax_page_is_shared(page)) {
-+			/* keep the shared flag if this page is still shared */
-+			if (dax_page_share_put(page) > 0)
- 				continue;
- 		} else
- 			WARN_ON_ONCE(page->mapping && page->mapping != mapping);
-@@ -840,12 +846,6 @@ static bool dax_fault_is_synchronous(const struct iomap_iter *iter,
- 		(iter->iomap.flags & IOMAP_F_DIRTY);
- }
- 
--static bool dax_fault_is_cow(const struct iomap_iter *iter)
--{
--	return (iter->flags & IOMAP_WRITE) &&
--		(iter->iomap.flags & IOMAP_F_SHARED);
--}
--
- /*
-  * By this point grab_mapping_entry() has ensured that we have a locked entry
-  * of the appropriate size so we don't have to worry about downgrading PMDs to
-@@ -859,13 +859,14 @@ static void *dax_insert_entry(struct xa_state *xas, struct vm_fault *vmf,
- {
- 	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
- 	void *new_entry = dax_make_entry(pfn, flags);
--	bool dirty = !dax_fault_is_synchronous(iter, vmf->vma);
--	bool cow = dax_fault_is_cow(iter);
-+	bool write = iter->flags & IOMAP_WRITE;
-+	bool dirty = write && !dax_fault_is_synchronous(iter, vmf->vma);
-+	bool shared = iter->iomap.flags & IOMAP_F_SHARED;
- 
- 	if (dirty)
- 		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
- 
--	if (cow || (dax_is_zero_entry(entry) && !(flags & DAX_ZERO_PAGE))) {
-+	if (shared || (dax_is_zero_entry(entry) && !(flags & DAX_ZERO_PAGE))) {
- 		unsigned long index = xas->xa_index;
- 		/* we are replacing a zero page with block mapping */
- 		if (dax_is_pmd_entry(entry))
-@@ -877,12 +878,12 @@ static void *dax_insert_entry(struct xa_state *xas, struct vm_fault *vmf,
- 
- 	xas_reset(xas);
- 	xas_lock_irq(xas);
--	if (cow || dax_is_zero_entry(entry) || dax_is_empty_entry(entry)) {
-+	if (shared || dax_is_zero_entry(entry) || dax_is_empty_entry(entry)) {
- 		void *old;
- 
- 		dax_disassociate_entry(entry, mapping, false);
- 		dax_associate_entry(new_entry, mapping, vmf->vma, vmf->address,
--				cow);
-+				shared);
- 		/*
- 		 * Only swap our new entry into the page cache if the current
- 		 * entry is a zero page or an empty entry.  If a normal PTE or
-@@ -902,7 +903,7 @@ static void *dax_insert_entry(struct xa_state *xas, struct vm_fault *vmf,
- 	if (dirty)
- 		xas_set_mark(xas, PAGECACHE_TAG_DIRTY);
- 
--	if (cow)
-+	if (write && shared)
- 		xas_set_mark(xas, PAGECACHE_TAG_TOWRITE);
- 
- 	xas_unlock_irq(xas);
-@@ -1086,7 +1087,8 @@ static int dax_iomap_direct_access(const struct iomap *iomap, loff_t pos,
- }
- 
- /**
-- * dax_iomap_cow_copy - Copy the data from source to destination before write
-+ * dax_iomap_copy_around - Prepare for an unaligned write to a shared/cow page
-+ * by copying the data before and after the range to be written.
-  * @pos:	address to do copy from.
-  * @length:	size of copy operation.
-  * @align_size:	aligned w.r.t align_size (either PMD_SIZE or PAGE_SIZE)
-@@ -1095,35 +1097,50 @@ static int dax_iomap_direct_access(const struct iomap *iomap, loff_t pos,
-  *
-  * This can be called from two places. Either during DAX write fault (page
-  * aligned), to copy the length size data to daddr. Or, while doing normal DAX
-- * write operation, dax_iomap_actor() might call this to do the copy of either
-+ * write operation, dax_iomap_iter() might call this to do the copy of either
-  * start or end unaligned address. In the latter case the rest of the copy of
-- * aligned ranges is taken care by dax_iomap_actor() itself.
-+ * aligned ranges is taken care by dax_iomap_iter() itself.
-+ * If the srcmap contains invalid data, such as HOLE and UNWRITTEN, zero the
-+ * area to make sure no old data remains.
-  */
--static int dax_iomap_cow_copy(loff_t pos, uint64_t length, size_t align_size,
-+static int dax_iomap_copy_around(loff_t pos, uint64_t length, size_t align_size,
- 		const struct iomap *srcmap, void *daddr)
- {
- 	loff_t head_off = pos & (align_size - 1);
- 	size_t size = ALIGN(head_off + length, align_size);
- 	loff_t end = pos + length;
- 	loff_t pg_end = round_up(end, align_size);
-+	/* copy_all is usually in page fault case */
- 	bool copy_all = head_off == 0 && end == pg_end;
-+	/* zero the edges if srcmap is a HOLE or IOMAP_UNWRITTEN */
-+	bool zero_edge = srcmap->flags & IOMAP_F_SHARED ||
-+			 srcmap->type == IOMAP_UNWRITTEN;
- 	void *saddr = 0;
- 	int ret = 0;
- 
--	ret = dax_iomap_direct_access(srcmap, pos, size, &saddr, NULL);
--	if (ret)
--		return ret;
-+	if (!zero_edge) {
-+		ret = dax_iomap_direct_access(srcmap, pos, size, &saddr, NULL);
-+		if (ret)
-+			return ret;
-+	}
- 
- 	if (copy_all) {
--		ret = copy_mc_to_kernel(daddr, saddr, length);
--		return ret ? -EIO : 0;
-+		if (zero_edge)
-+			memset(daddr, 0, size);
-+		else
-+			ret = copy_mc_to_kernel(daddr, saddr, length);
-+		goto out;
- 	}
- 
- 	/* Copy the head part of the range */
- 	if (head_off) {
--		ret = copy_mc_to_kernel(daddr, saddr, head_off);
--		if (ret)
--			return -EIO;
-+		if (zero_edge)
-+			memset(daddr, 0, head_off);
-+		else {
-+			ret = copy_mc_to_kernel(daddr, saddr, head_off);
-+			if (ret)
-+				return -EIO;
-+		}
- 	}
- 
- 	/* Copy the tail part of the range */
-@@ -1131,12 +1148,19 @@ static int dax_iomap_cow_copy(loff_t pos, uint64_t length, size_t align_size,
- 		loff_t tail_off = head_off + length;
- 		loff_t tail_len = pg_end - end;
- 
--		ret = copy_mc_to_kernel(daddr + tail_off, saddr + tail_off,
--					tail_len);
--		if (ret)
--			return -EIO;
-+		if (zero_edge)
-+			memset(daddr + tail_off, 0, tail_len);
-+		else {
-+			ret = copy_mc_to_kernel(daddr + tail_off,
-+						saddr + tail_off, tail_len);
-+			if (ret)
-+				return -EIO;
-+		}
- 	}
--	return 0;
-+out:
-+	if (zero_edge)
-+		dax_flush(srcmap->dax_dev, daddr, size);
-+	return ret ? -EIO : 0;
- }
- 
- /*
-@@ -1221,6 +1245,58 @@ static vm_fault_t dax_pmd_load_hole(struct xa_state *xas, struct vm_fault *vmf,
- }
- #endif /* CONFIG_FS_DAX_PMD */
- 
-+static s64 dax_unshare_iter(struct iomap_iter *iter)
-+{
-+	struct iomap *iomap = &iter->iomap;
-+	const struct iomap *srcmap = iomap_iter_srcmap(iter);
-+	loff_t pos = iter->pos;
-+	loff_t length = iomap_length(iter);
-+	int id = 0;
-+	s64 ret = 0;
-+	void *daddr = NULL, *saddr = NULL;
-+
-+	/* don't bother with blocks that are not shared to start with */
-+	if (!(iomap->flags & IOMAP_F_SHARED))
-+		return length;
-+	/* don't bother with holes or unwritten extents */
-+	if (srcmap->type == IOMAP_HOLE || srcmap->type == IOMAP_UNWRITTEN)
-+		return length;
-+
-+	id = dax_read_lock();
-+	ret = dax_iomap_direct_access(iomap, pos, length, &daddr, NULL);
-+	if (ret < 0)
-+		goto out_unlock;
-+
-+	ret = dax_iomap_direct_access(srcmap, pos, length, &saddr, NULL);
-+	if (ret < 0)
-+		goto out_unlock;
-+
-+	ret = copy_mc_to_kernel(daddr, saddr, length);
-+	if (ret)
-+		ret = -EIO;
-+
-+out_unlock:
-+	dax_read_unlock(id);
-+	return ret;
-+}
-+
-+int dax_file_unshare(struct inode *inode, loff_t pos, loff_t len,
-+		const struct iomap_ops *ops)
-+{
-+	struct iomap_iter iter = {
-+		.inode		= inode,
-+		.pos		= pos,
-+		.len		= len,
-+		.flags		= IOMAP_WRITE | IOMAP_UNSHARE | IOMAP_DAX,
-+	};
-+	int ret;
-+
-+	while ((ret = iomap_iter(&iter, ops)) > 0)
-+		iter.processed = dax_unshare_iter(&iter);
-+	return ret;
-+}
-+EXPORT_SYMBOL_GPL(dax_file_unshare);
-+
- static int dax_memzero(struct iomap_iter *iter, loff_t pos, size_t size)
- {
- 	const struct iomap *iomap = &iter->iomap;
-@@ -1235,13 +1311,10 @@ static int dax_memzero(struct iomap_iter *iter, loff_t pos, size_t size)
- 	if (ret < 0)
- 		return ret;
- 	memset(kaddr + offset, 0, size);
--	if (srcmap->addr != iomap->addr) {
--		ret = dax_iomap_cow_copy(pos, size, PAGE_SIZE, srcmap,
--					 kaddr);
--		if (ret < 0)
--			return ret;
--		dax_flush(iomap->dax_dev, kaddr, PAGE_SIZE);
--	} else
-+	if (iomap->flags & IOMAP_F_SHARED)
-+		ret = dax_iomap_copy_around(pos, size, PAGE_SIZE, srcmap,
-+					    kaddr);
-+	else
- 		dax_flush(iomap->dax_dev, kaddr + offset, size);
- 	return ret;
- }
-@@ -1258,6 +1331,15 @@ static s64 dax_zero_iter(struct iomap_iter *iter, bool *did_zero)
- 	if (srcmap->type == IOMAP_HOLE || srcmap->type == IOMAP_UNWRITTEN)
- 		return length;
- 
-+	/*
-+	 * invalidate the pages whose sharing state is to be changed
-+	 * because of CoW.
-+	 */
-+	if (iomap->flags & IOMAP_F_SHARED)
-+		invalidate_inode_pages2_range(iter->inode->i_mapping,
-+					      pos >> PAGE_SHIFT,
-+					      (pos + length - 1) >> PAGE_SHIFT);
-+
- 	do {
- 		unsigned offset = offset_in_page(pos);
- 		unsigned size = min_t(u64, PAGE_SIZE - offset, length);
-@@ -1318,12 +1400,13 @@ static loff_t dax_iomap_iter(const struct iomap_iter *iomi,
- 		struct iov_iter *iter)
- {
- 	const struct iomap *iomap = &iomi->iomap;
--	const struct iomap *srcmap = &iomi->srcmap;
-+	const struct iomap *srcmap = iomap_iter_srcmap(iomi);
- 	loff_t length = iomap_length(iomi);
- 	loff_t pos = iomi->pos;
- 	struct dax_device *dax_dev = iomap->dax_dev;
- 	loff_t end = pos + length, done = 0;
- 	bool write = iov_iter_rw(iter) == WRITE;
-+	bool cow = write && iomap->flags & IOMAP_F_SHARED;
- 	ssize_t ret = 0;
- 	size_t xfer;
- 	int id;
-@@ -1350,7 +1433,7 @@ static loff_t dax_iomap_iter(const struct iomap_iter *iomi,
- 	 * into page tables. We have to tear down these mappings so that data
- 	 * written by write(2) is visible in mmap.
- 	 */
--	if (iomap->flags & IOMAP_F_NEW) {
-+	if (iomap->flags & IOMAP_F_NEW || cow) {
- 		invalidate_inode_pages2_range(iomi->inode->i_mapping,
- 					      pos >> PAGE_SHIFT,
- 					      (end - 1) >> PAGE_SHIFT);
-@@ -1384,10 +1467,9 @@ static loff_t dax_iomap_iter(const struct iomap_iter *iomi,
- 			break;
- 		}
- 
--		if (write &&
--		    srcmap->type != IOMAP_HOLE && srcmap->addr != iomap->addr) {
--			ret = dax_iomap_cow_copy(pos, length, PAGE_SIZE, srcmap,
--						 kaddr);
-+		if (cow) {
-+			ret = dax_iomap_copy_around(pos, length, PAGE_SIZE,
-+						    srcmap, kaddr);
- 			if (ret)
- 				break;
- 		}
-@@ -1532,7 +1614,7 @@ static vm_fault_t dax_fault_iter(struct vm_fault *vmf,
- 		struct xa_state *xas, void **entry, bool pmd)
- {
- 	const struct iomap *iomap = &iter->iomap;
--	const struct iomap *srcmap = &iter->srcmap;
-+	const struct iomap *srcmap = iomap_iter_srcmap(iter);
- 	size_t size = pmd ? PMD_SIZE : PAGE_SIZE;
- 	loff_t pos = (loff_t)xas->xa_index << PAGE_SHIFT;
- 	bool write = iter->flags & IOMAP_WRITE;
-@@ -1563,9 +1645,8 @@ static vm_fault_t dax_fault_iter(struct vm_fault *vmf,
- 
- 	*entry = dax_insert_entry(xas, vmf, iter, *entry, pfn, entry_flags);
- 
--	if (write &&
--	    srcmap->type != IOMAP_HOLE && srcmap->addr != iomap->addr) {
--		err = dax_iomap_cow_copy(pos, size, size, srcmap, kaddr);
-+	if (write && iomap->flags & IOMAP_F_SHARED) {
-+		err = dax_iomap_copy_around(pos, size, size, srcmap, kaddr);
- 		if (err)
- 			return dax_fault_return(err);
- 	}
-@@ -1936,15 +2017,15 @@ int dax_dedupe_file_range_compare(struct inode *src, loff_t srcoff,
- 		.len		= len,
- 		.flags		= IOMAP_DAX,
- 	};
--	int ret;
-+	int ret, compared = 0;
- 
--	while ((ret = iomap_iter(&src_iter, ops)) > 0) {
--		while ((ret = iomap_iter(&dst_iter, ops)) > 0) {
--			dst_iter.processed = dax_range_compare_iter(&src_iter,
--						&dst_iter, len, same);
--		}
--		if (ret <= 0)
--			src_iter.processed = ret;
-+	while ((ret = iomap_iter(&src_iter, ops)) > 0 &&
-+	       (ret = iomap_iter(&dst_iter, ops)) > 0) {
-+		compared = dax_range_compare_iter(&src_iter, &dst_iter, len,
-+						  same);
-+		if (compared < 0)
-+			return ret;
-+		src_iter.processed = dst_iter.processed = compared;
- 	}
- 	return ret;
- }
 diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
 index 91ee0b308e13..356193e44cf0 100644
 --- a/fs/iomap/buffered-io.c
@@ -3103,23 +2687,8 @@ index aa303be11576..d354ea2b74f9 100644
  		}
  	} else {
  		/*
-diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
-index 1f783e979629..13f1b2add390 100644
---- a/fs/xfs/xfs_ioctl.c
-+++ b/fs/xfs/xfs_ioctl.c
-@@ -1138,10 +1138,6 @@ xfs_ioctl_setattr_xflags(
- 	if ((fa->fsx_xflags & FS_XFLAG_REALTIME) && xfs_is_reflink_inode(ip))
- 		ip->i_diflags2 &= ~XFS_DIFLAG2_REFLINK;
- 
--	/* Don't allow us to set DAX mode for a reflinked file for now. */
--	if ((fa->fsx_xflags & FS_XFLAG_DAX) && xfs_is_reflink_inode(ip))
--		return -EINVAL;
--
- 	/* diflags2 only valid for v3 inodes. */
- 	i_flags2 = xfs_flags2diflags2(ip, fa->fsx_xflags);
- 	if (i_flags2 && !xfs_has_v3inodes(mp))
 diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
-index 07da03976ec1..669c1bc5c3a7 100644
+index 07da03976ec1..43f447199c08 100644
 --- a/fs/xfs/xfs_iomap.c
 +++ b/fs/xfs/xfs_iomap.c
 @@ -48,13 +48,53 @@ xfs_alert_fsblock_zero(
@@ -3432,12 +3001,9 @@ index 07da03976ec1..669c1bc5c3a7 100644
  
  	ASSERT(!(flags & (IOMAP_WRITE | IOMAP_ZERO)));
  
-@@ -1215,15 +1251,16 @@ xfs_read_iomap_begin(
- 		return error;
- 	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
+@@ -1217,13 +1253,14 @@ xfs_read_iomap_begin(
  			       &nimaps, 0);
--	if (!error && (flags & IOMAP_REPORT))
-+	if (!error && ((flags & IOMAP_REPORT) || IS_DAX(inode)))
+ 	if (!error && (flags & IOMAP_REPORT))
  		error = xfs_reflink_trim_around_shared(ip, &imap, &shared);
 +	seq = xfs_iomap_inode_sequence(ip, shared ? IOMAP_F_SHARED : 0);
  	xfs_iunlock(ip, lockmode);
@@ -3505,24 +3071,6 @@ index 07da03976ec1..669c1bc5c3a7 100644
  }
  
  const struct iomap_ops xfs_xattr_iomap_ops = {
-@@ -1370,7 +1413,7 @@ xfs_zero_range(
- 
- 	if (IS_DAX(inode))
- 		return dax_zero_range(inode, pos, len, did_zero,
--				      &xfs_direct_write_iomap_ops);
-+				      &xfs_dax_write_iomap_ops);
- 	return iomap_zero_range(inode, pos, len, did_zero,
- 				&xfs_buffered_write_iomap_ops);
- }
-@@ -1385,7 +1428,7 @@ xfs_truncate_page(
- 
- 	if (IS_DAX(inode))
- 		return dax_truncate_page(inode, pos, did_zero,
--					&xfs_direct_write_iomap_ops);
-+					&xfs_dax_write_iomap_ops);
- 	return iomap_truncate_page(inode, pos, did_zero,
- 				   &xfs_buffered_write_iomap_ops);
- }
 diff --git a/fs/xfs/xfs_iomap.h b/fs/xfs/xfs_iomap.h
 index c782e8c0479c..4da13440bae9 100644
 --- a/fs/xfs/xfs_iomap.h
@@ -3553,21 +3101,6 @@ index c782e8c0479c..4da13440bae9 100644
  extern const struct iomap_ops xfs_direct_write_iomap_ops;
  extern const struct iomap_ops xfs_read_iomap_ops;
  extern const struct iomap_ops xfs_seek_iomap_ops;
-diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
-index 2e10e1c66ad6..bf0495f7a5e1 100644
---- a/fs/xfs/xfs_iops.c
-+++ b/fs/xfs/xfs_iops.c
-@@ -1185,10 +1185,6 @@ xfs_inode_supports_dax(
- 	if (!S_ISREG(VFS_I(ip)->i_mode))
- 		return false;
- 
--	/* Only supported on non-reflinked files. */
--	if (xfs_is_reflink_inode(ip))
--		return false;
--
- 	/* Block size must match page size */
- 	if (mp->m_sb.sb_blocksize != PAGE_SIZE)
- 		return false;
 diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
 index f02a0dd522b3..fc61cc024023 100644
 --- a/fs/xfs/xfs_log.c
@@ -3760,25 +3293,6 @@ index 18bb4ec4d7c9..ff53d40a2dae 100644
  out_miss_busy:
  	trace_xfs_dqreclaim_busy(dqp);
  	XFS_STATS_INC(dqp->q_mount, xs_qm_dqreclaim_misses);
-diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
-index 93bdd25680bc..fe46bce8cae6 100644
---- a/fs/xfs/xfs_reflink.c
-+++ b/fs/xfs/xfs_reflink.c
-@@ -1693,8 +1693,12 @@ xfs_reflink_unshare(
- 
- 	inode_dio_wait(inode);
- 
--	error = iomap_file_unshare(inode, offset, len,
--			&xfs_buffered_write_iomap_ops);
-+	if (IS_DAX(inode))
-+		error = dax_file_unshare(inode, offset, len,
-+				&xfs_dax_write_iomap_ops);
-+	else
-+		error = iomap_file_unshare(inode, offset, len,
-+				&xfs_buffered_write_iomap_ops);
- 	if (error)
- 		goto out;
- 
 diff --git a/fs/xfs/xfs_rtalloc.c b/fs/xfs/xfs_rtalloc.c
 index 292d5e54a92c..16534e9873f6 100644
 --- a/fs/xfs/xfs_rtalloc.c
@@ -4028,19 +3542,6 @@ index c325a28b89a8..10aa1fd39d2b 100644
  	offset += prefix_len;
  	strncpy(offset, (char *)name, namelen);			/* real name */
  	offset += namelen;
-diff --git a/include/linux/dax.h b/include/linux/dax.h
-index ba985333e26b..2b5ecb591059 100644
---- a/include/linux/dax.h
-+++ b/include/linux/dax.h
-@@ -205,6 +205,8 @@ static inline void dax_unlock_mapping_entry(struct address_space *mapping,
- }
- #endif
- 
-+int dax_file_unshare(struct inode *inode, loff_t pos, loff_t len,
-+		const struct iomap_ops *ops);
- int dax_zero_range(struct inode *inode, loff_t pos, loff_t len, bool *did_zero,
- 		const struct iomap_ops *ops);
- int dax_truncate_page(struct inode *inode, loff_t pos, bool *did_zero,
 diff --git a/include/linux/iomap.h b/include/linux/iomap.h
 index 238a03087e17..0983dfc9a203 100644
 --- a/include/linux/iomap.h
@@ -4132,35 +3633,6 @@ index 238a03087e17..0983dfc9a203 100644
  int iomap_read_folio(struct folio *folio, const struct iomap_ops *ops);
  void iomap_readahead(struct readahead_control *, const struct iomap_ops *ops);
  bool iomap_is_partially_uptodate(struct folio *, size_t from, size_t count);
-diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
-index da1d1cf42158..0df73b4e4bdf 100644
---- a/include/linux/mm_types.h
-+++ b/include/linux/mm_types.h
-@@ -103,7 +103,10 @@ struct page {
- 			};
- 			/* See page-flags.h for PAGE_MAPPING_FLAGS */
- 			struct address_space *mapping;
--			pgoff_t index;		/* Our offset within mapping. */
-+			union {
-+				pgoff_t index;		/* Our offset within mapping. */
-+				unsigned long share;	/* share count for fsdax */
-+			};
- 			/**
- 			 * @private: Mapping-private opaque data.
- 			 * Usually used for buffer_heads if PagePrivate.
-diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
-index ee6604fcc1d1..5eea240ac863 100644
---- a/include/linux/page-flags.h
-+++ b/include/linux/page-flags.h
-@@ -650,7 +650,7 @@ PAGEFLAG_FALSE(VmemmapSelfHosted, vmemmap_self_hosted)
-  * Different with flags above, this flag is used only for fsdax mode.  It
-  * indicates that this page->mapping is now under reflink case.
-  */
--#define PAGE_MAPPING_DAX_COW	0x1
-+#define PAGE_MAPPING_DAX_SHARED	((void *)0x1)
- 
- static __always_inline bool folio_mapping_flags(const struct folio *folio)
- {
 -- 
 2.39.0
 
