@@ -6,7 +6,7 @@
 
 # Custom Linux Kernel Patches for CachyOS
 
-This repository contains custom patches for the Linux kernel that is being used in [CachyOS](https://cachyos.org/), an Arch Linux-based operating system. These patches may provide additional features, bug fixes, or performance enhancements that are not included in the upstream Linux kernel.
+This repository contains custom patches for the Linux kernel that are being used in [CachyOS Kernels](https://github.com/CachyOS/linux-cachyos). These patches may provide additional features, bug fixes, or performance enhancements that are not included in the upstream Linux kernel.
 
 ## Contributions
 
