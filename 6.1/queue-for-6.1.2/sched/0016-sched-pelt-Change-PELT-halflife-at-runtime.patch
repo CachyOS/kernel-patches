@@ -1,0 +1,217 @@
+From 7892c95cdc6c85e5509b79af86b8aa5d70952932 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 4 Oct 2022 14:32:28 +0200
+Subject: [PATCH 16/19] sched/pelt: Change PELT halflife at runtime
+
+Many of the Android devices still prefer to run PELT with a shorter
+halflife than the hardcoded value of 32ms in mainline.
+
+The Android folks claim better response time of display pipeline tasks
+(higher min and avg fps for 60, 90 or 120Hz refresh rate). Some of the
+benchmarks like PCmark web-browsing show higher scores when running
+with 16ms or 8ms PELT halflife. The gain in response time and
+performance is considered to outweigh the increase of energy
+consumption in these cases.
+
+The original idea of introducing a PELT halflife compile time option
+for 32, 16, 8ms from Patrick Bellasi in 2018
+https://lkml.kernel.org/r/20180409165134.707-1-patrick.bellasi@arm.com
+wasn't integrated into mainline mainly because of breaking the PELT
+stability requirement (see (1) below).
+
+We have been experimenting with a new idea from Morten Rasmussen to
+instead introduce an additional clock between task and pelt clock. This
+way the effect of a shorter PELT halflife of 8ms or 16ms can be
+achieved by left-shifting the elapsed time. This is similar to the use
+of time shifting of the pelt clock to achieve scale invariance in PELT.
+The implementation is from Vincent Donnefort with some minor
+modifications to align with current tip sched/core.
+---
+ kernel/sched/core.c  |  2 +-
+ kernel/sched/pelt.c  | 60 ++++++++++++++++++++++++++++++++++++++++++++
+ kernel/sched/pelt.h  | 42 ++++++++++++++++++++++++++++---
+ kernel/sched/sched.h |  1 +
+ 4 files changed, 100 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 78b2d5cab..a7831ce37 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -722,7 +722,7 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
+ 	if ((irq_delta + steal) && sched_feat(NONTASK_CAPACITY))
+ 		update_irq_load_avg(rq, irq_delta + steal);
+ #endif
+-	update_rq_clock_pelt(rq, delta);
++	update_rq_clock_task_mult(rq, delta);
+ }
+ 
+ void update_rq_clock(struct rq *rq)
+diff --git a/kernel/sched/pelt.c b/kernel/sched/pelt.c
+index 0f3107682..036b0e2cd 100644
+--- a/kernel/sched/pelt.c
++++ b/kernel/sched/pelt.c
+@@ -467,3 +467,63 @@ int update_irq_load_avg(struct rq *rq, u64 running)
+ 	return ret;
+ }
+ #endif
++
++__read_mostly unsigned int sched_pelt_lshift;
++
++#ifdef CONFIG_SYSCTL
++static unsigned int sysctl_sched_pelt_multiplier = 1;
++
++int sched_pelt_multiplier(struct ctl_table *table, int write, void *buffer,
++			  size_t *lenp, loff_t *ppos)
++{
++	static DEFINE_MUTEX(mutex);
++	unsigned int old;
++	int ret;
++
++	mutex_lock(&mutex);
++	old = sysctl_sched_pelt_multiplier;
++	ret = proc_dointvec(table, write, buffer, lenp, ppos);
++	if (ret)
++		goto undo;
++	if (!write)
++		goto done;
++
++	switch (sysctl_sched_pelt_multiplier)  {
++	case 1:
++		fallthrough;
++	case 2:
++		fallthrough;
++	case 4:
++		WRITE_ONCE(sched_pelt_lshift,
++			   sysctl_sched_pelt_multiplier >> 1);
++		goto done;
++	default:
++		ret = -EINVAL;
++	}
++
++undo:
++	sysctl_sched_pelt_multiplier = old;
++done:
++	mutex_unlock(&mutex);
++
++	return ret;
++}
++
++static struct ctl_table sched_pelt_sysctls[] = {
++	{
++		.procname       = "sched_pelt_multiplier",
++		.data           = &sysctl_sched_pelt_multiplier,
++		.maxlen         = sizeof(unsigned int),
++		.mode           = 0644,
++		.proc_handler   = sched_pelt_multiplier,
++	},
++	{}
++};
++
++static int __init sched_pelt_sysctl_init(void)
++{
++	register_sysctl_init("kernel", sched_pelt_sysctls);
++	return 0;
++}
++late_initcall(sched_pelt_sysctl_init);
++#endif
+diff --git a/kernel/sched/pelt.h b/kernel/sched/pelt.h
+index 3a0e0dc28..9b35b5072 100644
+--- a/kernel/sched/pelt.h
++++ b/kernel/sched/pelt.h
+@@ -61,6 +61,14 @@ static inline void cfs_se_util_change(struct sched_avg *avg)
+ 	WRITE_ONCE(avg->util_est.enqueued, enqueued);
+ }
+ 
++static inline u64 rq_clock_task_mult(struct rq *rq)
++{
++	lockdep_assert_rq_held(rq);
++	assert_clock_updated(rq);
++
++	return rq->clock_task_mult;
++}
++
+ static inline u64 rq_clock_pelt(struct rq *rq)
+ {
+ 	lockdep_assert_rq_held(rq);
+@@ -72,7 +80,7 @@ static inline u64 rq_clock_pelt(struct rq *rq)
+ /* The rq is idle, we can sync to clock_task */
+ static inline void _update_idle_rq_clock_pelt(struct rq *rq)
+ {
+-	rq->clock_pelt  = rq_clock_task(rq);
++	rq->clock_pelt = rq_clock_task_mult(rq);
+ 
+ 	u64_u32_store(rq->clock_idle, rq_clock(rq));
+ 	/* Paired with smp_rmb in migrate_se_pelt_lag() */
+@@ -121,6 +129,27 @@ static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
+ 	rq->clock_pelt += delta;
+ }
+ 
++extern unsigned int sched_pelt_lshift;
++
++/*
++ * absolute time   |1      |2      |3      |4      |5      |6      |
++ * @ mult = 1      --------****************--------****************-
++ * @ mult = 2      --------********----------------********---------
++ * @ mult = 4      --------****--------------------****-------------
++ * clock task mult
++ * @ mult = 2      |   |   |2  |3  |   |   |   |   |5  |6  |   |   |
++ * @ mult = 4      | | | | |2|3| | | | | | | | | | |5|6| | | | | | |
++ *
++ */
++static inline void update_rq_clock_task_mult(struct rq *rq, s64 delta)
++{
++	delta <<= READ_ONCE(sched_pelt_lshift);
++
++	rq->clock_task_mult += delta;
++
++	update_rq_clock_pelt(rq, delta);
++}
++
+ /*
+  * When rq becomes idle, we have to check if it has lost idle time
+  * because it was fully busy. A rq is fully used when the /Sum util_sum
+@@ -147,7 +176,7 @@ static inline void update_idle_rq_clock_pelt(struct rq *rq)
+ 	 * rq's clock_task.
+ 	 */
+ 	if (util_sum >= divider)
+-		rq->lost_idle_time += rq_clock_task(rq) - rq->clock_pelt;
++		rq->lost_idle_time += rq_clock_task_mult(rq) - rq->clock_pelt;
+ 
+ 	_update_idle_rq_clock_pelt(rq);
+ }
+@@ -218,13 +247,18 @@ update_irq_load_avg(struct rq *rq, u64 running)
+ 	return 0;
+ }
+ 
+-static inline u64 rq_clock_pelt(struct rq *rq)
++static inline u64 rq_clock_task_mult(struct rq *rq)
+ {
+ 	return rq_clock_task(rq);
+ }
+ 
++static inline u64 rq_clock_pelt(struct rq *rq)
++{
++	return rq_clock_task_mult(rq);
++}
++
+ static inline void
+-update_rq_clock_pelt(struct rq *rq, s64 delta) { }
++update_rq_clock_task_mult(struct rq *rq, s64 delta) { }
+ 
+ static inline void
+ update_idle_rq_clock_pelt(struct rq *rq) { }
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 771f8ddb7..0fb95c98b 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1015,6 +1015,7 @@ struct rq {
+ 	u64			clock;
+ 	/* Ensure that all clocks are in the same cache line */
+ 	u64			clock_task ____cacheline_aligned;
++	u64			clock_task_mult;
+ 	u64			clock_pelt;
+ 	unsigned long		lost_idle_time;
+ 	u64			clock_pelt_idle;
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
