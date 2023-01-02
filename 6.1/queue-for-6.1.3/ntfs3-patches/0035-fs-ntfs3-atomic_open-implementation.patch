@@ -1,0 +1,205 @@
+From b0225be57ab0e7d177dcccd5dfefd7e3360b220d Mon Sep 17 00:00:00 2001
+From: Konstantin Komarov <almaz.alexandrovich@paragon-software.com>
+Date: Fri, 7 Oct 2022 19:53:30 +0300
+Subject: [PATCH 35/45] fs/ntfs3: atomic_open implementation
+
+Added ntfs_atomic_open function.
+Relaxed locking in ntfs_create_inode.
+
+Signed-off-by: Konstantin Komarov <almaz.alexandrovich@paragon-software.com>
+---
+ fs/ntfs3/inode.c |  24 ++++++++++--
+ fs/ntfs3/namei.c | 100 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 120 insertions(+), 4 deletions(-)
+
+diff --git a/fs/ntfs3/inode.c b/fs/ntfs3/inode.c
+index 45a4ddc0b..7e369d69d 100644
+--- a/fs/ntfs3/inode.c
++++ b/fs/ntfs3/inode.c
+@@ -1184,6 +1184,18 @@ ntfs_create_reparse_buffer(struct ntfs_sb_info *sbi, const char *symname,
+ 	return ERR_PTR(err);
+ }
+ 
++/*
++ * ntfs_create_inode
++ *
++ * Helper function for:
++ * - ntfs_create
++ * - ntfs_mknod
++ * - ntfs_symlink
++ * - ntfs_mkdir
++ * - ntfs_atomic_open
++ * 
++ * NOTE: if fnd != NULL (ntfs_atomic_open) then @dir is locked
++ */
+ struct inode *ntfs_create_inode(struct user_namespace *mnt_userns,
+ 				struct inode *dir, struct dentry *dentry,
+ 				const struct cpu_str *uni, umode_t mode,
+@@ -1213,7 +1225,8 @@ struct inode *ntfs_create_inode(struct user_namespace *mnt_userns,
+ 	struct REPARSE_DATA_BUFFER *rp = NULL;
+ 	bool rp_inserted = false;
+ 
+-	ni_lock_dir(dir_ni);
++	if (!fnd)
++		ni_lock_dir(dir_ni);
+ 
+ 	dir_root = indx_get_root(&dir_ni->dir, dir_ni, NULL, NULL);
+ 	if (!dir_root) {
+@@ -1583,7 +1596,8 @@ struct inode *ntfs_create_inode(struct user_namespace *mnt_userns,
+ 		goto out6;
+ 
+ 	/* Unlock parent directory before ntfs_init_acl. */
+-	ni_unlock(dir_ni);
++	if (!fnd)
++		ni_unlock(dir_ni);
+ 
+ 	inode->i_generation = le16_to_cpu(rec->seq);
+ 
+@@ -1643,7 +1657,8 @@ struct inode *ntfs_create_inode(struct user_namespace *mnt_userns,
+ out7:
+ 
+ 	/* Undo 'indx_insert_entry'. */
+-	ni_lock_dir(dir_ni);
++	if (!fnd)
++		ni_lock_dir(dir_ni);
+ 	indx_delete_entry(&dir_ni->dir, dir_ni, new_de + 1,
+ 			  le16_to_cpu(new_de->key_size), sbi);
+ 	/* ni_unlock(dir_ni); will be called later. */
+@@ -1671,7 +1686,8 @@ struct inode *ntfs_create_inode(struct user_namespace *mnt_userns,
+ 
+ out1:
+ 	if (err) {
+-		ni_unlock(dir_ni);
++		if (!fnd)
++			ni_unlock(dir_ni);
+ 		return ERR_PTR(err);
+ 	}
+ 
+diff --git a/fs/ntfs3/namei.c b/fs/ntfs3/namei.c
+index ad6d16dec..daff8d0cd 100644
+--- a/fs/ntfs3/namei.c
++++ b/fs/ntfs3/namei.c
+@@ -8,6 +8,7 @@
+ #include <linux/fs.h>
+ #include <linux/nls.h>
+ #include <linux/ctype.h>
++#include <linux/posix_acl.h>
+ 
+ #include "debug.h"
+ #include "ntfs.h"
+@@ -334,6 +335,104 @@ static int ntfs_rename(struct user_namespace *mnt_userns, struct inode *dir,
+ 	return err;
+ }
+ 
++/*
++ * ntfs_atomic_open
++ *
++ * inode_operations::atomic_open
++ */
++static int ntfs_atomic_open(struct inode *dir, struct dentry *dentry,
++			    struct file *file, u32 flags, umode_t mode)
++{
++	int err;
++	struct inode *inode;
++	struct ntfs_fnd *fnd = NULL;
++	struct ntfs_inode *ni = ntfs_i(dir);
++	struct dentry *d = NULL;
++	struct cpu_str *uni = __getname();
++	bool locked = false;
++
++	if (!uni)
++		return -ENOMEM;
++
++	err = ntfs_nls_to_utf16(ni->mi.sbi, dentry->d_name.name,
++				dentry->d_name.len, uni, NTFS_NAME_LEN,
++				UTF16_HOST_ENDIAN);
++	if (err < 0)
++		goto out;
++
++#ifdef CONFIG_NTFS3_FS_POSIX_ACL
++	if (IS_POSIXACL(dir)) {
++		/* 
++		 * Load in cache current acl to avoid ni_lock(dir):
++		 * ntfs_create_inode -> ntfs_init_acl -> posix_acl_create ->
++		 * ntfs_get_acl -> ntfs_get_acl_ex -> ni_lock
++		 */
++		struct posix_acl *p = get_acl(dir, ACL_TYPE_DEFAULT);
++
++		if (IS_ERR(p)) {
++			err = PTR_ERR(p);
++			goto out;
++		}
++		posix_acl_release(p);
++	}
++#endif
++
++	if (d_in_lookup(dentry)) {
++		ni_lock_dir(ni);
++		locked = true;
++		fnd = fnd_get();
++		if (!fnd) {
++			err = -ENOMEM;
++			goto out1;
++		}
++
++		d = d_splice_alias(dir_search_u(dir, uni, fnd), dentry);
++		if (IS_ERR(d)) {
++			err = PTR_ERR(d);
++			d = NULL;
++			goto out2;
++		}
++
++		if (d)
++			dentry = d;
++	}
++
++	if (!(flags & O_CREAT) || d_really_is_positive(dentry)) {
++		err = finish_no_open(file, d);
++		goto out2;
++	}
++
++	file->f_mode |= FMODE_CREATED;
++
++	/*
++	 * fnd contains tree's path to insert to.
++	 * If fnd is not NULL then dir is locked.
++	 */
++
++	/*
++	 * Unfortunately I don't know how to get here correct 'struct nameidata *nd'
++	 * or 'struct user_namespace *mnt_userns'.
++	 * See atomic_open in fs/namei.c.
++	 * This is why xfstest/633 failed.
++	 * Looks like ntfs_atomic_open must accept 'struct user_namespace *mnt_userns' as argument.
++	 */
++
++	inode = ntfs_create_inode(&init_user_ns, dir, dentry, uni, mode, 0,
++				  NULL, 0, fnd);
++	err = IS_ERR(inode) ? PTR_ERR(inode)
++			    : finish_open(file, dentry, ntfs_file_open);
++	dput(d);
++
++out2:
++	fnd_put(fnd);
++out1:
++	if (locked)
++		ni_unlock(ni);
++out:
++	__putname(uni);
++	return err;
++}
++
+ struct dentry *ntfs3_get_parent(struct dentry *child)
+ {
+ 	struct inode *inode = d_inode(child);
+@@ -500,6 +599,7 @@ const struct inode_operations ntfs_dir_inode_operations = {
+ 	.setattr	= ntfs3_setattr,
+ 	.getattr	= ntfs_getattr,
+ 	.listxattr	= ntfs_listxattr,
++	.atomic_open	= ntfs_atomic_open,
+ 	.fiemap		= ntfs_fiemap,
+ };
+ 
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

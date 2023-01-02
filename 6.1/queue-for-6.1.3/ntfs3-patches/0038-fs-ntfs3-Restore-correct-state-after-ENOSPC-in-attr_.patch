@@ -1,0 +1,286 @@
+From d17461acfb3f0faed335ceee9806ee316b8153c5 Mon Sep 17 00:00:00 2001
+From: Konstantin Komarov <almaz.alexandrovich@paragon-software.com>
+Date: Fri, 7 Oct 2022 20:20:14 +0300
+Subject: [PATCH 38/45] fs/ntfs3: Restore correct state after ENOSPC in
+ attr_data_get_block
+
+Added new function ntfs_check_for_free_space.
+Added undo mechanism in attr_data_get_block.
+Fixes xfstest generic/083
+
+Signed-off-by: Konstantin Komarov <almaz.alexandrovich@paragon-software.com>
+---
+ fs/ntfs3/attrib.c  | 141 +++++++++++++++++++++++++++++----------------
+ fs/ntfs3/fsntfs.c  |  33 +++++++++++
+ fs/ntfs3/ntfs_fs.h |   1 +
+ 3 files changed, 125 insertions(+), 50 deletions(-)
+
+diff --git a/fs/ntfs3/attrib.c b/fs/ntfs3/attrib.c
+index 91ea73e6f..5e6bafb10 100644
+--- a/fs/ntfs3/attrib.c
++++ b/fs/ntfs3/attrib.c
+@@ -891,8 +891,10 @@ int attr_data_get_block(struct ntfs_inode *ni, CLST vcn, CLST clen, CLST *lcn,
+ 	struct ATTR_LIST_ENTRY *le, *le_b;
+ 	struct mft_inode *mi, *mi_b;
+ 	CLST hint, svcn, to_alloc, evcn1, next_svcn, asize, end, vcn0, alen;
++	CLST alloc, evcn;
+ 	unsigned fr;
+-	u64 total_size;
++	u64 total_size, total_size0;
++	int step = 0;
+ 
+ 	if (new)
+ 		*new = false;
+@@ -932,7 +934,12 @@ int attr_data_get_block(struct ntfs_inode *ni, CLST vcn, CLST clen, CLST *lcn,
+ 
+ 	asize = le64_to_cpu(attr_b->nres.alloc_size) >> cluster_bits;
+ 	if (vcn >= asize) {
+-		err = -EINVAL;
++		if (new) {
++			err = -EINVAL;
++		} else {
++			*len = 1;
++			*lcn = SPARSE_LCN;
++		}
+ 		goto out;
+ 	}
+ 
+@@ -1036,10 +1043,12 @@ int attr_data_get_block(struct ntfs_inode *ni, CLST vcn, CLST clen, CLST *lcn,
+ 	if (err)
+ 		goto out;
+ 	*new = true;
++	step = 1;
+ 
+ 	end = vcn + alen;
+-	total_size = le64_to_cpu(attr_b->nres.total_size) +
+-		     ((u64)alen << cluster_bits);
++	/* Save 'total_size0' to restore if error. */
++	total_size0 = le64_to_cpu(attr_b->nres.total_size);
++	total_size = total_size0 + ((u64)alen << cluster_bits);
+ 
+ 	if (vcn != vcn0) {
+ 		if (!run_lookup_entry(run, vcn0, lcn, len, NULL)) {
+@@ -1081,7 +1090,7 @@ int attr_data_get_block(struct ntfs_inode *ni, CLST vcn, CLST clen, CLST *lcn,
+ 		if (!ni->attr_list.size) {
+ 			err = ni_create_attr_list(ni);
+ 			if (err)
+-				goto out;
++				goto undo1;
+ 			/* Layout of records is changed. */
+ 			le_b = NULL;
+ 			attr_b = ni_find_attr(ni, NULL, &le_b, ATTR_DATA, NULL,
+@@ -1098,67 +1107,83 @@ int attr_data_get_block(struct ntfs_inode *ni, CLST vcn, CLST clen, CLST *lcn,
+ 		}
+ 	}
+ 
++	/* 
++	 * The code below may require additional cluster (to extend attribute list)
++	 * and / or one MFT record 
++	 * It is too complex to undo operations if -ENOSPC occurs deep inside 
++	 * in 'ni_insert_nonresident'.
++	 * Return in advance -ENOSPC here if there are no free cluster and no free MFT.
++	 */
++	if (!ntfs_check_for_free_space(sbi, 1, 1)) {
++		/* Undo step 1. */
++		err = -ENOSPC;
++		goto undo1;
++	}
++
++	step = 2;
+ 	svcn = evcn1;
+ 
+ 	/* Estimate next attribute. */
+ 	attr = ni_find_attr(ni, attr, &le, ATTR_DATA, NULL, 0, &svcn, &mi);
+ 
+-	if (attr) {
+-		CLST alloc = bytes_to_cluster(
+-			sbi, le64_to_cpu(attr_b->nres.alloc_size));
+-		CLST evcn = le64_to_cpu(attr->nres.evcn);
+-
+-		if (end < next_svcn)
+-			end = next_svcn;
+-		while (end > evcn) {
+-			/* Remove segment [svcn : evcn). */
+-			mi_remove_attr(NULL, mi, attr);
+-
+-			if (!al_remove_le(ni, le)) {
+-				err = -EINVAL;
+-				goto out;
+-			}
++	if (!attr) {
++		/* Insert new attribute segment. */
++		goto ins_ext;
++	}
+ 
+-			if (evcn + 1 >= alloc) {
+-				/* Last attribute segment. */
+-				evcn1 = evcn + 1;
+-				goto ins_ext;
+-			}
++	/* Try to update existed attribute segment. */
++	alloc = bytes_to_cluster(sbi, le64_to_cpu(attr_b->nres.alloc_size));
++	evcn = le64_to_cpu(attr->nres.evcn);
+ 
+-			if (ni_load_mi(ni, le, &mi)) {
+-				attr = NULL;
+-				goto out;
+-			}
++	if (end < next_svcn)
++		end = next_svcn;
++	while (end > evcn) {
++		/* Remove segment [svcn : evcn). */
++		mi_remove_attr(NULL, mi, attr);
+ 
+-			attr = mi_find_attr(mi, NULL, ATTR_DATA, NULL, 0,
+-					    &le->id);
+-			if (!attr) {
+-				err = -EINVAL;
+-				goto out;
+-			}
+-			svcn = le64_to_cpu(attr->nres.svcn);
+-			evcn = le64_to_cpu(attr->nres.evcn);
++		if (!al_remove_le(ni, le)) {
++			err = -EINVAL;
++			goto out;
+ 		}
+ 
+-		if (end < svcn)
+-			end = svcn;
++		if (evcn + 1 >= alloc) {
++			/* Last attribute segment. */
++			evcn1 = evcn + 1;
++			goto ins_ext;
++		}
+ 
+-		err = attr_load_runs(attr, ni, run, &end);
+-		if (err)
++		if (ni_load_mi(ni, le, &mi)) {
++			attr = NULL;
+ 			goto out;
++		}
+ 
+-		evcn1 = evcn + 1;
+-		attr->nres.svcn = cpu_to_le64(next_svcn);
+-		err = mi_pack_runs(mi, attr, run, evcn1 - next_svcn);
+-		if (err)
++		attr = mi_find_attr(mi, NULL, ATTR_DATA, NULL, 0, &le->id);
++		if (!attr) {
++			err = -EINVAL;
+ 			goto out;
++		}
++		svcn = le64_to_cpu(attr->nres.svcn);
++		evcn = le64_to_cpu(attr->nres.evcn);
++	}
+ 
+-		le->vcn = cpu_to_le64(next_svcn);
+-		ni->attr_list.dirty = true;
+-		mi->dirty = true;
++	if (end < svcn)
++		end = svcn;
++
++	err = attr_load_runs(attr, ni, run, &end);
++	if (err)
++		goto out;
++
++	evcn1 = evcn + 1;
++	attr->nres.svcn = cpu_to_le64(next_svcn);
++	err = mi_pack_runs(mi, attr, run, evcn1 - next_svcn);
++	if (err)
++		goto out;
++
++	le->vcn = cpu_to_le64(next_svcn);
++	ni->attr_list.dirty = true;
++	mi->dirty = true;
++	next_svcn = le64_to_cpu(attr->nres.evcn) + 1;
+ 
+-		next_svcn = le64_to_cpu(attr->nres.evcn) + 1;
+-	}
+ ins_ext:
+ 	if (evcn1 > next_svcn) {
+ 		err = ni_insert_nonresident(ni, ATTR_DATA, NULL, 0, run,
+@@ -1170,10 +1195,26 @@ int attr_data_get_block(struct ntfs_inode *ni, CLST vcn, CLST clen, CLST *lcn,
+ ok:
+ 	run_truncate_around(run, vcn);
+ out:
++	if (err && step > 1) {
++		/* Too complex to restore. */
++		_ntfs_bad_inode(&ni->vfs_inode);
++	}
+ 	up_write(&ni->file.run_lock);
+ 	ni_unlock(ni);
+ 
+ 	return err;
++
++undo1:
++	/* Undo step1. */
++	attr_b->nres.total_size = cpu_to_le64(total_size0);
++	inode_set_bytes(&ni->vfs_inode, total_size0);
++
++	if (run_deallocate_ex(sbi, run, vcn, alen, NULL, false) ||
++	    !run_add_entry(run, vcn, SPARSE_LCN, alen, false) ||
++	    mi_pack_runs(mi, attr, run, max(end, evcn1) - svcn)) {
++		_ntfs_bad_inode(&ni->vfs_inode);
++	}
++	goto out;
+ }
+ 
+ int attr_data_read_resident(struct ntfs_inode *ni, struct page *page)
+diff --git a/fs/ntfs3/fsntfs.c b/fs/ntfs3/fsntfs.c
+index b68a7b780..4f04e8594 100644
+--- a/fs/ntfs3/fsntfs.c
++++ b/fs/ntfs3/fsntfs.c
+@@ -443,6 +443,39 @@ int ntfs_look_for_free_space(struct ntfs_sb_info *sbi, CLST lcn, CLST len,
+ 	return err;
+ }
+ 
++/*
++ * ntfs_check_for_free_space
++ *
++ * Check if it is possible to allocate 'clen' clusters and 'mlen' Mft records
++ */
++bool ntfs_check_for_free_space(struct ntfs_sb_info *sbi, CLST clen, CLST mlen)
++{
++	size_t free, zlen, avail;
++	struct wnd_bitmap *wnd;
++
++	wnd = &sbi->used.bitmap;
++	down_read_nested(&wnd->rw_lock, BITMAP_MUTEX_CLUSTERS);
++	free = wnd_zeroes(wnd);
++	zlen = wnd_zone_len(wnd);
++	up_read(&wnd->rw_lock);
++
++	if (free < zlen + clen)
++		return false;
++
++	avail = free - (zlen + clen);
++
++	wnd = &sbi->mft.bitmap;
++	down_read_nested(&wnd->rw_lock, BITMAP_MUTEX_MFT);
++	free = wnd_zeroes(wnd);
++	zlen = wnd_zone_len(wnd);
++	up_read(&wnd->rw_lock);
++
++	if (free >= zlen + mlen)
++		return true;
++
++	return avail >= bytes_to_cluster(sbi, mlen << sbi->record_bits);
++}
++
+ /*
+  * ntfs_extend_mft - Allocate additional MFT records.
+  *
+diff --git a/fs/ntfs3/ntfs_fs.h b/fs/ntfs3/ntfs_fs.h
+index 776993ae4..bfb7493c5 100644
+--- a/fs/ntfs3/ntfs_fs.h
++++ b/fs/ntfs3/ntfs_fs.h
+@@ -588,6 +588,7 @@ int ntfs_loadlog_and_replay(struct ntfs_inode *ni, struct ntfs_sb_info *sbi);
+ int ntfs_look_for_free_space(struct ntfs_sb_info *sbi, CLST lcn, CLST len,
+ 			     CLST *new_lcn, CLST *new_len,
+ 			     enum ALLOCATE_OPT opt);
++bool ntfs_check_for_free_space(struct ntfs_sb_info *sbi, CLST clen, CLST mlen);
+ int ntfs_look_free_mft(struct ntfs_sb_info *sbi, CLST *rno, bool mft,
+ 		       struct ntfs_inode *ni, struct mft_inode **mi);
+ void ntfs_mark_rec_free(struct ntfs_sb_info *sbi, CLST rno, bool is_mft);
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

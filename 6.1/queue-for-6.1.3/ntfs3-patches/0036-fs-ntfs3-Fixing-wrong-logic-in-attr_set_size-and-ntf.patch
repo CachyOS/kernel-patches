@@ -1,0 +1,268 @@
+From f70396cc28470265e62bb696a9ac06009673f3c2 Mon Sep 17 00:00:00 2001
+From: Konstantin Komarov <almaz.alexandrovich@paragon-software.com>
+Date: Fri, 7 Oct 2022 20:08:06 +0300
+Subject: [PATCH 36/45] fs/ntfs3: Fixing wrong logic in attr_set_size and
+ ntfs_fallocate
+
+There were 2 problems:
+- in some cases we lost dirty flag;
+- cluster allocation can be called even when it wasn't needed.
+Fixes xfstest generic/465
+
+Signed-off-by: Konstantin Komarov <almaz.alexandrovich@paragon-software.com>
+---
+ fs/ntfs3/attrib.c | 25 +++++++++++--------------
+ fs/ntfs3/file.c   | 30 ++++++++++++++++++------------
+ fs/ntfs3/index.c  |  9 +++++++++
+ fs/ntfs3/inode.c  | 17 +++++------------
+ 4 files changed, 43 insertions(+), 38 deletions(-)
+
+diff --git a/fs/ntfs3/attrib.c b/fs/ntfs3/attrib.c
+index eda83a37a..91ea73e6f 100644
+--- a/fs/ntfs3/attrib.c
++++ b/fs/ntfs3/attrib.c
+@@ -414,6 +414,7 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 	CLST alen, vcn, lcn, new_alen, old_alen, svcn, evcn;
+ 	CLST next_svcn, pre_alloc = -1, done = 0;
+ 	bool is_ext, is_bad = false;
++	bool dirty = false;
+ 	u32 align;
+ 	struct MFT_REC *rec;
+ 
+@@ -434,8 +435,10 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 			return err;
+ 
+ 		/* Return if file is still resident. */
+-		if (!attr_b->non_res)
++		if (!attr_b->non_res) {
++			dirty = true;
+ 			goto ok1;
++		}
+ 
+ 		/* Layout of records may be changed, so do a full search. */
+ 		goto again;
+@@ -458,7 +461,7 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 
+ 	if (keep_prealloc && new_size < old_size) {
+ 		attr_b->nres.data_size = cpu_to_le64(new_size);
+-		mi_b->dirty = true;
++		mi_b->dirty = dirty = true;
+ 		goto ok;
+ 	}
+ 
+@@ -504,7 +507,7 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 
+ 		if (new_alloc <= old_alloc) {
+ 			attr_b->nres.data_size = cpu_to_le64(new_size);
+-			mi_b->dirty = true;
++			mi_b->dirty = dirty = true;
+ 			goto ok;
+ 		}
+ 
+@@ -595,7 +598,7 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 		next_svcn = le64_to_cpu(attr->nres.evcn) + 1;
+ 		new_alloc_tmp = (u64)next_svcn << cluster_bits;
+ 		attr_b->nres.alloc_size = cpu_to_le64(new_alloc_tmp);
+-		mi_b->dirty = true;
++		mi_b->dirty = dirty = true;
+ 
+ 		if (next_svcn >= vcn && !to_allocate) {
+ 			/* Normal way. Update attribute and exit. */
+@@ -681,7 +684,7 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 		old_valid = old_size = old_alloc = (u64)vcn << cluster_bits;
+ 		attr_b->nres.valid_size = attr_b->nres.data_size =
+ 			attr_b->nres.alloc_size = cpu_to_le64(old_size);
+-		mi_b->dirty = true;
++		mi_b->dirty = dirty = true;
+ 		goto again_1;
+ 	}
+ 
+@@ -743,7 +746,7 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 				attr_b->nres.valid_size =
+ 					attr_b->nres.alloc_size;
+ 		}
+-		mi_b->dirty = true;
++		mi_b->dirty = dirty = true;
+ 
+ 		err = run_deallocate_ex(sbi, run, vcn, evcn - vcn + 1, &dlen,
+ 					true);
+@@ -804,16 +807,9 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 	if (ret)
+ 		*ret = attr_b;
+ 
+-	/* Update inode_set_bytes. */
+ 	if (((type == ATTR_DATA && !name_len) ||
+ 	     (type == ATTR_ALLOC && name == I30_NAME))) {
+-		bool dirty = false;
+-
+-		if (ni->vfs_inode.i_size != new_size) {
+-			ni->vfs_inode.i_size = new_size;
+-			dirty = true;
+-		}
+-
++		/* Update inode_set_bytes. */
+ 		if (attr_b->non_res) {
+ 			new_alloc = le64_to_cpu(attr_b->nres.alloc_size);
+ 			if (inode_get_bytes(&ni->vfs_inode) != new_alloc) {
+@@ -822,6 +818,7 @@ int attr_set_size(struct ntfs_inode *ni, enum ATTR_TYPE type,
+ 			}
+ 		}
+ 
++		/* Don't forget to update duplicate information in parent. */
+ 		if (dirty) {
+ 			ni->ni_flags |= NI_FLAG_UPDATE_PARENT;
+ 			mark_inode_dirty(&ni->vfs_inode);
+diff --git a/fs/ntfs3/file.c b/fs/ntfs3/file.c
+index 63aef132e..511e58f2b 100644
+--- a/fs/ntfs3/file.c
++++ b/fs/ntfs3/file.c
+@@ -337,7 +337,6 @@ static int ntfs_extend(struct inode *inode, loff_t pos, size_t count,
+ 		err = ntfs_set_size(inode, end);
+ 		if (err)
+ 			goto out;
+-		inode->i_size = end;
+ 	}
+ 
+ 	if (extend_init && !is_compressed(ni)) {
+@@ -588,12 +587,14 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t vbo, loff_t len)
+ 		if (err)
+ 			goto out;
+ 
+-		/*
+-		 * Allocate clusters, do not change 'valid' size.
+-		 */
+-		err = ntfs_set_size(inode, new_size);
+-		if (err)
+-			goto out;
++		if (new_size > i_size) {
++			/*
++			 * Allocate clusters, do not change 'valid' size.
++			 */
++			err = ntfs_set_size(inode, new_size);
++			if (err)
++				goto out;
++		}
+ 
+ 		if (is_supported_holes) {
+ 			CLST vcn = vbo >> sbi->cluster_bits;
+@@ -635,6 +636,8 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t vbo, loff_t len)
+ 					    &ni->file.run, i_size, &ni->i_valid,
+ 					    true, NULL);
+ 			ni_unlock(ni);
++		} else if (new_size > i_size) {
++			inode->i_size = new_size;
+ 		}
+ 	}
+ 
+@@ -678,7 +681,7 @@ int ntfs3_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
+ 		goto out;
+ 
+ 	if (ia_valid & ATTR_SIZE) {
+-		loff_t oldsize = inode->i_size;
++		loff_t newsize, oldsize;
+ 
+ 		if (WARN_ON(ni->ni_flags & NI_FLAG_COMPRESSED_MASK)) {
+ 			/* Should never be here, see ntfs_file_open(). */
+@@ -686,16 +689,19 @@ int ntfs3_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
+ 			goto out;
+ 		}
+ 		inode_dio_wait(inode);
++		oldsize = inode->i_size;
++		newsize = attr->ia_size;
+ 
+-		if (attr->ia_size <= oldsize)
+-			err = ntfs_truncate(inode, attr->ia_size);
+-		else if (attr->ia_size > oldsize)
+-			err = ntfs_extend(inode, attr->ia_size, 0, NULL);
++		if (newsize <= oldsize)
++			err = ntfs_truncate(inode, newsize);
++		else
++			err = ntfs_extend(inode, newsize, 0, NULL);
+ 
+ 		if (err)
+ 			goto out;
+ 
+ 		ni->ni_flags |= NI_FLAG_UPDATE_PARENT;
++		inode->i_size = newsize;
+ 	}
+ 
+ 	setattr_copy(mnt_userns, inode, attr);
+diff --git a/fs/ntfs3/index.c b/fs/ntfs3/index.c
+index a2e1e07b5..35369ae5c 100644
+--- a/fs/ntfs3/index.c
++++ b/fs/ntfs3/index.c
+@@ -1445,6 +1445,9 @@ static int indx_add_allocate(struct ntfs_index *indx, struct ntfs_inode *ni,
+ 		goto out1;
+ 	}
+ 
++	if (in->name == I30_NAME)
++		ni->vfs_inode.i_size = data_size;
++
+ 	*vbn = bit << indx->idx2vbn_bits;
+ 
+ 	return 0;
+@@ -1978,6 +1981,9 @@ static int indx_shrink(struct ntfs_index *indx, struct ntfs_inode *ni,
+ 	if (err)
+ 		return err;
+ 
++	if (in->name == I30_NAME)
++		ni->vfs_inode.i_size = new_data;
++
+ 	bpb = bitmap_size(bit);
+ 	if (bpb * 8 == nbits)
+ 		return 0;
+@@ -2461,6 +2467,9 @@ int indx_delete_entry(struct ntfs_index *indx, struct ntfs_inode *ni,
+ 
+ 		err = attr_set_size(ni, ATTR_ALLOC, in->name, in->name_len,
+ 				    &indx->alloc_run, 0, NULL, false, NULL);
++		if (in->name == I30_NAME)
++			ni->vfs_inode.i_size = 0;
++
+ 		err = ni_remove_attr(ni, ATTR_ALLOC, in->name, in->name_len,
+ 				     false, NULL);
+ 		run_close(&indx->alloc_run);
+diff --git a/fs/ntfs3/inode.c b/fs/ntfs3/inode.c
+index 7e369d69d..1afe6246a 100644
+--- a/fs/ntfs3/inode.c
++++ b/fs/ntfs3/inode.c
+@@ -551,17 +551,6 @@ static noinline int ntfs_get_block_vbo(struct inode *inode, u64 vbo,
+ 	clear_buffer_new(bh);
+ 	clear_buffer_uptodate(bh);
+ 
+-	/* Direct write uses 'create=0'. */
+-	if (!create && vbo >= ni->i_valid) {
+-		/* Out of valid. */
+-		return 0;
+-	}
+-
+-	if (vbo >= inode->i_size) {
+-		/* Out of size. */
+-		return 0;
+-	}
+-
+ 	if (is_resident(ni)) {
+ 		ni_lock(ni);
+ 		err = attr_data_read_resident(ni, page);
+@@ -625,7 +614,6 @@ static noinline int ntfs_get_block_vbo(struct inode *inode, u64 vbo,
+ 		}
+ 	} else if (vbo >= valid) {
+ 		/* Read out of valid data. */
+-		/* Should never be here 'cause already checked. */
+ 		clear_buffer_mapped(bh);
+ 	} else if (vbo + bytes <= valid) {
+ 		/* Normal read. */
+@@ -975,6 +963,11 @@ int ntfs_write_end(struct file *file, struct address_space *mapping,
+ 			dirty = true;
+ 		}
+ 
++		if (pos + err > inode->i_size) {
++			inode->i_size = pos + err;
++			dirty = true;
++		}
++
+ 		if (dirty)
+ 			mark_inode_dirty(inode);
+ 	}
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
