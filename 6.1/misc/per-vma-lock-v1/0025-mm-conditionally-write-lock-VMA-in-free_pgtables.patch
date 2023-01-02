@@ -1,0 +1,129 @@
+From c5af7307fc22d42a969a28fa9ac214439e8cc50d Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Fri, 10 Jun 2022 22:09:08 -0700
+Subject: [PATCH 25/42] mm: conditionally write-lock VMA in free_pgtables
+
+Normally free_pgtables needs to lock affected VMAs except for the case
+when VMAs were isolated under VMA write-lock. munmap() does just that,
+isolating while holding appropriate locks and then downgrading mmap_lock
+and dropping per-VMA locks before freeing page tables.
+Add a parameter to free_pgtables and unmap_region for such scenario.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ mm/internal.h |  2 +-
+ mm/memory.c   |  6 +++++-
+ mm/mmap.c     | 18 ++++++++++++------
+ 3 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/mm/internal.h b/mm/internal.h
+index 6b7ef495b..8ddc081b6 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -87,7 +87,7 @@ void folio_activate(struct folio *folio);
+ 
+ void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
+ 		   struct vm_area_struct *start_vma, unsigned long floor,
+-		   unsigned long ceiling);
++		   unsigned long ceiling, bool lock_vma);
+ void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte);
+ 
+ struct zap_details;
+diff --git a/mm/memory.c b/mm/memory.c
+index f1a906a95..eab501638 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -395,7 +395,7 @@ void free_pgd_range(struct mmu_gather *tlb,
+ 
+ void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
+ 		   struct vm_area_struct *vma, unsigned long floor,
+-		   unsigned long ceiling)
++		   unsigned long ceiling, bool lock_vma)
+ {
+ 	MA_STATE(mas, mt, vma->vm_end, vma->vm_end);
+ 
+@@ -413,6 +413,8 @@ void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
+ 		 * Hide vma from rmap and truncate_pagecache before freeing
+ 		 * pgtables
+ 		 */
++		if (lock_vma)
++			vma_write_lock(vma);
+ 		unlink_anon_vmas(vma);
+ 		unlink_file_vma(vma);
+ 
+@@ -427,6 +429,8 @@ void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
+ 			       && !is_vm_hugetlb_page(next)) {
+ 				vma = next;
+ 				next = mas_find(&mas, ceiling - 1);
++				if (lock_vma)
++					vma_write_lock(vma);
+ 				unlink_anon_vmas(vma);
+ 				unlink_file_vma(vma);
+ 			}
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 27fc08460..cb97f88b5 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -78,7 +78,7 @@ core_param(ignore_rlimit_data, ignore_rlimit_data, bool, 0644);
+ static void unmap_region(struct mm_struct *mm, struct maple_tree *mt,
+ 		struct vm_area_struct *vma, struct vm_area_struct *prev,
+ 		struct vm_area_struct *next, unsigned long start,
+-		unsigned long end);
++		unsigned long end, bool lock_vma);
+ 
+ static pgprot_t vm_pgprot_modify(pgprot_t oldprot, unsigned long vm_flags)
+ {
+@@ -2199,7 +2199,7 @@ static inline void remove_mt(struct mm_struct *mm, struct ma_state *mas)
+ static void unmap_region(struct mm_struct *mm, struct maple_tree *mt,
+ 		struct vm_area_struct *vma, struct vm_area_struct *prev,
+ 		struct vm_area_struct *next,
+-		unsigned long start, unsigned long end)
++		unsigned long start, unsigned long end, bool lock_vma)
+ {
+ 	struct mmu_gather tlb;
+ 
+@@ -2208,7 +2208,8 @@ static void unmap_region(struct mm_struct *mm, struct maple_tree *mt,
+ 	update_hiwater_rss(mm);
+ 	unmap_vmas(&tlb, mt, vma, start, end);
+ 	free_pgtables(&tlb, mt, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
+-				 next ? next->vm_start : USER_PGTABLES_CEILING);
++				 next ? next->vm_start : USER_PGTABLES_CEILING,
++				 lock_vma);
+ 	tlb_finish_mmu(&tlb);
+ }
+ 
+@@ -2465,7 +2466,11 @@ do_mas_align_munmap(struct ma_state *mas, struct vm_area_struct *vma,
+ 			mmap_write_downgrade(mm);
+ 	}
+ 
+-	unmap_region(mm, &mt_detach, vma, prev, next, start, end);
++	/*
++	 * We can free page tables without locking the vmas because they were
++	 * isolated before we downgraded mmap_lock and dropped per-vma locks.
++	 */
++	unmap_region(mm, &mt_detach, vma, prev, next, start, end, !downgrade);
+ 	/* Statistics and freeing VMAs */
+ 	mas_set(&mas_detach, start);
+ 	remove_mt(mm, &mas_detach);
+@@ -2782,7 +2787,8 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
+ 	vma->vm_file = NULL;
+ 
+ 	/* Undo any partial mapping done by a device driver. */
+-	unmap_region(mm, mas.tree, vma, prev, next, vma->vm_start, vma->vm_end);
++	unmap_region(mm, mas.tree, vma, prev, next, vma->vm_start, vma->vm_end,
++		     true);
+ 	if (file && (vm_flags & VM_SHARED))
+ 		mapping_unmap_writable(file->f_mapping);
+ free_vma:
+@@ -3132,7 +3138,7 @@ void exit_mmap(struct mm_struct *mm)
+ 	mmap_write_lock(mm);
+ 	mt_clear_in_rcu(&mm->mm_mt);
+ 	free_pgtables(&tlb, &mm->mm_mt, vma, FIRST_USER_ADDRESS,
+-		      USER_PGTABLES_CEILING);
++		      USER_PGTABLES_CEILING, true);
+ 	tlb_finish_mmu(&tlb);
+ 
+ 	/*
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

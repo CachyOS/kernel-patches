@@ -1,0 +1,236 @@
+From c342702176ac36dd53630cc5823969ad9b84d255 Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Wed, 11 May 2022 16:32:37 -0700
+Subject: [PATCH 13/42] mm: add per-VMA lock and helper functions to control it
+
+Introduce a per-VMA rw_semaphore to be used during page fault handling
+instead of mmap_lock. Because there are cases when multiple VMAs need
+to be exclusively locked during VMA tree modifications, instead of the
+usual lock/unlock patter we mark a VMA as locked by taking per-VMA lock
+exclusively and setting vma->lock_seq to the current mm->lock_seq. When
+mmap_write_lock holder is done with all modifications and drops mmap_lock,
+it will increment mm->lock_seq, effectively unlocking all VMAs marked as
+locked.
+VMA lock is placed on the cache line boundary so that its 'count' field
+falls into the first cache line while the rest of the fields fall into
+the second cache line. This lets the 'count' field to be cached with
+other frequently accessed fields and used quickly in uncontended case
+while 'owner' and other fields used in the contended case will not
+invalidate the first cache line while waiting on the lock.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ include/linux/mm.h        | 87 +++++++++++++++++++++++++++++++++++++++
+ include/linux/mm_types.h  |  8 ++++
+ include/linux/mmap_lock.h | 13 ++++++
+ kernel/fork.c             |  4 ++
+ mm/init-mm.c              |  3 ++
+ 5 files changed, 115 insertions(+)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 974ccca60..ecac940b9 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -611,6 +611,92 @@ struct vm_operations_struct {
+ 					  unsigned long addr);
+ };
+ 
++#ifdef CONFIG_PER_VMA_LOCK
++static inline void vma_init_lock(struct vm_area_struct *vma)
++{
++	init_rwsem(&vma->lock);
++	vma->vm_lock_seq = -1;
++}
++
++static inline void vma_write_lock(struct vm_area_struct *vma)
++{
++	int mm_lock_seq;
++
++	mmap_assert_write_locked(vma->vm_mm);
++
++	/*
++	 * current task is holding mmap_write_lock, both vma->vm_lock_seq and
++	 * mm->mm_lock_seq can't be concurrently modified.
++	 */
++	mm_lock_seq = READ_ONCE(vma->vm_mm->mm_lock_seq);
++	if (vma->vm_lock_seq == mm_lock_seq)
++		return;
++
++	down_write(&vma->lock);
++	vma->vm_lock_seq = mm_lock_seq;
++	up_write(&vma->lock);
++}
++
++/*
++ * Try to read-lock a vma. The function is allowed to occasionally yield false
++ * locked result to avoid performance overhead, in which case we fall back to
++ * using mmap_lock. The function should never yield false unlocked result.
++ */
++static inline bool vma_read_trylock(struct vm_area_struct *vma)
++{
++	/* Check before locking. A race might cause false locked result. */
++	if (vma->vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq))
++		return false;
++
++	if (unlikely(down_read_trylock(&vma->lock) == 0))
++		return false;
++
++	/*
++	 * Overflow might produce false locked result.
++	 * False unlocked result is impossible because we modify and check
++	 * vma->vm_lock_seq under vma->lock protection and mm->mm_lock_seq
++	 * modification invalidates all existing locks.
++	 */
++	if (unlikely(vma->vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq))) {
++		up_read(&vma->lock);
++		return false;
++	}
++	return true;
++}
++
++static inline void vma_read_unlock(struct vm_area_struct *vma)
++{
++	up_read(&vma->lock);
++}
++
++static inline void vma_assert_locked(struct vm_area_struct *vma)
++{
++	lockdep_assert_held(&vma->lock);
++	VM_BUG_ON_VMA(!rwsem_is_locked(&vma->lock), vma);
++}
++
++static inline void vma_assert_write_locked(struct vm_area_struct *vma)
++{
++	mmap_assert_write_locked(vma->vm_mm);
++	/*
++	 * current task is holding mmap_write_lock, both vma->vm_lock_seq and
++	 * mm->mm_lock_seq can't be concurrently modified.
++	 */
++	VM_BUG_ON_VMA(vma->vm_lock_seq != READ_ONCE(vma->vm_mm->mm_lock_seq), vma);
++}
++
++#else /* CONFIG_PER_VMA_LOCK */
++
++static inline void vma_init_lock(struct vm_area_struct *vma) {}
++static inline void vma_write_lock(struct vm_area_struct *vma) {}
++static inline bool vma_read_trylock(struct vm_area_struct *vma)
++		{ return false; }
++static inline void vma_read_unlock(struct vm_area_struct *vma) {}
++static inline void vma_assert_locked(struct vm_area_struct *vma) {}
++static inline void vma_assert_write_locked(struct vm_area_struct *vma) {}
++
++#endif /* CONFIG_PER_VMA_LOCK */
++
+ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
+ {
+ 	static const struct vm_operations_struct dummy_vm_ops = {};
+@@ -619,6 +705,7 @@ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
+ 	vma->vm_mm = mm;
+ 	vma->vm_ops = &dummy_vm_ops;
+ 	INIT_LIST_HEAD(&vma->anon_vma_chain);
++	vma_init_lock(vma);
+ }
+ 
+ static inline void vma_set_anonymous(struct vm_area_struct *vma)
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index a05627f70..0f6e9764c 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -472,6 +472,11 @@ struct vm_area_struct {
+ 	 * containing the name given to the vma, or NULL if unnamed.
+ 	 */
+ 
++#ifdef CONFIG_PER_VMA_LOCK
++	int vm_lock_seq;
++	struct rw_semaphore lock;
++#endif
++
+ 	union {
+ 		struct {
+ 			struct rb_node rb;
+@@ -591,6 +596,9 @@ struct mm_struct {
+ 					  * init_mm.mmlist, and are protected
+ 					  * by mmlist_lock
+ 					  */
++#ifdef CONFIG_PER_VMA_LOCK
++		int mm_lock_seq;
++#endif
+ 
+ 
+ 		unsigned long hiwater_rss; /* High-watermark of RSS usage */
+diff --git a/include/linux/mmap_lock.h b/include/linux/mmap_lock.h
+index e49ba91bb..40facd4c3 100644
+--- a/include/linux/mmap_lock.h
++++ b/include/linux/mmap_lock.h
+@@ -72,6 +72,17 @@ static inline void mmap_assert_write_locked(struct mm_struct *mm)
+ 	VM_BUG_ON_MM(!rwsem_is_locked(&mm->mmap_lock), mm);
+ }
+ 
++#ifdef CONFIG_PER_VMA_LOCK
++static inline void vma_write_unlock_mm(struct mm_struct *mm)
++{
++	mmap_assert_write_locked(mm);
++	/* No races during update due to exclusive mmap_lock being held */
++	WRITE_ONCE(mm->mm_lock_seq, mm->mm_lock_seq + 1);
++}
++#else
++static inline void vma_write_unlock_mm(struct mm_struct *mm) {}
++#endif
++
+ static inline void mmap_init_lock(struct mm_struct *mm)
+ {
+ 	init_rwsem(&mm->mmap_lock);
+@@ -114,12 +125,14 @@ static inline bool mmap_write_trylock(struct mm_struct *mm)
+ static inline void mmap_write_unlock(struct mm_struct *mm)
+ {
+ 	__mmap_lock_trace_released(mm, true);
++	vma_write_unlock_mm(mm);
+ 	up_write(&mm->mmap_lock);
+ }
+ 
+ static inline void mmap_write_downgrade(struct mm_struct *mm)
+ {
+ 	__mmap_lock_trace_acquire_returned(mm, false, true);
++	vma_write_unlock_mm(mm);
+ 	downgrade_write(&mm->mmap_lock);
+ }
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 36aa636d4..7e2efcd29 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -474,6 +474,7 @@ struct vm_area_struct *vm_area_dup(struct vm_area_struct *orig)
+ 		 */
+ 		*new = data_race(*orig);
+ 		INIT_LIST_HEAD(&new->anon_vma_chain);
++		vma_init_lock(new);
+ 		dup_anon_vma_name(orig, new);
+ 	}
+ 	return new;
+@@ -1133,6 +1134,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 	seqcount_init(&mm->write_protect_seq);
+ 	mmap_init_lock(mm);
+ 	INIT_LIST_HEAD(&mm->mmlist);
++#ifdef CONFIG_PER_VMA_LOCK
++	WRITE_ONCE(mm->mm_lock_seq, 0);
++#endif
+ 	mm_pgtables_bytes_init(mm);
+ 	mm->map_count = 0;
+ 	mm->locked_vm = 0;
+diff --git a/mm/init-mm.c b/mm/init-mm.c
+index c9327abb7..33269314e 100644
+--- a/mm/init-mm.c
++++ b/mm/init-mm.c
+@@ -37,6 +37,9 @@ struct mm_struct init_mm = {
+ 	.page_table_lock =  __SPIN_LOCK_UNLOCKED(init_mm.page_table_lock),
+ 	.arg_lock	=  __SPIN_LOCK_UNLOCKED(init_mm.arg_lock),
+ 	.mmlist		= LIST_HEAD_INIT(init_mm.mmlist),
++#ifdef CONFIG_PER_VMA_LOCK
++	.mm_lock_seq	= 0,
++#endif
+ 	.user_ns	= &init_user_ns,
+ 	.cpu_bitmap	= CPU_BITS_NONE,
+ #ifdef CONFIG_IOMMU_SVA
+-- 
+2.39.0.rc2.1.gbd5df96b79
+

@@ -1,0 +1,100 @@
+From 233e8ce51a8281126f75537d256dbc25d02f37a1 Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Thu, 12 May 2022 15:03:53 -0700
+Subject: [PATCH 29/42] mm: introduce lock_vma_under_rcu to be used from
+ arch-specific code
+
+Introduce lock_vma_under_rcu function to lookup and lock a VMA during
+page fault handling. When VMA is not found, can't be locked or changes
+after being locked, the function returns NULL. The lookup is performed
+under RCU protection to prevent the found VMA from being destroyed before
+the VMA lock is acquired. VMA lock statistics are updated according to
+the results.
+For now only anonymous VMAs can be searched this way. In other cases the
+function returns NULL.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ include/linux/mm.h |  3 +++
+ mm/memory.c        | 51 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 464d61569..93820279d 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -692,6 +692,9 @@ static inline void vma_assert_no_reader(struct vm_area_struct *vma)
+ 		      vma);
+ }
+ 
++struct vm_area_struct *lock_vma_under_rcu(struct mm_struct *mm,
++					  unsigned long address);
++
+ #else /* CONFIG_PER_VMA_LOCK */
+ 
+ static inline void vma_init_lock(struct vm_area_struct *vma) {}
+diff --git a/mm/memory.c b/mm/memory.c
+index eab501638..0782d2811 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5240,6 +5240,57 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ }
+ EXPORT_SYMBOL_GPL(handle_mm_fault);
+ 
++#ifdef CONFIG_PER_VMA_LOCK
++/*
++ * Lookup and lock a VMA under RCU protection. Returned VMA is guaranteed to be
++ * stable and not isolated. If the VMA is not found or is being modified the
++ * function returns NULL.
++ */
++struct vm_area_struct *lock_vma_under_rcu(struct mm_struct *mm,
++					  unsigned long address)
++{
++	MA_STATE(mas, &mm->mm_mt, address, address);
++	struct vm_area_struct *vma, *validate;
++
++	rcu_read_lock();
++	vma = mas_walk(&mas);
++retry:
++	if (!vma)
++		goto inval;
++
++	/* Only anonymous vmas are supported for now */
++	if (!vma_is_anonymous(vma))
++		goto inval;
++
++	if (!vma_read_trylock(vma))
++		goto inval;
++
++	/* Check since vm_start/vm_end might change before we lock the VMA */
++	if (unlikely(address < vma->vm_start || address >= vma->vm_end)) {
++		vma_read_unlock(vma);
++		goto inval;
++	}
++
++	/* Check if the VMA got isolated after we found it */
++	mas.index = address;
++	validate = mas_walk(&mas);
++	if (validate != vma) {
++		vma_read_unlock(vma);
++		count_vm_vma_lock_event(VMA_LOCK_MISS);
++		/* The area was replaced with another one. */
++		vma = validate;
++		goto retry;
++	}
++
++	rcu_read_unlock();
++	return vma;
++inval:
++	rcu_read_unlock();
++	count_vm_vma_lock_event(VMA_LOCK_ABORT);
++	return NULL;
++}
++#endif /* CONFIG_PER_VMA_LOCK */
++
+ #ifndef __PAGETABLE_P4D_FOLDED
+ /*
+  * Allocate p4d page table.
+-- 
+2.39.0.rc2.1.gbd5df96b79
+
