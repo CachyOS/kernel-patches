@@ -1,6 +1,6 @@
-From 9ac135a350312b1d8ac568396308d4252c5b2071 Mon Sep 17 00:00:00 2001
+From 8dcb4f89165c3ff7d08ee465587452e0efc70e27 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 31 Dec 2022 14:29:24 +0100
+Date: Wed, 4 Jan 2023 12:06:28 +0100
 Subject: [PATCH 06/20] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -27,21 +27,16 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/eventpoll.c                                |    2 +-
  include/linux/maple_tree.h                    |    6 -
  include/linux/pageblock-flags.h               |    2 +-
- kernel/futex/syscalls.c                       |   11 +-
- kernel/locking/rtmutex.c                      |   55 +-
- kernel/locking/rtmutex_api.c                  |    6 +-
  kernel/padata.c                               |    4 +-
  lib/maple_tree.c                              |   49 +-
  mm/hugetlb.c                                  |  333 ++---
  mm/memory-tiers.c                             |    2 +-
- mm/mremap.c                                   |    3 +-
  scripts/Makefile.vmlinux_o                    |    2 +-
  scripts/mod/modpost.c                         |    4 +-
  sound/pci/hda/cs35l41_hda.c                   |    2 +-
- sound/pci/hda/patch_hdmi.c                    |   27 +-
  tools/objtool/elf.c                           |   27 +-
  tools/objtool/include/objtool/elf.h           |    2 +
- 36 files changed, 1846 insertions(+), 303 deletions(-)
+ 31 files changed, 1769 insertions(+), 278 deletions(-)
  create mode 100644 Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
  create mode 100644 Documentation/leds/ledtrig-blkdev.rst
  create mode 100644 drivers/leds/trigger/ledtrig-blkdev.c
@@ -328,7 +323,7 @@ index 000000000000..9ff5b99de451
 +  A device can be associated with multiple LEDs, and an LED can be associated
 +  with multiple devices.
 diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
-index ed86c44c2575..2bc4afdaa646 100644
+index 6d4590271b6c..aeaf844b880c 100644
 --- a/block/bfq-iosched.c
 +++ b/block/bfq-iosched.c
 @@ -7180,6 +7180,7 @@ static void bfq_exit_queue(struct elevator_queue *e)
@@ -1984,10 +1979,10 @@ index 000000000000..8614e308fadc
 +MODULE_AUTHOR("Ian Pilcher <arequipeno@gmail.com>");
 +MODULE_LICENSE("GPL v2");
 diff --git a/fs/eventpoll.c b/fs/eventpoll.c
-index 52954d4637b5..081df056398a 100644
+index 64659b110973..8b5ca9f8f4bb 100644
 --- a/fs/eventpoll.c
 +++ b/fs/eventpoll.c
-@@ -1758,7 +1758,7 @@ static int ep_autoremove_wake_function(struct wait_queue_entry *wq_entry,
+@@ -1760,7 +1760,7 @@ static int ep_autoremove_wake_function(struct wait_queue_entry *wq_entry,
  {
  	int ret = default_wake_function(wq_entry, mode, sync, key);
  
@@ -2046,182 +2041,6 @@ index 5f1ae07d724b..97cda629c9e9 100644
 +#define pageblock_order		PAGE_ALLOC_COSTLY_ORDER
  
  #endif /* CONFIG_HUGETLB_PAGE */
- 
-diff --git a/kernel/futex/syscalls.c b/kernel/futex/syscalls.c
-index 086a22d1adb7..a8074079b09e 100644
---- a/kernel/futex/syscalls.c
-+++ b/kernel/futex/syscalls.c
-@@ -286,19 +286,22 @@ SYSCALL_DEFINE5(futex_waitv, struct futex_waitv __user *, waiters,
- 	}
- 
- 	futexv = kcalloc(nr_futexes, sizeof(*futexv), GFP_KERNEL);
--	if (!futexv)
--		return -ENOMEM;
-+	if (!futexv) {
-+		ret = -ENOMEM;
-+		goto destroy_timer;
-+	}
- 
- 	ret = futex_parse_waitv(futexv, waiters, nr_futexes);
- 	if (!ret)
- 		ret = futex_wait_multiple(futexv, nr_futexes, timeout ? &to : NULL);
- 
-+	kfree(futexv);
-+
-+destroy_timer:
- 	if (timeout) {
- 		hrtimer_cancel(&to.timer);
- 		destroy_hrtimer_on_stack(&to.timer);
- 	}
--
--	kfree(futexv);
- 	return ret;
- }
- 
-diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
-index 7779ee8abc2a..010cf4e6d0b8 100644
---- a/kernel/locking/rtmutex.c
-+++ b/kernel/locking/rtmutex.c
-@@ -89,15 +89,31 @@ static inline int __ww_mutex_check_kill(struct rt_mutex *lock,
-  * set this bit before looking at the lock.
-  */
- 
--static __always_inline void
--rt_mutex_set_owner(struct rt_mutex_base *lock, struct task_struct *owner)
-+static __always_inline struct task_struct *
-+rt_mutex_owner_encode(struct rt_mutex_base *lock, struct task_struct *owner)
- {
- 	unsigned long val = (unsigned long)owner;
- 
- 	if (rt_mutex_has_waiters(lock))
- 		val |= RT_MUTEX_HAS_WAITERS;
- 
--	WRITE_ONCE(lock->owner, (struct task_struct *)val);
-+	return (struct task_struct *)val;
-+}
-+
-+static __always_inline void
-+rt_mutex_set_owner(struct rt_mutex_base *lock, struct task_struct *owner)
-+{
-+	/*
-+	 * lock->wait_lock is held but explicit acquire semantics are needed
-+	 * for a new lock owner so WRITE_ONCE is insufficient.
-+	 */
-+	xchg_acquire(&lock->owner, rt_mutex_owner_encode(lock, owner));
-+}
-+
-+static __always_inline void rt_mutex_clear_owner(struct rt_mutex_base *lock)
-+{
-+	/* lock->wait_lock is held so the unlock provides release semantics. */
-+	WRITE_ONCE(lock->owner, rt_mutex_owner_encode(lock, NULL));
- }
- 
- static __always_inline void clear_rt_mutex_waiters(struct rt_mutex_base *lock)
-@@ -106,7 +122,8 @@ static __always_inline void clear_rt_mutex_waiters(struct rt_mutex_base *lock)
- 			((unsigned long)lock->owner & ~RT_MUTEX_HAS_WAITERS);
- }
- 
--static __always_inline void fixup_rt_mutex_waiters(struct rt_mutex_base *lock)
-+static __always_inline void
-+fixup_rt_mutex_waiters(struct rt_mutex_base *lock, bool acquire_lock)
- {
- 	unsigned long owner, *p = (unsigned long *) &lock->owner;
- 
-@@ -172,8 +189,21 @@ static __always_inline void fixup_rt_mutex_waiters(struct rt_mutex_base *lock)
- 	 * still set.
- 	 */
- 	owner = READ_ONCE(*p);
--	if (owner & RT_MUTEX_HAS_WAITERS)
--		WRITE_ONCE(*p, owner & ~RT_MUTEX_HAS_WAITERS);
-+	if (owner & RT_MUTEX_HAS_WAITERS) {
-+		/*
-+		 * See rt_mutex_set_owner() and rt_mutex_clear_owner() on
-+		 * why xchg_acquire() is used for updating owner for
-+		 * locking and WRITE_ONCE() for unlocking.
-+		 *
-+		 * WRITE_ONCE() would work for the acquire case too, but
-+		 * in case that the lock acquisition failed it might
-+		 * force other lockers into the slow path unnecessarily.
-+		 */
-+		if (acquire_lock)
-+			xchg_acquire(p, owner & ~RT_MUTEX_HAS_WAITERS);
-+		else
-+			WRITE_ONCE(*p, owner & ~RT_MUTEX_HAS_WAITERS);
-+	}
- }
- 
- /*
-@@ -208,6 +238,13 @@ static __always_inline void mark_rt_mutex_waiters(struct rt_mutex_base *lock)
- 		owner = *p;
- 	} while (cmpxchg_relaxed(p, owner,
- 				 owner | RT_MUTEX_HAS_WAITERS) != owner);
-+
-+	/*
-+	 * The cmpxchg loop above is relaxed to avoid back-to-back ACQUIRE
-+	 * operations in the event of contention. Ensure the successful
-+	 * cmpxchg is visible.
-+	 */
-+	smp_mb__after_atomic();
- }
- 
- /*
-@@ -1243,7 +1280,7 @@ static int __sched __rt_mutex_slowtrylock(struct rt_mutex_base *lock)
- 	 * try_to_take_rt_mutex() sets the lock waiters bit
- 	 * unconditionally. Clean this up.
- 	 */
--	fixup_rt_mutex_waiters(lock);
-+	fixup_rt_mutex_waiters(lock, true);
- 
- 	return ret;
- }
-@@ -1604,7 +1641,7 @@ static int __sched __rt_mutex_slowlock(struct rt_mutex_base *lock,
- 	 * try_to_take_rt_mutex() sets the waiter bit
- 	 * unconditionally. We might have to fix that up.
- 	 */
--	fixup_rt_mutex_waiters(lock);
-+	fixup_rt_mutex_waiters(lock, true);
- 
- 	trace_contention_end(lock, ret);
- 
-@@ -1719,7 +1756,7 @@ static void __sched rtlock_slowlock_locked(struct rt_mutex_base *lock)
- 	 * try_to_take_rt_mutex() sets the waiter bit unconditionally.
- 	 * We might have to fix that up:
- 	 */
--	fixup_rt_mutex_waiters(lock);
-+	fixup_rt_mutex_waiters(lock, true);
- 	debug_rt_mutex_free_waiter(&waiter);
- 
- 	trace_contention_end(lock, 0);
-diff --git a/kernel/locking/rtmutex_api.c b/kernel/locking/rtmutex_api.c
-index 900220941caa..cb9fdff76a8a 100644
---- a/kernel/locking/rtmutex_api.c
-+++ b/kernel/locking/rtmutex_api.c
-@@ -267,7 +267,7 @@ void __sched rt_mutex_init_proxy_locked(struct rt_mutex_base *lock,
- void __sched rt_mutex_proxy_unlock(struct rt_mutex_base *lock)
- {
- 	debug_rt_mutex_proxy_unlock(lock);
--	rt_mutex_set_owner(lock, NULL);
-+	rt_mutex_clear_owner(lock);
- }
- 
- /**
-@@ -382,7 +382,7 @@ int __sched rt_mutex_wait_proxy_lock(struct rt_mutex_base *lock,
- 	 * try_to_take_rt_mutex() sets the waiter bit unconditionally. We might
- 	 * have to fix that up.
- 	 */
--	fixup_rt_mutex_waiters(lock);
-+	fixup_rt_mutex_waiters(lock, true);
- 	raw_spin_unlock_irq(&lock->wait_lock);
- 
- 	return ret;
-@@ -438,7 +438,7 @@ bool __sched rt_mutex_cleanup_proxy_lock(struct rt_mutex_base *lock,
- 	 * try_to_take_rt_mutex() sets the waiter bit unconditionally. We might
- 	 * have to fix that up.
- 	 */
--	fixup_rt_mutex_waiters(lock);
-+	fixup_rt_mutex_waiters(lock, false);
- 
- 	raw_spin_unlock_irq(&lock->wait_lock);
  
 diff --git a/kernel/padata.c b/kernel/padata.c
 index de90af5fcbe6..6bfae19c8a08 100644
@@ -2796,20 +2615,6 @@ index fa8c9d07f9ce..ac0dae9e54bf 100644
  		panic("%s() failed to allocate default DRAM tier\n", __func__);
  
  	/*
-diff --git a/mm/mremap.c b/mm/mremap.c
-index e465ffe279bb..fe587c5d6591 100644
---- a/mm/mremap.c
-+++ b/mm/mremap.c
-@@ -1016,7 +1016,8 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
- 			long pages = (new_len - old_len) >> PAGE_SHIFT;
- 			unsigned long extension_start = addr + old_len;
- 			unsigned long extension_end = addr + new_len;
--			pgoff_t extension_pgoff = vma->vm_pgoff + (old_len >> PAGE_SHIFT);
-+			pgoff_t extension_pgoff = vma->vm_pgoff +
-+				((extension_start - vma->vm_start) >> PAGE_SHIFT);
- 
- 			if (vma->vm_flags & VM_ACCOUNT) {
- 				if (security_vm_enough_memory_mm(mm, pages)) {
 diff --git a/scripts/Makefile.vmlinux_o b/scripts/Makefile.vmlinux_o
 index 0edfdb40364b..ae52d3b3f063 100644
 --- a/scripts/Makefile.vmlinux_o
@@ -2853,73 +2658,6 @@ index e5f0549bf06d..3917f398334d 100644
  		hw_cfg->bst_type = CS35L41_EXT_BOOST;
  		hw_cfg->gpio1.func = CS35l41_VSPK_SWITCH;
  		hw_cfg->gpio1.valid = true;
-diff --git a/sound/pci/hda/patch_hdmi.c b/sound/pci/hda/patch_hdmi.c
-index 8015e4471267..386dd9d9143f 100644
---- a/sound/pci/hda/patch_hdmi.c
-+++ b/sound/pci/hda/patch_hdmi.c
-@@ -167,6 +167,7 @@ struct hdmi_spec {
- 	struct hdmi_ops ops;
- 
- 	bool dyn_pin_out;
-+	bool static_pcm_mapping;
- 	/* hdmi interrupt trigger control flag for Nvidia codec */
- 	bool hdmi_intr_trig_ctrl;
- 	bool nv_dp_workaround; /* workaround DP audio infoframe for Nvidia */
-@@ -1525,13 +1526,16 @@ static void update_eld(struct hda_codec *codec,
- 	 */
- 	pcm_jack = pin_idx_to_pcm_jack(codec, per_pin);
- 
--	if (eld->eld_valid) {
--		hdmi_attach_hda_pcm(spec, per_pin);
--		hdmi_pcm_setup_pin(spec, per_pin);
--	} else {
--		hdmi_pcm_reset_pin(spec, per_pin);
--		hdmi_detach_hda_pcm(spec, per_pin);
-+	if (!spec->static_pcm_mapping) {
-+		if (eld->eld_valid) {
-+			hdmi_attach_hda_pcm(spec, per_pin);
-+			hdmi_pcm_setup_pin(spec, per_pin);
-+		} else {
-+			hdmi_pcm_reset_pin(spec, per_pin);
-+			hdmi_detach_hda_pcm(spec, per_pin);
-+		}
- 	}
-+
- 	/* if pcm_idx == -1, it means this is in monitor connection event
- 	 * we can get the correct pcm_idx now.
- 	 */
-@@ -2281,8 +2285,8 @@ static int generic_hdmi_build_pcms(struct hda_codec *codec)
- 	struct hdmi_spec *spec = codec->spec;
- 	int idx, pcm_num;
- 
--	/* limit the PCM devices to the codec converters */
--	pcm_num = spec->num_cvts;
-+	/* limit the PCM devices to the codec converters or available PINs */
-+	pcm_num = min(spec->num_cvts, spec->num_pins);
- 	codec_dbg(codec, "hdmi: pcm_num set to %d\n", pcm_num);
- 
- 	for (idx = 0; idx < pcm_num; idx++) {
-@@ -2379,6 +2383,11 @@ static int generic_hdmi_build_controls(struct hda_codec *codec)
- 		struct hdmi_spec_per_pin *per_pin = get_pin(spec, pin_idx);
- 		struct hdmi_eld *pin_eld = &per_pin->sink_eld;
- 
-+		if (spec->static_pcm_mapping) {
-+			hdmi_attach_hda_pcm(spec, per_pin);
-+			hdmi_pcm_setup_pin(spec, per_pin);
-+		}
-+
- 		pin_eld->eld_valid = false;
- 		hdmi_present_sense(per_pin, 0);
- 	}
-@@ -4419,6 +4428,8 @@ static int patch_atihdmi(struct hda_codec *codec)
- 
- 	spec = codec->spec;
- 
-+	spec->static_pcm_mapping = true;
-+
- 	spec->ops.pin_get_eld = atihdmi_pin_get_eld;
- 	spec->ops.pin_setup_infoframe = atihdmi_pin_setup_infoframe;
- 	spec->ops.pin_hbr_setup = atihdmi_pin_hbr_setup;
 diff --git a/tools/objtool/elf.c b/tools/objtool/elf.c
 index 7e24b09b1163..ae64935581ff 100644
 --- a/tools/objtool/elf.c
