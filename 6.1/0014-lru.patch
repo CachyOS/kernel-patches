@@ -1,19 +1,25 @@
-From 90e690326c04a27f6529ed7f223dc0e071051b97 Mon Sep 17 00:00:00 2001
+From fc466f188968991db9a45b860b57c5fe9f9e8244 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Fri, 16 Dec 2022 14:25:10 +0100
+Date: Sat, 7 Jan 2023 11:50:45 +0100
 Subject: [PATCH 14/20] lru
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  Documentation/mm/multigen_lru.rst |   8 +-
+ include/linux/fs.h                |   2 +
  include/linux/memcontrol.h        |  10 +
- include/linux/mm_inline.h         |  25 +-
+ include/linux/mm_inline.h         |  36 +-
  include/linux/mmzone.h            | 127 ++++-
+ lib/maple_tree.c                  |  80 ++--
+ mm/fadvise.c                      |   5 +-
  mm/memcontrol.c                   |  16 +
+ mm/memory.c                       |   7 +-
  mm/page_alloc.c                   |   1 +
- mm/vmscan.c                       | 742 ++++++++++++++++++++----------
+ mm/rmap.c                         |  42 +-
+ mm/vmscan.c                       | 747 ++++++++++++++++++++----------
  mm/workingset.c                   |   4 +-
- 8 files changed, 671 insertions(+), 262 deletions(-)
+ tools/testing/radix-tree/maple.c  |  18 +-
+ 14 files changed, 765 insertions(+), 338 deletions(-)
 
 diff --git a/Documentation/mm/multigen_lru.rst b/Documentation/mm/multigen_lru.rst
 index d7062c6a8946..d8f721f98868 100644
@@ -47,6 +53,19 @@ index d7062c6a8946..d8f721f98868 100644
  ``min_seq%MAX_NR_GENS`` becomes empty. To select a type and a tier to
  evict from, it first compares ``min_seq[]`` to select the older type.
  If both types are equally old, it selects the one whose first tier has
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 6b115bce14b9..9ef204d48f66 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -166,6 +166,8 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ /* File supports DIRECT IO */
+ #define	FMODE_CAN_ODIRECT	((__force fmode_t)0x400000)
+ 
++#define	FMODE_NOREUSE		((__force fmode_t)0x800000)
++
+ /* File was opened by fanotify and shouldn't generate fanotify events */
+ #define FMODE_NONOTIFY		((__force fmode_t)0x4000000)
+ 
 diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
 index e1644a24009c..f9a44d32e763 100644
 --- a/include/linux/memcontrol.h
@@ -76,7 +95,7 @@ index e1644a24009c..f9a44d32e763 100644
  {
  }
 diff --git a/include/linux/mm_inline.h b/include/linux/mm_inline.h
-index 8c7e1b60d9ce..9a8e2049333c 100644
+index e8ed225d8f7c..9a8e2049333c 100644
 --- a/include/linux/mm_inline.h
 +++ b/include/linux/mm_inline.h
 @@ -122,6 +122,18 @@ static inline bool lru_gen_in_fault(void)
@@ -140,6 +159,22 @@ index 8c7e1b60d9ce..9a8e2049333c 100644
  static inline bool lru_gen_add_folio(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
  {
  	return false;
+@@ -578,4 +595,15 @@ pte_install_uffd_wp_if_needed(struct vm_area_struct *vma, unsigned long addr,
+ #endif
+ }
+ 
++static inline bool vma_has_recency(struct vm_area_struct *vma)
++{
++	if (vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ))
++		return false;
++
++	if (vma->vm_file && (vma->vm_file->f_mode & FMODE_NOREUSE))
++		return false;
++
++	return true;
++}
++
+ #endif
 diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
 index 5f74891556f3..87b3b5a2aac4 100644
 --- a/include/linux/mmzone.h
@@ -367,6 +402,229 @@ index 5f74891556f3..87b3b5a2aac4 100644
  #endif
  
  	CACHELINE_PADDING(_pad2_);
+diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+index 24db7998a274..3e0c2d860f2c 100644
+--- a/lib/maple_tree.c
++++ b/lib/maple_tree.c
+@@ -149,13 +149,12 @@ struct maple_subtree_state {
+ /* Functions */
+ static inline struct maple_node *mt_alloc_one(gfp_t gfp)
+ {
+-	return kmem_cache_alloc(maple_node_cache, gfp | __GFP_ZERO);
++	return kmem_cache_alloc(maple_node_cache, gfp);
+ }
+ 
+ static inline int mt_alloc_bulk(gfp_t gfp, size_t size, void **nodes)
+ {
+-	return kmem_cache_alloc_bulk(maple_node_cache, gfp | __GFP_ZERO, size,
+-				     nodes);
++	return kmem_cache_alloc_bulk(maple_node_cache, gfp, size, nodes);
+ }
+ 
+ static inline void mt_free_bulk(size_t size, void __rcu **nodes)
+@@ -1126,9 +1125,10 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
+ {
+ 	struct maple_alloc *ret, *node = mas->alloc;
+ 	unsigned long total = mas_allocated(mas);
++	unsigned int req = mas_alloc_req(mas);
+ 
+ 	/* nothing or a request pending. */
+-	if (unlikely(!total))
++	if (WARN_ON(!total))
+ 		return NULL;
+ 
+ 	if (total == 1) {
+@@ -1138,27 +1138,25 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
+ 		goto single_node;
+ 	}
+ 
+-	if (!node->node_count) {
++	if (node->node_count == 1) {
+ 		/* Single allocation in this node. */
+ 		mas->alloc = node->slot[0];
+-		node->slot[0] = NULL;
+ 		mas->alloc->total = node->total - 1;
+ 		ret = node;
+ 		goto new_head;
+ 	}
+-
+ 	node->total--;
+-	ret = node->slot[node->node_count];
+-	node->slot[node->node_count--] = NULL;
++	ret = node->slot[--node->node_count];
++	node->slot[node->node_count] = NULL;
+ 
+ single_node:
+ new_head:
+-	ret->total = 0;
+-	ret->node_count = 0;
+-	if (ret->request_count) {
+-		mas_set_alloc_req(mas, ret->request_count + 1);
+-		ret->request_count = 0;
++	if (req) {
++		req++;
++		mas_set_alloc_req(mas, req);
+ 	}
++
++	memset(ret, 0, sizeof(*ret));
+ 	return (struct maple_node *)ret;
+ }
+ 
+@@ -1177,21 +1175,20 @@ static inline void mas_push_node(struct ma_state *mas, struct maple_node *used)
+ 	unsigned long count;
+ 	unsigned int requested = mas_alloc_req(mas);
+ 
+-	memset(reuse, 0, sizeof(*reuse));
+ 	count = mas_allocated(mas);
+ 
+-	if (count && (head->node_count < MAPLE_ALLOC_SLOTS - 1)) {
+-		if (head->slot[0])
+-			head->node_count++;
+-		head->slot[head->node_count] = reuse;
++	reuse->request_count = 0;
++	reuse->node_count = 0;
++	if (count && (head->node_count < MAPLE_ALLOC_SLOTS)) {
++		head->slot[head->node_count++] = reuse;
+ 		head->total++;
+ 		goto done;
+ 	}
+ 
+ 	reuse->total = 1;
+ 	if ((head) && !((unsigned long)head & 0x1)) {
+-		head->request_count = 0;
+ 		reuse->slot[0] = head;
++		reuse->node_count = 1;
+ 		reuse->total += head->total;
+ 	}
+ 
+@@ -1210,7 +1207,6 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ {
+ 	struct maple_alloc *node;
+ 	unsigned long allocated = mas_allocated(mas);
+-	unsigned long success = allocated;
+ 	unsigned int requested = mas_alloc_req(mas);
+ 	unsigned int count;
+ 	void **slots = NULL;
+@@ -1226,24 +1222,29 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ 		WARN_ON(!allocated);
+ 	}
+ 
+-	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS - 1) {
++	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS) {
+ 		node = (struct maple_alloc *)mt_alloc_one(gfp);
+ 		if (!node)
+ 			goto nomem_one;
+ 
+-		if (allocated)
++		if (allocated) {
+ 			node->slot[0] = mas->alloc;
++			node->node_count = 1;
++		} else {
++			node->node_count = 0;
++		}
+ 
+-		success++;
+ 		mas->alloc = node;
++		node->total = ++allocated;
+ 		requested--;
+ 	}
+ 
+ 	node = mas->alloc;
++	node->request_count = 0;
+ 	while (requested) {
+ 		max_req = MAPLE_ALLOC_SLOTS;
+-		if (node->slot[0]) {
+-			unsigned int offset = node->node_count + 1;
++		if (node->node_count) {
++			unsigned int offset = node->node_count;
+ 
+ 			slots = (void **)&node->slot[offset];
+ 			max_req -= offset;
+@@ -1257,15 +1258,13 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ 			goto nomem_bulk;
+ 
+ 		node->node_count += count;
+-		/* zero indexed. */
+-		if (slots == (void **)&node->slot)
+-			node->node_count--;
+-
+-		success += count;
++		allocated += count;
+ 		node = node->slot[0];
++		node->node_count = 0;
++		node->request_count = 0;
+ 		requested -= count;
+ 	}
+-	mas->alloc->total = success;
++	mas->alloc->total = allocated;
+ 	return;
+ 
+ nomem_bulk:
+@@ -1274,7 +1273,7 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ nomem_one:
+ 	mas_set_alloc_req(mas, requested);
+ 	if (mas->alloc && !(((unsigned long)mas->alloc & 0x1)))
+-		mas->alloc->total = success;
++		mas->alloc->total = allocated;
+ 	mas_set_err(mas, -ENOMEM);
+ }
+ 
+@@ -5735,6 +5734,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
+ void mas_destroy(struct ma_state *mas)
+ {
+ 	struct maple_alloc *node;
++	unsigned long total;
+ 
+ 	/*
+ 	 * When using mas_for_each() to insert an expected number of elements,
+@@ -5757,14 +5757,20 @@ void mas_destroy(struct ma_state *mas)
+ 	}
+ 	mas->mas_flags &= ~(MA_STATE_BULK|MA_STATE_PREALLOC);
+ 
+-	while (mas->alloc && !((unsigned long)mas->alloc & 0x1)) {
++	total = mas_allocated(mas);
++	while (total) {
+ 		node = mas->alloc;
+ 		mas->alloc = node->slot[0];
+-		if (node->node_count > 0)
+-			mt_free_bulk(node->node_count,
+-				     (void __rcu **)&node->slot[1]);
++		if (node->node_count > 1) {
++			size_t count = node->node_count - 1;
++
++			mt_free_bulk(count, (void __rcu **)&node->slot[1]);
++			total -= count;
++		}
+ 		kmem_cache_free(maple_node_cache, node);
++		total--;
+ 	}
++
+ 	mas->alloc = NULL;
+ }
+ EXPORT_SYMBOL_GPL(mas_destroy);
+diff --git a/mm/fadvise.c b/mm/fadvise.c
+index c76ee665355a..2ba24d865bf5 100644
+--- a/mm/fadvise.c
++++ b/mm/fadvise.c
+@@ -80,7 +80,7 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
+ 	case POSIX_FADV_NORMAL:
+ 		file->f_ra.ra_pages = bdi->ra_pages;
+ 		spin_lock(&file->f_lock);
+-		file->f_mode &= ~FMODE_RANDOM;
++		file->f_mode &= ~(FMODE_RANDOM | FMODE_NOREUSE);
+ 		spin_unlock(&file->f_lock);
+ 		break;
+ 	case POSIX_FADV_RANDOM:
+@@ -107,6 +107,9 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
+ 		force_page_cache_readahead(mapping, file, start_index, nrpages);
+ 		break;
+ 	case POSIX_FADV_NOREUSE:
++		spin_lock(&file->f_lock);
++		file->f_mode |= FMODE_NOREUSE;
++		spin_unlock(&file->f_lock);
+ 		break;
+ 	case POSIX_FADV_DONTNEED:
+ 		__filemap_fdatawrite_range(mapping, offset, endbyte,
 diff --git a/mm/memcontrol.c b/mm/memcontrol.c
 index f39aa192474e..cf82e2c4312d 100644
 --- a/mm/memcontrol.c
@@ -422,6 +680,31 @@ index f39aa192474e..cf82e2c4312d 100644
  }
  
  static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
+diff --git a/mm/memory.c b/mm/memory.c
+index b35b3f616a4b..1aaf29d5267d 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1449,8 +1449,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 					force_flush = 1;
+ 					set_page_dirty(page);
+ 				}
+-				if (pte_young(ptent) &&
+-				    likely(!(vma->vm_flags & VM_SEQ_READ)))
++				if (pte_young(ptent) && likely(vma_has_recency(vma)))
+ 					mark_page_accessed(page);
+ 			}
+ 			rss[mm_counter(page)]--;
+@@ -5170,8 +5169,8 @@ static inline void mm_account_fault(struct pt_regs *regs,
+ #ifdef CONFIG_LRU_GEN
+ static void lru_gen_enter_fault(struct vm_area_struct *vma)
+ {
+-	/* the LRU algorithm doesn't apply to sequential or random reads */
+-	current->in_lru_fault = !(vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ));
++	/* the LRU algorithm only applies to accesses with recency */
++	current->in_lru_fault = vma_has_recency(vma);
+ }
+ 
+ static void lru_gen_exit_fault(void)
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
 index cec612c4e74c..91ca0b8ad411 100644
 --- a/mm/page_alloc.c
@@ -434,8 +717,87 @@ index cec612c4e74c..91ca0b8ad411 100644
  }
  
  static void __init free_area_init_memoryless_node(int nid)
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 2ec925e5fa6a..33dc890e2f04 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -823,25 +823,14 @@ static bool folio_referenced_one(struct folio *folio,
+ 		}
+ 
+ 		if (pvmw.pte) {
+-			if (lru_gen_enabled() && pte_young(*pvmw.pte) &&
+-			    !(vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ))) {
++			if (lru_gen_enabled() && pte_young(*pvmw.pte)) {
+ 				lru_gen_look_around(&pvmw);
+ 				referenced++;
+ 			}
+ 
+ 			if (ptep_clear_flush_young_notify(vma, address,
+-						pvmw.pte)) {
+-				/*
+-				 * Don't treat a reference through
+-				 * a sequentially read mapping as such.
+-				 * If the folio has been used in another mapping,
+-				 * we will catch it; if this other mapping is
+-				 * already gone, the unmap path will have set
+-				 * the referenced flag or activated the folio.
+-				 */
+-				if (likely(!(vma->vm_flags & VM_SEQ_READ)))
+-					referenced++;
+-			}
++						pvmw.pte))
++				referenced++;
+ 		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
+ 			if (pmdp_clear_flush_young_notify(vma, address,
+ 						pvmw.pmd))
+@@ -875,7 +864,20 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
+ 	struct folio_referenced_arg *pra = arg;
+ 	struct mem_cgroup *memcg = pra->memcg;
+ 
+-	if (!mm_match_cgroup(vma->vm_mm, memcg))
++	/*
++	 * Ignore references from this mapping if it has no recency. If the
++	 * folio has been used in another mapping, we will catch it; if this
++	 * other mapping is already gone, the unmap path will have set the
++	 * referenced flag or activated the folio in zap_pte_range().
++	 */
++	if (!vma_has_recency(vma))
++		return true;
++
++	/*
++	 * If we are reclaiming on behalf of a cgroup, skip counting on behalf
++	 * of references from different cgroups.
++	 */
++	if (memcg && !mm_match_cgroup(vma->vm_mm, memcg))
+ 		return true;
+ 
+ 	return false;
+@@ -906,6 +908,7 @@ int folio_referenced(struct folio *folio, int is_locked,
+ 		.arg = (void *)&pra,
+ 		.anon_lock = folio_lock_anon_vma_read,
+ 		.try_lock = true,
++		.invalid_vma = invalid_folio_referenced_vma,
+ 	};
+ 
+ 	*vm_flags = 0;
+@@ -921,15 +924,6 @@ int folio_referenced(struct folio *folio, int is_locked,
+ 			return 1;
+ 	}
+ 
+-	/*
+-	 * If we are reclaiming on behalf of a cgroup, skip
+-	 * counting on behalf of references from different
+-	 * cgroups
+-	 */
+-	if (memcg) {
+-		rwc.invalid_vma = invalid_folio_referenced_vma;
+-	}
+-
+ 	rmap_walk(folio, &rwc);
+ 	*vm_flags = pra.vm_flags;
+ 
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 9c1fed19d103..2948f4cd4338 100644
+index 77c2bb3bccf8..2948f4cd4338 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -54,6 +54,7 @@
@@ -586,7 +948,19 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  	walk->batched = 0;
  
-@@ -4204,7 +4209,7 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
+@@ -3753,7 +3758,10 @@ static int should_skip_vma(unsigned long start, unsigned long end, struct mm_wal
+ 	if (is_vm_hugetlb_page(vma))
+ 		return true;
+ 
+-	if (vma->vm_flags & (VM_LOCKED | VM_SPECIAL | VM_SEQ_READ | VM_RAND_READ))
++	if (!vma_has_recency(vma))
++		return true;
++
++	if (vma->vm_flags & (VM_LOCKED | VM_SPECIAL))
+ 		return true;
+ 
+ 	if (vma == get_gate_vma(vma->vm_mm))
+@@ -4201,7 +4209,7 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
  	} while (err == -EAGAIN);
  }
  
@@ -595,7 +969,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  {
  	struct lru_gen_mm_walk *walk = current->reclaim_state->mm_walk;
  
-@@ -4212,7 +4217,7 @@ static struct lru_gen_mm_walk *set_mm_walk(struct pglist_data *pgdat)
+@@ -4209,7 +4217,7 @@ static struct lru_gen_mm_walk *set_mm_walk(struct pglist_data *pgdat)
  		VM_WARN_ON_ONCE(walk);
  
  		walk = &pgdat->mm_walk;
@@ -604,7 +978,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  		VM_WARN_ON_ONCE(current_is_kswapd());
  
  		walk = kzalloc(sizeof(*walk), __GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN);
-@@ -4240,7 +4245,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+@@ -4237,7 +4245,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
  {
  	int zone;
  	int remaining = MAX_LRU_BATCH;
@@ -613,7 +987,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
  
  	if (type == LRU_GEN_ANON && !can_swap)
-@@ -4248,7 +4253,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+@@ -4245,7 +4253,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
  
  	/* prevent cold/hot inversion if force_scan is true */
  	for (zone = 0; zone < MAX_NR_ZONES; zone++) {
@@ -622,7 +996,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  		while (!list_empty(head)) {
  			struct folio *folio = lru_to_folio(head);
-@@ -4259,7 +4264,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+@@ -4256,7 +4264,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
  			VM_WARN_ON_ONCE_FOLIO(folio_zonenum(folio) != zone, folio);
  
  			new_gen = folio_inc_gen(lruvec, folio, false);
@@ -631,7 +1005,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  			if (!--remaining)
  				return false;
-@@ -4276,7 +4281,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
+@@ -4273,7 +4281,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
  {
  	int gen, type, zone;
  	bool success = false;
@@ -640,7 +1014,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	DEFINE_MIN_SEQ(lruvec);
  
  	VM_WARN_ON_ONCE(!seq_is_valid(lruvec));
-@@ -4287,7 +4292,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
+@@ -4284,7 +4292,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
  			gen = lru_gen_from_seq(min_seq[type]);
  
  			for (zone = 0; zone < MAX_NR_ZONES; zone++) {
@@ -649,7 +1023,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  					goto next;
  			}
  
-@@ -4297,7 +4302,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
+@@ -4294,7 +4302,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
  		;
  	}
  
@@ -658,7 +1032,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	if (can_swap) {
  		min_seq[LRU_GEN_ANON] = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_FILE]);
  		min_seq[LRU_GEN_FILE] = max(min_seq[LRU_GEN_ANON], lrugen->min_seq[LRU_GEN_FILE]);
-@@ -4319,7 +4324,7 @@ static void inc_max_seq(struct lruvec *lruvec, bool can_swap, bool force_scan)
+@@ -4316,7 +4324,7 @@ static void inc_max_seq(struct lruvec *lruvec, bool can_swap, bool force_scan)
  {
  	int prev, next;
  	int type, zone;
@@ -667,7 +1041,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  	spin_lock_irq(&lruvec->lru_lock);
  
-@@ -4377,7 +4382,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+@@ -4374,7 +4382,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
  	bool success;
  	struct lru_gen_mm_walk *walk;
  	struct mm_struct *mm = NULL;
@@ -676,7 +1050,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  	VM_WARN_ON_ONCE(max_seq > READ_ONCE(lrugen->max_seq));
  
-@@ -4393,12 +4398,12 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+@@ -4390,12 +4398,12 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
  	 * handful of PTEs. Spreading the work out over a period of time usually
  	 * is less efficient, but it avoids bursty page faults.
  	 */
@@ -691,7 +1065,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	if (!walk) {
  		success = iterate_mm_list_nowalk(lruvec, max_seq);
  		goto done;
-@@ -4421,8 +4426,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+@@ -4418,8 +4426,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
  		if (sc->priority <= DEF_PRIORITY - 2)
  			wait_event_killable(lruvec->mm_state.wait,
  					    max_seq < READ_ONCE(lrugen->max_seq));
@@ -701,7 +1075,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	}
  
  	VM_WARN_ON_ONCE(max_seq != READ_ONCE(lrugen->max_seq));
-@@ -4435,97 +4439,52 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+@@ -4432,97 +4439,52 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
  	return true;
  }
  
@@ -784,12 +1158,12 @@ index 9c1fed19d103..2948f4cd4338 100644
  	DEFINE_MIN_SEQ(lruvec);
  
 -	VM_WARN_ON_ONCE(sc->memcg_low_reclaim);
--
--	mem_cgroup_calculate_protection(NULL, memcg);
 +	/* see the comment on lru_gen_folio */
 +	gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);
 +	birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
  
+-	mem_cgroup_calculate_protection(NULL, memcg);
+-
 -	if (mem_cgroup_below_min(memcg))
 +	if (time_is_after_jiffies(birth + min_ttl))
  		return false;
@@ -819,7 +1193,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  }
  
  /* to protect the working set of the last N jiffies */
-@@ -4538,46 +4497,30 @@ static unsigned long lru_gen_min_ttl __read_mostly;
+@@ -4535,46 +4497,30 @@ static unsigned long lru_gen_min_ttl __read_mostly;
  static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  {
  	struct mem_cgroup *memcg;
@@ -873,7 +1247,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	 */
  	if (mutex_trylock(&oom_lock)) {
  		struct oom_control oc = {
-@@ -4731,7 +4674,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
+@@ -4728,7 +4674,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
  	int delta = folio_nr_pages(folio);
  	int refs = folio_lru_refs(folio);
  	int tier = lru_tier_from_refs(refs);
@@ -882,7 +1256,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  	VM_WARN_ON_ONCE_FOLIO(gen >= MAX_NR_GENS, folio);
  
-@@ -4756,7 +4699,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
+@@ -4753,7 +4699,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
  
  	/* promoted */
  	if (gen != lru_gen_from_seq(lrugen->min_seq[type])) {
@@ -891,7 +1265,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  		return true;
  	}
  
-@@ -4765,7 +4708,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
+@@ -4762,7 +4708,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
  		int hist = lru_hist_from_seq(lrugen->min_seq[type]);
  
  		gen = folio_inc_gen(lruvec, folio, false);
@@ -900,7 +1274,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  		WRITE_ONCE(lrugen->protected[hist][type][tier - 1],
  			   lrugen->protected[hist][type][tier - 1] + delta);
-@@ -4777,7 +4720,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
+@@ -4774,7 +4720,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
  	if (folio_test_locked(folio) || folio_test_writeback(folio) ||
  	    (type == LRU_GEN_FILE && folio_test_dirty(folio))) {
  		gen = folio_inc_gen(lruvec, folio, true);
@@ -909,7 +1283,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  		return true;
  	}
  
-@@ -4788,12 +4731,8 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
+@@ -4785,12 +4731,8 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
  {
  	bool success;
  
@@ -923,7 +1297,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	    (folio_test_dirty(folio) ||
  	     (folio_test_anon(folio) && !folio_test_swapcache(folio))))
  		return false;
-@@ -4831,7 +4770,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+@@ -4828,7 +4770,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
  	int scanned = 0;
  	int isolated = 0;
  	int remaining = MAX_LRU_BATCH;
@@ -932,7 +1306,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
  
  	VM_WARN_ON_ONCE(!list_empty(list));
-@@ -4844,7 +4783,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+@@ -4841,7 +4783,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
  	for (zone = sc->reclaim_idx; zone >= 0; zone--) {
  		LIST_HEAD(moved);
  		int skipped = 0;
@@ -941,7 +1315,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  		while (!list_empty(head)) {
  			struct folio *folio = lru_to_folio(head);
-@@ -4890,9 +4829,8 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+@@ -4887,9 +4829,8 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
  	__count_vm_events(PGSCAN_ANON + type, isolated);
  
  	/*
@@ -953,7 +1327,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	 */
  	return isolated || !remaining ? scanned : 0;
  }
-@@ -4987,8 +4925,7 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
+@@ -4984,8 +4925,7 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
  	return scanned;
  }
  
@@ -963,7 +1337,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  {
  	int type;
  	int scanned;
-@@ -5077,161 +5014,399 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
+@@ -5074,161 +5014,399 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
  		goto retry;
  	}
  
@@ -1453,7 +1827,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  	if (lrugen->enabled) {
  		enum lru_list lru;
-@@ -5244,7 +5419,7 @@ static bool __maybe_unused state_is_valid(struct lruvec *lruvec)
+@@ -5241,7 +5419,7 @@ static bool __maybe_unused state_is_valid(struct lruvec *lruvec)
  		int gen, type, zone;
  
  		for_each_gen_type_zone(gen, type, zone) {
@@ -1462,7 +1836,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  				return false;
  		}
  	}
-@@ -5289,7 +5464,7 @@ static bool drain_evictable(struct lruvec *lruvec)
+@@ -5286,7 +5464,7 @@ static bool drain_evictable(struct lruvec *lruvec)
  	int remaining = MAX_LRU_BATCH;
  
  	for_each_gen_type_zone(gen, type, zone) {
@@ -1471,7 +1845,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  		while (!list_empty(head)) {
  			bool success;
-@@ -5338,9 +5513,6 @@ static void lru_gen_change_state(bool enabled)
+@@ -5335,9 +5513,6 @@ static void lru_gen_change_state(bool enabled)
  		for_each_node(nid) {
  			struct lruvec *lruvec = get_lruvec(memcg, nid);
  
@@ -1481,7 +1855,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  			spin_lock_irq(&lruvec->lru_lock);
  
  			VM_WARN_ON_ONCE(!seq_is_valid(lruvec));
-@@ -5513,7 +5685,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
+@@ -5510,7 +5685,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
  	int i;
  	int type, tier;
  	int hist = lru_hist_from_seq(seq);
@@ -1490,7 +1864,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  	for (tier = 0; tier < MAX_NR_TIERS; tier++) {
  		seq_printf(m, "            %10d", tier);
-@@ -5563,7 +5735,7 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
+@@ -5560,7 +5735,7 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
  	unsigned long seq;
  	bool full = !debugfs_real_fops(m->file)->write;
  	struct lruvec *lruvec = v;
@@ -1499,7 +1873,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  	int nid = lruvec_pgdat(lruvec)->node_id;
  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
  	DEFINE_MAX_SEQ(lruvec);
-@@ -5660,7 +5832,7 @@ static int run_eviction(struct lruvec *lruvec, unsigned long seq, struct scan_co
+@@ -5657,7 +5832,7 @@ static int run_eviction(struct lruvec *lruvec, unsigned long seq, struct scan_co
  		if (sc->nr_reclaimed >= nr_to_reclaim)
  			return 0;
  
@@ -1508,7 +1882,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  			return 0;
  
  		cond_resched();
-@@ -5681,11 +5853,11 @@ static int run_cmd(char cmd, int memcg_id, int nid, unsigned long seq,
+@@ -5678,11 +5853,11 @@ static int run_cmd(char cmd, int memcg_id, int nid, unsigned long seq,
  
  	if (!mem_cgroup_disabled()) {
  		rcu_read_lock();
@@ -1523,7 +1897,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  		rcu_read_unlock();
  
  		if (!memcg)
-@@ -5745,7 +5917,7 @@ static ssize_t lru_gen_seq_write(struct file *file, const char __user *src,
+@@ -5742,7 +5917,7 @@ static ssize_t lru_gen_seq_write(struct file *file, const char __user *src,
  	set_task_reclaim_state(current, &sc.reclaim_state);
  	flags = memalloc_noreclaim_save();
  	blk_start_plug(&plug);
@@ -1532,7 +1906,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  		err = -ENOMEM;
  		goto done;
  	}
-@@ -5817,7 +5989,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+@@ -5814,7 +5989,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
  {
  	int i;
  	int gen, type, zone;
@@ -1541,7 +1915,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  	lrugen->max_seq = MIN_NR_GENS + 1;
  	lrugen->enabled = lru_gen_enabled();
-@@ -5826,13 +5998,26 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+@@ -5823,13 +5998,26 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
  		lrugen->timestamps[i] = jiffies;
  
  	for_each_gen_type_zone(gen, type, zone)
@@ -1569,7 +1943,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  void lru_gen_init_memcg(struct mem_cgroup *memcg)
  {
  	INIT_LIST_HEAD(&memcg->mm_list.fifo);
-@@ -5856,7 +6041,69 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
+@@ -5853,7 +6041,69 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
  		}
  	}
  }
@@ -1640,7 +2014,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  
  static int __init init_lru_gen(void)
  {
-@@ -5883,6 +6130,10 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
+@@ -5880,6 +6130,10 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
  {
  }
  
@@ -1651,7 +2025,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  #endif /* CONFIG_LRU_GEN */
  
  static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
-@@ -5896,7 +6147,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5893,7 +6147,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  	bool proportional_reclaim;
  	struct blk_plug plug;
  
@@ -1660,7 +2034,7 @@ index 9c1fed19d103..2948f4cd4338 100644
  		lru_gen_shrink_lruvec(lruvec, sc);
  		return;
  	}
-@@ -6139,6 +6390,11 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -6136,6 +6390,11 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
  
@@ -1694,6 +2068,64 @@ index 25844171b72d..5b031c7d11e8 100644
  	struct mem_cgroup *memcg;
  	struct pglist_data *pgdat;
  	int type = folio_is_file_lru(folio);
+diff --git a/tools/testing/radix-tree/maple.c b/tools/testing/radix-tree/maple.c
+index 2e91973fbaa6..aceb6011315c 100644
+--- a/tools/testing/radix-tree/maple.c
++++ b/tools/testing/radix-tree/maple.c
+@@ -172,11 +172,11 @@ static noinline void check_new_node(struct maple_tree *mt)
+ 
+ 		if (!MAPLE_32BIT) {
+ 			if (i >= 35)
+-				e = i - 35;
++				e = i - 34;
+ 			else if (i >= 5)
+-				e = i - 5;
++				e = i - 4;
+ 			else if (i >= 2)
+-				e = i - 2;
++				e = i - 1;
+ 		} else {
+ 			if (i >= 4)
+ 				e = i - 4;
+@@ -304,17 +304,17 @@ static noinline void check_new_node(struct maple_tree *mt)
+ 	MT_BUG_ON(mt, mas.node != MA_ERROR(-ENOMEM));
+ 	MT_BUG_ON(mt, !mas_nomem(&mas, GFP_KERNEL));
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
+-	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
++	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS);
+ 
+ 	mn = mas_pop_node(&mas); /* get the next node. */
+ 	MT_BUG_ON(mt, mn == NULL);
+ 	MT_BUG_ON(mt, not_empty(mn));
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS);
+-	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 2);
++	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
+ 
+ 	mas_push_node(&mas, mn);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
+-	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
++	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS);
+ 
+ 	/* Check the limit of pop/push/pop */
+ 	mas_node_count(&mas, MAPLE_ALLOC_SLOTS + 2); /* Request */
+@@ -322,14 +322,14 @@ static noinline void check_new_node(struct maple_tree *mt)
+ 	MT_BUG_ON(mt, mas.node != MA_ERROR(-ENOMEM));
+ 	MT_BUG_ON(mt, !mas_nomem(&mas, GFP_KERNEL));
+ 	MT_BUG_ON(mt, mas_alloc_req(&mas));
+-	MT_BUG_ON(mt, mas.alloc->node_count);
++	MT_BUG_ON(mt, mas.alloc->node_count != 1);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 2);
+ 	mn = mas_pop_node(&mas);
+ 	MT_BUG_ON(mt, not_empty(mn));
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
+-	MT_BUG_ON(mt, mas.alloc->node_count  != MAPLE_ALLOC_SLOTS - 1);
++	MT_BUG_ON(mt, mas.alloc->node_count  != MAPLE_ALLOC_SLOTS);
+ 	mas_push_node(&mas, mn);
+-	MT_BUG_ON(mt, mas.alloc->node_count);
++	MT_BUG_ON(mt, mas.alloc->node_count != 1);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 2);
+ 	mn = mas_pop_node(&mas);
+ 	MT_BUG_ON(mt, not_empty(mn));
 -- 
 2.39.0
 
