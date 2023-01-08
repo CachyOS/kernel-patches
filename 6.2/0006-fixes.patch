@@ -1,12 +1,13 @@
-From 5cbae93717a71f3576c49745b78b34e4013acb39 Mon Sep 17 00:00:00 2001
+From 1b14261a958fc7aa282e2d2cf6af56a60539edb0 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 2 Jan 2023 13:40:59 +0100
+Date: Sun, 8 Jan 2023 19:23:39 +0100
 Subject: [PATCH 06/13] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  Documentation/ABI/stable/sysfs-block          |   10 +
  .../testing/sysfs-class-led-trigger-blkdev    |   78 ++
+ .../admin-guide/blockdev/zsmalloc.rst         |  157 +++
  Documentation/admin-guide/mm/ksm.rst          |    7 +
  Documentation/leds/index.rst                  |    1 +
  Documentation/leds/ledtrig-blkdev.rst         |  158 +++
@@ -16,15 +17,22 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/eventpoll.c                                |    2 +-
  fs/proc/base.c                                |    1 +
  include/linux/migrate.h                       |    1 +
- include/linux/mm_inline.h                     |    2 +-
+ include/linux/mm_inline.h                     |    3 +-
  include/linux/mm_types.h                      |    7 +-
  include/linux/pageblock-flags.h               |    2 +-
  kernel/padata.c                               |    4 +-
+ mm/Kconfig                                    |   19 +
+ mm/compaction.c                               |    1 -
+ mm/hugetlb.c                                  |   44 +-
  mm/ksm.c                                      |  183 ++-
  mm/migrate.c                                  |  694 +++++++---
  mm/rmap.c                                     |   20 +-
+ mm/z3fold.c                                   |    2 -
+ mm/zsmalloc.c                                 |   75 +-
  scripts/Makefile.vmlinux_o                    |    2 +-
  sound/pci/hda/cs35l41_hda.c                   |    2 +-
+ tools/objtool/Build                           |    2 -
+ tools/objtool/Makefile                        |   66 +-
  tools/objtool/builtin-check.c                 |    4 +-
  tools/objtool/check.c                         |    6 +-
  tools/objtool/elf.c                           |   56 +-
@@ -33,8 +41,9 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  tools/objtool/include/objtool/special.h       |    2 +-
  tools/objtool/special.c                       |    6 +-
  .../selftests/vm/ksm_functional_tests.c       |  103 +-
- 28 files changed, 2313 insertions(+), 283 deletions(-)
+ 36 files changed, 2596 insertions(+), 367 deletions(-)
  create mode 100644 Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
+ create mode 100644 Documentation/admin-guide/blockdev/zsmalloc.rst
  create mode 100644 Documentation/leds/ledtrig-blkdev.rst
  create mode 100644 drivers/leds/trigger/ledtrig-blkdev.c
 
@@ -143,6 +152,169 @@ index 000000000000..45275eb0bad3
 +		symbolic links in this directory are *kernel* names, which
 +		may not match the device special file paths written to
 +		link_device and unlink_device.)
+diff --git a/Documentation/admin-guide/blockdev/zsmalloc.rst b/Documentation/admin-guide/blockdev/zsmalloc.rst
+new file mode 100644
+index 000000000000..2e238afb1b4b
+--- /dev/null
++++ b/Documentation/admin-guide/blockdev/zsmalloc.rst
+@@ -0,0 +1,157 @@
++========================================
++zsmalloc allocator
++========================================
++
++Internals
++---------
++
++zsmalloc has 255 size classes. Size classes hold a number of zspages, each
++zspage can consist of up to ZSMALLOC_CHAIN_SIZE physical (0 order) pages.
++The exact (most optimal) zspage chain size is calculated for each size class
++during zsmalloc pool creation (see calculate_zspage_chain_size()).
++
++As a reasonable optimization, zsmalloc merges size classes that have
++similar characteristics: number of pages per zspage and number of
++objects zspage can store.
++
++For example, let's look at the following size classes:::
++
++class  size almost_full almost_empty obj_allocated   obj_used pages_used pages_per_zspage freeable
++..
++   94  1536           0            0             0          0          0                3        0
++  100  1632           0            0             0          0          0                2        0
++..
++
++Size classes #95-99 are merged with size class #100. That is, each time
++we store an object of size, say, 1568 bytes instead of using class #96
++we end up storing it in size class #100. Class #100 is for objects of
++1632 bytes in size, hence every 1568 bytes object wastes 1632-1568 bytes.
++Class #100 zspages consist of 2 physical pages and can hold 5 objects.
++When we need to store, say, 13 objects of size 1568 we end up allocating
++three zspages; in other words, 6 physical pages.
++
++However, if we'll look closer at size class #96 (which should hold objects
++of size 1568 bytes) and trace calculate_zspage_chain_size():::
++
++    pages per zspage      wasted bytes     used%
++           1                  960           76
++           2                  352           95
++           3                 1312           89
++           4                  704           95
++           5                   96           99
++
++We'd notice that the most optimal zspage configuration for this class is
++when it consists of 5 physical pages. A 5 page class #96 configuration
++would store 13 objects of size 1568 in a single zspage, allocating 5 physical
++pages, as opposed to 6 physical pages that class #100 would allocate otherwise.
++
++A larger zspage chain size for class #96 also changes its key characteristics:
++pages per-zspage and objects per-zspage. As a result we merge less classes. In
++other words classes are grouped in a more compact way, which decreases memory
++wastage.
++
++Let's take a closer look at the bottom of /sys/kernel/debug/zsmalloc/zramX/classes:::
++
++class  size almost_full almost_empty obj_allocated   obj_used pages_used pages_per_zspage freeable
++..
++  202  3264           0            0             0          0          0                4        0
++  254  4096           0            0             0          0          0                1        0
++..
++
++For exactly same reason - maximum 4 pages per zspage - the last non-huge
++size class is #202, which stores objects of size 3264 bytes. Any object
++larger than 3264 bytes, hence, is considered to be huge and lands in size
++class #254, which uses a whole physical page to store every object (objects
++in huge classes don't share physical pages).
++
++Another consequence of larger zspages chain sizes is that we move the huge
++size class watermark up and as a result have less huge classes and store
++large objects in a more compact way.
++
++For zspage chain size of 8, huge class watermark becomes 3632 bytes:::
++
++class  size almost_full almost_empty obj_allocated   obj_used pages_used pages_per_zspage freeable
++..
++  202  3264           0            0             0          0          0                4        0
++  211  3408           0            0             0          0          0                5        0
++  217  3504           0            0             0          0          0                6        0
++  222  3584           0            0             0          0          0                7        0
++  225  3632           0            0             0          0          0                8        0
++  254  4096           0            0             0          0          0                1        0
++..
++
++For zspage chain size of 16, huge class watermark becomes 3840 bytes:::
++
++class  size almost_full almost_empty obj_allocated   obj_used pages_used pages_per_zspage freeable
++..
++  202  3264           0            0             0          0          0                4        0
++  206  3328           0            0             0          0          0               13        0
++  207  3344           0            0             0          0          0                9        0
++  208  3360           0            0             0          0          0               14        0
++  211  3408           0            0             0          0          0                5        0
++  212  3424           0            0             0          0          0               16        0
++  214  3456           0            0             0          0          0               11        0
++  217  3504           0            0             0          0          0                6        0
++  219  3536           0            0             0          0          0               13        0
++  222  3584           0            0             0          0          0                7        0
++  223  3600           0            0             0          0          0               15        0
++  225  3632           0            0             0          0          0                8        0
++  228  3680           0            0             0          0          0                9        0
++  230  3712           0            0             0          0          0               10        0
++  232  3744           0            0             0          0          0               11        0
++  234  3776           0            0             0          0          0               12        0
++  235  3792           0            0             0          0          0               13        0
++  236  3808           0            0             0          0          0               14        0
++  238  3840           0            0             0          0          0               15        0
++  254  4096           0            0             0          0          0                1        0
++..
++
++Overall the combined zspage chain size effect on zsmalloc pool configuration:::
++
++pages per zspage   number of size classes (clusters)   huge size class watermark
++       4                        69                               3264
++       5                        86                               3408
++       6                        93                               3504
++       7                       112                               3584
++       8                       123                               3632
++       9                       140                               3680
++      10                       143                               3712
++      11                       159                               3744
++      12                       164                               3776
++      13                       180                               3792
++      14                       183                               3808
++      15                       188                               3840
++      16                       191                               3840
++
++A synthetic test:::
++
++CONFIG_ZSMALLOC_CHAIN_SIZE=4
++
++zsmalloc classes stats
++ class  size almost_full almost_empty obj_allocated   obj_used pages_used pages_per_zspage freeable
++ ..
++ Total                13           51        413836     412973     159955                         3
++
++zram mm_stat
++1691783168 628083717 655175680        0 655175680       60        0    34048    34049
++
++CONFIG_ZSMALLOC_CHAIN_SIZE=8
++
++zsmalloc classes stats
++ class  size almost_full almost_empty obj_allocated   obj_used pages_used pages_per_zspage freeable
++ ..
++ Total                18           87        414852     412978     156666                         0
++
++zram mm_stat
++1691803648 627793930 641703936        0 641703936       60        0    33591    33591
++
++Note that for the same amount of data zsmalloc uses less physical pages: down
++to 156666 from 159955, and maximum zsmalloc pool memory usage also went down
++from 655175680 to 641703936 bytes.
++
++The obvious downside of larger zspage chains is that some zspages require
++more physical pages, which can, in theory, increase system memory pressure
++in cases when zspool suffers from heavy internal fragmentation and zspool
++compaction cannot relocate objects and release some zspages. In such cases
++users are advised to lower zspage chain size limit (CONFIG_ZSMALLOC_CHAIN_SIZE
++option).
 diff --git a/Documentation/admin-guide/mm/ksm.rst b/Documentation/admin-guide/mm/ksm.rst
 index fb6ba2002a4b..f160f9487a90 100644
 --- a/Documentation/admin-guide/mm/ksm.rst
@@ -1628,18 +1800,19 @@ index 3ef77f52a4f0..7376074f2e1e 100644
  /**
   * struct movable_operations - Driver page migration
 diff --git a/include/linux/mm_inline.h b/include/linux/mm_inline.h
-index e8ed225d8f7c..d650ca2c5d29 100644
+index e8ed225d8f7c..ff3f3f23f649 100644
 --- a/include/linux/mm_inline.h
 +++ b/include/linux/mm_inline.h
-@@ -413,7 +413,7 @@ static inline void free_anon_vma_name(struct vm_area_struct *vma)
+@@ -413,8 +413,7 @@ static inline void free_anon_vma_name(struct vm_area_struct *vma)
  	 * Not using anon_vma_name because it generates a warning if mmap_lock
  	 * is not held, which might be the case here.
  	 */
 -	if (!vma->vm_file)
-+	if (!vma->vm_file || vma_is_anon_shmem(vma))
- 		anon_vma_name_put(vma->anon_name);
+-		anon_vma_name_put(vma->anon_name);
++	anon_vma_name_put(vma->anon_name);
  }
  
+ static inline bool anon_vma_name_eq(struct anon_vma_name *anon_name1,
 diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
 index 3b8475007734..9081cfe89d6f 100644
 --- a/include/linux/mm_types.h
@@ -1700,6 +1873,135 @@ index e007b8a4b738..7c80301ab084 100644
  {
  	struct padata_work *pw = container_of(w, struct padata_work, pw_work);
  	struct padata_mt_job_state *ps = pw->pw_data;
+diff --git a/mm/Kconfig b/mm/Kconfig
+index bf317c39ed2d..b3218be4b3c6 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -191,6 +191,25 @@ config ZSMALLOC_STAT
+ 	  information to userspace via debugfs.
+ 	  If unsure, say N.
+ 
++config ZSMALLOC_CHAIN_SIZE
++	int "Maximum number of physical pages per-zspage"
++	default 8
++	range 1 16
++	depends on ZSMALLOC
++	help
++	  Each zmalloc page (zspage) can consist of 1 or more physical
++	  (0 order) non contiguous pages. This option sets the upper
++	  (hard) limit on that number.
++
++	  The exact zspage chain size is calculated for each size class
++	  individually during pool initialisation. Changing this results
++	  in different size classes characteristics (pages per-zspage,
++	  objects per-zspage) which in turn results in different pool
++	  configurations: zsmalloc merges size classes that share key
++	  characteristics.
++
++	  Please read zsmalloc documentation for more details.
++
+ menu "SLAB allocator options"
+ 
+ choice
+diff --git a/mm/compaction.c b/mm/compaction.c
+index ccc81ec31a47..8e0b5b4aaec6 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -122,7 +122,6 @@ bool PageMovable(struct page *page)
+ 
+ 	return false;
+ }
+-EXPORT_SYMBOL(PageMovable);
+ 
+ void __SetPageMovable(struct page *page, const struct movable_operations *mops)
+ {
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index db895230ee7e..267b0512c822 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -94,6 +94,8 @@ static int hugetlb_acct_memory(struct hstate *h, long delta);
+ static void hugetlb_vma_lock_free(struct vm_area_struct *vma);
+ static void hugetlb_vma_lock_alloc(struct vm_area_struct *vma);
+ static void __hugetlb_vma_unlock_write_free(struct vm_area_struct *vma);
++static void hugetlb_unshare_pmds(struct vm_area_struct *vma,
++		unsigned long start, unsigned long end);
+ 
+ static inline bool subpool_is_free(struct hugepage_subpool *spool)
+ {
+@@ -4834,6 +4836,25 @@ static int hugetlb_vm_op_split(struct vm_area_struct *vma, unsigned long addr)
+ {
+ 	if (addr & ~(huge_page_mask(hstate_vma(vma))))
+ 		return -EINVAL;
++
++	/*
++	 * PMD sharing is only possible for PUD_SIZE-aligned address ranges
++	 * in HugeTLB VMAs. If we will lose PUD_SIZE alignment due to this
++	 * split, unshare PMDs in the PUD_SIZE interval surrounding addr now.
++	 */
++	if (addr & ~PUD_MASK) {
++		/*
++		 * hugetlb_vm_op_split is called right before we attempt to
++		 * split the VMA. We will need to unshare PMDs in the old and
++		 * new VMAs, so let's unshare before we split.
++		 */
++		unsigned long floor = addr & PUD_MASK;
++		unsigned long ceil = floor + PUD_SIZE;
++
++		if (floor >= vma->vm_start && ceil <= vma->vm_end)
++			hugetlb_unshare_pmds(vma, floor, ceil);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -7328,26 +7349,21 @@ void move_hugetlb_state(struct folio *old_folio, struct folio *new_folio, int re
+ 	}
+ }
+ 
+-/*
+- * This function will unconditionally remove all the shared pmd pgtable entries
+- * within the specific vma for a hugetlbfs memory range.
+- */
+-void hugetlb_unshare_all_pmds(struct vm_area_struct *vma)
++static void hugetlb_unshare_pmds(struct vm_area_struct *vma,
++				   unsigned long start,
++				   unsigned long end)
+ {
+ 	struct hstate *h = hstate_vma(vma);
+ 	unsigned long sz = huge_page_size(h);
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	struct mmu_notifier_range range;
+-	unsigned long address, start, end;
++	unsigned long address;
+ 	spinlock_t *ptl;
+ 	pte_t *ptep;
+ 
+ 	if (!(vma->vm_flags & VM_MAYSHARE))
+ 		return;
+ 
+-	start = ALIGN(vma->vm_start, PUD_SIZE);
+-	end = ALIGN_DOWN(vma->vm_end, PUD_SIZE);
+-
+ 	if (start >= end)
+ 		return;
+ 
+@@ -7379,6 +7395,16 @@ void hugetlb_unshare_all_pmds(struct vm_area_struct *vma)
+ 	mmu_notifier_invalidate_range_end(&range);
+ }
+ 
++/*
++ * This function will unconditionally remove all the shared pmd pgtable entries
++ * within the specific vma for a hugetlbfs memory range.
++ */
++void hugetlb_unshare_all_pmds(struct vm_area_struct *vma)
++{
++	hugetlb_unshare_pmds(vma, ALIGN(vma->vm_start, PUD_SIZE),
++			ALIGN_DOWN(vma->vm_end, PUD_SIZE));
++}
++
+ #ifdef CONFIG_CMA
+ static bool cma_reserve_called __initdata;
+ 
 diff --git a/mm/ksm.c b/mm/ksm.c
 index 33dc7e783f0c..e110659f8e99 100644
 --- a/mm/ksm.c
@@ -2978,6 +3280,175 @@ index b616870a09be..2e125f3e462e 100644
  		return;
  
  	if (folio_is_zone_device(folio) &&
+diff --git a/mm/z3fold.c b/mm/z3fold.c
+index a4de0c317ac7..0cef845d397b 100644
+--- a/mm/z3fold.c
++++ b/mm/z3fold.c
+@@ -1450,7 +1450,6 @@ static bool z3fold_page_isolate(struct page *page, isolate_mode_t mode)
+ 	struct z3fold_header *zhdr;
+ 	struct z3fold_pool *pool;
+ 
+-	VM_BUG_ON_PAGE(!PageMovable(page), page);
+ 	VM_BUG_ON_PAGE(PageIsolated(page), page);
+ 
+ 	if (test_bit(PAGE_HEADLESS, &page->private))
+@@ -1490,7 +1489,6 @@ static int z3fold_page_migrate(struct page *newpage, struct page *page,
+ 	struct z3fold_header *zhdr, *new_zhdr;
+ 	struct z3fold_pool *pool;
+ 
+-	VM_BUG_ON_PAGE(!PageMovable(page), page);
+ 	VM_BUG_ON_PAGE(!PageIsolated(page), page);
+ 	VM_BUG_ON_PAGE(!test_bit(PAGE_CLAIMED, &page->private), page);
+ 	VM_BUG_ON_PAGE(!PageLocked(newpage), newpage);
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 9445bee6b014..77a8746a453d 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -73,13 +73,6 @@
+  */
+ #define ZS_ALIGN		8
+ 
+-/*
+- * A single 'zspage' is composed of up to 2^N discontiguous 0-order (single)
+- * pages. ZS_MAX_ZSPAGE_ORDER defines upper limit on N.
+- */
+-#define ZS_MAX_ZSPAGE_ORDER 2
+-#define ZS_MAX_PAGES_PER_ZSPAGE (_AC(1, UL) << ZS_MAX_ZSPAGE_ORDER)
+-
+ #define ZS_HANDLE_SIZE (sizeof(unsigned long))
+ 
+ /*
+@@ -126,7 +119,7 @@
+ #define MAX(a, b) ((a) >= (b) ? (a) : (b))
+ /* ZS_MIN_ALLOC_SIZE must be multiple of ZS_ALIGN */
+ #define ZS_MIN_ALLOC_SIZE \
+-	MAX(32, (ZS_MAX_PAGES_PER_ZSPAGE << PAGE_SHIFT >> OBJ_INDEX_BITS))
++	MAX(32, (CONFIG_ZSMALLOC_CHAIN_SIZE << PAGE_SHIFT >> OBJ_INDEX_BITS))
+ /* each chunk includes extra space to keep handle */
+ #define ZS_MAX_ALLOC_SIZE	PAGE_SIZE
+ 
+@@ -802,42 +795,6 @@ static enum fullness_group fix_fullness_group(struct size_class *class,
+ 	return newfg;
+ }
+ 
+-/*
+- * We have to decide on how many pages to link together
+- * to form a zspage for each size class. This is important
+- * to reduce wastage due to unusable space left at end of
+- * each zspage which is given as:
+- *     wastage = Zp % class_size
+- *     usage = Zp - wastage
+- * where Zp = zspage size = k * PAGE_SIZE where k = 1, 2, ...
+- *
+- * For example, for size class of 3/8 * PAGE_SIZE, we should
+- * link together 3 PAGE_SIZE sized pages to form a zspage
+- * since then we can perfectly fit in 8 such objects.
+- */
+-static int get_pages_per_zspage(int class_size)
+-{
+-	int i, max_usedpc = 0;
+-	/* zspage order which gives maximum used size per KB */
+-	int max_usedpc_order = 1;
+-
+-	for (i = 1; i <= ZS_MAX_PAGES_PER_ZSPAGE; i++) {
+-		int zspage_size;
+-		int waste, usedpc;
+-
+-		zspage_size = i * PAGE_SIZE;
+-		waste = zspage_size % class_size;
+-		usedpc = (zspage_size - waste) * 100 / zspage_size;
+-
+-		if (usedpc > max_usedpc) {
+-			max_usedpc = usedpc;
+-			max_usedpc_order = i;
+-		}
+-	}
+-
+-	return max_usedpc_order;
+-}
+-
+ static struct zspage *get_zspage(struct page *page)
+ {
+ 	struct zspage *zspage = (struct zspage *)page_private(page);
+@@ -1114,7 +1071,7 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+ 					gfp_t gfp)
+ {
+ 	int i;
+-	struct page *pages[ZS_MAX_PAGES_PER_ZSPAGE];
++	struct page *pages[CONFIG_ZSMALLOC_CHAIN_SIZE];
+ 	struct zspage *zspage = cache_alloc_zspage(pool, gfp);
+ 
+ 	if (!zspage)
+@@ -1946,7 +1903,7 @@ static void replace_sub_page(struct size_class *class, struct zspage *zspage,
+ 				struct page *newpage, struct page *oldpage)
+ {
+ 	struct page *page;
+-	struct page *pages[ZS_MAX_PAGES_PER_ZSPAGE] = {NULL, };
++	struct page *pages[CONFIG_ZSMALLOC_CHAIN_SIZE] = {NULL, };
+ 	int idx = 0;
+ 
+ 	page = get_first_page(zspage);
+@@ -1973,7 +1930,6 @@ static bool zs_page_isolate(struct page *page, isolate_mode_t mode)
+ 	 * Page is locked so zspage couldn't be destroyed. For detail, look at
+ 	 * lock_zspage in free_zspage.
+ 	 */
+-	VM_BUG_ON_PAGE(!PageMovable(page), page);
+ 	VM_BUG_ON_PAGE(PageIsolated(page), page);
+ 
+ 	zspage = get_zspage(page);
+@@ -2005,7 +1961,6 @@ static int zs_page_migrate(struct page *newpage, struct page *page,
+ 	if (mode == MIGRATE_SYNC_NO_COPY)
+ 		return -EINVAL;
+ 
+-	VM_BUG_ON_PAGE(!PageMovable(page), page);
+ 	VM_BUG_ON_PAGE(!PageIsolated(page), page);
+ 
+ 	/* The page is locked, so this pointer must remain valid */
+@@ -2070,7 +2025,6 @@ static void zs_page_putback(struct page *page)
+ {
+ 	struct zspage *zspage;
+ 
+-	VM_BUG_ON_PAGE(!PageMovable(page), page);
+ 	VM_BUG_ON_PAGE(!PageIsolated(page), page);
+ 
+ 	zspage = get_zspage(page);
+@@ -2321,6 +2275,27 @@ static int zs_register_shrinker(struct zs_pool *pool)
+ 				 pool->name);
+ }
+ 
++static int calculate_zspage_chain_size(int class_size)
++{
++	int i, min_waste = INT_MAX;
++	int chain_size = 1;
++
++	if (is_power_of_2(class_size))
++		return chain_size;
++
++	for (i = 1; i <= CONFIG_ZSMALLOC_CHAIN_SIZE; i++) {
++		int waste;
++
++		waste = (i * PAGE_SIZE) % class_size;
++		if (waste < min_waste) {
++			min_waste = waste;
++			chain_size = i;
++		}
++	}
++
++	return chain_size;
++}
++
+ /**
+  * zs_create_pool - Creates an allocation pool to work from.
+  * @name: pool name to be created
+@@ -2365,7 +2340,7 @@ struct zs_pool *zs_create_pool(const char *name)
+ 		size = ZS_MIN_ALLOC_SIZE + i * ZS_SIZE_CLASS_DELTA;
+ 		if (size > ZS_MAX_ALLOC_SIZE)
+ 			size = ZS_MAX_ALLOC_SIZE;
+-		pages_per_zspage = get_pages_per_zspage(size);
++		pages_per_zspage = calculate_zspage_chain_size(size);
+ 		objs_per_zspage = pages_per_zspage * PAGE_SIZE / size;
+ 
+ 		/*
 diff --git a/scripts/Makefile.vmlinux_o b/scripts/Makefile.vmlinux_o
 index 0edfdb40364b..ae52d3b3f063 100644
 --- a/scripts/Makefile.vmlinux_o
@@ -3004,6 +3475,128 @@ index 91842c0c8c74..04668418d8ff 100644
  		hw_cfg->bst_type = CS35L41_EXT_BOOST;
  		hw_cfg->gpio1.func = CS35l41_VSPK_SWITCH;
  		hw_cfg->gpio1.valid = true;
+diff --git a/tools/objtool/Build b/tools/objtool/Build
+index 33f2ee5a46d3..a3cdf8af6635 100644
+--- a/tools/objtool/Build
++++ b/tools/objtool/Build
+@@ -16,8 +16,6 @@ objtool-y += libctype.o
+ objtool-y += str_error_r.o
+ objtool-y += librbtree.o
+ 
+-CFLAGS += -I$(srctree)/tools/lib
+-
+ $(OUTPUT)libstring.o: ../lib/string.c FORCE
+ 	$(call rule_mkdir)
+ 	$(call if_changed_dep,cc_o_c)
+diff --git a/tools/objtool/Makefile b/tools/objtool/Makefile
+index a3a9cc24e0e3..49956f4f58b9 100644
+--- a/tools/objtool/Makefile
++++ b/tools/objtool/Makefile
+@@ -2,19 +2,21 @@
+ include ../scripts/Makefile.include
+ include ../scripts/Makefile.arch
+ 
+-# always use the host compiler
+-AR	 = $(HOSTAR)
+-CC	 = $(HOSTCC)
+-LD	 = $(HOSTLD)
+-
+ ifeq ($(srctree),)
+ srctree := $(patsubst %/,%,$(dir $(CURDIR)))
+ srctree := $(patsubst %/,%,$(dir $(srctree)))
+ endif
+ 
+-SUBCMD_SRCDIR		= $(srctree)/tools/lib/subcmd/
+-LIBSUBCMD_OUTPUT	= $(or $(OUTPUT),$(CURDIR)/)
+-LIBSUBCMD		= $(LIBSUBCMD_OUTPUT)libsubcmd.a
++MAKE = make -S
++LIBSUBCMD_DIR = $(srctree)/tools/lib/subcmd/
++ifneq ($(OUTPUT),)
++  LIBSUBCMD_OUTPUT = $(abspath $(OUTPUT))/libsubcmd
++else
++  LIBSUBCMD_OUTPUT = $(CURDIR)/libsubcmd
++endif
++LIBSUBCMD_DESTDIR = $(LIBSUBCMD_OUTPUT)
++LIBSUBCMD = $(LIBSUBCMD_OUTPUT)/libsubcmd.a
++CFLAGS += -I$(LIBSUBCMD_OUTPUT)/include
+ 
+ OBJTOOL    := $(OUTPUT)objtool
+ OBJTOOL_IN := $(OBJTOOL)-in.o
+@@ -28,16 +30,31 @@ INCLUDES := -I$(srctree)/tools/include \
+ 	    -I$(srctree)/tools/arch/$(HOSTARCH)/include/uapi \
+ 	    -I$(srctree)/tools/arch/$(SRCARCH)/include	\
+ 	    -I$(srctree)/tools/objtool/include \
+-	    -I$(srctree)/tools/objtool/arch/$(SRCARCH)/include
++	    -I$(srctree)/tools/objtool/arch/$(SRCARCH)/include \
++	    -I$(LIBSUBCMD_OUTPUT)/include
+ WARNINGS := $(EXTRA_WARNINGS) -Wno-switch-default -Wno-switch-enum -Wno-packed -Wno-nested-externs
+-CFLAGS   := -Werror $(WARNINGS) $(KBUILD_HOSTCFLAGS) -g $(INCLUDES) $(LIBELF_FLAGS)
+-LDFLAGS  += $(LIBELF_LIBS) $(LIBSUBCMD) $(KBUILD_HOSTLDFLAGS)
++OBJTOOL_CFLAGS := -Werror $(WARNINGS) -g $(INCLUDES) $(LIBELF_FLAGS) $(HOSTCFLAGS)
++OBJTOOL_LDFLAGS := $(LIBELF_LIBS) $(LIBSUBCMD)
+ 
+ # Allow old libelf to be used:
+ elfshdr := $(shell echo '$(pound)include <libelf.h>' | $(CC) $(CFLAGS) -x c -E - | grep elf_getshdr)
+-CFLAGS += $(if $(elfshdr),,-DLIBELF_USE_DEPRECATED)
++OBJTOOL_CFLAGS += $(if $(elfshdr),,-DLIBELF_USE_DEPRECATED)
++
++# Always want host compilation.
++HOST_OVERRIDES := CC="$(HOSTCC)" EXTRA_CFLAGS="$(OBJTOOL_CFLAGS)" \
++		  LD="$(HOSTLD)" AR="$(HOSTAR)"
++BUILD_HOST_OVERRIDES := CC="$(HOSTCC)" CFLAGS="$(OBJTOOL_CFLAGS)" \
++			LD="$(HOSTLD)" LDFLAGS="$(OBJTOOL_LDFLAGS)" \
++			AR="$(HOSTAR)"
+ 
+ AWK = awk
++MKDIR = mkdir
++
++ifeq ($(V),1)
++  Q =
++else
++  Q = @
++endif
+ 
+ BUILD_ORC := n
+ 
+@@ -50,20 +67,31 @@ export srctree OUTPUT CFLAGS SRCARCH AWK
+ include $(srctree)/tools/build/Makefile.include
+ 
+ $(OBJTOOL_IN): fixdep FORCE
+-	@$(CONFIG_SHELL) ./sync-check.sh
+-	@$(MAKE) $(build)=objtool
++	$(Q)$(CONFIG_SHELL) ./sync-check.sh
++	$(Q)$(MAKE) $(build)=objtool $(BUILD_HOST_OVERRIDES)
++
+ 
+ $(OBJTOOL): $(LIBSUBCMD) $(OBJTOOL_IN)
+-	$(QUIET_LINK)$(CC) $(OBJTOOL_IN) $(LDFLAGS) -o $@
++	$(QUIET_LINK)$(HOSTCC) $(OBJTOOL_IN) $(KBUILD_HOSTLDFLAGS) $(OBJTOOL_LDFLAGS) -o $@
++
++
++$(LIBSUBCMD_OUTPUT):
++	$(Q)$(MKDIR) -p $@
+ 
++$(LIBSUBCMD): fixdep FORCE $(LIBSUBCMD_OUTPUT)
++	$(Q)$(MAKE) -C $(LIBSUBCMD_DIR) O=$(LIBSUBCMD_OUTPUT) \
++		DESTDIR=$(LIBSUBCMD_DESTDIR) prefix= subdir= \
++		$(HOST_OVERRIDES) \
++		$@ install_headers
+ 
+-$(LIBSUBCMD): fixdep FORCE
+-	$(Q)$(MAKE) -C $(SUBCMD_SRCDIR) OUTPUT=$(LIBSUBCMD_OUTPUT)
++$(LIBSUBCMD)-clean:
++	$(call QUIET_CLEAN, libsubcmd)
++	$(Q)$(RM) -r -- $(LIBSUBCMD_OUTPUT)
+ 
+-clean:
++clean: $(LIBSUBCMD)-clean
+ 	$(call QUIET_CLEAN, objtool) $(RM) $(OBJTOOL)
+ 	$(Q)find $(OUTPUT) -name '*.o' -delete -o -name '\.*.cmd' -delete -o -name '\.*.d' -delete
+-	$(Q)$(RM) $(OUTPUT)arch/x86/lib/inat-tables.c $(OUTPUT)fixdep $(LIBSUBCMD)
++	$(Q)$(RM) $(OUTPUT)arch/x86/lib/inat-tables.c $(OUTPUT)fixdep
+ 
+ FORCE:
+ 
 diff --git a/tools/objtool/builtin-check.c b/tools/objtool/builtin-check.c
 index a4f39407bf59..e11c766b98ce 100644
 --- a/tools/objtool/builtin-check.c

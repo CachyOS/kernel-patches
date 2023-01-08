@@ -1,6 +1,6 @@
-From 935a5c229938468303c6534f2436a832ec4b05dd Mon Sep 17 00:00:00 2001
+From 21c0b33491981657a0fdefa5b8cbcf97e9be2f42 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 2 Jan 2023 13:40:13 +0100
+Date: Sun, 8 Jan 2023 19:25:36 +0100
 Subject: [PATCH 10/13] Introduce per VMA lock
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -121,7 +121,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/fork.c                                 | 148 +++++++++++++---
  kernel/kcov.c                                 |   2 +-
  kernel/relay.c                                |   2 +-
- lib/maple_tree.c                              | 147 +++++++++++++---
+ lib/maple_tree.c                              | 146 +++++++++++++---
  mm/Kconfig                                    |  13 ++
  mm/Kconfig.debug                              |   8 +
  mm/debug.c                                    |   1 +
@@ -151,7 +151,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  sound/usb/usx2y/usX2Yhwdep.c                  |   2 +-
  sound/usb/usx2y/usx2yhwdeppcm.c               |   2 +-
  tools/testing/radix-tree/maple.c              |  16 ++
- 146 files changed, 1050 insertions(+), 314 deletions(-)
+ 146 files changed, 1047 insertions(+), 316 deletions(-)
 
 diff --git a/arch/arm/kernel/process.c b/arch/arm/kernel/process.c
 index f811733a8fc5..ec65f3ea3150 100644
@@ -1714,10 +1714,10 @@ index 26a541cc64d1..86eb3fc9ffb4 100644
  
  	return 0;
 diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
-index 166044642fd5..9bc2997a6617 100644
+index ec32f785dfde..7b81994a7d02 100644
 --- a/drivers/vhost/vdpa.c
 +++ b/drivers/vhost/vdpa.c
-@@ -1305,7 +1305,7 @@ static int vhost_vdpa_mmap(struct file *file, struct vm_area_struct *vma)
+@@ -1315,7 +1315,7 @@ static int vhost_vdpa_mmap(struct file *file, struct vm_area_struct *vma)
  	if (vma->vm_end - vma->vm_start != notify.size)
  		return -ENOTSUPP;
  
@@ -2035,7 +2035,7 @@ index 595a5bcf46b9..bf777fed0dd4 100644
  }
  
 diff --git a/include/linux/mm.h b/include/linux/mm.h
-index 5bd8b835bab1..4906681a2190 100644
+index 3e91110c17ac..01ea2aab3806 100644
 --- a/include/linux/mm.h
 +++ b/include/linux/mm.h
 @@ -250,6 +250,7 @@ void setup_initial_init_mm(void *start_code, void *end_code,
@@ -2228,7 +2228,7 @@ index 5bd8b835bab1..4906681a2190 100644
  static inline void vma_set_anonymous(struct vm_area_struct *vma)
  {
  	vma->vm_ops = NULL;
-@@ -1974,7 +2123,7 @@ void zap_page_range_single(struct vm_area_struct *vma, unsigned long address,
+@@ -1994,7 +2143,7 @@ void zap_page_range_single(struct vm_area_struct *vma, unsigned long address,
  			   unsigned long size, struct zap_details *details);
  void unmap_vmas(struct mmu_gather *tlb, struct maple_tree *mt,
  		struct vm_area_struct *start_vma, unsigned long start,
@@ -2237,7 +2237,7 @@ index 5bd8b835bab1..4906681a2190 100644
  
  struct mmu_notifier_range;
  
-@@ -3615,7 +3764,7 @@ static inline int seal_check_future_write(int seals, struct vm_area_struct *vma)
+@@ -3635,7 +3784,7 @@ static inline int seal_check_future_write(int seals, struct vm_area_struct *vma)
  		 * VM_MAYWRITE as we still want them to be COW-writable.
  		 */
  		if (vma->vm_flags & VM_SHARED)
@@ -2772,7 +2772,7 @@ index ef12532168d9..085aa8707bc2 100644
  
  	return 0;
 diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index 26e2045d3cda..4e4709f9a37f 100644
+index 26e2045d3cda..80ca28b656d3 100644
 --- a/lib/maple_tree.c
 +++ b/lib/maple_tree.c
 @@ -179,7 +179,7 @@ static void mt_free_rcu(struct rcu_head *head)
@@ -2784,30 +2784,42 @@ index 26e2045d3cda..4e4709f9a37f 100644
  	call_rcu(&node->rcu, mt_free_rcu);
  }
  
-@@ -540,6 +540,12 @@ static inline bool ma_dead_node(const struct maple_node *node)
+@@ -535,11 +535,14 @@ static inline struct maple_node *mte_parent(const struct maple_enode *enode)
+  */
+ static inline bool ma_dead_node(const struct maple_node *node)
+ {
+-	struct maple_node *parent = (void *)((unsigned long)
+-					     node->parent & ~MAPLE_NODE_MASK);
++	struct maple_node *parent;
  
++	/* Do not reorder reads from the node prior to the parent check */
++	smp_rmb();
++	parent = (void *)((unsigned long) node->parent & ~MAPLE_NODE_MASK);
  	return (parent == node);
  }
-+
-+static inline bool ma_dead_pivots(const unsigned long *piv)
-+{
-+	return (piv == NULL);
-+}
 +
  /*
   * mte_dead_node() - check if the @enode is dead.
   * @enode: The encoded maple node
-@@ -626,6 +632,9 @@ static inline unsigned int mas_alloc_req(const struct ma_state *mas)
+@@ -551,6 +554,8 @@ static inline bool mte_dead_node(const struct maple_enode *enode)
+ 	struct maple_node *parent, *node;
+ 
+ 	node = mte_to_node(enode);
++	/* Do not reorder reads from the node prior to the parent check */
++	smp_rmb();
+ 	parent = mte_parent(enode);
+ 	return (parent == node);
+ }
+@@ -621,6 +626,8 @@ static inline unsigned int mas_alloc_req(const struct ma_state *mas)
+  * @node - the maple node
+  * @type - the node type
+  *
++ * In the event of a dead node, this array may be %NULL
++ *
+  * Return: A pointer to the maple node pivots
+  */
  static inline unsigned long *ma_pivots(struct maple_node *node,
- 					   enum maple_type type)
- {
-+	if (unlikely(ma_dead_node(node)))
-+		return NULL;
-+
- 	switch (type) {
- 	case maple_arange_64:
- 		return node->ma64.pivot;
-@@ -894,6 +903,44 @@ static inline void ma_set_meta(struct maple_node *mn, enum maple_type mt,
+@@ -894,6 +901,44 @@ static inline void ma_set_meta(struct maple_node *mn, enum maple_type mt,
  	meta->end = end;
  }
  
@@ -2852,7 +2864,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  /*
   * ma_meta_end() - Get the data end of a node from the metadata
   * @mn: The maple node
-@@ -1091,8 +1138,11 @@ static int mas_ascend(struct ma_state *mas)
+@@ -1091,8 +1136,11 @@ static int mas_ascend(struct ma_state *mas)
  		a_type = mas_parent_enum(mas, p_enode);
  		a_node = mte_parent(p_enode);
  		a_slot = mte_parent_slot(p_enode);
@@ -2860,12 +2872,12 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		a_enode = mt_mk_node(a_node, a_type);
 +		pivots = ma_pivots(a_node, a_type);
 +
-+		if (unlikely(ma_dead_pivots(pivots)))
++		if (unlikely(ma_dead_node(a_node)))
 +			return 1;
  
  		if (!set_min && a_slot) {
  			set_min = true;
-@@ -1353,11 +1403,15 @@ static inline struct maple_enode *mas_start(struct ma_state *mas)
+@@ -1353,11 +1401,15 @@ static inline struct maple_enode *mas_start(struct ma_state *mas)
  		mas->depth = 0;
  		mas->offset = 0;
  
@@ -2881,27 +2893,27 @@ index 26e2045d3cda..4e4709f9a37f 100644
  			return NULL;
  		}
  
-@@ -1398,6 +1452,9 @@ static inline unsigned char ma_data_end(struct maple_node *node,
+@@ -1398,6 +1450,9 @@ static inline unsigned char ma_data_end(struct maple_node *node,
  {
  	unsigned char offset;
  
-+	if (unlikely(ma_dead_node(node)))
++	if (!pivots)
 +		return 0;
 +
  	if (type == maple_arange_64)
  		return ma_meta_end(node, type);
  
-@@ -1433,6 +1490,9 @@ static inline unsigned char mas_data_end(struct ma_state *mas)
+@@ -1433,6 +1488,9 @@ static inline unsigned char mas_data_end(struct ma_state *mas)
  		return ma_meta_end(node, type);
  
  	pivots = ma_pivots(node, type);
-+	if (unlikely(ma_dead_pivots(pivots)))
++	if (unlikely(ma_dead_node(node)))
 +		return 0;
 +
  	offset = mt_pivots[type] - 1;
  	if (likely(!pivots[offset]))
  		return ma_meta_end(node, type);
-@@ -1721,8 +1781,10 @@ static inline void mas_replace(struct ma_state *mas, bool advanced)
+@@ -1721,8 +1779,10 @@ static inline void mas_replace(struct ma_state *mas, bool advanced)
  		rcu_assign_pointer(slots[offset], mas->node);
  	}
  
@@ -2913,7 +2925,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  }
  
  /*
-@@ -4163,6 +4225,7 @@ static inline bool mas_wr_node_store(struct ma_wr_state *wr_mas)
+@@ -4163,6 +4223,7 @@ static inline bool mas_wr_node_store(struct ma_wr_state *wr_mas)
  done:
  	mas_leaf_set_meta(mas, newnode, dst_pivots, maple_leaf_64, new_end);
  	if (in_rcu) {
@@ -2921,17 +2933,17 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		mas->node = mt_mk_node(newnode, wr_mas->type);
  		mas_replace(mas, false);
  	} else {
-@@ -4504,6 +4567,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
+@@ -4504,6 +4565,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
  	node = mas_mn(mas);
  	slots = ma_slots(node, mt);
  	pivots = ma_pivots(node, mt);
-+	if (unlikely(ma_dead_pivots(pivots)))
++	if (unlikely(ma_dead_node(node)))
 +		return 1;
 +
  	mas->max = pivots[offset];
  	if (offset)
  		mas->min = pivots[offset - 1] + 1;
-@@ -4525,6 +4591,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
+@@ -4525,6 +4589,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
  		slots = ma_slots(node, mt);
  		pivots = ma_pivots(node, mt);
  		offset = ma_data_end(node, mt, pivots, mas->max);
@@ -2941,26 +2953,38 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		if (offset)
  			mas->min = pivots[offset - 1] + 1;
  
-@@ -4596,6 +4665,8 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
+@@ -4573,6 +4640,7 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
+ 	struct maple_enode *enode;
+ 	int level = 0;
+ 	unsigned char offset;
++	unsigned char node_end;
+ 	enum maple_type mt;
+ 	void __rcu **slots;
+ 
+@@ -4596,7 +4664,11 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
  		node = mas_mn(mas);
  		mt = mte_node_type(mas->node);
  		pivots = ma_pivots(node, mt);
-+		if (unlikely(ma_dead_pivots(pivots)))
+-	} while (unlikely(offset == ma_data_end(node, mt, pivots, mas->max)));
++		node_end = ma_data_end(node, mt, pivots, mas->max);
++		if (unlikely(ma_dead_node(node)))
 +			return 1;
- 	} while (unlikely(offset == ma_data_end(node, mt, pivots, mas->max)));
++
++	} while (unlikely(offset == node_end));
  
  	slots = ma_slots(node, mt);
-@@ -4612,6 +4683,9 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
+ 	pivot = mas_safe_pivot(mas, pivots, ++offset, mt);
+@@ -4612,6 +4684,9 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
  		mt = mte_node_type(mas->node);
  		slots = ma_slots(node, mt);
  		pivots = ma_pivots(node, mt);
-+		if (unlikely(ma_dead_pivots(pivots)))
++		if (unlikely(ma_dead_node(node)))
 +			return 1;
 +
  		offset = 0;
  		pivot = pivots[0];
  	}
-@@ -4658,12 +4732,15 @@ static inline void *mas_next_nentry(struct ma_state *mas,
+@@ -4658,16 +4733,18 @@ static inline void *mas_next_nentry(struct ma_state *mas,
  		return NULL;
  	}
  
@@ -2979,11 +3003,15 @@ index 26e2045d3cda..4e4709f9a37f 100644
  	if (mas->index > max)
  		return NULL;
  
+-	count = ma_data_end(node, type, pivots, mas->max);
+ 	if (mas->offset > count)
+ 		return NULL;
+ 
 @@ -4815,6 +4892,11 @@ static inline void *mas_prev_nentry(struct ma_state *mas, unsigned long limit,
  
  	slots = ma_slots(mn, mt);
  	pivots = ma_pivots(mn, mt);
-+	if (unlikely(ma_dead_pivots(pivots))) {
++	if (unlikely(ma_dead_node(mn))) {
 +		mas_rewalk(mas, index);
 +		goto retry;
 +	}
@@ -2991,19 +3019,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  	if (offset == mt_pivots[mt])
  		pivot = mas->max;
  	else
-@@ -4825,6 +4907,11 @@ static inline void *mas_prev_nentry(struct ma_state *mas, unsigned long limit,
- 		goto retry;
- 	}
- 
-+	if (offset == mt_pivots[mt])
-+		pivot = mas->max;
-+	else
-+		pivot = pivots[offset];
-+
- 	while (offset && ((!mas_slot(mas, slots, offset) && pivot >= limit) ||
- 	       !pivot))
- 		pivot = pivots[--offset];
-@@ -5411,20 +5498,22 @@ static inline int mas_rev_alloc(struct ma_state *mas, unsigned long min,
+@@ -5411,20 +5493,22 @@ static inline int mas_rev_alloc(struct ma_state *mas, unsigned long min,
   * mas_dead_leaves() - Mark all leaves of a node as dead.
   * @mas: The maple state
   * @slots: Pointer to the slot array
@@ -3028,7 +3044,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		entry = mas_slot_locked(mas, slots, offset);
  		type = mte_node_type(entry);
  		node = mte_to_node(entry);
-@@ -5433,7 +5522,6 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
+@@ -5433,7 +5517,6 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
  			break;
  
  		mte_set_node_dead(entry);
@@ -3036,7 +3052,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		node->type = type;
  		rcu_assign_pointer(slots[offset], node);
  	}
-@@ -5443,14 +5531,13 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
+@@ -5443,14 +5526,13 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
  
  static void __rcu **mas_dead_walk(struct ma_state *mas, unsigned char offset)
  {
@@ -3054,7 +3070,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		next = mas_slot_locked(mas, slots, offset);
  		offset = 0;
  	} while (!ma_is_leaf(next->type));
-@@ -5514,11 +5601,14 @@ static inline void __rcu **mas_destroy_descend(struct ma_state *mas,
+@@ -5514,11 +5596,14 @@ static inline void __rcu **mas_destroy_descend(struct ma_state *mas,
  		node = mas_mn(mas);
  		slots = ma_slots(node, mte_node_type(mas->node));
  		next = mas_slot_locked(mas, slots, 0);
@@ -3070,7 +3086,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		node->piv_parent = prev;
  		node->parent_slot = offset;
  		offset = 0;
-@@ -5538,13 +5628,18 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5538,13 +5623,18 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  
  	MA_STATE(mas, &mt, 0, 0);
  
@@ -3091,7 +3107,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  	slots = mas_destroy_descend(&mas, start, 0);
  	node = mas_mn(&mas);
  	do {
-@@ -5552,7 +5647,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5552,7 +5642,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  		unsigned char offset;
  		struct maple_enode *parent, *tmp;
  
@@ -3101,7 +3117,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		if (free)
  			mt_free_bulk(node->slot_len, slots);
  		offset = node->parent_slot + 1;
-@@ -5576,7 +5672,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5576,7 +5667,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  	} while (start != mas.node);
  
  	node = mas_mn(&mas);
@@ -3111,7 +3127,7 @@ index 26e2045d3cda..4e4709f9a37f 100644
  	if (free)
  		mt_free_bulk(node->slot_len, slots);
  
-@@ -5586,6 +5683,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5586,6 +5678,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  free_leaf:
  	if (free)
  		mt_free_rcu(&node->rcu);
@@ -3120,22 +3136,21 @@ index 26e2045d3cda..4e4709f9a37f 100644
  }
  
  /*
-@@ -6613,11 +6712,11 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
+@@ -6613,11 +6707,11 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
  	while (likely(!ma_is_leaf(mt))) {
  		MT_BUG_ON(mas->tree, mte_dead_node(mas->node));
  		slots = ma_slots(mn, mt);
 -		pivots = ma_pivots(mn, mt);
 -		max = pivots[0];
  		entry = mas_slot(mas, slots, 0);
--		if (unlikely(ma_dead_node(mn)))
 +		pivots = ma_pivots(mn, mt);
-+		if (unlikely(ma_dead_pivots(pivots)))
+ 		if (unlikely(ma_dead_node(mn)))
  			return NULL;
 +		max = pivots[0];
  		mas->node = entry;
  		mn = mas_mn(mas);
  		mt = mte_node_type(mas->node);
-@@ -6637,13 +6736,13 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
+@@ -6637,13 +6731,13 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
  	if (likely(entry))
  		return entry;
  
@@ -3143,9 +3158,8 @@ index 26e2045d3cda..4e4709f9a37f 100644
 -	mas->index = pivots[0] + 1;
  	mas->offset = 1;
  	entry = mas_slot(mas, slots, 1);
--	if (unlikely(ma_dead_node(mn)))
 +	pivots = ma_pivots(mn, mt);
-+	if (unlikely(ma_dead_pivots(pivots)))
+ 	if (unlikely(ma_dead_node(mn)))
  		return NULL;
  
 +	mas->index = pivots[0] + 1;
@@ -3153,10 +3167,10 @@ index 26e2045d3cda..4e4709f9a37f 100644
  		goto none;
  
 diff --git a/mm/Kconfig b/mm/Kconfig
-index bf317c39ed2d..907abf950578 100644
+index b3218be4b3c6..930da83576e5 100644
 --- a/mm/Kconfig
 +++ b/mm/Kconfig
-@@ -1183,6 +1183,19 @@ config LRU_GEN_STATS
+@@ -1202,6 +1202,19 @@ config LRU_GEN_STATS
  	  This option has a per-memcg and per-node memory overhead.
  # }
  
@@ -3205,10 +3219,10 @@ index 9d3d893dc7f4..96d594e16292 100644
  static bool page_init_poisoning __read_mostly = true;
  
 diff --git a/mm/hugetlb.c b/mm/hugetlb.c
-index 72f21bdc581e..06373a4f9905 100644
+index 65faada88f9d..6f7d06e543ea 100644
 --- a/mm/hugetlb.c
 +++ b/mm/hugetlb.c
-@@ -6952,8 +6952,8 @@ static unsigned long page_table_shareable(struct vm_area_struct *svma,
+@@ -6982,8 +6982,8 @@ static unsigned long page_table_shareable(struct vm_area_struct *svma,
  	unsigned long s_end = sbase + PUD_SIZE;
  
  	/* Allow segments to share if only one is marked locked */

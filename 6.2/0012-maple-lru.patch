@@ -1,6 +1,6 @@
-From a56e830b81282219170ea283cf6912d22ea90f75 Mon Sep 17 00:00:00 2001
+From 1c6660a23482b8700234caad5e617a73034b9a6d Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 2 Jan 2023 13:50:17 +0100
+Date: Sun, 8 Jan 2023 19:26:17 +0100
 Subject: [PATCH 12/13] maple-lru
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -11,7 +11,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  include/linux/memcontrol.h        |  10 +
  include/linux/mm_inline.h         |  36 +-
  include/linux/mmzone.h            | 131 +++++-
- lib/maple_tree.c                  |  29 +-
+ lib/maple_tree.c                  | 109 +++--
  mm/fadvise.c                      |   5 +-
  mm/memcontrol.c                   |  16 +
  mm/memory.c                       |   7 +-
@@ -19,7 +19,8 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  mm/rmap.c                         |  42 +-
  mm/vmscan.c                       | 736 ++++++++++++++++++++----------
  mm/workingset.c                   |   4 +-
- 14 files changed, 725 insertions(+), 308 deletions(-)
+ tools/testing/radix-tree/maple.c  |  18 +-
+ 15 files changed, 777 insertions(+), 354 deletions(-)
 
 diff --git a/Documentation/mm/multigen_lru.rst b/Documentation/mm/multigen_lru.rst
 index d7062c6a8946..d8f721f98868 100644
@@ -54,7 +55,7 @@ index d7062c6a8946..d8f721f98868 100644
  evict from, it first compares ``min_seq[]`` to select the older type.
  If both types are equally old, it selects the one whose first tier has
 diff --git a/include/linux/fs.h b/include/linux/fs.h
-index 066555ad1bf8..5660ed0edf1a 100644
+index c1769a2c5d70..d353c262d669 100644
 --- a/include/linux/fs.h
 +++ b/include/linux/fs.h
 @@ -166,6 +166,8 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
@@ -133,7 +134,7 @@ index a2ebb4e2da63..26667bf16da5 100644
  {
  }
 diff --git a/include/linux/mm_inline.h b/include/linux/mm_inline.h
-index d650ca2c5d29..064f92c78bfa 100644
+index ff3f3f23f649..26dcbda07e92 100644
 --- a/include/linux/mm_inline.h
 +++ b/include/linux/mm_inline.h
 @@ -122,6 +122,18 @@ static inline bool lru_gen_in_fault(void)
@@ -197,7 +198,7 @@ index d650ca2c5d29..064f92c78bfa 100644
  static inline bool lru_gen_add_folio(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
  {
  	return false;
-@@ -578,4 +595,15 @@ pte_install_uffd_wp_if_needed(struct vm_area_struct *vma, unsigned long addr,
+@@ -577,4 +594,15 @@ pte_install_uffd_wp_if_needed(struct vm_area_struct *vma, unsigned long addr,
  #endif
  }
  
@@ -445,10 +446,26 @@ index cd28a100d9e4..815c7c2edf45 100644
  
  	CACHELINE_PADDING(_pad2_);
 diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index 4e4709f9a37f..6475890d1afd 100644
+index 80ca28b656d3..ab99738adee3 100644
 --- a/lib/maple_tree.c
 +++ b/lib/maple_tree.c
-@@ -183,7 +183,6 @@ static void ma_free_rcu(struct maple_node *node)
+@@ -149,13 +149,12 @@ struct maple_subtree_state {
+ /* Functions */
+ static inline struct maple_node *mt_alloc_one(gfp_t gfp)
+ {
+-	return kmem_cache_alloc(maple_node_cache, gfp | __GFP_ZERO);
++	return kmem_cache_alloc(maple_node_cache, gfp);
+ }
+ 
+ static inline int mt_alloc_bulk(gfp_t gfp, size_t size, void **nodes)
+ {
+-	return kmem_cache_alloc_bulk(maple_node_cache, gfp | __GFP_ZERO, size,
+-				     nodes);
++	return kmem_cache_alloc_bulk(maple_node_cache, gfp, size, nodes);
+ }
+ 
+ static inline void mt_free_bulk(size_t size, void __rcu **nodes)
+@@ -183,7 +182,6 @@ static void ma_free_rcu(struct maple_node *node)
  	call_rcu(&node->rcu, mt_free_rcu);
  }
  
@@ -456,7 +473,7 @@ index 4e4709f9a37f..6475890d1afd 100644
  static void mas_set_height(struct ma_state *mas)
  {
  	unsigned int new_flags = mas->tree->ma_flags;
-@@ -468,7 +467,7 @@ static inline
+@@ -468,7 +466,7 @@ static inline
  void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
  		    unsigned char slot)
  {
@@ -465,7 +482,7 @@ index 4e4709f9a37f..6475890d1afd 100644
  	unsigned long shift;
  	unsigned long type;
  	enum maple_type p_type = mte_node_type(parent);
-@@ -502,10 +501,9 @@ void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
+@@ -502,10 +500,9 @@ void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
   */
  static inline unsigned int mte_parent_slot(const struct maple_enode *enode)
  {
@@ -478,16 +495,157 @@ index 4e4709f9a37f..6475890d1afd 100644
  		return 0;
  
  	/*
-@@ -1327,8 +1325,6 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+@@ -1175,9 +1172,10 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
+ {
+ 	struct maple_alloc *ret, *node = mas->alloc;
+ 	unsigned long total = mas_allocated(mas);
++	unsigned int req = mas_alloc_req(mas);
+ 
+ 	/* nothing or a request pending. */
+-	if (unlikely(!total))
++	if (WARN_ON(!total))
+ 		return NULL;
+ 
+ 	if (total == 1) {
+@@ -1187,27 +1185,25 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
+ 		goto single_node;
+ 	}
+ 
+-	if (!node->node_count) {
++	if (node->node_count == 1) {
+ 		/* Single allocation in this node. */
+ 		mas->alloc = node->slot[0];
+-		node->slot[0] = NULL;
+ 		mas->alloc->total = node->total - 1;
+ 		ret = node;
+ 		goto new_head;
+ 	}
+-
+ 	node->total--;
+-	ret = node->slot[node->node_count];
+-	node->slot[node->node_count--] = NULL;
++	ret = node->slot[--node->node_count];
++	node->slot[node->node_count] = NULL;
+ 
+ single_node:
+ new_head:
+-	ret->total = 0;
+-	ret->node_count = 0;
+-	if (ret->request_count) {
+-		mas_set_alloc_req(mas, ret->request_count + 1);
+-		ret->request_count = 0;
++	if (req) {
++		req++;
++		mas_set_alloc_req(mas, req);
+ 	}
++
++	memset(ret, 0, sizeof(*ret));
+ 	return (struct maple_node *)ret;
+ }
+ 
+@@ -1226,21 +1222,20 @@ static inline void mas_push_node(struct ma_state *mas, struct maple_node *used)
+ 	unsigned long count;
+ 	unsigned int requested = mas_alloc_req(mas);
+ 
+-	memset(reuse, 0, sizeof(*reuse));
+ 	count = mas_allocated(mas);
+ 
+-	if (count && (head->node_count < MAPLE_ALLOC_SLOTS - 1)) {
+-		if (head->slot[0])
+-			head->node_count++;
+-		head->slot[head->node_count] = reuse;
++	reuse->request_count = 0;
++	reuse->node_count = 0;
++	if (count && (head->node_count < MAPLE_ALLOC_SLOTS)) {
++		head->slot[head->node_count++] = reuse;
+ 		head->total++;
+ 		goto done;
+ 	}
+ 
+ 	reuse->total = 1;
+ 	if ((head) && !((unsigned long)head & 0x1)) {
+-		head->request_count = 0;
+ 		reuse->slot[0] = head;
++		reuse->node_count = 1;
+ 		reuse->total += head->total;
+ 	}
+ 
+@@ -1259,7 +1254,6 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ {
+ 	struct maple_alloc *node;
+ 	unsigned long allocated = mas_allocated(mas);
+-	unsigned long success = allocated;
+ 	unsigned int requested = mas_alloc_req(mas);
+ 	unsigned int count;
+ 	void **slots = NULL;
+@@ -1275,24 +1269,29 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ 		WARN_ON(!allocated);
+ 	}
+ 
+-	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS - 1) {
++	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS) {
+ 		node = (struct maple_alloc *)mt_alloc_one(gfp);
+ 		if (!node)
+ 			goto nomem_one;
+ 
+-		if (allocated)
++		if (allocated) {
+ 			node->slot[0] = mas->alloc;
++			node->node_count = 1;
++		} else {
++			node->node_count = 0;
++		}
+ 
+-		success++;
+ 		mas->alloc = node;
++		node->total = ++allocated;
+ 		requested--;
+ 	}
+ 
+ 	node = mas->alloc;
++	node->request_count = 0;
+ 	while (requested) {
+ 		max_req = MAPLE_ALLOC_SLOTS;
+-		if (node->slot[0]) {
+-			unsigned int offset = node->node_count + 1;
++		if (node->node_count) {
++			unsigned int offset = node->node_count;
+ 
+ 			slots = (void **)&node->slot[offset];
+ 			max_req -= offset;
+@@ -1306,15 +1305,13 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ 			goto nomem_bulk;
+ 
+ 		node->node_count += count;
+-		/* zero indexed. */
+-		if (slots == (void **)&node->slot)
+-			node->node_count--;
+-
+-		success += count;
++		allocated += count;
+ 		node = node->slot[0];
++		node->node_count = 0;
++		node->request_count = 0;
+ 		requested -= count;
+ 	}
+-	mas->alloc->total = success;
++	mas->alloc->total = allocated;
+ 	return;
+ 
+ nomem_bulk:
+@@ -1323,10 +1320,8 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ nomem_one:
+ 	mas_set_alloc_req(mas, requested);
  	if (mas->alloc && !(((unsigned long)mas->alloc & 0x1)))
- 		mas->alloc->total = success;
+-		mas->alloc->total = success;
++		mas->alloc->total = allocated;
  	mas_set_err(mas, -ENOMEM);
 -	return;
 -
  }
  
  /*
-@@ -1948,10 +1944,9 @@ static inline int mab_calc_split(struct ma_state *mas,
+@@ -1946,10 +1941,9 @@ static inline int mab_calc_split(struct ma_state *mas,
  
  	/* Avoid ending a node on a NULL entry */
  	split = mab_no_null_split(bn, split, slot_count);
@@ -500,7 +658,7 @@ index 4e4709f9a37f..6475890d1afd 100644
  
  	return split;
  }
-@@ -3008,7 +3003,7 @@ static inline void *mtree_range_walk(struct ma_state *mas)
+@@ -3006,7 +3000,7 @@ static inline void *mtree_range_walk(struct ma_state *mas)
  	mas->min = prev_min;
  	mas->max = prev_max;
  	mas->node = last;
@@ -509,7 +667,7 @@ index 4e4709f9a37f..6475890d1afd 100644
  
  dead_node:
  	mas_reset(mas);
-@@ -3528,7 +3523,6 @@ static inline bool mas_push_data(struct ma_state *mas, int height,
+@@ -3526,7 +3520,6 @@ static inline bool mas_push_data(struct ma_state *mas, int height,
   */
  static int mas_split(struct ma_state *mas, struct maple_big_node *b_node)
  {
@@ -517,7 +675,7 @@ index 4e4709f9a37f..6475890d1afd 100644
  	struct maple_subtree_state mast;
  	int height = 0;
  	unsigned char mid_split, split = 0;
-@@ -3954,7 +3948,7 @@ static inline void *mtree_lookup_walk(struct ma_state *mas)
+@@ -3952,7 +3945,7 @@ static inline void *mtree_lookup_walk(struct ma_state *mas)
  			goto dead_node;
  	} while (!ma_is_leaf(type));
  
@@ -526,7 +684,7 @@ index 4e4709f9a37f..6475890d1afd 100644
  
  dead_node:
  	mas_reset(mas);
-@@ -4787,15 +4781,11 @@ static inline void *mas_next_nentry(struct ma_state *mas,
+@@ -4787,15 +4780,11 @@ static inline void *mas_next_nentry(struct ma_state *mas,
  
  static inline void mas_rewalk(struct ma_state *mas, unsigned long index)
  {
@@ -542,7 +700,7 @@ index 4e4709f9a37f..6475890d1afd 100644
  }
  
  /*
-@@ -5719,7 +5709,6 @@ static void mas_wr_store_setup(struct ma_wr_state *wr_mas)
+@@ -5714,7 +5703,6 @@ static void mas_wr_store_setup(struct ma_wr_state *wr_mas)
  				mas_reset(wr_mas->mas);
  		}
  	}
@@ -550,7 +708,40 @@ index 4e4709f9a37f..6475890d1afd 100644
  }
  
  /* Interface */
-@@ -6833,7 +6822,7 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
+@@ -5839,6 +5827,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
+ void mas_destroy(struct ma_state *mas)
+ {
+ 	struct maple_alloc *node;
++	unsigned long total;
+ 
+ 	/*
+ 	 * When using mas_for_each() to insert an expected number of elements,
+@@ -5861,14 +5850,20 @@ void mas_destroy(struct ma_state *mas)
+ 	}
+ 	mas->mas_flags &= ~(MA_STATE_BULK|MA_STATE_PREALLOC);
+ 
+-	while (mas->alloc && !((unsigned long)mas->alloc & 0x1)) {
++	total = mas_allocated(mas);
++	while (total) {
+ 		node = mas->alloc;
+ 		mas->alloc = node->slot[0];
+-		if (node->node_count > 0)
+-			mt_free_bulk(node->node_count,
+-				     (void __rcu **)&node->slot[1]);
++		if (node->node_count > 1) {
++			size_t count = node->node_count - 1;
++
++			mt_free_bulk(count, (void __rcu **)&node->slot[1]);
++			total -= count;
++		}
+ 		kmem_cache_free(maple_node_cache, node);
++		total--;
+ 	}
++
+ 	mas->alloc = NULL;
+ }
+ EXPORT_SYMBOL_GPL(mas_destroy);
+@@ -6828,7 +6823,7 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
  
  		if (i < (MAPLE_RANGE64_SLOTS - 1))
  			last = node->pivot[i];
@@ -559,7 +750,7 @@ index 4e4709f9a37f..6475890d1afd 100644
  			break;
  		if (last == 0 && i > 0)
  			break;
-@@ -6940,7 +6929,7 @@ void mt_dump(const struct maple_tree *mt)
+@@ -6935,7 +6930,7 @@ void mt_dump(const struct maple_tree *mt)
  	if (!xa_is_node(entry))
  		mt_dump_entry(entry, 0, 0, 0);
  	else if (entry)
@@ -1988,6 +2179,64 @@ index 1a86645b7b3c..fd666584515c 100644
  	struct mem_cgroup *memcg;
  	struct pglist_data *pgdat;
  	int type = folio_is_file_lru(folio);
+diff --git a/tools/testing/radix-tree/maple.c b/tools/testing/radix-tree/maple.c
+index 2539ad6c4777..2a16939cf028 100644
+--- a/tools/testing/radix-tree/maple.c
++++ b/tools/testing/radix-tree/maple.c
+@@ -175,11 +175,11 @@ static noinline void check_new_node(struct maple_tree *mt)
+ 
+ 		if (!MAPLE_32BIT) {
+ 			if (i >= 35)
+-				e = i - 35;
++				e = i - 34;
+ 			else if (i >= 5)
+-				e = i - 5;
++				e = i - 4;
+ 			else if (i >= 2)
+-				e = i - 2;
++				e = i - 1;
+ 		} else {
+ 			if (i >= 4)
+ 				e = i - 4;
+@@ -312,17 +312,17 @@ static noinline void check_new_node(struct maple_tree *mt)
+ 	MT_BUG_ON(mt, mas.node != MA_ERROR(-ENOMEM));
+ 	MT_BUG_ON(mt, !mas_nomem(&mas, GFP_KERNEL));
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
+-	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
++	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS);
+ 
+ 	mn = mas_pop_node(&mas); /* get the next node. */
+ 	MT_BUG_ON(mt, mn == NULL);
+ 	MT_BUG_ON(mt, not_empty(mn));
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS);
+-	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 2);
++	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
+ 
+ 	mas_push_node(&mas, mn);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
+-	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
++	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS);
+ 
+ 	/* Check the limit of pop/push/pop */
+ 	mas_node_count(&mas, MAPLE_ALLOC_SLOTS + 2); /* Request */
+@@ -330,14 +330,14 @@ static noinline void check_new_node(struct maple_tree *mt)
+ 	MT_BUG_ON(mt, mas.node != MA_ERROR(-ENOMEM));
+ 	MT_BUG_ON(mt, !mas_nomem(&mas, GFP_KERNEL));
+ 	MT_BUG_ON(mt, mas_alloc_req(&mas));
+-	MT_BUG_ON(mt, mas.alloc->node_count);
++	MT_BUG_ON(mt, mas.alloc->node_count != 1);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 2);
+ 	mn = mas_pop_node(&mas);
+ 	MT_BUG_ON(mt, not_empty(mn));
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
+-	MT_BUG_ON(mt, mas.alloc->node_count  != MAPLE_ALLOC_SLOTS - 1);
++	MT_BUG_ON(mt, mas.alloc->node_count  != MAPLE_ALLOC_SLOTS);
+ 	mas_push_node(&mas, mn);
+-	MT_BUG_ON(mt, mas.alloc->node_count);
++	MT_BUG_ON(mt, mas.alloc->node_count != 1);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 2);
+ 	mn = mas_pop_node(&mas);
+ 	MT_BUG_ON(mt, not_empty(mn));
 -- 
 2.39.0
 
