@@ -3,6 +3,186 @@ From: Peter Jung <admin@ptr1337.dev>
 Date: Sat, 7 Jan 2023 11:37:49 +0100
 Subject: [PATCH] Introduce per VMA lock
 
+This is the v1 of per-VMA locks patchset originally posted as an RFC at
+[1] and described in LWN article at [2]. Per-vma locks idea that was
+discussed during SPF [3] discussion at LSF/MM this year [4], which
+concluded with suggestion that “a reader/writer semaphore could be put
+into the VMA itself; that would have the effect of using the VMA as a
+sort of range lock. There would still be contention at the VMA level, but
+it would be an improvement.” This patchset implements this suggested
+approach.
+
+When handling page faults we lookup the VMA that contains the faulting
+page under RCU protection and try to acquire its lock. If that fails we
+fall back to using mmap_lock, similar to how SPF handled this situation.
+
+One notable way the implementation deviates from the proposal is the way
+VMAs are read-locked. During some of mm updates, multiple VMAs need to be
+locked until the end of the update (e.g. vma_merge, split_vma, etc).
+Tracking all the locked VMAs, avoiding recursive locks, figuring out when
+it's safe to unlock previously locked VMAs would make the code more
+complex. So, instead of the usual lock/unlock pattern, the proposed
+solution marks a VMA as locked and provides an efficient way to:
+1. Identify locked VMAs.
+2. Unlock all locked VMAs in bulk.
+We also postpone unlocking the locked VMAs until the end of the update,
+when we do mmap_write_unlock. Potentially this keeps a VMA locked for
+longer than is absolutely necessary but it results in a big reduction of
+code complexity.
+Read-locking a VMA is done using two sequence numbers - one in the
+vm_area_struct and one in the mm_struct. VMA is considered read-locked
+when these sequence numbers are equal. To read-lock a VMA we set the
+sequence number in vm_area_struct to be equal to the sequence number in
+mm_struct. To unlock all VMAs we increment mm_struct's seq number. This
+allows for an efficient way to track locked VMAs and to drop the locks on
+all VMAs at the end of the update.
+
+The patchset implements per-VMA locking only for anonymous pages which
+are not in swap and avoids userfaultfs as their implementation is more
+complex. Additional support for file-back page faults, swapped and user
+pages can be added incrementally.
+
+Performance benchmarks show similar although slightly smaller benefits as
+with SPF patchset (~75% of SPF benefits). Still, with lower complexity
+this approach might be more desirable.
+
+Since RFC was posted in September 2022, two separate Google teams outside
+of Android evaluated the patchset and confirmed positive results. Here are
+the known usecases when per-VMA locks show benefits:
+
+Android:
+Apps with high number of threads (~100) launch times improve by up to 20%.
+Each thread mmaps several areas upon startup (Stack and Thread-local
+storage (TLS), thread signal stack, indirect ref table), which requires
+taking mmap_lock in write mode. Page faults take mmap_lock in read mode.
+During app launch, both thread creation and page faults establishing the
+active workinget are happening in parallel and that causes lock contention
+between mm writers and readers even if updates and page faults are
+happening in different VMAs. Per-vma locks prevent this contention by
+providing more granular lock.
+
+Google Fibers:
+We have several dynamically sized thread pools that spawn new threads
+under increased load and reduce their number when idling. For example,
+Google's in-process scheduling/threading framework, UMCG/Fibers, is backed
+by such a thread pool. When idling, only a small number of idle worker
+threads are available; when a spike of incoming requests arrive, each
+request is handled in its own "fiber", which is a work item posted onto a
+UMCG worker thread; quite often these spikes lead to a number of new
+threads spawning. Each new thread needs to allocate and register an RSEQ
+section on its TLS, then register itself with the kernel as a UMCG worker
+thread, and only after that it can be considered by the in-process
+UMCG/Fiber scheduler as available to do useful work. In short, during an
+incoming workload spike new threads have to be spawned, and they perform
+several syscalls (RSEQ registration, UMCG worker registration, memory
+allocations) before they can actually start doing useful work. Removing
+any bottlenecks on this thread startup path will greatly improve our
+services' latencies when faced with request/workload spikes.
+At high scale, mmap_lock contention during thread creation and stack page
+faults leads to user-visible multi-second serving latencies in a similar
+pattern to Android app startup. Per-VMA locking patchset has been run
+successfully in limited experiments with user-facing production workloads.
+In these experiments, we observed that the peak thread creation rate was
+high enough that thread creation is no longer a bottleneck.
+
+TCP zerocopy receive:
+From the point of view of TCP zerocopy receive, the per-vma lock patch is
+massively beneficial.
+In today's implementation, a process with N threads where N - 1 are
+performing zerocopy receive and 1 thread is performing madvise() with the
+write lock taken (e.g. needs to change vm_flags) will result in all N -1
+receive threads blocking until the madvise is done. Conversely, on a busy
+process receiving a lot of data, an madvise operation that does need to
+take the mmap lock in write mode will need to wait for all of the receives
+to be done - a lose:lose proposition. Per-VMA locking _removes_ by
+definition this source of contention entirely.
+There are other benefits for receive as well, chiefly a reduction in
+cacheline bouncing across receiving threads for locking/unlocking the
+single mmap lock. On an RPC style synthetic workload with 4KB RPCs:
+1a) The find+lock+unlock VMA path in the base case, without the per-vma
+lock patchset, is about 0.7% of cycles as measured by perf.
+1b) mmap_read_lock + mmap_read_unlock in the base case is about 0.5%
+cycles overall - most of this is within the TCP read hotpath (a small
+fraction is 'other' usage in the system).
+2a) The find+lock+unlock VMA path, with the per-vma patchset and a trivial
+patch written to take advantage of it in TCP, is about 0.4% of cycles
+(down from 0.7% above)
+2b) mmap_read_lock + mmap_read_unlock in the per-vma patchset is < 0.1%
+cycles and is out of the TCP read hotpath entirely (down from 0.5% before,
+the remaining usage is the 'other' usage in the system).
+So, in addition to entirely removing an onerous source of contention, it
+also reduces the CPU cycles of TCP receive zerocopy by about 0.5%+
+(compared to overall cycles in perf) for the 'small' RPC scenario.
+
+The patchset structure is:
+0001-0007: Enable maple-tree RCU mode
+0008-0038: Main per-vma locks patchset
+0039-0040: Performance optimizations
+0041: Memory overhead optimization
+
+Branch for testing is posted at:
+https://github.com/surenbaghdasaryan/linux/tree/per_vma_lock
+
+The patchset applies cleanly over Linus' tree at:
+commit b7bfaa761d76 ("Linux 6.2-rc3")
+
+[1] https://lore.kernel.org/all/20220901173516.702122-1-surenb@google.com/
+[2] https://lwn.net/Articles/906852/
+[3] https://lore.kernel.org/all/20220128131006.67712-1-michel@lespinasse.org/
+[4] https://lwn.net/Articles/893906/
+
+Laurent Dufour (1):
+  powerc/mm: try VMA lock-based page fault handling first
+
+Liam Howlett (4):
+  maple_tree: Be more cautious about dead nodes
+  maple_tree: Detect dead nodes in mas_start()
+  maple_tree: Fix freeing of nodes in rcu mode
+  maple_tree: remove extra smp_wmb() from mas_dead_leaves()
+
+Liam R. Howlett (3):
+  maple_tree: Fix write memory barrier of nodes once dead for RCU mode
+  maple_tree: Add smp_rmb() to dead node detection
+  mm: Enable maple tree RCU mode by default.
+
+Michel Lespinasse (1):
+  mm: rcu safe VMA freeing
+
+Suren Baghdasaryan (32):
+  mm: introduce CONFIG_PER_VMA_LOCK
+  mm: move mmap_lock assert function definitions
+  mm: export dump_mm()
+  mm: add per-VMA lock and helper functions to control it
+  mm: introduce vma->vm_flags modifier functions
+  mm: replace VM_LOCKED_CLEAR_MASK with VM_LOCKED_MASK
+  mm: replace vma->vm_flags direct modifications with modifier calls
+  mm: replace vma->vm_flags indirect modification in ksm_madvise
+  mm/mmap: move VMA locking before anon_vma_lock_write call
+  mm/khugepaged: write-lock VMA while collapsing a huge page
+  mm/mmap: write-lock VMAs before merging, splitting or expanding them
+  mm/mmap: write-lock VMAs in vma_adjust
+  mm/mmap: write-lock VMAs affected by VMA expansion
+  mm/mremap: write-lock VMA while remapping it to a new address range
+  mm: write-lock VMAs before removing them from VMA tree
+  mm: conditionally write-lock VMA in free_pgtables
+  mm/mmap: write-lock adjacent VMAs if they can grow into unmapped area
+  kernel/fork: assert no VMA readers during its destruction
+  mm/mmap: prevent pagefault handler from racing with mmu_notifier
+    registration
+  mm: introduce lock_vma_under_rcu to be used from arch-specific code
+  mm: fall back to mmap_lock if vma->anon_vma is not yet set
+  mm: add FAULT_FLAG_VMA_LOCK flag
+  mm: prevent do_swap_page from handling page faults under VMA lock
+  mm: prevent userfaults to be handled under per-vma lock
+  mm: introduce per-VMA lock statistics
+  x86/mm: try VMA lock-based page fault handling first
+  arm64/mm: try VMA lock-based page fault handling first
+  mm: introduce mod_vm_flags_nolock
+  mm: avoid assertion in untrack_pfn
+  kernel/fork: throttle call_rcu() calls in vm_area_free
+  mm: separate vma->lock from vm_area_struct
+  mm: replace rw_semaphore with atomic_t in vma_lock
+
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  Documentation/filesystems/proc.rst            |   8 +-
