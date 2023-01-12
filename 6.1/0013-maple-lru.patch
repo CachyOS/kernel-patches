@@ -1,7 +1,7 @@
-From ee525b8cb02fb40e87ed2533429ddcd7675f99b3 Mon Sep 17 00:00:00 2001
+From 6e55cc7aca1941bf0c2fdd9cffab258db7bddf9f Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 7 Jan 2023 11:50:45 +0100
-Subject: [PATCH 13/19] lru
+Date: Thu, 12 Jan 2023 12:54:42 +0100
+Subject: [PATCH 13/19] maple-lru
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -10,16 +10,18 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  include/linux/memcontrol.h        |  10 +
  include/linux/mm_inline.h         |  36 +-
  include/linux/mmzone.h            | 127 ++++-
- lib/maple_tree.c                  |  80 ++--
+ lib/maple_tree.c                  | 101 ++--
+ lib/test_maple_tree.c             |  89 ++++
  mm/fadvise.c                      |   5 +-
  mm/memcontrol.c                   |  16 +
  mm/memory.c                       |   7 +-
+ mm/nommu.c                        |   9 +-
  mm/page_alloc.c                   |   1 +
  mm/rmap.c                         |  42 +-
  mm/vmscan.c                       | 747 ++++++++++++++++++++----------
  mm/workingset.c                   |   4 +-
  tools/testing/radix-tree/maple.c  |  18 +-
- 14 files changed, 765 insertions(+), 338 deletions(-)
+ 16 files changed, 870 insertions(+), 352 deletions(-)
 
 diff --git a/Documentation/mm/multigen_lru.rst b/Documentation/mm/multigen_lru.rst
 index d7062c6a8946..d8f721f98868 100644
@@ -54,7 +56,7 @@ index d7062c6a8946..d8f721f98868 100644
  evict from, it first compares ``min_seq[]`` to select the older type.
  If both types are equally old, it selects the one whose first tier has
 diff --git a/include/linux/fs.h b/include/linux/fs.h
-index 6b115bce14b9..9ef204d48f66 100644
+index 081d1f539628..f581229ad04b 100644
 --- a/include/linux/fs.h
 +++ b/include/linux/fs.h
 @@ -166,6 +166,8 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
@@ -403,7 +405,7 @@ index 5f74891556f3..87b3b5a2aac4 100644
  
  	CACHELINE_PADDING(_pad2_);
 diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index 24db7998a274..3e0c2d860f2c 100644
+index 24db7998a274..8f415f868b82 100644
 --- a/lib/maple_tree.c
 +++ b/lib/maple_tree.c
 @@ -149,13 +149,12 @@ struct maple_subtree_state {
@@ -569,7 +571,64 @@ index 24db7998a274..3e0c2d860f2c 100644
  	mas_set_err(mas, -ENOMEM);
  }
  
-@@ -5735,6 +5734,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
+@@ -4878,7 +4877,7 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size)
+ 	unsigned long *pivots, *gaps;
+ 	void __rcu **slots;
+ 	unsigned long gap = 0;
+-	unsigned long max, min, index;
++	unsigned long max, min;
+ 	unsigned char offset;
+ 
+ 	if (unlikely(mas_is_err(mas)))
+@@ -4900,8 +4899,7 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size)
+ 		min = mas_safe_min(mas, pivots, --offset);
+ 
+ 	max = mas_safe_pivot(mas, pivots, offset, type);
+-	index = mas->index;
+-	while (index <= max) {
++	while (mas->index <= max) {
+ 		gap = 0;
+ 		if (gaps)
+ 			gap = gaps[offset];
+@@ -4932,10 +4930,8 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size)
+ 		min = mas_safe_min(mas, pivots, offset);
+ 	}
+ 
+-	if (unlikely(index > max)) {
+-		mas_set_err(mas, -EBUSY);
+-		return false;
+-	}
++	if (unlikely((mas->index > max) || (size - 1 > max - mas->index)))
++		goto no_space;
+ 
+ 	if (unlikely(ma_is_leaf(type))) {
+ 		mas->offset = offset;
+@@ -4952,9 +4948,11 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size)
+ 	return false;
+ 
+ ascend:
+-	if (mte_is_root(mas->node))
+-		mas_set_err(mas, -EBUSY);
++	if (!mte_is_root(mas->node))
++		return false;
+ 
++no_space:
++	mas_set_err(mas, -EBUSY);
+ 	return false;
+ }
+ 
+@@ -5581,8 +5579,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+ 
+ /*
+  * mte_destroy_walk() - Free a tree or sub-tree.
+- * @enode - the encoded maple node (maple_enode) to start
+- * @mn - the tree to free - needed for node types.
++ * @enode: the encoded maple node (maple_enode) to start
++ * @mt: the tree to free - needed for node types.
+  *
+  * Must hold the write lock.
+  */
+@@ -5735,6 +5733,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
  void mas_destroy(struct ma_state *mas)
  {
  	struct maple_alloc *node;
@@ -577,7 +636,7 @@ index 24db7998a274..3e0c2d860f2c 100644
  
  	/*
  	 * When using mas_for_each() to insert an expected number of elements,
-@@ -5757,14 +5757,20 @@ void mas_destroy(struct ma_state *mas)
+@@ -5757,14 +5756,20 @@ void mas_destroy(struct ma_state *mas)
  	}
  	mas->mas_flags &= ~(MA_STATE_BULK|MA_STATE_PREALLOC);
  
@@ -602,6 +661,113 @@ index 24db7998a274..3e0c2d860f2c 100644
  	mas->alloc = NULL;
  }
  EXPORT_SYMBOL_GPL(mas_destroy);
+diff --git a/lib/test_maple_tree.c b/lib/test_maple_tree.c
+index 497fc93ccf9e..ec847bf4dcb4 100644
+--- a/lib/test_maple_tree.c
++++ b/lib/test_maple_tree.c
+@@ -2517,6 +2517,91 @@ static noinline void check_bnode_min_spanning(struct maple_tree *mt)
+ 	mt_set_non_kernel(0);
+ }
+ 
++static noinline void check_empty_area_window(struct maple_tree *mt)
++{
++	unsigned long i, nr_entries = 20;
++	MA_STATE(mas, mt, 0, 0);
++
++	for (i = 1; i <= nr_entries; i++)
++		mtree_store_range(mt, i*10, i*10 + 9,
++				  xa_mk_value(i), GFP_KERNEL);
++
++	/* Create another hole besides the one at 0 */
++	mtree_store_range(mt, 160, 169, NULL, GFP_KERNEL);
++
++	/* Check lower bounds that don't fit */
++	rcu_read_lock();
++	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 5, 90, 10) != -EBUSY);
++
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 6, 90, 5) != -EBUSY);
++
++	/* Check lower bound that does fit */
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 5, 90, 5) != 0);
++	MT_BUG_ON(mt, mas.index != 5);
++	MT_BUG_ON(mt, mas.last != 9);
++	rcu_read_unlock();
++
++	/* Check one gap that doesn't fit and one that does */
++	rcu_read_lock();
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 5, 217, 9) != 0);
++	MT_BUG_ON(mt, mas.index != 161);
++	MT_BUG_ON(mt, mas.last != 169);
++
++	/* Check one gap that does fit above the min */
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 100, 218, 3) != 0);
++	MT_BUG_ON(mt, mas.index != 216);
++	MT_BUG_ON(mt, mas.last != 218);
++
++	/* Check size that doesn't fit any gap */
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 100, 218, 16) != -EBUSY);
++
++	/*
++	 * Check size that doesn't fit the lower end of the window but
++	 * does fit the gap
++	 */
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 167, 200, 4) != -EBUSY);
++
++	/*
++	 * Check size that doesn't fit the upper end of the window but
++	 * does fit the gap
++	 */
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 100, 162, 4) != -EBUSY);
++
++	/* Check mas_empty_area forward */
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area(&mas, 0, 100, 9) != 0);
++	MT_BUG_ON(mt, mas.index != 0);
++	MT_BUG_ON(mt, mas.last != 8);
++
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area(&mas, 0, 100, 4) != 0);
++	MT_BUG_ON(mt, mas.index != 0);
++	MT_BUG_ON(mt, mas.last != 3);
++
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area(&mas, 0, 100, 11) != -EBUSY);
++
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area(&mas, 5, 100, 6) != -EBUSY);
++
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area(&mas, 0, 8, 10) != -EBUSY);
++
++	mas_reset(&mas);
++	mas_empty_area(&mas, 100, 165, 3);
++
++	mas_reset(&mas);
++	MT_BUG_ON(mt, mas_empty_area(&mas, 100, 163, 6) != -EBUSY);
++	rcu_read_unlock();
++}
++
+ static DEFINE_MTREE(tree);
+ static int maple_tree_seed(void)
+ {
+@@ -2765,6 +2850,10 @@ static int maple_tree_seed(void)
+ 	check_bnode_min_spanning(&tree);
+ 	mtree_destroy(&tree);
+ 
++	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
++	check_empty_area_window(&tree);
++	mtree_destroy(&tree);
++
+ #if defined(BENCH)
+ skip:
+ #endif
 diff --git a/mm/fadvise.c b/mm/fadvise.c
 index c76ee665355a..2ba24d865bf5 100644
 --- a/mm/fadvise.c
@@ -705,6 +871,68 @@ index b35b3f616a4b..1aaf29d5267d 100644
  }
  
  static void lru_gen_exit_fault(void)
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 214c70e1d059..5b83938ecb67 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -559,7 +559,6 @@ void vma_mas_remove(struct vm_area_struct *vma, struct ma_state *mas)
+ 
+ static void setup_vma_to_mm(struct vm_area_struct *vma, struct mm_struct *mm)
+ {
+-	mm->map_count++;
+ 	vma->vm_mm = mm;
+ 
+ 	/* add the VMA to the mapping */
+@@ -587,6 +586,7 @@ static void mas_add_vma_to_mm(struct ma_state *mas, struct mm_struct *mm,
+ 	BUG_ON(!vma->vm_region);
+ 
+ 	setup_vma_to_mm(vma, mm);
++	mm->map_count++;
+ 
+ 	/* add the VMA to the tree */
+ 	vma_mas_store(vma, mas);
+@@ -1240,6 +1240,7 @@ unsigned long do_mmap(struct file *file,
+ error_just_free:
+ 	up_write(&nommu_region_sem);
+ error:
++	mas_destroy(&mas);
+ 	if (region->vm_file)
+ 		fput(region->vm_file);
+ 	kmem_cache_free(vm_region_jar, region);
+@@ -1250,7 +1251,6 @@ unsigned long do_mmap(struct file *file,
+ 
+ sharing_violation:
+ 	up_write(&nommu_region_sem);
+-	mas_destroy(&mas);
+ 	pr_warn("Attempt to share mismatched mappings\n");
+ 	ret = -EINVAL;
+ 	goto error;
+@@ -1347,6 +1347,7 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	if (vma->vm_file)
+ 		return -ENOMEM;
+ 
++	mm = vma->vm_mm;
+ 	if (mm->map_count >= sysctl_max_map_count)
+ 		return -ENOMEM;
+ 
+@@ -1398,6 +1399,7 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	mas_set_range(&mas, vma->vm_start, vma->vm_end - 1);
+ 	mas_store(&mas, vma);
+ 	vma_mas_store(new, &mas);
++	mm->map_count++;
+ 	return 0;
+ 
+ err_mas_preallocate:
+@@ -1509,7 +1511,8 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len, struct list
+ erase_whole_vma:
+ 	if (delete_vma_from_mm(vma))
+ 		ret = -ENOMEM;
+-	delete_vma(mm, vma);
++	else
++		delete_vma(mm, vma);
+ 	return ret;
+ }
+ 
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
 index cec612c4e74c..91ca0b8ad411 100644
 --- a/mm/page_alloc.c

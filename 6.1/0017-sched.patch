@@ -1,29 +1,30 @@
-From b54419f1279d63dfeb33e88dae680eec3560e7e3 Mon Sep 17 00:00:00 2001
+From 091288e1aa36ce825e0fb6fbc9ecd430f7bce41d Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 31 Dec 2022 14:33:43 +0100
+Date: Thu, 12 Jan 2023 12:55:04 +0100
 Subject: [PATCH 17/19] sched
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- arch/s390/include/asm/hardirq.h |   6 +
- include/linux/interrupt.h       |  20 +
- include/linux/mm_types.h        |  14 +
- include/linux/psi_types.h       |   4 +
- include/linux/sched.h           |   3 -
- init/Kconfig                    |  10 +
- kernel/sched/core.c             | 251 +++++++-----
- kernel/sched/deadline.c         |   7 +-
- kernel/sched/debug.c            |   2 +
- kernel/sched/fair.c             | 696 +++++++++++++++++++++++++++++---
- kernel/sched/pelt.c             |  60 +++
- kernel/sched/pelt.h             |  42 +-
- kernel/sched/psi.c              |  92 ++++-
- kernel/sched/rt.c               |  49 ++-
- kernel/sched/sched.h            |  52 ++-
- kernel/sched/stats.h            |  22 +-
- kernel/sched/topology.c         |   2 +-
- kernel/softirq.c                |  46 ++-
- 18 files changed, 1171 insertions(+), 207 deletions(-)
+ arch/s390/include/asm/hardirq.h  |   6 +
+ include/linux/interrupt.h        |  20 +
+ include/linux/mm_types.h         |  14 +
+ include/linux/psi_types.h        |   4 +
+ include/linux/sched.h            |   3 -
+ init/Kconfig                     |  10 +
+ kernel/sched/core.c              | 328 +++++++++------
+ kernel/sched/cpufreq_schedutil.c |  43 +-
+ kernel/sched/deadline.c          |   7 +-
+ kernel/sched/debug.c             |   2 +
+ kernel/sched/fair.c              | 696 ++++++++++++++++++++++++++++---
+ kernel/sched/pelt.c              |  60 +++
+ kernel/sched/pelt.h              |  42 +-
+ kernel/sched/psi.c               |  92 +++-
+ kernel/sched/rt.c                |  49 ++-
+ kernel/sched/sched.h             |  52 ++-
+ kernel/sched/stats.h             |  22 +-
+ kernel/sched/topology.c          |   2 +-
+ kernel/softirq.c                 |  46 +-
+ 19 files changed, 1236 insertions(+), 262 deletions(-)
 
 diff --git a/arch/s390/include/asm/hardirq.h b/arch/s390/include/asm/hardirq.h
 index 58668ffb5488..cd9cc11588ab 100644
@@ -170,7 +171,7 @@ index a25ba6556e2b..5cf5c424fbf1 100644
  	bool "Enable deprecated sysfs features to support old userspace tools"
  	depends on SYSFS
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 535af9fbea7b..a7831ce37f7c 100644
+index 535af9fbea7b..2150e821899c 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -722,7 +722,7 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
@@ -403,13 +404,13 @@ index 535af9fbea7b..a7831ce37f7c 100644
  	}
  
 -	__do_set_cpus_allowed(p, new_mask, flags);
--
++	__do_set_cpus_allowed(p, ctx);
+ 
 -	if (flags & SCA_USER)
 -		user_mask = clear_user_cpus_ptr(p);
 -
 -	ret = affine_move_task(rq, p, rf, dest_cpu, flags);
-+	__do_set_cpus_allowed(p, ctx);
- 
+-
 -	kfree(user_mask);
 -
 -	return ret;
@@ -580,7 +581,102 @@ index 535af9fbea7b..a7831ce37f7c 100644
  }
  
  static inline void migrate_disable_switch(struct rq *rq, struct task_struct *p) { }
-@@ -3719,13 +3739,6 @@ void sched_ttwu_pending(void *arg)
+@@ -3603,14 +3623,39 @@ ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
+ }
+ 
+ /*
+- * Mark the task runnable and perform wakeup-preemption.
++ * Mark the task runnable.
+  */
+-static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+-			   struct rq_flags *rf)
++static inline void ttwu_do_wakeup(struct task_struct *p)
+ {
+-	check_preempt_curr(rq, p, wake_flags);
+ 	WRITE_ONCE(p->__state, TASK_RUNNING);
+ 	trace_sched_wakeup(p);
++}
++
++static void
++ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
++		 struct rq_flags *rf)
++{
++	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
++
++	lockdep_assert_rq_held(rq);
++
++	if (p->sched_contributes_to_load)
++		rq->nr_uninterruptible--;
++
++#ifdef CONFIG_SMP
++	if (wake_flags & WF_MIGRATED)
++		en_flags |= ENQUEUE_MIGRATED;
++	else
++#endif
++	if (p->in_iowait) {
++		delayacct_blkio_end(p);
++		atomic_dec(&task_rq(p)->nr_iowait);
++	}
++
++	activate_task(rq, p, en_flags);
++	check_preempt_curr(rq, p, wake_flags);
++
++	ttwu_do_wakeup(p);
+ 
+ #ifdef CONFIG_SMP
+ 	if (p->sched_class->task_woken) {
+@@ -3640,31 +3685,6 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+ #endif
+ }
+ 
+-static void
+-ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
+-		 struct rq_flags *rf)
+-{
+-	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
+-
+-	lockdep_assert_rq_held(rq);
+-
+-	if (p->sched_contributes_to_load)
+-		rq->nr_uninterruptible--;
+-
+-#ifdef CONFIG_SMP
+-	if (wake_flags & WF_MIGRATED)
+-		en_flags |= ENQUEUE_MIGRATED;
+-	else
+-#endif
+-	if (p->in_iowait) {
+-		delayacct_blkio_end(p);
+-		atomic_dec(&task_rq(p)->nr_iowait);
+-	}
+-
+-	activate_task(rq, p, en_flags);
+-	ttwu_do_wakeup(rq, p, wake_flags, rf);
+-}
+-
+ /*
+  * Consider @p being inside a wait loop:
+  *
+@@ -3698,9 +3718,15 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
+ 
+ 	rq = __task_rq_lock(p, &rf);
+ 	if (task_on_rq_queued(p)) {
+-		/* check_preempt_curr() may use rq clock */
+-		update_rq_clock(rq);
+-		ttwu_do_wakeup(rq, p, wake_flags, &rf);
++		if (!task_on_cpu(rq, p)) {
++			/*
++			 * When on_rq && !on_cpu the task is preempted, see if
++			 * it should preempt the task that is current now.
++			 */
++			update_rq_clock(rq);
++			check_preempt_curr(rq, p, wake_flags);
++		}
++		ttwu_do_wakeup(p);
+ 		ret = 1;
+ 	}
+ 	__task_rq_unlock(rq, &rf);
+@@ -3719,13 +3745,6 @@ void sched_ttwu_pending(void *arg)
  	if (!llist)
  		return;
  
@@ -594,7 +690,7 @@ index 535af9fbea7b..a7831ce37f7c 100644
  	rq_lock_irqsave(rq, &rf);
  	update_rq_clock(rq);
  
-@@ -3739,6 +3752,17 @@ void sched_ttwu_pending(void *arg)
+@@ -3739,6 +3758,17 @@ void sched_ttwu_pending(void *arg)
  		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
  	}
  
@@ -612,7 +708,28 @@ index 535af9fbea7b..a7831ce37f7c 100644
  	rq_unlock_irqrestore(rq, &rf);
  }
  
-@@ -8106,7 +8130,7 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
+@@ -4062,8 +4092,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 			goto out;
+ 
+ 		trace_sched_waking(p);
+-		WRITE_ONCE(p->__state, TASK_RUNNING);
+-		trace_sched_wakeup(p);
++		ttwu_do_wakeup(p);
+ 		goto out;
+ 	}
+ 
+@@ -5469,7 +5498,9 @@ void scheduler_tick(void)
+ 	unsigned long thermal_pressure;
+ 	u64 resched_latency;
+ 
+-	arch_scale_freq_tick();
++	if (housekeeping_cpu(cpu, HK_TYPE_TICK))
++		arch_scale_freq_tick();
++
+ 	sched_clock_tick();
+ 
+ 	rq_lock(rq, &rf);
+@@ -8106,7 +8137,7 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
  #endif
  
  static int
@@ -621,7 +738,7 @@ index 535af9fbea7b..a7831ce37f7c 100644
  {
  	int retval;
  	cpumask_var_t cpus_allowed, new_mask;
-@@ -8120,13 +8144,16 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+@@ -8120,13 +8151,16 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
  	}
  
  	cpuset_cpus_allowed(p, cpus_allowed);
@@ -641,7 +758,7 @@ index 535af9fbea7b..a7831ce37f7c 100644
  	if (retval)
  		goto out_free_new_mask;
  
-@@ -8137,7 +8164,24 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+@@ -8137,7 +8171,24 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
  		 * Just reset the cpumask to the cpuset's cpus_allowed.
  		 */
  		cpumask_copy(new_mask, cpus_allowed);
@@ -667,7 +784,7 @@ index 535af9fbea7b..a7831ce37f7c 100644
  	}
  
  out_free_new_mask:
-@@ -8149,6 +8193,8 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
+@@ -8149,6 +8200,8 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
  
  long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
  {
@@ -676,7 +793,7 @@ index 535af9fbea7b..a7831ce37f7c 100644
  	struct task_struct *p;
  	int retval;
  
-@@ -8183,7 +8229,21 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+@@ -8183,7 +8236,21 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
  	if (retval)
  		goto out_put_task;
  
@@ -699,7 +816,7 @@ index 535af9fbea7b..a7831ce37f7c 100644
  out_put_task:
  	put_task_struct(p);
  	return retval;
-@@ -8964,6 +9024,12 @@ void show_state_filter(unsigned int state_filter)
+@@ -8964,6 +9031,12 @@ void show_state_filter(unsigned int state_filter)
   */
  void __init init_idle(struct task_struct *idle, int cpu)
  {
@@ -712,7 +829,7 @@ index 535af9fbea7b..a7831ce37f7c 100644
  	struct rq *rq = cpu_rq(cpu);
  	unsigned long flags;
  
-@@ -8988,7 +9054,7 @@ void __init init_idle(struct task_struct *idle, int cpu)
+@@ -8988,7 +9061,7 @@ void __init init_idle(struct task_struct *idle, int cpu)
  	 *
  	 * And since this is boot we can forgo the serialization.
  	 */
@@ -721,7 +838,7 @@ index 535af9fbea7b..a7831ce37f7c 100644
  #endif
  	/*
  	 * We're having a chicken and egg problem, even though we are
-@@ -9775,6 +9841,7 @@ void __init sched_init(void)
+@@ -9775,6 +9848,7 @@ void __init sched_init(void)
  
  		rq->core_cookie = 0UL;
  #endif
@@ -729,6 +846,150 @@ index 535af9fbea7b..a7831ce37f7c 100644
  	}
  
  	set_load_weight(&init_task, false);
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index 1207c78f85c1..5c840151f3bb 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -48,7 +48,6 @@ struct sugov_cpu {
+ 
+ 	unsigned long		util;
+ 	unsigned long		bw_dl;
+-	unsigned long		max;
+ 
+ 	/* The field below is for single-CPU policies only: */
+ #ifdef CONFIG_NO_HZ_COMMON
+@@ -158,7 +157,6 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu)
+ {
+ 	struct rq *rq = cpu_rq(sg_cpu->cpu);
+ 
+-	sg_cpu->max = arch_scale_cpu_capacity(sg_cpu->cpu);
+ 	sg_cpu->bw_dl = cpu_bw_dl(rq);
+ 	sg_cpu->util = effective_cpu_util(sg_cpu->cpu, cpu_util_cfs(sg_cpu->cpu),
+ 					  FREQUENCY_UTIL, NULL);
+@@ -238,6 +236,7 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
+  * sugov_iowait_apply() - Apply the IO boost to a CPU.
+  * @sg_cpu: the sugov data for the cpu to boost
+  * @time: the update time from the caller
++ * @max_cap: the max CPU capacity
+  *
+  * A CPU running a task which woken up after an IO operation can have its
+  * utilization boosted to speed up the completion of those IO operations.
+@@ -251,7 +250,8 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
+  * This mechanism is designed to boost high frequently IO waiting tasks, while
+  * being more conservative on tasks which does sporadic IO operations.
+  */
+-static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
++static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
++			       unsigned long max_cap)
+ {
+ 	unsigned long boost;
+ 
+@@ -280,7 +280,7 @@ static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
+ 	 * sg_cpu->util is already in capacity scale; convert iowait_boost
+ 	 * into the same scale so we can compare.
+ 	 */
+-	boost = (sg_cpu->iowait_boost * sg_cpu->max) >> SCHED_CAPACITY_SHIFT;
++	boost = (sg_cpu->iowait_boost * max_cap) >> SCHED_CAPACITY_SHIFT;
+ 	boost = uclamp_rq_util_with(cpu_rq(sg_cpu->cpu), boost, NULL);
+ 	if (sg_cpu->util < boost)
+ 		sg_cpu->util = boost;
+@@ -310,7 +310,8 @@ static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
+ }
+ 
+ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
+-					      u64 time, unsigned int flags)
++					      u64 time, unsigned long max_cap,
++					      unsigned int flags)
+ {
+ 	sugov_iowait_boost(sg_cpu, time, flags);
+ 	sg_cpu->last_update = time;
+@@ -321,7 +322,7 @@ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
+ 		return false;
+ 
+ 	sugov_get_util(sg_cpu);
+-	sugov_iowait_apply(sg_cpu, time);
++	sugov_iowait_apply(sg_cpu, time, max_cap);
+ 
+ 	return true;
+ }
+@@ -332,12 +333,15 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
+ 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+ 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
+ 	unsigned int cached_freq = sg_policy->cached_raw_freq;
++	unsigned long max_cap;
+ 	unsigned int next_f;
+ 
+-	if (!sugov_update_single_common(sg_cpu, time, flags))
++	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
++
++	if (!sugov_update_single_common(sg_cpu, time, max_cap, flags))
+ 		return;
+ 
+-	next_f = get_next_freq(sg_policy, sg_cpu->util, sg_cpu->max);
++	next_f = get_next_freq(sg_policy, sg_cpu->util, max_cap);
+ 	/*
+ 	 * Do not reduce the frequency if the CPU has not been idle
+ 	 * recently, as the reduction is likely to be premature then.
+@@ -374,6 +378,7 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
+ {
+ 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+ 	unsigned long prev_util = sg_cpu->util;
++	unsigned long max_cap;
+ 
+ 	/*
+ 	 * Fall back to the "frequency" path if frequency invariance is not
+@@ -385,7 +390,9 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
+ 		return;
+ 	}
+ 
+-	if (!sugov_update_single_common(sg_cpu, time, flags))
++	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
++
++	if (!sugov_update_single_common(sg_cpu, time, max_cap, flags))
+ 		return;
+ 
+ 	/*
+@@ -399,7 +406,7 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
+ 		sg_cpu->util = prev_util;
+ 
+ 	cpufreq_driver_adjust_perf(sg_cpu->cpu, map_util_perf(sg_cpu->bw_dl),
+-				   map_util_perf(sg_cpu->util), sg_cpu->max);
++				   map_util_perf(sg_cpu->util), max_cap);
+ 
+ 	sg_cpu->sg_policy->last_freq_update_time = time;
+ }
+@@ -408,25 +415,21 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
+ {
+ 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
+ 	struct cpufreq_policy *policy = sg_policy->policy;
+-	unsigned long util = 0, max = 1;
++	unsigned long util = 0, max_cap;
+ 	unsigned int j;
+ 
++	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
++
+ 	for_each_cpu(j, policy->cpus) {
+ 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
+-		unsigned long j_util, j_max;
+ 
+ 		sugov_get_util(j_sg_cpu);
+-		sugov_iowait_apply(j_sg_cpu, time);
+-		j_util = j_sg_cpu->util;
+-		j_max = j_sg_cpu->max;
++		sugov_iowait_apply(j_sg_cpu, time, max_cap);
+ 
+-		if (j_util * max > j_max * util) {
+-			util = j_util;
+-			max = j_max;
+-		}
++		util = max(j_sg_cpu->util, util);
+ 	}
+ 
+-	return get_next_freq(sg_policy, util, max);
++	return get_next_freq(sg_policy, util, max_cap);
+ }
+ 
+ static void
 diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
 index 9ae8f41e3372..0d97d54276cc 100644
 --- a/kernel/sched/deadline.c
