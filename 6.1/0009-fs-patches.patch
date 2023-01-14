@@ -1,4 +1,4 @@
-From 95bec8fa71848699976891414fb39ee79ebd6085 Mon Sep 17 00:00:00 2001
+From 3755d7d932595cfcdebc841864e90b0a130f4b49 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 16 Dec 2022 14:24:11 +0100
 Subject: [PATCH 09/19] fs-patches
@@ -11,6 +11,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/btrfs/ctree.h                    |   1 +
  fs/btrfs/disk-io.c                  |  14 ++
  fs/btrfs/super.c                    |   2 +
+ fs/btrfs/tree-log.c                 |  30 ++-
  fs/btrfs/volumes.c                  |   3 +
  fs/btrfs/volumes.h                  |   2 +
  fs/iomap/buffered-io.c              | 254 ++++++++++++++++++-
@@ -35,6 +36,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/ntfs3/upcase.c                   |  12 +
  fs/ntfs3/xattr.c                    | 250 ++++++++++++++-----
  fs/xfs/libxfs/xfs_bmap.c            |   8 +-
+ fs/xfs/libxfs/xfs_btree.c           |   7 +-
  fs/xfs/libxfs/xfs_btree.h           |   1 -
  fs/xfs/libxfs/xfs_errortag.h        |  18 +-
  fs/xfs/libxfs/xfs_refcount.c        | 146 +++++++++--
@@ -64,10 +66,12 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/xfs/xfs_buf_item.c               |   2 +
  fs/xfs/xfs_error.c                  |  46 +++-
  fs/xfs/xfs_error.h                  |  13 +
+ fs/xfs/xfs_extent_busy.c            |   1 +
  fs/xfs/xfs_file.c                   |   2 +-
  fs/xfs/xfs_fsmap.c                  |   4 +-
- fs/xfs/xfs_icache.c                 |   6 +
+ fs/xfs/xfs_icache.c                 |  16 ++
  fs/xfs/xfs_inode.c                  |   2 +-
+ fs/xfs/xfs_ioctl.c                  |   4 +-
  fs/xfs/xfs_iomap.c                  | 185 ++++++++------
  fs/xfs/xfs_iomap.h                  |   6 +-
  fs/xfs/xfs_log.c                    |  46 ++--
@@ -81,7 +85,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  fs/xfs/xfs_trans_ail.c              |   4 +-
  fs/xfs/xfs_xattr.c                  |   2 +-
  include/linux/iomap.h               |  47 +++-
- 76 files changed, 2881 insertions(+), 942 deletions(-)
+ 80 files changed, 2924 insertions(+), 951 deletions(-)
 
 diff --git a/Documentation/filesystems/ntfs3.rst b/Documentation/filesystems/ntfs3.rst
 index d67ccd22c63b..5aa102bd72c2 100644
@@ -357,6 +361,62 @@ index abfd7c897075..887f36a48330 100644
  			break;
  		case Opt_space_cache:
  		case Opt_space_cache_version:
+diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+index c3cf3dabe0b1..9da5cc3b6546 100644
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -3857,7 +3857,10 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
+ 					      path->slots[0]);
+ 			if (tmp.type == BTRFS_DIR_INDEX_KEY)
+ 				last_old_dentry_offset = tmp.offset;
++		} else if (ret < 0) {
++			err = ret;
+ 		}
++
+ 		goto done;
+ 	}
+ 
+@@ -3877,19 +3880,34 @@ static noinline int log_dir_items(struct btrfs_trans_handle *trans,
+ 		 */
+ 		if (tmp.type == BTRFS_DIR_INDEX_KEY)
+ 			last_old_dentry_offset = tmp.offset;
++	} else if (ret < 0) {
++		err = ret;
++		goto done;
+ 	}
++
+ 	btrfs_release_path(path);
+ 
+ 	/*
+-	 * Find the first key from this transaction again.  See the note for
+-	 * log_new_dir_dentries, if we're logging a directory recursively we
+-	 * won't be holding its i_mutex, which means we can modify the directory
+-	 * while we're logging it.  If we remove an entry between our first
+-	 * search and this search we'll not find the key again and can just
+-	 * bail.
++	 * Find the first key from this transaction again or the one we were at
++	 * in the loop below in case we had to reschedule. We may be logging the
++	 * directory without holding its VFS lock, which happen when logging new
++	 * dentries (through log_new_dir_dentries()) or in some cases when we
++	 * need to log the parent directory of an inode. This means a dir index
++	 * key might be deleted from the inode's root, and therefore we may not
++	 * find it anymore. If we can't find it, just move to the next key. We
++	 * can not bail out and ignore, because if we do that we will simply
++	 * not log dir index keys that come after the one that was just deleted
++	 * and we can end up logging a dir index range that ends at (u64)-1
++	 * (@last_offset is initialized to that), resulting in removing dir
++	 * entries we should not remove at log replay time.
+ 	 */
+ search:
+ 	ret = btrfs_search_slot(NULL, root, &min_key, path, 0, 0);
++	if (ret > 0)
++		ret = btrfs_next_item(root, path);
++	if (ret < 0)
++		err = ret;
++	/* If ret is 1, there are no more keys in the inode's root. */
+ 	if (ret != 0)
+ 		goto done;
+ 
 diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
 index dba087ad40ea..4afb986b5a62 100644
 --- a/fs/btrfs/volumes.c
@@ -4524,6 +4584,24 @@ index 49d0d4ea63fc..0d56a8d862e8 100644
  	*seq = READ_ONCE(ifp->if_seq);
  
  	if (whichfork == XFS_COW_FORK)
+diff --git a/fs/xfs/libxfs/xfs_btree.c b/fs/xfs/libxfs/xfs_btree.c
+index 4c16c8c31fcb..35f574421670 100644
+--- a/fs/xfs/libxfs/xfs_btree.c
++++ b/fs/xfs/libxfs/xfs_btree.c
+@@ -4666,7 +4666,12 @@ xfs_btree_space_to_height(
+ 	const unsigned int	*limits,
+ 	unsigned long long	leaf_blocks)
+ {
+-	unsigned long long	node_blocks = limits[1];
++	/*
++	 * The root btree block can have fewer than minrecs pointers in it
++	 * because the tree might not be big enough to require that amount of
++	 * fanout. Hence it has a minimum size of 2 pointers, not limits[1].
++	 */
++	unsigned long long	node_blocks = 2;
+ 	unsigned long long	blocks_left = leaf_blocks - 1;
+ 	unsigned int		height = 1;
+ 
 diff --git a/fs/xfs/libxfs/xfs_btree.h b/fs/xfs/libxfs/xfs_btree.h
 index eef27858a013..29c4b4ccb909 100644
 --- a/fs/xfs/libxfs/xfs_btree.h
@@ -6408,6 +6486,18 @@ index 5191e9145e55..dbe6c37dc697 100644
  #define xfs_errortag_set(mp, tag, val)		(ENOSYS)
  #define xfs_errortag_add(mp, tag)		(ENOSYS)
  #define xfs_errortag_clearall(mp)		(ENOSYS)
+diff --git a/fs/xfs/xfs_extent_busy.c b/fs/xfs/xfs_extent_busy.c
+index ad22a003f959..f3d328e4a440 100644
+--- a/fs/xfs/xfs_extent_busy.c
++++ b/fs/xfs/xfs_extent_busy.c
+@@ -236,6 +236,7 @@ xfs_extent_busy_update_extent(
+ 		 *
+ 		 */
+ 		busyp->bno = fend;
++		busyp->length = bend - fend;
+ 	} else if (bbno < fbno) {
+ 		/*
+ 		 * Case 8:
 diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
 index e462d39c840e..595a5bcf46b9 100644
 --- a/fs/xfs/xfs_file.c
@@ -6444,7 +6534,7 @@ index d8337274c74d..88a88506ffff 100644
  }
  
 diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
-index eae7427062cf..f35e2cee5265 100644
+index eae7427062cf..ddeaccc04aec 100644
 --- a/fs/xfs/xfs_icache.c
 +++ b/fs/xfs/xfs_icache.c
 @@ -342,6 +342,9 @@ xfs_iget_recycle(
@@ -6474,6 +6564,36 @@ index eae7427062cf..f35e2cee5265 100644
  		if (error)
  			return error;
  	} else {
+@@ -1847,12 +1853,20 @@ xfs_inodegc_worker(
+ 						struct xfs_inodegc, work);
+ 	struct llist_node	*node = llist_del_all(&gc->list);
+ 	struct xfs_inode	*ip, *n;
++	unsigned int		nofs_flag;
+ 
+ 	WRITE_ONCE(gc->items, 0);
+ 
+ 	if (!node)
+ 		return;
+ 
++	/*
++	 * We can allocate memory here while doing writeback on behalf of
++	 * memory reclaim.  To avoid memory allocation deadlocks set the
++	 * task-wide nofs context for the following operations.
++	 */
++	nofs_flag = memalloc_nofs_save();
++
+ 	ip = llist_entry(node, struct xfs_inode, i_gclist);
+ 	trace_xfs_inodegc_worker(ip->i_mount, READ_ONCE(gc->shrinker_hits));
+ 
+@@ -1861,6 +1875,8 @@ xfs_inodegc_worker(
+ 		xfs_iflags_set(ip, XFS_INACTIVATING);
+ 		xfs_inodegc_inactivate(ip);
+ 	}
++
++	memalloc_nofs_restore(nofs_flag);
+ }
+ 
+ /*
 diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
 index aa303be11576..d354ea2b74f9 100644
 --- a/fs/xfs/xfs_inode.c
@@ -6487,6 +6607,28 @@ index aa303be11576..d354ea2b74f9 100644
  		}
  	} else {
  		/*
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 1f783e979629..85fbb3b71d1c 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -754,7 +754,7 @@ xfs_bulkstat_fmt(
+ static int
+ xfs_bulk_ireq_setup(
+ 	struct xfs_mount	*mp,
+-	struct xfs_bulk_ireq	*hdr,
++	const struct xfs_bulk_ireq *hdr,
+ 	struct xfs_ibulk	*breq,
+ 	void __user		*ubuffer)
+ {
+@@ -780,7 +780,7 @@ xfs_bulk_ireq_setup(
+ 
+ 		switch (hdr->ino) {
+ 		case XFS_BULK_IREQ_SPECIAL_ROOT:
+-			hdr->ino = mp->m_sb.sb_rootino;
++			breq->startino = mp->m_sb.sb_rootino;
+ 			break;
+ 		default:
+ 			return -EINVAL;
 diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
 index 07da03976ec1..43f447199c08 100644
 --- a/fs/xfs/xfs_iomap.c

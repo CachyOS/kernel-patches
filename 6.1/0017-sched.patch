@@ -1,30 +1,28 @@
-From 091288e1aa36ce825e0fb6fbc9ecd430f7bce41d Mon Sep 17 00:00:00 2001
+From 835e8364f20c87010e6e6f2151ae3c147ec3c67c Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Thu, 12 Jan 2023 12:55:04 +0100
+Date: Sat, 14 Jan 2023 11:49:28 +0100
 Subject: [PATCH 17/19] sched
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  arch/s390/include/asm/hardirq.h  |   6 +
- include/linux/interrupt.h        |  20 +
- include/linux/mm_types.h         |  14 +
+ include/linux/interrupt.h        |  20 ++
  include/linux/psi_types.h        |   4 +
  include/linux/sched.h            |   3 -
  init/Kconfig                     |  10 +
- kernel/sched/core.c              | 328 +++++++++------
- kernel/sched/cpufreq_schedutil.c |  43 +-
+ kernel/sched/core.c              | 328 +++++++++++++++++-----------
+ kernel/sched/cpufreq_schedutil.c |  43 ++--
  kernel/sched/deadline.c          |   7 +-
- kernel/sched/debug.c             |   2 +
- kernel/sched/fair.c              | 696 ++++++++++++++++++++++++++++---
- kernel/sched/pelt.c              |  60 +++
- kernel/sched/pelt.h              |  42 +-
- kernel/sched/psi.c               |  92 +++-
- kernel/sched/rt.c                |  49 ++-
- kernel/sched/sched.h             |  52 ++-
+ kernel/sched/fair.c              | 361 ++++++++++++++++++++++++++-----
+ kernel/sched/pelt.c              |  60 +++++
+ kernel/sched/pelt.h              |  42 +++-
+ kernel/sched/psi.c               |  92 ++++++--
+ kernel/sched/rt.c                |  49 ++++-
+ kernel/sched/sched.h             |  50 ++++-
  kernel/sched/stats.h             |  22 +-
  kernel/sched/topology.c          |   2 +-
- kernel/softirq.c                 |  46 +-
- 19 files changed, 1236 insertions(+), 262 deletions(-)
+ kernel/softirq.c                 |  46 +++-
+ 17 files changed, 887 insertions(+), 258 deletions(-)
 
 diff --git a/arch/s390/include/asm/hardirq.h b/arch/s390/include/asm/hardirq.h
 index 58668ffb5488..cd9cc11588ab 100644
@@ -88,31 +86,6 @@ index a92bce40b04b..7d09eb998d4c 100644
  static inline struct task_struct *this_cpu_ksoftirqd(void)
  {
  	return this_cpu_read(ksoftirqd);
-diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
-index 500e536796ca..9824b1b365c0 100644
---- a/include/linux/mm_types.h
-+++ b/include/linux/mm_types.h
-@@ -665,6 +665,20 @@ struct mm_struct {
- 
- 		/* numa_scan_seq prevents two threads remapping PTEs. */
- 		int numa_scan_seq;
-+
-+		/* Process-based Adaptive NUMA */
-+		atomic_long_t faults_locality[2];
-+		atomic_long_t faults_shared[2];
-+		unsigned long faults_locality_history[2];
-+		unsigned long faults_shared_history[2];
-+
-+		spinlock_t pan_numa_lock;
-+		unsigned int numa_scan_period;
-+		int remote_fault_rates[2]; /* histogram of remote fault rate */
-+		long scanned_pages;
-+		bool trend;
-+		int slope;
-+		u8 hist_trend;
- #endif
- 		/*
- 		 * An operation with batched TLB flushing is going on. Anything
 diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
 index 6e4372735068..1e0a0d7ace3a 100644
 --- a/include/linux/psi_types.h
@@ -150,10 +123,10 @@ index 4e03f1dcbe52..5affff14993d 100644
  	/* Force alignment to the next boundary: */
  	unsigned			:0;
 diff --git a/init/Kconfig b/init/Kconfig
-index a25ba6556e2b..5cf5c424fbf1 100644
+index 00b0bd436998..80f1023e3610 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -1324,6 +1324,16 @@ config SCHED_AUTOGROUP
+@@ -1328,6 +1328,16 @@ config SCHED_AUTOGROUP
  	  desktop applications.  Task group autogeneration is currently based
  	  upon task session.
  
@@ -1022,443 +995,11 @@ index 9ae8f41e3372..0d97d54276cc 100644
  }
  
  /* Assumes rq->lock is held */
-diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
-index 1637b65ba07a..a8377d0e5ebd 100644
---- a/kernel/sched/debug.c
-+++ b/kernel/sched/debug.c
-@@ -334,6 +334,8 @@ static __init int sched_init_debug(void)
- 	debugfs_create_u32("scan_period_max_ms", 0644, numa, &sysctl_numa_balancing_scan_period_max);
- 	debugfs_create_u32("scan_size_mb", 0644, numa, &sysctl_numa_balancing_scan_size);
- 	debugfs_create_u32("hot_threshold_ms", 0644, numa, &sysctl_numa_balancing_hot_threshold);
-+	debugfs_create_u32("pan_scan_period_min", 0644, numa, &sysctl_pan_scan_period_min);
-+	debugfs_create_u32("pan_scan_period_max", 0644, numa, &sysctl_pan_scan_period_max);
- #endif
- 
- 	debugfs_create_file("debug", 0444, debugfs_sched, NULL, &sched_debug_fops);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index d2e15db21c06..c2b003ecfd49 100644
+index d2e15db21c06..6e6d2fdca355 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -1115,6 +1115,10 @@ unsigned int sysctl_numa_balancing_hot_threshold = MSEC_PER_SEC;
- /* Restrict the NUMA promotion throughput (MB/s) for each target node. */
- unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
- 
-+/* Clips of max and min scanning periods */
-+unsigned int sysctl_pan_scan_period_min = 50;
-+unsigned int sysctl_pan_scan_period_max = 5000;
-+
- struct numa_group {
- 	refcount_t refcount;
- 
-@@ -2348,6 +2352,301 @@ static void numa_group_count_active_nodes(struct numa_group *numa_group)
- 	numa_group->active_nodes = active_nodes;
- }
- 
-+/**********************************************/
-+/*  Process-based Adaptive NUMA (PAN) Design  */
-+/**********************************************/
-+#define SLOPE(N, D) ((N)/(D))
-+
-+static unsigned int pan_scan_max(struct task_struct *p)
-+{
-+	unsigned long smax, nr_scan_pages;
-+	unsigned long rss = 0;
-+
-+	smax = sysctl_pan_scan_period_max;
-+	nr_scan_pages = sysctl_numa_balancing_scan_size << (20 - PAGE_SHIFT);
-+
-+	rss = get_mm_rss(p->mm);
-+	if (!rss)
-+		rss = nr_scan_pages;
-+
-+	if (READ_ONCE(p->mm->numa_scan_seq) == 0) {
-+		smax = p->mm->scanned_pages * sysctl_pan_scan_period_max;
-+		smax = smax / rss;
-+		smax = max_t(unsigned long, sysctl_pan_scan_period_min, smax);
-+	}
-+
-+	return smax;
-+}
-+
-+/*
-+ * Process-based Adaptive NUMA scan period update alogirthm
-+ *
-+ * These are the important concepts behind the scan period update:
-+ *
-+ * - increase trend (of scan period)
-+ *   scan period => up, memory coverage => down, overhead => down,
-+ *   accuracy => down
-+ * - decrease trend
-+ *   scan period => down, memory coverage => up, overhead => up,
-+ *   accuracy => up
-+ * - trend: Reflects the current active trend
-+ *   1 means increasing trend, 0 means decreasing trend
-+ * - slope
-+ *   it controls scan_period: new_scan_period = current_scan_period *
-+ *                                              100 / slope
-+ * - hist_trend: Reflects the intended trend in the last two
-+ *   windows. Uses the last two bits (bit0 and bit1) for the same.
-+ *   1 if increasing trend was intended, 0 if decreasing was intended.
-+ */
-+
-+/*
-+ * Check if the scan period needs updation when the remote fault
-+ * rate has changed (delta > 5)
-+ *
-+ * Returns TRUE if scan period needs updation, else FALSE.
-+ */
-+static bool pan_changed_rate_update(struct mm_struct *mm, int ps_ratio,
-+				    int oldest_remote_fault_rate,
-+				    int fault_rate_diff)
-+{
-+	u8 value;
-+
-+	/*
-+	 * Set the intended trend for the current window.
-+	 * - If the remote fault rate has decreased, set the
-+	 *   intended trend to increasing.
-+	 * - Otherwise leave the intended trend as decreasing.
-+	 */
-+	mm->hist_trend = mm->hist_trend << 1;
-+	if (fault_rate_diff < 5)
-+		mm->hist_trend |= 0x01;
-+
-+	value = mm->hist_trend & 0x03;
-+
-+	if (fault_rate_diff < -5 && value == 3) {
-+		/*
-+		 * The remote fault rate has decreased and the intended
-+		 * trend was set to increasing in the previous window.
-+		 *
-+		 * If on decreasing trend, reverse the trend and change
-+		 * the slope using the fault rates from (current-1)
-+		 * and (current-2) windows.
-+		 *
-+		 * If already on increasing trend, change the slope using
-+		 * the fault rates from (current) and (current-1) windows.
-+		 */
-+		if (!mm->trend) {
-+			mm->trend = true;
-+			mm->slope = SLOPE(mm->remote_fault_rates[0] * 100,
-+					  oldest_remote_fault_rate);
-+		} else {
-+			mm->slope = SLOPE(mm->remote_fault_rates[1] * 100,
-+					  mm->remote_fault_rates[0]);
-+		}
-+	} else if (fault_rate_diff > 5 && value == 0) {
-+		/*
-+		 * The remote fault rate has increased and the intended
-+		 * trend was set to decreasing in the previous window.
-+		 *
-+		 * If on increasing trend,
-+		 *  - If shared fault ratio is more than 30%, don't yet
-+		 *  reverse the trend, just mark the intended trend as
-+		 *  increasing.
-+		 *  - Otherwise reverse the trend. Change the slope using
-+		 *  the fault rates from (current-1) and (current-2) windows.
-+		 *
-+		 *  If on decreasing trend
-+		 *  - Continue with a changed slope using the fault
-+		 *  rates from (current) and (current-1) windows.
-+		 */
-+		if (mm->trend) {
-+			if (ps_ratio < 7) {
-+				mm->hist_trend |= 0x01;
-+				return true;
-+			}
-+
-+			mm->trend = false;
-+			mm->slope = SLOPE(mm->remote_fault_rates[0] * 100,
-+					  oldest_remote_fault_rate);
-+		} else {
-+			mm->slope = SLOPE(mm->remote_fault_rates[1] * 100,
-+					  mm->remote_fault_rates[0]);
-+		}
-+	} else if (value == 1 || value == 2) {
-+		/*
-+		 * The intended trend is oscillating
-+		 *
-+		 * If on decreasing trend and the shared fault ratio
-+		 * is more than 30%, reverse the trend and change the slope.
-+		 *
-+		 * If on increasing trend, continue as is.
-+		 */
-+		if (!mm->trend && ps_ratio < 7) {
-+			mm->hist_trend |= 0x01;
-+			mm->trend = true;
-+			mm->slope = SLOPE(100 * 100,
-+					  100 + ((7 - ps_ratio) * 10));
-+		}
-+		return false;
-+	}
-+	return true;
-+}
-+
-+/*
-+ * Check if the scan period needs updation when the remote fault
-+ * rate has remained more or less the same (delta <= 5)
-+ *
-+ * Returns TRUE if scan period needs updation, else FALSE.
-+ */
-+static bool pan_const_rate_update(struct mm_struct *mm, int ps_ratio,
-+				  int oldest_remote_fault_rate)
-+{
-+	int diff1, diff2;
-+
-+	mm->hist_trend = mm->hist_trend << 1;
-+
-+	/*
-+	 * If we are in the increasing trend, don't change anything
-+	 * except the intended trend for this window that was reset
-+	 * to decreasing by default.
-+	 */
-+	if (mm->trend)
-+		return false;
-+
-+	/* We are in the decreasing trend, reverse under some condidtions. */
-+	diff1 = oldest_remote_fault_rate - mm->remote_fault_rates[0];
-+	diff2 = mm->remote_fault_rates[0] - mm->remote_fault_rates[1];
-+
-+	if (ps_ratio < 7) {
-+		/*
-+		 * More than 30% of the pages are shared, so no point in
-+		 * further reducing the scan period. If increasing trend
-+		 * was intended in the previous window also, then reverse
-+		 * the trend to increasing. Else just record the increasing
-+		 * intended trend for this window and return.
-+		 */
-+		mm->hist_trend |= 0x01;
-+		if ((mm->hist_trend & 0x03) == 3) {
-+			mm->trend = true;
-+			mm->slope = SLOPE(100 * 100,
-+					  (100 + ((7 - ps_ratio) * 10)));
-+		} else
-+			return false;
-+	} else if (diff1 >= 0 && diff2 >= 0 && mm->numa_scan_seq > 1) {
-+		/*
-+		 * Remote fault rate has reduced successively in the last
-+		 * two windows and address space has been scanned at least
-+		 * once. If increasing trend was intended in the previous
-+		 * window also, then reverse the trend to increasing. Else
-+		 * just record the increasing trend for this window and return.
-+		 */
-+		mm->hist_trend |= 0x01;
-+		if ((mm->hist_trend & 0x03) == 3) {
-+			mm->trend = true;
-+			mm->slope = SLOPE(100 * 100, 110);
-+			mm->hist_trend |= 0x03;
-+		} else
-+			return false;
-+	}
-+	return true;
-+}
-+
-+static void pan_calculate_scan_period(struct task_struct *p)
-+{
-+	int remote_fault_rate, oldest_remote_fault_rate, ps_ratio, i, diff;
-+	struct mm_struct *mm = p->mm;
-+	unsigned long remote_hist = mm->faults_locality_history[0];
-+	unsigned long local_hist = mm->faults_locality_history[1];
-+	unsigned long shared_hist = mm->faults_shared_history[0];
-+	unsigned long priv_hist = mm->faults_shared_history[1];
-+	bool need_update;
-+
-+	ps_ratio = (priv_hist * 10) / (priv_hist + shared_hist + 1);
-+	remote_fault_rate = (remote_hist * 100) / (local_hist + remote_hist + 1);
-+
-+	/* Keep the remote fault ratio at least 1% */
-+	remote_fault_rate = max(remote_fault_rate, 1);
-+	for (i = 0; i < 2; i++)
-+		if (mm->remote_fault_rates[i] == 0)
-+			mm->remote_fault_rates[i] = 1;
-+
-+	/* Shift right in mm->remote_fault_rates[] to keep track of history */
-+	oldest_remote_fault_rate = mm->remote_fault_rates[0];
-+	mm->remote_fault_rates[0] = mm->remote_fault_rates[1];
-+	mm->remote_fault_rates[1] = remote_fault_rate;
-+	diff = remote_fault_rate - oldest_remote_fault_rate;
-+
-+	if (abs(diff) <= 5)
-+		need_update = pan_const_rate_update(mm, ps_ratio,
-+						    oldest_remote_fault_rate);
-+	else
-+		need_update = pan_changed_rate_update(mm, ps_ratio,
-+						      oldest_remote_fault_rate,
-+						      diff);
-+
-+	if (need_update) {
-+		if (mm->slope == 0)
-+			mm->slope = 100;
-+		mm->numa_scan_period = (100 * mm->numa_scan_period) / mm->slope;
-+	}
-+}
-+
-+/*
-+ * Update the cumulative history of local/remote and private/shared
-+ * statistics. If the numbers are too small worthy of updating,
-+ * return FALSE, otherwise return TRUE.
-+ */
-+static bool pan_update_history(struct task_struct *p)
-+{
-+	unsigned long local, remote, shared, private;
-+	long diff;
-+	int i;
-+
-+	remote = atomic_long_read(&p->mm->faults_locality[0]);
-+	local = atomic_long_read(&p->mm->faults_locality[1]);
-+	shared = atomic_long_read(&p->mm->faults_shared[0]);
-+	private = atomic_long_read(&p->mm->faults_shared[1]);
-+
-+	/* skip if the activities in this window are too small */
-+	if (local + remote < 100)
-+		return false;
-+
-+	/* decay over the time window by 1/4 */
-+	diff = local - (long)(p->mm->faults_locality_history[1] / 4);
-+	p->mm->faults_locality_history[1] += diff;
-+	diff = remote - (long)(p->mm->faults_locality_history[0] / 4);
-+	p->mm->faults_locality_history[0] += diff;
-+
-+	/* decay over the time window by 1/2 */
-+	diff = shared - (long)(p->mm->faults_shared_history[0] / 2);
-+	p->mm->faults_shared_history[0] += diff;
-+	diff = private - (long)(p->mm->faults_shared_history[1] / 2);
-+	p->mm->faults_shared_history[1] += diff;
-+
-+	/* clear the statistics for the next window */
-+	for (i = 0; i < 2; i++) {
-+		atomic_long_set(&(p->mm->faults_locality[i]), 0);
-+		atomic_long_set(&(p->mm->faults_shared[i]), 0);
-+	}
-+
-+	return true;
-+}
-+
-+/*
-+ * Updates mm->numa_scan_period under mm->pan_numa_lock.
-+ */
-+static unsigned long pan_get_scan_period(struct task_struct *p)
-+{
-+	if (pan_update_history(p))
-+		pan_calculate_scan_period(p);
-+
-+	p->mm->numa_scan_period = clamp(p->mm->numa_scan_period,
-+					READ_ONCE(sysctl_pan_scan_period_min),
-+					pan_scan_max(p));
-+
-+	return p->mm->numa_scan_period;
-+}
-+
- /*
-  * When adapting the scan rate, the period is divided into NUMA_PERIOD_SLOTS
-  * increments. The more local the fault statistics are, the higher the scan
-@@ -2889,6 +3188,9 @@ void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags)
- 			task_numa_group(p, last_cpupid, flags, &priv);
- 	}
- 
-+	atomic_long_add(pages, &(p->mm->faults_locality[local]));
-+	atomic_long_add(pages, &(p->mm->faults_shared[priv]));
-+
- 	/*
- 	 * If a workload spans multiple NUMA nodes, a shared fault that
- 	 * occurs wholly within the set of nodes that the workload is
-@@ -2976,12 +3278,20 @@ static void task_numa_work(struct callback_head *work)
- 	if (time_before(now, migrate))
- 		return;
- 
--	if (p->numa_scan_period == 0) {
-+	if (p->mm->numa_scan_period == 0) {
-+		p->numa_scan_period_max = task_scan_max(p);
-+		p->numa_scan_period = task_scan_start(p);
-+		mm->numa_scan_period = p->numa_scan_period;
-+	} else if (p->numa_scan_period == 0) {
- 		p->numa_scan_period_max = task_scan_max(p);
- 		p->numa_scan_period = task_scan_start(p);
- 	}
- 
--	next_scan = now + msecs_to_jiffies(p->numa_scan_period);
-+	if (!spin_trylock(&p->mm->pan_numa_lock))
-+		return;
-+	next_scan = now + msecs_to_jiffies(pan_get_scan_period(p));
-+	spin_unlock(&p->mm->pan_numa_lock);
-+
- 	if (cmpxchg(&mm->numa_next_scan, migrate, next_scan) != migrate)
- 		return;
- 
-@@ -3070,6 +3380,7 @@ static void task_numa_work(struct callback_head *work)
- 		mm->numa_scan_offset = start;
- 	else
- 		reset_ptenuma_scan(p);
-+	mm->scanned_pages += ((sysctl_numa_balancing_scan_size << (20 - PAGE_SHIFT)) - pages);
- 	mmap_read_unlock(mm);
- 
- 	/*
-@@ -3084,6 +3395,26 @@ static void task_numa_work(struct callback_head *work)
- 	}
- }
- 
-+/* Init Process-based Adaptive NUMA */
-+static void pan_init_numa(struct task_struct *p)
-+{
-+	struct mm_struct *mm = p->mm;
-+	int i;
-+
-+	spin_lock_init(&mm->pan_numa_lock);
-+	mm->numa_scan_period = sysctl_numa_balancing_scan_delay;
-+	mm->scanned_pages = 0;
-+	mm->trend = false;
-+	mm->hist_trend = 0;
-+	mm->slope = 100;
-+
-+	for (i = 0; i < 2; i++) {
-+		mm->faults_locality_history[i] = 0;
-+		mm->faults_shared_history[i] = 0;
-+		mm->remote_fault_rates[i] = 1;
-+	}
-+}
-+
- void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
- {
- 	int mm_users = 0;
-@@ -3094,6 +3425,7 @@ void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
- 		if (mm_users == 1) {
- 			mm->numa_next_scan = jiffies + msecs_to_jiffies(sysctl_numa_balancing_scan_delay);
- 			mm->numa_scan_seq = 0;
-+			pan_init_numa(p);
- 		}
- 	}
- 	p->node_stamp			= 0;
-@@ -3145,6 +3477,9 @@ static void task_tick_numa(struct rq *rq, struct task_struct *curr)
- 	if (!curr->mm || (curr->flags & (PF_EXITING | PF_KTHREAD)) || work->next != work)
- 		return;
- 
-+	if (!spin_trylock(&curr->mm->pan_numa_lock))
-+		return;
-+
- 	/*
- 	 * Using runtime rather than walltime has the dual advantage that
- 	 * we (mostly) drive the selection from busy threads and that the
-@@ -3152,16 +3487,17 @@ static void task_tick_numa(struct rq *rq, struct task_struct *curr)
- 	 * NUMA placement.
- 	 */
- 	now = curr->se.sum_exec_runtime;
--	period = (u64)curr->numa_scan_period * NSEC_PER_MSEC;
-+	period = (u64)curr->mm->numa_scan_period * NSEC_PER_MSEC;
- 
- 	if (now > curr->node_stamp + period) {
- 		if (!curr->node_stamp)
--			curr->numa_scan_period = task_scan_start(curr);
-+			curr->mm->numa_scan_period = task_scan_start(curr);
- 		curr->node_stamp += period;
- 
- 		if (!time_before(jiffies, curr->mm->numa_next_scan))
- 			task_work_add(curr, work, TWA_RESUME);
- 	}
-+	spin_unlock(&curr->mm->pan_numa_lock);
- }
- 
- static void update_scan_period(struct task_struct *p, int new_cpu)
-@@ -4483,12 +4819,16 @@ static inline int util_fits_cpu(unsigned long util,
+@@ -4483,12 +4483,16 @@ static inline int util_fits_cpu(unsigned long util,
  	 * For uclamp_max, we can tolerate a drop in performance level as the
  	 * goal is to cap the task. So it's okay if it's getting less.
  	 *
@@ -1480,7 +1021,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  
  	/*
  	 * We want to force a task to fit a cpu as implied by uclamp_max.
-@@ -4527,8 +4867,7 @@ static inline int util_fits_cpu(unsigned long util,
+@@ -4527,8 +4531,7 @@ static inline int util_fits_cpu(unsigned long util,
  	 *     2. The system is being saturated when we're operating near
  	 *        max capacity, it doesn't make sense to block overutilized.
  	 */
@@ -1490,7 +1031,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  	fits = fits || uclamp_max_fits;
  
  	/*
-@@ -4563,8 +4902,8 @@ static inline int util_fits_cpu(unsigned long util,
+@@ -4563,8 +4566,8 @@ static inline int util_fits_cpu(unsigned long util,
  	 * handle the case uclamp_min > uclamp_max.
  	 */
  	uclamp_min = min(uclamp_min, uclamp_max);
@@ -1501,16 +1042,20 @@ index d2e15db21c06..c2b003ecfd49 100644
  
  	return fits;
  }
-@@ -4574,7 +4913,7 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
+@@ -4574,7 +4577,11 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
  	unsigned long uclamp_min = uclamp_eff_value(p, UCLAMP_MIN);
  	unsigned long uclamp_max = uclamp_eff_value(p, UCLAMP_MAX);
  	unsigned long util = task_util_est(p);
 -	return util_fits_cpu(util, uclamp_min, uclamp_max, cpu);
++	/*
++	 * Return true only if the cpu fully fits the task requirements, which
++	 * include the utilization but also the performance.
++	 */
 +	return (util_fits_cpu(util, uclamp_min, uclamp_max, cpu) > 0);
  }
  
  static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
-@@ -4898,7 +5237,13 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+@@ -4898,7 +4905,13 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
  	struct sched_entity *se;
  	s64 delta;
  
@@ -1525,7 +1070,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
  	if (delta_exec > ideal_runtime) {
  		resched_curr(rq_of(cfs_rq));
-@@ -5463,22 +5808,105 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+@@ -5463,22 +5476,105 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
  		resched_curr(rq);
  }
  
@@ -1636,7 +1181,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  		SCHED_WARN_ON(cfs_rq->runtime_remaining > 0);
  
  		raw_spin_lock(&cfs_b->lock);
-@@ -5492,16 +5920,30 @@ static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
+@@ -5492,16 +5588,30 @@ static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
  		cfs_rq->runtime_remaining += runtime;
  
  		/* we check whether we're throttled above */
@@ -1672,7 +1217,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  }
  
  /*
-@@ -5546,10 +5988,8 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
+@@ -5546,10 +5656,8 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
  	while (throttled && cfs_b->runtime > 0) {
  		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
  		/* we can't nest cfs_b->lock while distributing bandwidth */
@@ -1684,7 +1229,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  	}
  
  	/*
-@@ -5826,6 +6266,9 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+@@ -5826,6 +5934,9 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
  {
  	cfs_rq->runtime_enabled = 0;
  	INIT_LIST_HEAD(&cfs_rq->throttled_list);
@@ -1694,7 +1239,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  }
  
  void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
-@@ -5842,12 +6285,38 @@ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+@@ -5842,12 +5953,38 @@ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
  
  static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
  {
@@ -1733,7 +1278,15 @@ index d2e15db21c06..c2b003ecfd49 100644
  }
  
  /*
-@@ -6803,6 +7272,7 @@ static int
+@@ -6010,6 +6147,7 @@ static inline bool cpu_overutilized(int cpu)
+ 	unsigned long rq_util_min = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);
+ 	unsigned long rq_util_max = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);
+ 
++	/* Return true only if the utlization doesn't fit its capacity */
+ 	return !util_fits_cpu(cpu_util_cfs(cpu), rq_util_min, rq_util_max, cpu);
+ }
+ 
+@@ -6803,6 +6941,7 @@ static int
  select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
  {
  	unsigned long task_util, util_min, util_max, best_cap = 0;
@@ -1741,7 +1294,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  	int cpu, best_cpu = -1;
  	struct cpumask *cpus;
  
-@@ -6818,12 +7288,28 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
+@@ -6818,12 +6957,28 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
  
  		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
  			continue;
@@ -1772,16 +1325,20 @@ index d2e15db21c06..c2b003ecfd49 100644
  		}
  	}
  
-@@ -6836,7 +7322,7 @@ static inline bool asym_fits_cpu(unsigned long util,
+@@ -6836,7 +6991,11 @@ static inline bool asym_fits_cpu(unsigned long util,
  				 int cpu)
  {
  	if (sched_asym_cpucap_active())
 -		return util_fits_cpu(util, util_min, util_max, cpu);
++		/*
++		 * Return true only if the cpu fully fits the task requirements
++		 * which include the utilization but also the performance.
++		 */
 +		return (util_fits_cpu(util, util_min, util_max, cpu) > 0);
  
  	return true;
  }
-@@ -7203,6 +7689,9 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+@@ -7203,6 +7362,9 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
  	unsigned long p_util_max = uclamp_is_used() ? uclamp_eff_value(p, UCLAMP_MAX) : 1024;
  	struct root_domain *rd = this_rq()->rd;
  	int cpu, best_energy_cpu, target = -1;
@@ -1791,7 +1348,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  	struct sched_domain *sd;
  	struct perf_domain *pd;
  	struct energy_env eenv;
-@@ -7235,9 +7724,10 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+@@ -7235,9 +7397,10 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
  		unsigned long cur_delta, max_spare_cap = 0;
  		unsigned long rq_util_min, rq_util_max;
  		unsigned long util_min, util_max;
@@ -1803,7 +1360,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  
  		cpumask_and(cpus, perf_domain_span(pd), cpu_online_mask);
  
-@@ -7290,25 +7780,31 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+@@ -7290,25 +7453,31 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
  					util_max = max(rq_util_max, p_util_max);
  				}
  			}
@@ -1840,7 +1397,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  			continue;
  
  		eenv_pd_busy_time(&eenv, cpus, p);
-@@ -7316,33 +7812,57 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+@@ -7316,33 +7485,57 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
  		base_energy = compute_energy(&eenv, pd, cpus, p, -1);
  
  		/* Evaluate the energy impact of using prev_cpu. */
@@ -1886,7 +1443,7 @@ index d2e15db21c06..c2b003ecfd49 100644
 +			 * Both fit for the task but best energy cpu has lower
 +			 * energy impact.
 +			 */
-+			if ((max_fits > 0) &&
++			if ((max_fits > 0) && (best_fits > 0) &&
 +			    (cur_delta >= best_delta))
 +				continue;
 +
@@ -1905,7 +1462,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  		target = best_energy_cpu;
  
  	return target;
-@@ -8842,16 +9362,73 @@ static unsigned long scale_rt_capacity(int cpu)
+@@ -8842,16 +9035,73 @@ static unsigned long scale_rt_capacity(int cpu)
  
  static void update_cpu_capacity(struct sched_domain *sd, int cpu)
  {
@@ -1982,7 +1539,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  
  	sdg->sgc->capacity = capacity;
  	sdg->sgc->min_capacity = capacity;
-@@ -10079,24 +10656,23 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
+@@ -10079,24 +10329,23 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
  	 */
  	update_sd_lb_stats(env, &sds);
  
@@ -2016,7 +1573,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  	/* ASYM feature bypasses nice load balance check */
  	if (busiest->group_type == group_asym_packing)
  		goto force_balance;
-@@ -10109,6 +10685,7 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
+@@ -10109,6 +10358,7 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
  	if (busiest->group_type == group_imbalanced)
  		goto force_balance;
  
@@ -2024,7 +1581,7 @@ index d2e15db21c06..c2b003ecfd49 100644
  	/*
  	 * If the local group is busier than the selected busiest group
  	 * don't try and pull any tasks.
-@@ -12418,6 +12995,11 @@ __init void init_sched_fair_class(void)
+@@ -12418,6 +12668,11 @@ __init void init_sched_fair_class(void)
  	for_each_possible_cpu(i) {
  		zalloc_cpumask_var_node(&per_cpu(load_balance_mask, i), GFP_KERNEL, cpu_to_node(i));
  		zalloc_cpumask_var_node(&per_cpu(select_rq_mask,    i), GFP_KERNEL, cpu_to_node(i));
@@ -2485,7 +2042,7 @@ index ed2a47e4ddae..152347c4394c 100644
  
  		ret = cpupri_find(&task_rq(task)->rd->cpupri,
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index d6d488e8eb55..23b6dc73f408 100644
+index d6d488e8eb55..96dc9d4ef873 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -645,6 +645,9 @@ struct cfs_rq {
@@ -2576,16 +2133,7 @@ index d6d488e8eb55..23b6dc73f408 100644
  
  static inline struct task_struct *get_push_task(struct rq *rq)
  {
-@@ -2453,6 +2477,8 @@ extern unsigned int sysctl_numa_balancing_scan_period_min;
- extern unsigned int sysctl_numa_balancing_scan_period_max;
- extern unsigned int sysctl_numa_balancing_scan_size;
- extern unsigned int sysctl_numa_balancing_hot_threshold;
-+extern unsigned int sysctl_pan_scan_period_min;
-+extern unsigned int sysctl_pan_scan_period_max;
- #endif
- 
- #ifdef CONFIG_SCHED_HRTICK
-@@ -2878,6 +2904,24 @@ static inline unsigned long capacity_orig_of(int cpu)
+@@ -2878,6 +2902,24 @@ static inline unsigned long capacity_orig_of(int cpu)
  	return cpu_rq(cpu)->cpu_capacity_orig;
  }
  
