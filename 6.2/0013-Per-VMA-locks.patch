@@ -1,7 +1,190 @@
-From 99e28f80fa7f1cdb6dbcc0348f7efe61f025969b Mon Sep 17 00:00:00 2001
+From 02ff4b007580c21e14a2d10946c998a2c2d77313 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Wed, 11 Jan 2023 13:46:37 +0100
-Subject: [PATCH 13/15] per VMA lock
+Date: Sun, 15 Jan 2023 16:56:07 +0100
+Subject: [PATCH 13/14] Per-VMA locks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is the v1 of per-VMA locks patchset originally posted as an RFC at
+[1] and described in LWN article at [2]. Per-vma locks idea that was
+discussed during SPF [3] discussion at LSF/MM this year [4], which
+concluded with suggestion that “a reader/writer semaphore could be put
+into the VMA itself; that would have the effect of using the VMA as a
+sort of range lock. There would still be contention at the VMA level, but
+it would be an improvement.” This patchset implements this suggested
+approach.
+
+When handling page faults we lookup the VMA that contains the faulting
+page under RCU protection and try to acquire its lock. If that fails we
+fall back to using mmap_lock, similar to how SPF handled this situation.
+
+One notable way the implementation deviates from the proposal is the way
+VMAs are read-locked. During some of mm updates, multiple VMAs need to be
+locked until the end of the update (e.g. vma_merge, split_vma, etc).
+Tracking all the locked VMAs, avoiding recursive locks, figuring out when
+it's safe to unlock previously locked VMAs would make the code more
+complex. So, instead of the usual lock/unlock pattern, the proposed
+solution marks a VMA as locked and provides an efficient way to:
+1. Identify locked VMAs.
+2. Unlock all locked VMAs in bulk.
+We also postpone unlocking the locked VMAs until the end of the update,
+when we do mmap_write_unlock. Potentially this keeps a VMA locked for
+longer than is absolutely necessary but it results in a big reduction of
+code complexity.
+Read-locking a VMA is done using two sequence numbers - one in the
+vm_area_struct and one in the mm_struct. VMA is considered read-locked
+when these sequence numbers are equal. To read-lock a VMA we set the
+sequence number in vm_area_struct to be equal to the sequence number in
+mm_struct. To unlock all VMAs we increment mm_struct's seq number. This
+allows for an efficient way to track locked VMAs and to drop the locks on
+all VMAs at the end of the update.
+
+The patchset implements per-VMA locking only for anonymous pages which
+are not in swap and avoids userfaultfs as their implementation is more
+complex. Additional support for file-back page faults, swapped and user
+pages can be added incrementally.
+
+Performance benchmarks show similar although slightly smaller benefits as
+with SPF patchset (~75% of SPF benefits). Still, with lower complexity
+this approach might be more desirable.
+
+Since RFC was posted in September 2022, two separate Google teams outside
+of Android evaluated the patchset and confirmed positive results. Here are
+the known usecases when per-VMA locks show benefits:
+
+Android:
+Apps with high number of threads (~100) launch times improve by up to 20%.
+Each thread mmaps several areas upon startup (Stack and Thread-local
+storage (TLS), thread signal stack, indirect ref table), which requires
+taking mmap_lock in write mode. Page faults take mmap_lock in read mode.
+During app launch, both thread creation and page faults establishing the
+active workinget are happening in parallel and that causes lock contention
+between mm writers and readers even if updates and page faults are
+happening in different VMAs. Per-vma locks prevent this contention by
+providing more granular lock.
+
+Google Fibers:
+We have several dynamically sized thread pools that spawn new threads
+under increased load and reduce their number when idling. For example,
+Google's in-process scheduling/threading framework, UMCG/Fibers, is backed
+by such a thread pool. When idling, only a small number of idle worker
+threads are available; when a spike of incoming requests arrive, each
+request is handled in its own "fiber", which is a work item posted onto a
+UMCG worker thread; quite often these spikes lead to a number of new
+threads spawning. Each new thread needs to allocate and register an RSEQ
+section on its TLS, then register itself with the kernel as a UMCG worker
+thread, and only after that it can be considered by the in-process
+UMCG/Fiber scheduler as available to do useful work. In short, during an
+incoming workload spike new threads have to be spawned, and they perform
+several syscalls (RSEQ registration, UMCG worker registration, memory
+allocations) before they can actually start doing useful work. Removing
+any bottlenecks on this thread startup path will greatly improve our
+services' latencies when faced with request/workload spikes.
+At high scale, mmap_lock contention during thread creation and stack page
+faults leads to user-visible multi-second serving latencies in a similar
+pattern to Android app startup. Per-VMA locking patchset has been run
+successfully in limited experiments with user-facing production workloads.
+In these experiments, we observed that the peak thread creation rate was
+high enough that thread creation is no longer a bottleneck.
+
+TCP zerocopy receive:
+From the point of view of TCP zerocopy receive, the per-vma lock patch is
+massively beneficial.
+In today's implementation, a process with N threads where N - 1 are
+performing zerocopy receive and 1 thread is performing madvise() with the
+write lock taken (e.g. needs to change vm_flags) will result in all N -1
+receive threads blocking until the madvise is done. Conversely, on a busy
+process receiving a lot of data, an madvise operation that does need to
+take the mmap lock in write mode will need to wait for all of the receives
+to be done - a lose:lose proposition. Per-VMA locking _removes_ by
+definition this source of contention entirely.
+There are other benefits for receive as well, chiefly a reduction in
+cacheline bouncing across receiving threads for locking/unlocking the
+single mmap lock. On an RPC style synthetic workload with 4KB RPCs:
+1a) The find+lock+unlock VMA path in the base case, without the per-vma
+lock patchset, is about 0.7% of cycles as measured by perf.
+1b) mmap_read_lock + mmap_read_unlock in the base case is about 0.5%
+cycles overall - most of this is within the TCP read hotpath (a small
+fraction is 'other' usage in the system).
+2a) The find+lock+unlock VMA path, with the per-vma patchset and a trivial
+patch written to take advantage of it in TCP, is about 0.4% of cycles
+(down from 0.7% above)
+2b) mmap_read_lock + mmap_read_unlock in the per-vma patchset is < 0.1%
+cycles and is out of the TCP read hotpath entirely (down from 0.5% before,
+the remaining usage is the 'other' usage in the system).
+So, in addition to entirely removing an onerous source of contention, it
+also reduces the CPU cycles of TCP receive zerocopy by about 0.5%+
+(compared to overall cycles in perf) for the 'small' RPC scenario.
+
+The patchset structure is:
+0001-0007: Enable maple-tree RCU mode
+0008-0038: Main per-vma locks patchset
+0039-0040: Performance optimizations
+0041: Memory overhead optimization
+
+Branch for testing is posted at:
+https://github.com/surenbaghdasaryan/linux/tree/per_vma_lock
+
+The patchset applies cleanly over Linus' tree at:
+commit b7bfaa761d76 ("Linux 6.2-rc3")
+
+[1] https://lore.kernel.org/all/20220901173516.702122-1-surenb@google.com/
+[2] https://lwn.net/Articles/906852/
+[3] https://lore.kernel.org/all/20220128131006.67712-1-michel@lespinasse.org/
+[4] https://lwn.net/Articles/893906/
+
+Laurent Dufour (1):
+  powerc/mm: try VMA lock-based page fault handling first
+
+Liam Howlett (4):
+  maple_tree: Be more cautious about dead nodes
+  maple_tree: Detect dead nodes in mas_start()
+  maple_tree: Fix freeing of nodes in rcu mode
+  maple_tree: remove extra smp_wmb() from mas_dead_leaves()
+
+Liam R. Howlett (3):
+  maple_tree: Fix write memory barrier of nodes once dead for RCU mode
+  maple_tree: Add smp_rmb() to dead node detection
+  mm: Enable maple tree RCU mode by default.
+
+Michel Lespinasse (1):
+  mm: rcu safe VMA freeing
+
+Suren Baghdasaryan (32):
+  mm: introduce CONFIG_PER_VMA_LOCK
+  mm: move mmap_lock assert function definitions
+  mm: export dump_mm()
+  mm: add per-VMA lock and helper functions to control it
+  mm: introduce vma->vm_flags modifier functions
+  mm: replace VM_LOCKED_CLEAR_MASK with VM_LOCKED_MASK
+  mm: replace vma->vm_flags direct modifications with modifier calls
+  mm: replace vma->vm_flags indirect modification in ksm_madvise
+  mm/mmap: move VMA locking before anon_vma_lock_write call
+  mm/khugepaged: write-lock VMA while collapsing a huge page
+  mm/mmap: write-lock VMAs before merging, splitting or expanding them
+  mm/mmap: write-lock VMAs in vma_adjust
+  mm/mmap: write-lock VMAs affected by VMA expansion
+  mm/mremap: write-lock VMA while remapping it to a new address range
+  mm: write-lock VMAs before removing them from VMA tree
+  mm: conditionally write-lock VMA in free_pgtables
+  mm/mmap: write-lock adjacent VMAs if they can grow into unmapped area
+  kernel/fork: assert no VMA readers during its destruction
+  mm/mmap: prevent pagefault handler from racing with mmu_notifier
+    registration
+  mm: introduce lock_vma_under_rcu to be used from arch-specific code
+  mm: fall back to mmap_lock if vma->anon_vma is not yet set
+  mm: add FAULT_FLAG_VMA_LOCK flag
+  mm: prevent do_swap_page from handling page faults under VMA lock
+  mm: prevent userfaults to be handled under per-vma lock
+  mm: introduce per-VMA lock statistics
+  x86/mm: try VMA lock-based page fault handling first
+  arm64/mm: try VMA lock-based page fault handling first
+  mm: introduce mod_vm_flags_nolock
+  mm: avoid assertion in untrack_pfn
+  kernel/fork: throttle call_rcu() calls in vm_area_free
+  mm: separate vma->lock from vm_area_struct
+  mm: replace rw_semaphore with atomic_t in vma_lock
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -167,7 +350,7 @@ index f811733a8fc5..ec65f3ea3150 100644
  }
  arch_initcall(gate_vma_init);
 diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
-index 03934808b2ed..829fa6d14a36 100644
+index c5ccca26a408..9f2c0e352da3 100644
 --- a/arch/arm64/Kconfig
 +++ b/arch/arm64/Kconfig
 @@ -95,6 +95,7 @@ config ARM64
@@ -648,10 +831,10 @@ index 1a14f52added..23db68436170 100644
  		return;
  
 diff --git a/arch/x86/mm/pat/memtype.c b/arch/x86/mm/pat/memtype.c
-index 46de9cf5c91d..f71c8381430b 100644
+index fb4b1b5e0dea..9b0ad857b14d 100644
 --- a/arch/x86/mm/pat/memtype.c
 +++ b/arch/x86/mm/pat/memtype.c
-@@ -999,7 +999,7 @@ int track_pfn_remap(struct vm_area_struct *vma, pgprot_t *prot,
+@@ -1000,7 +1000,7 @@ int track_pfn_remap(struct vm_area_struct *vma, pgprot_t *prot,
  
  		ret = reserve_pfn_range(paddr, size, prot, 0);
  		if (ret == 0 && vma)
@@ -660,7 +843,7 @@ index 46de9cf5c91d..f71c8381430b 100644
  		return ret;
  	}
  
-@@ -1045,7 +1045,7 @@ void track_pfn_insert(struct vm_area_struct *vma, pgprot_t *prot, pfn_t pfn)
+@@ -1046,7 +1046,7 @@ void track_pfn_insert(struct vm_area_struct *vma, pgprot_t *prot, pfn_t pfn)
   * can be for the entire vma (in which case pfn, size are zero).
   */
  void untrack_pfn(struct vm_area_struct *vma, unsigned long pfn,
@@ -669,7 +852,7 @@ index 46de9cf5c91d..f71c8381430b 100644
  {
  	resource_size_t paddr;
  	unsigned long prot;
-@@ -1064,8 +1064,12 @@ void untrack_pfn(struct vm_area_struct *vma, unsigned long pfn,
+@@ -1065,8 +1065,12 @@ void untrack_pfn(struct vm_area_struct *vma, unsigned long pfn,
  		size = vma->vm_end - vma->vm_start;
  	}
  	free_pfn_range(paddr, size);
@@ -684,7 +867,7 @@ index 46de9cf5c91d..f71c8381430b 100644
  }
  
  /*
-@@ -1075,7 +1079,7 @@ void untrack_pfn(struct vm_area_struct *vma, unsigned long pfn,
+@@ -1076,7 +1080,7 @@ void untrack_pfn(struct vm_area_struct *vma, unsigned long pfn,
   */
  void untrack_pfn_moved(struct vm_area_struct *vma)
  {
@@ -2772,7 +2955,7 @@ index ef12532168d9..085aa8707bc2 100644
  
  	return 0;
 diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index 2a9bbb821539..415f3c4138ee 100644
+index a2299bf519f8..e9050ff99444 100644
 --- a/lib/maple_tree.c
 +++ b/lib/maple_tree.c
 @@ -178,7 +178,7 @@ static void mt_free_rcu(struct rcu_head *head)
@@ -3019,7 +3202,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  	if (offset == mt_pivots[mt])
  		pivot = mas->max;
  	else
-@@ -5400,20 +5482,22 @@ static inline int mas_rev_alloc(struct ma_state *mas, unsigned long min,
+@@ -5399,20 +5481,22 @@ static inline int mas_rev_alloc(struct ma_state *mas, unsigned long min,
   * mas_dead_leaves() - Mark all leaves of a node as dead.
   * @mas: The maple state
   * @slots: Pointer to the slot array
@@ -3044,7 +3227,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  		entry = mas_slot_locked(mas, slots, offset);
  		type = mte_node_type(entry);
  		node = mte_to_node(entry);
-@@ -5422,7 +5506,6 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
+@@ -5421,7 +5505,6 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
  			break;
  
  		mte_set_node_dead(entry);
@@ -3052,7 +3235,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  		node->type = type;
  		rcu_assign_pointer(slots[offset], node);
  	}
-@@ -5432,14 +5515,13 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
+@@ -5431,14 +5514,13 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
  
  static void __rcu **mas_dead_walk(struct ma_state *mas, unsigned char offset)
  {
@@ -3070,7 +3253,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  		next = mas_slot_locked(mas, slots, offset);
  		offset = 0;
  	} while (!ma_is_leaf(next->type));
-@@ -5503,11 +5585,14 @@ static inline void __rcu **mas_destroy_descend(struct ma_state *mas,
+@@ -5502,11 +5584,14 @@ static inline void __rcu **mas_destroy_descend(struct ma_state *mas,
  		node = mas_mn(mas);
  		slots = ma_slots(node, mte_node_type(mas->node));
  		next = mas_slot_locked(mas, slots, 0);
@@ -3086,7 +3269,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  		node->piv_parent = prev;
  		node->parent_slot = offset;
  		offset = 0;
-@@ -5527,13 +5612,18 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5526,13 +5611,18 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  
  	MA_STATE(mas, &mt, 0, 0);
  
@@ -3107,7 +3290,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  	slots = mas_destroy_descend(&mas, start, 0);
  	node = mas_mn(&mas);
  	do {
-@@ -5541,7 +5631,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5540,7 +5630,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  		unsigned char offset;
  		struct maple_enode *parent, *tmp;
  
@@ -3117,7 +3300,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  		if (free)
  			mt_free_bulk(node->slot_len, slots);
  		offset = node->parent_slot + 1;
-@@ -5565,7 +5656,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5564,7 +5655,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  	} while (start != mas.node);
  
  	node = mas_mn(&mas);
@@ -3127,7 +3310,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  	if (free)
  		mt_free_bulk(node->slot_len, slots);
  
-@@ -5575,6 +5667,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5574,6 +5666,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  free_leaf:
  	if (free)
  		mt_free_rcu(&node->rcu);
@@ -3136,7 +3319,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  }
  
  /*
-@@ -6608,11 +6702,11 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
+@@ -6607,11 +6701,11 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
  	while (likely(!ma_is_leaf(mt))) {
  		MT_BUG_ON(mas->tree, mte_dead_node(mas->node));
  		slots = ma_slots(mn, mt);
@@ -3150,7 +3333,7 @@ index 2a9bbb821539..415f3c4138ee 100644
  		mas->node = entry;
  		mn = mas_mn(mas);
  		mt = mte_node_type(mas->node);
-@@ -6632,13 +6726,13 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
+@@ -6631,13 +6725,13 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
  	if (likely(entry))
  		return entry;
  
