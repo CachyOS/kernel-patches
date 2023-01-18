@@ -1,91 +1,22 @@
-From 835e8364f20c87010e6e6f2151ae3c147ec3c67c Mon Sep 17 00:00:00 2001
+From 137830cd09422345458a91217994014dc5568f91 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 14 Jan 2023 11:49:28 +0100
-Subject: [PATCH 17/19] sched
+Date: Wed, 18 Jan 2023 13:24:05 +0100
+Subject: [PATCH 16/18] sched
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- arch/s390/include/asm/hardirq.h  |   6 +
- include/linux/interrupt.h        |  20 ++
  include/linux/psi_types.h        |   4 +
  include/linux/sched.h            |   3 -
- init/Kconfig                     |  10 +
- kernel/sched/core.c              | 328 +++++++++++++++++-----------
+ kernel/sched/core.c              |  95 ++++----
  kernel/sched/cpufreq_schedutil.c |  43 ++--
- kernel/sched/deadline.c          |   7 +-
  kernel/sched/fair.c              | 361 ++++++++++++++++++++++++++-----
  kernel/sched/pelt.c              |  60 +++++
  kernel/sched/pelt.h              |  42 +++-
  kernel/sched/psi.c               |  92 ++++++--
- kernel/sched/rt.c                |  49 ++++-
- kernel/sched/sched.h             |  50 ++++-
+ kernel/sched/sched.h             |  31 +++
  kernel/sched/stats.h             |  22 +-
- kernel/sched/topology.c          |   2 +-
- kernel/softirq.c                 |  46 +++-
- 17 files changed, 887 insertions(+), 258 deletions(-)
+ 10 files changed, 599 insertions(+), 154 deletions(-)
 
-diff --git a/arch/s390/include/asm/hardirq.h b/arch/s390/include/asm/hardirq.h
-index 58668ffb5488..cd9cc11588ab 100644
---- a/arch/s390/include/asm/hardirq.h
-+++ b/arch/s390/include/asm/hardirq.h
-@@ -16,6 +16,12 @@
- #define local_softirq_pending() (S390_lowcore.softirq_pending)
- #define set_softirq_pending(x) (S390_lowcore.softirq_pending = (x))
- #define or_softirq_pending(x)  (S390_lowcore.softirq_pending |= (x))
-+/*
-+ *  Not sure what the right thing is here  for s390,
-+ *  but returning 0 will result in no logical change
-+ *  from what happens now
-+ */
-+#define __cpu_softirq_pending(x) (0)
- 
- #define __ARCH_IRQ_STAT
- #define __ARCH_IRQ_EXIT_IRQS_DISABLED
-diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
-index a92bce40b04b..7d09eb998d4c 100644
---- a/include/linux/interrupt.h
-+++ b/include/linux/interrupt.h
-@@ -527,6 +527,17 @@ DECLARE_STATIC_KEY_FALSE(force_irqthreads_key);
- #define set_softirq_pending(x)	(__this_cpu_write(local_softirq_pending_ref, (x)))
- #define or_softirq_pending(x)	(__this_cpu_or(local_softirq_pending_ref, (x)))
- 
-+/**
-+ * __cpu_softirq_pending() - Checks to see if softirq is pending on a cpu
-+ *
-+ * This helper is inherently racy, as we're accessing per-cpu data w/o locks.
-+ * But peeking at the flag can still be useful when deciding where to place a
-+ * task.
-+ */
-+static inline u32 __cpu_softirq_pending(int cpu)
-+{
-+	return (u32)per_cpu(local_softirq_pending_ref, cpu);
-+}
- #endif /* local_softirq_pending */
- 
- /* Some architectures might implement lazy enabling/disabling of
-@@ -571,6 +582,11 @@ enum
-  * _ IRQ_POLL: irq_poll_cpu_dead() migrates the queue
-  */
- #define SOFTIRQ_HOTPLUG_SAFE_MASK (BIT(RCU_SOFTIRQ) | BIT(IRQ_POLL_SOFTIRQ))
-+/* Softirq's where the handling might be long: */
-+#define LONG_SOFTIRQ_MASK (BIT(NET_TX_SOFTIRQ)    | \
-+			   BIT(NET_RX_SOFTIRQ)    | \
-+			   BIT(BLOCK_SOFTIRQ)     | \
-+			   BIT(IRQ_POLL_SOFTIRQ))
- 
- /* map softirq index to softirq name. update 'softirq_to_name' in
-  * kernel/softirq.c when adding a new softirq.
-@@ -607,6 +623,10 @@ extern void raise_softirq(unsigned int nr);
- 
- DECLARE_PER_CPU(struct task_struct *, ksoftirqd);
- 
-+#ifdef CONFIG_RT_SOFTIRQ_AWARE_SCHED
-+DECLARE_PER_CPU(u32, active_softirqs);
-+#endif
-+
- static inline struct task_struct *this_cpu_ksoftirqd(void)
- {
- 	return this_cpu_read(ksoftirqd);
 diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
 index 6e4372735068..1e0a0d7ace3a 100644
 --- a/include/linux/psi_types.h
@@ -122,29 +53,8 @@ index 4e03f1dcbe52..5affff14993d 100644
  
  	/* Force alignment to the next boundary: */
  	unsigned			:0;
-diff --git a/init/Kconfig b/init/Kconfig
-index 00b0bd436998..80f1023e3610 100644
---- a/init/Kconfig
-+++ b/init/Kconfig
-@@ -1328,6 +1328,16 @@ config SCHED_AUTOGROUP
- 	  desktop applications.  Task group autogeneration is currently based
- 	  upon task session.
- 
-+config RT_SOFTIRQ_AWARE_SCHED
-+	bool "Improve RT scheduling during long softirq execution"
-+	depends on SMP && !PREEMPT_RT
-+	default n
-+	help
-+	  Enable an optimization which tries to avoid placing RT tasks on CPUs
-+	  occupied by nonpreemptible tasks, such as a long softirq or CPUs
-+	  which may soon block preemptions, such as a CPU running a ksoftirq
-+	  thread which handles slow softirqs.
-+
- config SYSFS_DEPRECATED
- 	bool "Enable deprecated sysfs features to support old userspace tools"
- 	depends on SYSFS
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 535af9fbea7b..2150e821899c 100644
+index 172ec79b66f6..facdeaad44fa 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -722,7 +722,7 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
@@ -165,396 +75,7 @@ index 535af9fbea7b..2150e821899c 100644
  	}
  
  	uclamp_rq_inc(rq, p);
-@@ -2189,14 +2189,18 @@ void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
- #ifdef CONFIG_SMP
- 
- static void
--__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
-+__do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx);
- 
- static int __set_cpus_allowed_ptr(struct task_struct *p,
--				  const struct cpumask *new_mask,
--				  u32 flags);
-+				  struct affinity_context *ctx);
- 
- static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
- {
-+	struct affinity_context ac = {
-+		.new_mask  = cpumask_of(rq->cpu),
-+		.flags     = SCA_MIGRATE_DISABLE,
-+	};
-+
- 	if (likely(!p->migration_disabled))
- 		return;
- 
-@@ -2206,7 +2210,7 @@ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
- 	/*
- 	 * Violates locking rules! see comment in __do_set_cpus_allowed().
- 	 */
--	__do_set_cpus_allowed(p, cpumask_of(rq->cpu), SCA_MIGRATE_DISABLE);
-+	__do_set_cpus_allowed(p, &ac);
- }
- 
- void migrate_disable(void)
-@@ -2228,6 +2232,10 @@ EXPORT_SYMBOL_GPL(migrate_disable);
- void migrate_enable(void)
- {
- 	struct task_struct *p = current;
-+	struct affinity_context ac = {
-+		.new_mask  = &p->cpus_mask,
-+		.flags     = SCA_MIGRATE_ENABLE,
-+	};
- 
- 	if (p->migration_disabled > 1) {
- 		p->migration_disabled--;
-@@ -2243,7 +2251,7 @@ void migrate_enable(void)
- 	 */
- 	preempt_disable();
- 	if (p->cpus_ptr != &p->cpus_mask)
--		__set_cpus_allowed_ptr(p, &p->cpus_mask, SCA_MIGRATE_ENABLE);
-+		__set_cpus_allowed_ptr(p, &ac);
- 	/*
- 	 * Mustn't clear migration_disabled() until cpus_ptr points back at the
- 	 * regular cpus_mask, otherwise things that race (eg.
-@@ -2523,19 +2531,25 @@ int push_cpu_stop(void *arg)
-  * sched_class::set_cpus_allowed must do the below, but is not required to
-  * actually call this function.
-  */
--void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
-+void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx)
- {
--	if (flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
--		p->cpus_ptr = new_mask;
-+	if (ctx->flags & (SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) {
-+		p->cpus_ptr = ctx->new_mask;
- 		return;
- 	}
- 
--	cpumask_copy(&p->cpus_mask, new_mask);
--	p->nr_cpus_allowed = cpumask_weight(new_mask);
-+	cpumask_copy(&p->cpus_mask, ctx->new_mask);
-+	p->nr_cpus_allowed = cpumask_weight(ctx->new_mask);
-+
-+	/*
-+	 * Swap in a new user_cpus_ptr if SCA_USER flag set
-+	 */
-+	if (ctx->flags & SCA_USER)
-+		swap(p->user_cpus_ptr, ctx->user_mask);
- }
- 
- static void
--__do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32 flags)
-+__do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
- {
- 	struct rq *rq = task_rq(p);
- 	bool queued, running;
-@@ -2552,7 +2566,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
- 	 *
- 	 * XXX do further audits, this smells like something putrid.
- 	 */
--	if (flags & SCA_MIGRATE_DISABLE)
-+	if (ctx->flags & SCA_MIGRATE_DISABLE)
- 		SCHED_WARN_ON(!p->on_cpu);
- 	else
- 		lockdep_assert_held(&p->pi_lock);
-@@ -2571,7 +2585,7 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
- 	if (running)
- 		put_prev_task(rq, p);
- 
--	p->sched_class->set_cpus_allowed(p, new_mask, flags);
-+	p->sched_class->set_cpus_allowed(p, ctx);
- 
- 	if (queued)
- 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
-@@ -2579,14 +2593,27 @@ __do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask, u32
- 		set_next_task(rq, p);
- }
- 
-+/*
-+ * Used for kthread_bind() and select_fallback_rq(), in both cases the user
-+ * affinity (if any) should be destroyed too.
-+ */
- void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
- {
--	__do_set_cpus_allowed(p, new_mask, 0);
-+	struct affinity_context ac = {
-+		.new_mask  = new_mask,
-+		.user_mask = NULL,
-+		.flags     = SCA_USER,	/* clear the user requested mask */
-+	};
-+
-+	__do_set_cpus_allowed(p, &ac);
-+	kfree(ac.user_mask);
- }
- 
- int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
- 		      int node)
- {
-+	unsigned long flags;
-+
- 	if (!src->user_cpus_ptr)
- 		return 0;
- 
-@@ -2594,7 +2621,10 @@ int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src,
- 	if (!dst->user_cpus_ptr)
- 		return -ENOMEM;
- 
-+	/* Use pi_lock to protect content of user_cpus_ptr */
-+	raw_spin_lock_irqsave(&src->pi_lock, flags);
- 	cpumask_copy(dst->user_cpus_ptr, src->user_cpus_ptr);
-+	raw_spin_unlock_irqrestore(&src->pi_lock, flags);
- 	return 0;
- }
- 
-@@ -2690,6 +2720,8 @@ void release_user_cpus_ptr(struct task_struct *p)
-  */
- static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flags *rf,
- 			    int dest_cpu, unsigned int flags)
-+	__releases(rq->lock)
-+	__releases(p->pi_lock)
- {
- 	struct set_affinity_pending my_pending = { }, *pending = NULL;
- 	bool stop_pending, complete = false;
-@@ -2832,8 +2864,7 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
-  * Called with both p->pi_lock and rq->lock held; drops both before returning.
-  */
- static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
--					 const struct cpumask *new_mask,
--					 u32 flags,
-+					 struct affinity_context *ctx,
- 					 struct rq *rq,
- 					 struct rq_flags *rf)
- 	__releases(rq->lock)
-@@ -2842,7 +2873,6 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
- 	const struct cpumask *cpu_allowed_mask = task_cpu_possible_mask(p);
- 	const struct cpumask *cpu_valid_mask = cpu_active_mask;
- 	bool kthread = p->flags & PF_KTHREAD;
--	struct cpumask *user_mask = NULL;
- 	unsigned int dest_cpu;
- 	int ret = 0;
- 
-@@ -2862,7 +2892,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
- 		cpu_valid_mask = cpu_online_mask;
- 	}
- 
--	if (!kthread && !cpumask_subset(new_mask, cpu_allowed_mask)) {
-+	if (!kthread && !cpumask_subset(ctx->new_mask, cpu_allowed_mask)) {
- 		ret = -EINVAL;
- 		goto out;
- 	}
-@@ -2871,18 +2901,18 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
- 	 * Must re-check here, to close a race against __kthread_bind(),
- 	 * sched_setaffinity() is not guaranteed to observe the flag.
- 	 */
--	if ((flags & SCA_CHECK) && (p->flags & PF_NO_SETAFFINITY)) {
-+	if ((ctx->flags & SCA_CHECK) && (p->flags & PF_NO_SETAFFINITY)) {
- 		ret = -EINVAL;
- 		goto out;
- 	}
- 
--	if (!(flags & SCA_MIGRATE_ENABLE)) {
--		if (cpumask_equal(&p->cpus_mask, new_mask))
-+	if (!(ctx->flags & SCA_MIGRATE_ENABLE)) {
-+		if (cpumask_equal(&p->cpus_mask, ctx->new_mask))
- 			goto out;
- 
- 		if (WARN_ON_ONCE(p == current &&
- 				 is_migration_disabled(p) &&
--				 !cpumask_test_cpu(task_cpu(p), new_mask))) {
-+				 !cpumask_test_cpu(task_cpu(p), ctx->new_mask))) {
- 			ret = -EBUSY;
- 			goto out;
- 		}
-@@ -2893,22 +2923,15 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
- 	 * for groups of tasks (ie. cpuset), so that load balancing is not
- 	 * immediately required to distribute the tasks within their new mask.
- 	 */
--	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, new_mask);
-+	dest_cpu = cpumask_any_and_distribute(cpu_valid_mask, ctx->new_mask);
- 	if (dest_cpu >= nr_cpu_ids) {
- 		ret = -EINVAL;
- 		goto out;
- 	}
- 
--	__do_set_cpus_allowed(p, new_mask, flags);
-+	__do_set_cpus_allowed(p, ctx);
- 
--	if (flags & SCA_USER)
--		user_mask = clear_user_cpus_ptr(p);
--
--	ret = affine_move_task(rq, p, rf, dest_cpu, flags);
--
--	kfree(user_mask);
--
--	return ret;
-+	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
- 
- out:
- 	task_rq_unlock(rq, p, rf);
-@@ -2926,25 +2949,41 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
-  * call is not atomic; no spinlocks may be held.
-  */
- static int __set_cpus_allowed_ptr(struct task_struct *p,
--				  const struct cpumask *new_mask, u32 flags)
-+				  struct affinity_context *ctx)
- {
- 	struct rq_flags rf;
- 	struct rq *rq;
- 
- 	rq = task_rq_lock(p, &rf);
--	return __set_cpus_allowed_ptr_locked(p, new_mask, flags, rq, &rf);
-+	/*
-+	 * Masking should be skipped if SCA_USER or any of the SCA_MIGRATE_*
-+	 * flags are set.
-+	 */
-+	if (p->user_cpus_ptr &&
-+	    !(ctx->flags & (SCA_USER | SCA_MIGRATE_ENABLE | SCA_MIGRATE_DISABLE)) &&
-+	    cpumask_and(rq->scratch_mask, ctx->new_mask, p->user_cpus_ptr))
-+		ctx->new_mask = rq->scratch_mask;
-+
-+	return __set_cpus_allowed_ptr_locked(p, ctx, rq, &rf);
- }
- 
- int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
- {
--	return __set_cpus_allowed_ptr(p, new_mask, 0);
-+	struct affinity_context ac = {
-+		.new_mask  = new_mask,
-+		.flags     = 0,
-+	};
-+
-+	return __set_cpus_allowed_ptr(p, &ac);
- }
- EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
- 
- /*
-  * Change a given task's CPU affinity to the intersection of its current
-- * affinity mask and @subset_mask, writing the resulting mask to @new_mask
-- * and pointing @p->user_cpus_ptr to a copy of the old mask.
-+ * affinity mask and @subset_mask, writing the resulting mask to @new_mask.
-+ * If user_cpus_ptr is defined, use it as the basis for restricting CPU
-+ * affinity or use cpu_online_mask instead.
-+ *
-  * If the resulting mask is empty, leave the affinity unchanged and return
-  * -EINVAL.
-  */
-@@ -2952,17 +2991,14 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
- 				     struct cpumask *new_mask,
- 				     const struct cpumask *subset_mask)
- {
--	struct cpumask *user_mask = NULL;
-+	struct affinity_context ac = {
-+		.new_mask  = new_mask,
-+		.flags     = 0,
-+	};
- 	struct rq_flags rf;
- 	struct rq *rq;
- 	int err;
- 
--	if (!p->user_cpus_ptr) {
--		user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
--		if (!user_mask)
--			return -ENOMEM;
--	}
--
- 	rq = task_rq_lock(p, &rf);
- 
- 	/*
-@@ -2975,31 +3011,21 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
- 		goto err_unlock;
- 	}
- 
--	if (!cpumask_and(new_mask, &p->cpus_mask, subset_mask)) {
-+	if (!cpumask_and(new_mask, task_user_cpus(p), subset_mask)) {
- 		err = -EINVAL;
- 		goto err_unlock;
- 	}
- 
--	/*
--	 * We're about to butcher the task affinity, so keep track of what
--	 * the user asked for in case we're able to restore it later on.
--	 */
--	if (user_mask) {
--		cpumask_copy(user_mask, p->cpus_ptr);
--		p->user_cpus_ptr = user_mask;
--	}
--
--	return __set_cpus_allowed_ptr_locked(p, new_mask, 0, rq, &rf);
-+	return __set_cpus_allowed_ptr_locked(p, &ac, rq, &rf);
- 
- err_unlock:
- 	task_rq_unlock(rq, p, &rf);
--	kfree(user_mask);
- 	return err;
- }
- 
- /*
-  * Restrict the CPU affinity of task @p so that it is a subset of
-- * task_cpu_possible_mask() and point @p->user_cpu_ptr to a copy of the
-+ * task_cpu_possible_mask() and point @p->user_cpus_ptr to a copy of the
-  * old affinity mask. If the resulting mask is empty, we warn and walk
-  * up the cpuset hierarchy until we find a suitable mask.
-  */
-@@ -3043,34 +3069,29 @@ void force_compatible_cpus_allowed_ptr(struct task_struct *p)
- }
- 
- static int
--__sched_setaffinity(struct task_struct *p, const struct cpumask *mask);
-+__sched_setaffinity(struct task_struct *p, struct affinity_context *ctx);
- 
- /*
-  * Restore the affinity of a task @p which was previously restricted by a
-- * call to force_compatible_cpus_allowed_ptr(). This will clear (and free)
-- * @p->user_cpus_ptr.
-+ * call to force_compatible_cpus_allowed_ptr().
-  *
-  * It is the caller's responsibility to serialise this with any calls to
-  * force_compatible_cpus_allowed_ptr(@p).
-  */
- void relax_compatible_cpus_allowed_ptr(struct task_struct *p)
- {
--	struct cpumask *user_mask = p->user_cpus_ptr;
--	unsigned long flags;
-+	struct affinity_context ac = {
-+		.new_mask  = task_user_cpus(p),
-+		.flags     = 0,
-+	};
-+	int ret;
- 
- 	/*
--	 * Try to restore the old affinity mask. If this fails, then
--	 * we free the mask explicitly to avoid it being inherited across
--	 * a subsequent fork().
-+	 * Try to restore the old affinity mask with __sched_setaffinity().
-+	 * Cpuset masking will be done there too.
- 	 */
--	if (!user_mask || !__sched_setaffinity(p, user_mask))
--		return;
--
--	raw_spin_lock_irqsave(&p->pi_lock, flags);
--	user_mask = clear_user_cpus_ptr(p);
--	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
--
--	kfree(user_mask);
-+	ret = __sched_setaffinity(p, &ac);
-+	WARN_ON_ONCE(ret);
- }
- 
- void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
-@@ -3548,10 +3569,9 @@ void sched_set_stop_task(int cpu, struct task_struct *stop)
- #else /* CONFIG_SMP */
- 
- static inline int __set_cpus_allowed_ptr(struct task_struct *p,
--					 const struct cpumask *new_mask,
--					 u32 flags)
-+					 struct affinity_context *ctx)
- {
--	return set_cpus_allowed_ptr(p, new_mask);
-+	return set_cpus_allowed_ptr(p, ctx->new_mask);
- }
- 
- static inline void migrate_disable_switch(struct rq *rq, struct task_struct *p) { }
-@@ -3603,14 +3623,39 @@ ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
+@@ -3632,14 +3632,39 @@ ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
  }
  
  /*
@@ -598,7 +119,7 @@ index 535af9fbea7b..2150e821899c 100644
  
  #ifdef CONFIG_SMP
  	if (p->sched_class->task_woken) {
-@@ -3640,31 +3685,6 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+@@ -3669,31 +3694,6 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
  #endif
  }
  
@@ -630,7 +151,7 @@ index 535af9fbea7b..2150e821899c 100644
  /*
   * Consider @p being inside a wait loop:
   *
-@@ -3698,9 +3718,15 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
+@@ -3727,9 +3727,15 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
  
  	rq = __task_rq_lock(p, &rf);
  	if (task_on_rq_queued(p)) {
@@ -649,7 +170,7 @@ index 535af9fbea7b..2150e821899c 100644
  		ret = 1;
  	}
  	__task_rq_unlock(rq, &rf);
-@@ -3719,13 +3745,6 @@ void sched_ttwu_pending(void *arg)
+@@ -3748,13 +3754,6 @@ void sched_ttwu_pending(void *arg)
  	if (!llist)
  		return;
  
@@ -663,7 +184,7 @@ index 535af9fbea7b..2150e821899c 100644
  	rq_lock_irqsave(rq, &rf);
  	update_rq_clock(rq);
  
-@@ -3739,6 +3758,17 @@ void sched_ttwu_pending(void *arg)
+@@ -3768,6 +3767,17 @@ void sched_ttwu_pending(void *arg)
  		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
  	}
  
@@ -681,7 +202,7 @@ index 535af9fbea7b..2150e821899c 100644
  	rq_unlock_irqrestore(rq, &rf);
  }
  
-@@ -4062,8 +4092,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+@@ -4091,8 +4101,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
  			goto out;
  
  		trace_sched_waking(p);
@@ -691,134 +212,6 @@ index 535af9fbea7b..2150e821899c 100644
  		goto out;
  	}
  
-@@ -5469,7 +5498,9 @@ void scheduler_tick(void)
- 	unsigned long thermal_pressure;
- 	u64 resched_latency;
- 
--	arch_scale_freq_tick();
-+	if (housekeeping_cpu(cpu, HK_TYPE_TICK))
-+		arch_scale_freq_tick();
-+
- 	sched_clock_tick();
- 
- 	rq_lock(rq, &rf);
-@@ -8106,7 +8137,7 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
- #endif
- 
- static int
--__sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
-+__sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
- {
- 	int retval;
- 	cpumask_var_t cpus_allowed, new_mask;
-@@ -8120,13 +8151,16 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
- 	}
- 
- 	cpuset_cpus_allowed(p, cpus_allowed);
--	cpumask_and(new_mask, mask, cpus_allowed);
-+	cpumask_and(new_mask, ctx->new_mask, cpus_allowed);
-+
-+	ctx->new_mask = new_mask;
-+	ctx->flags |= SCA_CHECK;
- 
- 	retval = dl_task_check_affinity(p, new_mask);
- 	if (retval)
- 		goto out_free_new_mask;
--again:
--	retval = __set_cpus_allowed_ptr(p, new_mask, SCA_CHECK | SCA_USER);
-+
-+	retval = __set_cpus_allowed_ptr(p, ctx);
- 	if (retval)
- 		goto out_free_new_mask;
- 
-@@ -8137,7 +8171,24 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
- 		 * Just reset the cpumask to the cpuset's cpus_allowed.
- 		 */
- 		cpumask_copy(new_mask, cpus_allowed);
--		goto again;
-+
-+		/*
-+		 * If SCA_USER is set, a 2nd call to __set_cpus_allowed_ptr()
-+		 * will restore the previous user_cpus_ptr value.
-+		 *
-+		 * In the unlikely event a previous user_cpus_ptr exists,
-+		 * we need to further restrict the mask to what is allowed
-+		 * by that old user_cpus_ptr.
-+		 */
-+		if (unlikely((ctx->flags & SCA_USER) && ctx->user_mask)) {
-+			bool empty = !cpumask_and(new_mask, new_mask,
-+						  ctx->user_mask);
-+
-+			if (WARN_ON_ONCE(empty))
-+				cpumask_copy(new_mask, cpus_allowed);
-+		}
-+		__set_cpus_allowed_ptr(p, ctx);
-+		retval = -EINVAL;
- 	}
- 
- out_free_new_mask:
-@@ -8149,6 +8200,8 @@ __sched_setaffinity(struct task_struct *p, const struct cpumask *mask)
- 
- long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
- {
-+	struct affinity_context ac;
-+	struct cpumask *user_mask;
- 	struct task_struct *p;
- 	int retval;
- 
-@@ -8183,7 +8236,21 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
- 	if (retval)
- 		goto out_put_task;
- 
--	retval = __sched_setaffinity(p, in_mask);
-+	user_mask = kmalloc(cpumask_size(), GFP_KERNEL);
-+	if (!user_mask) {
-+		retval = -ENOMEM;
-+		goto out_put_task;
-+	}
-+	cpumask_copy(user_mask, in_mask);
-+	ac = (struct affinity_context){
-+		.new_mask  = in_mask,
-+		.user_mask = user_mask,
-+		.flags     = SCA_USER,
-+	};
-+
-+	retval = __sched_setaffinity(p, &ac);
-+	kfree(ac.user_mask);
-+
- out_put_task:
- 	put_task_struct(p);
- 	return retval;
-@@ -8964,6 +9031,12 @@ void show_state_filter(unsigned int state_filter)
-  */
- void __init init_idle(struct task_struct *idle, int cpu)
- {
-+#ifdef CONFIG_SMP
-+	struct affinity_context ac = (struct affinity_context) {
-+		.new_mask  = cpumask_of(cpu),
-+		.flags     = 0,
-+	};
-+#endif
- 	struct rq *rq = cpu_rq(cpu);
- 	unsigned long flags;
- 
-@@ -8988,7 +9061,7 @@ void __init init_idle(struct task_struct *idle, int cpu)
- 	 *
- 	 * And since this is boot we can forgo the serialization.
- 	 */
--	set_cpus_allowed_common(idle, cpumask_of(cpu), 0);
-+	set_cpus_allowed_common(idle, &ac);
- #endif
- 	/*
- 	 * We're having a chicken and egg problem, even though we are
-@@ -9775,6 +9848,7 @@ void __init sched_init(void)
- 
- 		rq->core_cookie = 0UL;
- #endif
-+		zalloc_cpumask_var_node(&rq->scratch_mask, GFP_KERNEL, cpu_to_node(i));
- 	}
- 
- 	set_load_weight(&init_task, false);
 diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
 index 1207c78f85c1..5c840151f3bb 100644
 --- a/kernel/sched/cpufreq_schedutil.c
@@ -963,38 +356,6 @@ index 1207c78f85c1..5c840151f3bb 100644
  }
  
  static void
-diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
-index 9ae8f41e3372..0d97d54276cc 100644
---- a/kernel/sched/deadline.c
-+++ b/kernel/sched/deadline.c
-@@ -2485,8 +2485,7 @@ static void task_woken_dl(struct rq *rq, struct task_struct *p)
- }
- 
- static void set_cpus_allowed_dl(struct task_struct *p,
--				const struct cpumask *new_mask,
--				u32 flags)
-+				struct affinity_context *ctx)
- {
- 	struct root_domain *src_rd;
- 	struct rq *rq;
-@@ -2501,7 +2500,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
- 	 * update. We already made space for us in the destination
- 	 * domain (see cpuset_can_attach()).
- 	 */
--	if (!cpumask_intersects(src_rd->span, new_mask)) {
-+	if (!cpumask_intersects(src_rd->span, ctx->new_mask)) {
- 		struct dl_bw *src_dl_b;
- 
- 		src_dl_b = dl_bw_of(cpu_of(rq));
-@@ -2515,7 +2514,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
- 		raw_spin_unlock(&src_dl_b->lock);
- 	}
- 
--	set_cpus_allowed_common(p, new_mask, flags);
-+	set_cpus_allowed_common(p, ctx);
- }
- 
- /* Assumes rq->lock is held */
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
 index d2e15db21c06..6e6d2fdca355 100644
 --- a/kernel/sched/fair.c
@@ -1952,97 +1313,8 @@ index 7f40d87e8f50..8ac8b81bfee6 100644
  	}
  	kfree(t);
  }
-diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
-index ed2a47e4ddae..152347c4394c 100644
---- a/kernel/sched/rt.c
-+++ b/kernel/sched/rt.c
-@@ -1595,6 +1595,32 @@ static void yield_task_rt(struct rq *rq)
- #ifdef CONFIG_SMP
- static int find_lowest_rq(struct task_struct *task);
- 
-+#ifdef CONFIG_RT_SOFTIRQ_AWARE_SCHED
-+/*
-+ * Return whether the given cpu is currently non-preemptible
-+ * while handling a potentially long softirq, or if the current
-+ * task is likely to block preemptions soon because it is a
-+ * ksoftirq thread that is handling softirqs.
-+ */
-+static bool cpu_busy_with_softirqs(int cpu)
-+{
-+	u32 softirqs = per_cpu(active_softirqs, cpu) |
-+		       __cpu_softirq_pending(cpu);
-+
-+	return softirqs & LONG_SOFTIRQ_MASK;
-+}
-+#else
-+static bool cpu_busy_with_softirqs(int cpu)
-+{
-+	return false;
-+}
-+#endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
-+
-+static bool rt_task_fits_cpu(struct task_struct *p, int cpu)
-+{
-+	return rt_task_fits_capacity(p, cpu) && !cpu_busy_with_softirqs(cpu);
-+}
-+
- static int
- select_task_rq_rt(struct task_struct *p, int cpu, int flags)
- {
-@@ -1633,22 +1659,24 @@ select_task_rq_rt(struct task_struct *p, int cpu, int flags)
- 	 * This test is optimistic, if we get it wrong the load-balancer
- 	 * will have to sort it out.
- 	 *
--	 * We take into account the capacity of the CPU to ensure it fits the
--	 * requirement of the task - which is only important on heterogeneous
--	 * systems like big.LITTLE.
-+	 * We use rt_task_fits_cpu() to evaluate if the CPU is busy with
-+	 * potentially long-running softirq work, as well as take into
-+	 * account the capacity of the CPU to ensure it fits the
-+	 * requirement of the task - which is only important on
-+	 * heterogeneous systems like big.LITTLE.
- 	 */
- 	test = curr &&
- 	       unlikely(rt_task(curr)) &&
- 	       (curr->nr_cpus_allowed < 2 || curr->prio <= p->prio);
- 
--	if (test || !rt_task_fits_capacity(p, cpu)) {
-+	if (test || !rt_task_fits_cpu(p, cpu)) {
- 		int target = find_lowest_rq(p);
- 
- 		/*
- 		 * Bail out if we were forcing a migration to find a better
- 		 * fitting CPU but our search failed.
- 		 */
--		if (!test && target != -1 && !rt_task_fits_capacity(p, target))
-+		if (!test && target != -1 && !rt_task_fits_cpu(p, target))
- 			goto out_unlock;
- 
- 		/*
-@@ -1890,14 +1918,17 @@ static int find_lowest_rq(struct task_struct *task)
- 		return -1; /* No other targets possible */
- 
- 	/*
--	 * If we're on asym system ensure we consider the different capacities
--	 * of the CPUs when searching for the lowest_mask.
-+	 * If we're using the softirq optimization or if we are
-+	 * on asym system, ensure we consider the softirq processing
-+	 * or different capacities of the CPUs when searching for the
-+	 * lowest_mask.
- 	 */
--	if (sched_asym_cpucap_active()) {
-+	if (IS_ENABLED(CONFIG_RT_SOFTIRQ_AWARE_SCHED) ||
-+	    sched_asym_cpucap_active()) {
- 
- 		ret = cpupri_find_fitness(&task_rq(task)->rd->cpupri,
- 					  task, lowest_mask,
--					  rt_task_fits_capacity);
-+					  rt_task_fits_cpu);
- 	} else {
- 
- 		ret = cpupri_find(&task_rq(task)->rd->cpupri,
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index d6d488e8eb55..96dc9d4ef873 100644
+index d6d488e8eb55..b7a346b2e623 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -645,6 +645,9 @@ struct cfs_rq {
@@ -2086,54 +1358,7 @@ index d6d488e8eb55..96dc9d4ef873 100644
  };
  
  #ifdef CONFIG_FAIR_GROUP_SCHED
-@@ -1877,6 +1890,13 @@ static inline void dirty_sched_domain_sysctl(int cpu)
- #endif
- 
- extern int sched_update_scaling(void);
-+
-+static inline const struct cpumask *task_user_cpus(struct task_struct *p)
-+{
-+	if (!p->user_cpus_ptr)
-+		return cpu_possible_mask; /* &init_task.cpus_mask */
-+	return p->user_cpus_ptr;
-+}
- #endif /* CONFIG_SMP */
- 
- #include "stats.h"
-@@ -2144,6 +2164,12 @@ extern const u32		sched_prio_to_wmult[40];
- 
- #define RETRY_TASK		((void *)-1UL)
- 
-+struct affinity_context {
-+	const struct cpumask *new_mask;
-+	struct cpumask *user_mask;
-+	unsigned int flags;
-+};
-+
- struct sched_class {
- 
- #ifdef CONFIG_UCLAMP_TASK
-@@ -2172,9 +2198,7 @@ struct sched_class {
- 
- 	void (*task_woken)(struct rq *this_rq, struct task_struct *task);
- 
--	void (*set_cpus_allowed)(struct task_struct *p,
--				 const struct cpumask *newmask,
--				 u32 flags);
-+	void (*set_cpus_allowed)(struct task_struct *p, struct affinity_context *ctx);
- 
- 	void (*rq_online)(struct rq *rq);
- 	void (*rq_offline)(struct rq *rq);
-@@ -2285,7 +2309,7 @@ extern void update_group_capacity(struct sched_domain *sd, int cpu);
- 
- extern void trigger_load_balance(struct rq *rq);
- 
--extern void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask, u32 flags);
-+extern void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx);
- 
- static inline struct task_struct *get_push_task(struct rq *rq)
- {
-@@ -2878,6 +2902,24 @@ static inline unsigned long capacity_orig_of(int cpu)
+@@ -2878,6 +2891,24 @@ static inline unsigned long capacity_orig_of(int cpu)
  	return cpu_rq(cpu)->cpu_capacity_orig;
  }
  
@@ -2218,138 +1443,6 @@ index 84a188913cc9..38f3698f5e5b 100644
  		__task_rq_unlock(rq, &rf);
  	}
  }
-diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
-index 8088a94726d0..f059218500ea 100644
---- a/kernel/sched/topology.c
-+++ b/kernel/sched/topology.c
-@@ -578,7 +578,7 @@ static int init_rootdomain(struct root_domain *rd)
-  */
- struct root_domain def_root_domain;
- 
--void init_defrootdomain(void)
-+void __init init_defrootdomain(void)
- {
- 	init_rootdomain(&def_root_domain);
- 
-diff --git a/kernel/softirq.c b/kernel/softirq.c
-index c8a6913c067d..5db2afd0be68 100644
---- a/kernel/softirq.c
-+++ b/kernel/softirq.c
-@@ -60,6 +60,21 @@ static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp
- 
- DEFINE_PER_CPU(struct task_struct *, ksoftirqd);
- 
-+#ifdef CONFIG_RT_SOFTIRQ_AWARE_SCHED
-+/*
-+ * active_softirqs -- per cpu, a mask of softirqs that are being handled,
-+ * with the expectation that approximate answers are acceptable and therefore
-+ * no synchronization.
-+ */
-+DEFINE_PER_CPU(u32, active_softirqs);
-+static inline void set_active_softirqs(u32 pending)
-+{
-+	__this_cpu_write(active_softirqs, pending);
-+}
-+#else /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
-+static inline void set_active_softirqs(u32 pending) {};
-+#endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
-+
- const char * const softirq_to_name[NR_SOFTIRQS] = {
- 	"HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL",
- 	"TASKLET", "SCHED", "HRTIMER", "RCU"
-@@ -80,6 +95,7 @@ static void wakeup_softirqd(void)
- 		wake_up_process(tsk);
- }
- 
-+#ifndef CONFIG_RT_SOFTIRQ_AWARE_SCHED
- /*
-  * If ksoftirqd is scheduled, we do not want to process pending softirqs
-  * right now. Let ksoftirqd handle this at its own rate, to get fairness,
-@@ -94,6 +110,9 @@ static bool ksoftirqd_running(unsigned long pending)
- 		return false;
- 	return tsk && task_is_running(tsk) && !__kthread_should_park(tsk);
- }
-+#else
-+#define ksoftirqd_running(pending) (false)
-+#endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
- 
- #ifdef CONFIG_TRACE_IRQFLAGS
- DEFINE_PER_CPU(int, hardirqs_enabled);
-@@ -525,6 +544,21 @@ static inline bool lockdep_softirq_start(void) { return false; }
- static inline void lockdep_softirq_end(bool in_hardirq) { }
- #endif
- 
-+#ifdef CONFIG_RT_SOFTIRQ_AWARE_SCHED
-+static __u32 softirq_deferred_for_rt(__u32 *pending)
-+{
-+	__u32 deferred = 0;
-+
-+	if (rt_task(current)) {
-+		deferred = *pending & LONG_SOFTIRQ_MASK;
-+		*pending &= ~LONG_SOFTIRQ_MASK;
-+	}
-+	return deferred;
-+}
-+#else
-+#define softirq_deferred_for_rt(x) (0)
-+#endif
-+
- asmlinkage __visible void __softirq_entry __do_softirq(void)
- {
- 	unsigned long end = jiffies + MAX_SOFTIRQ_TIME;
-@@ -532,6 +566,7 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
- 	int max_restart = MAX_SOFTIRQ_RESTART;
- 	struct softirq_action *h;
- 	bool in_hardirq;
-+	__u32 deferred;
- 	__u32 pending;
- 	int softirq_bit;
- 
-@@ -543,14 +578,17 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
- 	current->flags &= ~PF_MEMALLOC;
- 
- 	pending = local_softirq_pending();
-+	deferred = softirq_deferred_for_rt(&pending);
- 
- 	softirq_handle_begin();
-+
- 	in_hardirq = lockdep_softirq_start();
- 	account_softirq_enter(current);
- 
- restart:
- 	/* Reset the pending bitmask before enabling irqs */
--	set_softirq_pending(0);
-+	set_softirq_pending(deferred);
-+	set_active_softirqs(pending);
- 
- 	local_irq_enable();
- 
-@@ -580,6 +618,7 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
- 		pending >>= softirq_bit;
- 	}
- 
-+	set_active_softirqs(0);
- 	if (!IS_ENABLED(CONFIG_PREEMPT_RT) &&
- 	    __this_cpu_read(ksoftirqd) == current)
- 		rcu_softirq_qs();
-@@ -587,13 +626,16 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
- 	local_irq_disable();
- 
- 	pending = local_softirq_pending();
-+	deferred = softirq_deferred_for_rt(&pending);
-+
- 	if (pending) {
- 		if (time_before(jiffies, end) && !need_resched() &&
- 		    --max_restart)
- 			goto restart;
-+	}
- 
-+	if (pending | deferred)
- 		wakeup_softirqd();
--	}
- 
- 	account_softirq_exit(current);
- 	lockdep_softirq_end(in_hardirq);
 -- 
-2.39.0
+2.39.1
 
