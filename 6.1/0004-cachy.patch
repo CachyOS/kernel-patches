@@ -1,6 +1,6 @@
-From c0e6112808395fedb566cadb28cf9d0e0af3dcd4 Mon Sep 17 00:00:00 2001
+From 60e5e51fb3d2430ddd06307e486dc91f17cdc7e8 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Tue, 24 Jan 2023 10:10:54 +0100
+Date: Wed, 1 Feb 2023 10:26:13 +0100
 Subject: [PATCH 04/19] cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -38,6 +38,8 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  drivers/pci/quirks.c                          | 101 +++
  include/linux/pagemap.h                       |   2 +-
  include/linux/user_namespace.h                |   4 +
+ include/net/netns/ipv4.h                      |   1 +
+ include/trace/events/tcp.h                    |   7 +
  init/Kconfig                                  |  39 ++
  kernel/Kconfig.hz                             |  24 +
  kernel/fork.c                                 |  14 +
@@ -58,10 +60,13 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  mm/swap.c                                     |   5 +
  mm/vmpressure.c                               |   4 +
  mm/vmscan.c                                   |   8 +
+ net/ipv4/sysctl_net_ipv4.c                    |   7 +
+ net/ipv4/tcp_input.c                          |  36 +
+ net/ipv4/tcp_ipv4.c                           |   2 +
  scripts/Makefile.debug                        |   6 +-
  scripts/Makefile.lib                          |  13 +-
  scripts/Makefile.modinst                      |   7 +-
- 56 files changed, 1693 insertions(+), 64 deletions(-)
+ 61 files changed, 1746 insertions(+), 64 deletions(-)
  create mode 100644 arch/x86/Makefile.postlink
  create mode 100644 drivers/i2c/busses/i2c-nct6775.c
 
@@ -119,7 +124,7 @@ index 352ff53a2306..7c210744d84c 100644
  vmlinuz
  voffset.h
 diff --git a/Makefile b/Makefile
-index 49261450039a..974f42f497ed 100644
+index 3778b422fa11..d7de7eab5a4f 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -823,6 +823,9 @@ KBUILD_CFLAGS	+= $(call cc-disable-warning, address-of-packed-member)
@@ -1985,6 +1990,36 @@ index 45f09bec02c4..87b20e2ee274 100644
  static inline struct user_namespace *get_user_ns(struct user_namespace *ns)
  {
  	return &init_user_ns;
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index 1b8004679445..d6d7f9942b97 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -188,6 +188,7 @@ struct netns_ipv4 {
+ 	int sysctl_udp_rmem_min;
+ 
+ 	u8 sysctl_fib_notify_on_flag_change;
++	unsigned int sysctl_tcp_collapse_max_bytes;
+ 
+ #ifdef CONFIG_NET_L3_MASTER_DEV
+ 	u8 sysctl_udp_l3mdev_accept;
+diff --git a/include/trace/events/tcp.h b/include/trace/events/tcp.h
+index 901b440238d5..7026df84a0f6 100644
+--- a/include/trace/events/tcp.h
++++ b/include/trace/events/tcp.h
+@@ -187,6 +187,13 @@ DEFINE_EVENT(tcp_event_sk, tcp_rcv_space_adjust,
+ 	TP_ARGS(sk)
+ );
+ 
++DEFINE_EVENT(tcp_event_sk, tcp_collapse_max_bytes_exceeded,
++
++	TP_PROTO(struct sock *sk),
++
++	TP_ARGS(sk)
++);
++
+ TRACE_EVENT(tcp_retransmit_synack,
+ 
+ 	TP_PROTO(const struct sock *sk, const struct request_sock *req),
 diff --git a/init/Kconfig b/init/Kconfig
 index 0c214af99085..6b0c6acfeb2e 100644
 --- a/init/Kconfig
@@ -2395,7 +2430,7 @@ index e3142ee35fc6..f543a01cdd58 100644
  
   out:
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 0f32acb05055..d2e15db21c06 100644
+index 2c3d0d49c80e..a1e6338637cf 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -69,9 +69,13 @@
@@ -2563,10 +2598,10 @@ index 57e1d8c5b505..d66ec503a7ca 100644
  
  #
 diff --git a/mm/compaction.c b/mm/compaction.c
-index ca1603524bbe..ccc81ec31a47 100644
+index 8238e83385a7..d0b16a5b30f7 100644
 --- a/mm/compaction.c
 +++ b/mm/compaction.c
-@@ -2716,7 +2716,11 @@ static void compact_nodes(void)
+@@ -2717,7 +2717,11 @@ static void compact_nodes(void)
   * aggressively the kernel should compact memory in the
   * background. It takes values in the range [0, 100].
   */
@@ -2671,6 +2706,98 @@ index 8fcc5fa768c0..77c2bb3bccf8 100644
  
  static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  {
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 9b8a6db7a66b..0e364b98c4b3 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -1384,6 +1384,13 @@ static struct ctl_table ipv4_net_table[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_TWO,
+ 	},
++	{
++		.procname	= "tcp_collapse_max_bytes",
++		.data		= &init_net.ipv4.sysctl_tcp_collapse_max_bytes,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec_minmax,
++	},
+ 	{ }
+ };
+ 
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 8a455eb0c552..71cdd9e884f4 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -5402,6 +5402,7 @@ static bool tcp_prune_ofo_queue(struct sock *sk)
+ static int tcp_prune_queue(struct sock *sk)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
++	struct net *net = sock_net(sk);
+ 
+ 	NET_INC_STATS(sock_net(sk), LINUX_MIB_PRUNECALLED);
+ 
+@@ -5413,6 +5414,39 @@ static int tcp_prune_queue(struct sock *sk)
+ 	if (atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf)
+ 		return 0;
+ 
++	/* For context and additional information about this patch, see the
++	 * blog post at
++	 *
++	 * sysctl:  net.ipv4.tcp_collapse_max_bytes
++	 *
++	 * If tcp_collapse_max_bytes is non-zero, attempt to collapse the
++	 * queue to free up memory if the current amount of memory allocated
++	 * is less than tcp_collapse_max_bytes.  Otherwise, the packet is
++	 * dropped without attempting to collapse the queue.
++	 *
++	 * If tcp_collapse_max_bytes is zero, this feature is disabled
++	 * and the default Linux behavior is used.  The default Linux
++	 * behavior is to always perform the attempt to collapse the
++	 * queue to free up memory.
++	 *
++	 * When the receive queue is small, we want to collapse the
++	 * queue.  There are two reasons for this: (a) the latency of
++	 * performing the collapse will be small on a small queue, and
++	 * (b) we want to avoid sending a congestion signal (via a
++	 * packet drop) to the sender when the receive queue is small.
++	 *
++	 * The result is that we avoid latency spikes caused by the
++	 * time it takes to perform the collapse logic when the receive
++	 * queue is large and full, while preserving existing behavior
++	 * and performance for all other cases.
++	 */
++	if (net->ipv4.sysctl_tcp_collapse_max_bytes &&
++		(atomic_read(&sk->sk_rmem_alloc) > net->ipv4.sysctl_tcp_collapse_max_bytes)) {
++		/* We are dropping the packet */
++		trace_tcp_collapse_max_bytes_exceeded(sk);
++		goto do_not_collapse;
++	}
++
+ 	tcp_collapse_ofo_queue(sk);
+ 	if (!skb_queue_empty(&sk->sk_receive_queue))
+ 		tcp_collapse(sk, &sk->sk_receive_queue, NULL,
+@@ -5431,6 +5465,8 @@ static int tcp_prune_queue(struct sock *sk)
+ 	if (atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf)
+ 		return 0;
+ 
++do_not_collapse:
++
+ 	/* If we are really being abused, tell the caller to silently
+ 	 * drop receive data on the floor.  It will get retransmitted
+ 	 * and hopefully then we'll have sufficient space.
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index da46357f501b..77967b2db29e 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -3215,6 +3215,8 @@ static int __net_init tcp_sk_init(struct net *net)
+ 	else
+ 		net->ipv4.tcp_congestion_control = &tcp_reno;
+ 
++	net->ipv4.sysctl_tcp_collapse_max_bytes = 0;
++
+ 	return 0;
+ }
+ 
 diff --git a/scripts/Makefile.debug b/scripts/Makefile.debug
 index 332c486f705f..059ff38fe0cb 100644
 --- a/scripts/Makefile.debug
