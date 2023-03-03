@@ -1,32 +1,32 @@
-From 4146b9df71595a233386acaed0dc699b27eb7e8a Mon Sep 17 00:00:00 2001
+From bf6134d9c945781ba5d8e780c14dc1664426371f Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 13 Feb 2023 09:25:47 +0100
+Date: Fri, 3 Mar 2023 17:01:31 +0100
 Subject: [PATCH 10/15] maple-lru
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- Documentation/mm/multigen_lru.rst |   86 ++-
+ Documentation/mm/multigen_lru.rst |  128 +++-
  include/linux/fs.h                |    2 +
  include/linux/maple_tree.h        |    6 -
  include/linux/memcontrol.h        |   10 +
  include/linux/mm_inline.h         |   19 +-
- include/linux/mmzone.h            |  122 +++-
- lib/maple_tree.c                  |  113 ++-
+ include/linux/mmzone.h            |  124 +++-
+ lib/maple_tree.c                  |  150 ++--
  mm/fadvise.c                      |    5 +-
  mm/memcontrol.c                   |   12 +
  mm/memory.c                       |    7 +-
  mm/page_alloc.c                   |    1 +
  mm/rmap.c                         |   42 +-
- mm/vmscan.c                       | 1059 ++++++++++++++++++-----------
+ mm/vmscan.c                       | 1083 ++++++++++++++++++-----------
  mm/workingset.c                   |    4 +-
  tools/testing/radix-tree/maple.c  |   18 +-
- 15 files changed, 1002 insertions(+), 504 deletions(-)
+ 15 files changed, 1071 insertions(+), 540 deletions(-)
 
 diff --git a/Documentation/mm/multigen_lru.rst b/Documentation/mm/multigen_lru.rst
-index d7062c6a8946..5f1f6ecbb79b 100644
+index d7062c6a8946..52ed5092022f 100644
 --- a/Documentation/mm/multigen_lru.rst
 +++ b/Documentation/mm/multigen_lru.rst
-@@ -89,15 +89,15 @@ variables are monotonically increasing.
+@@ -89,21 +89,22 @@ variables are monotonically increasing.
  
  Generation numbers are truncated into ``order_base_2(MAX_NR_GENS+1)``
  bits in order to fit into the gen counter in ``folio->flags``. Each
@@ -45,7 +45,15 @@ index d7062c6a8946..5f1f6ecbb79b 100644
  contrast to moving across generations, which requires the LRU lock,
  moving across tiers only involves atomic operations on
  ``folio->flags`` and therefore has a negligible cost. A feedback loop
-@@ -127,7 +127,7 @@ page mapped by this PTE to ``(max_seq%MAX_NR_GENS)+1``.
+ modeled after the PID controller monitors refaults over all the tiers
+ from anon and file types and decides which tiers from which types to
+-evict or protect.
++evict or protect. The desired effect is to balance refault percentages
++between anon and file types proportional to the swappiness level.
+ 
+ There are two conceptually independent procedures: the aging and the
+ eviction. They form a closed-loop system, i.e., the page reclaim.
+@@ -127,7 +128,7 @@ page mapped by this PTE to ``(max_seq%MAX_NR_GENS)+1``.
  Eviction
  --------
  The eviction consumes old generations. Given an ``lruvec``, it
@@ -54,7 +62,7 @@ index d7062c6a8946..5f1f6ecbb79b 100644
  ``min_seq%MAX_NR_GENS`` becomes empty. To select a type and a tier to
  evict from, it first compares ``min_seq[]`` to select the older type.
  If both types are equally old, it selects the one whose first tier has
-@@ -141,9 +141,85 @@ loop has detected outlying refaults from the tier this page is in. To
+@@ -141,15 +142,124 @@ loop has detected outlying refaults from the tier this page is in. To
  this end, the feedback loop uses the first tier as the baseline, for
  the reason stated earlier.
  
@@ -73,6 +81,27 @@ index d7062c6a8946..5f1f6ecbb79b 100644
 +   and memory sizes.
 +2. It is more reliable because it is directly wired to the OOM killer.
 +
++``mm_struct`` list
++------------------
++An ``mm_struct`` list is maintained for each memcg, and an
++``mm_struct`` follows its owner task to the new memcg when this task
++is migrated.
++
++A page table walker iterates ``lruvec_memcg()->mm_list`` and calls
++``walk_page_range()`` with each ``mm_struct`` on this list to scan
++PTEs. When multiple page table walkers iterate the same list, each of
++them gets a unique ``mm_struct``, and therefore they can run in
++parallel.
++
++Page table walkers ignore any misplaced pages, e.g., if an
++``mm_struct`` was migrated, pages left in the previous memcg will be
++ignored when the current memcg is under reclaim. Similarly, page table
++walkers will ignore pages from nodes other than the one under reclaim.
++
++This infrastructure also tracks the usage of ``mm_struct`` between
++context switches so that page table walkers can skip processes that
++have been sleeping since the last iteration.
++
 +Rmap/PT walk feedback
 +---------------------
 +Searching the rmap for PTEs mapping each page on an LRU list (to test
@@ -87,7 +116,7 @@ index d7062c6a8946..5f1f6ecbb79b 100644
 +adds the PMD entry pointing to the PTE table to the Bloom filter. This
 +forms a feedback loop between the eviction and the aging.
 +
-+Bloom Filters
++Bloom filters
 +-------------
 +Bloom filters are a space and memory efficient data structure for set
 +membership test, i.e., test if an element is not in the set or may be
@@ -102,6 +131,18 @@ index d7062c6a8946..5f1f6ecbb79b 100644
 +is false positive, the cost is an additional scan of a range of PTEs,
 +which may yield hot pages anyway. Parameters of the filter itself can
 +control the false positive rate in the limit.
++
++PID controller
++--------------
++A feedback loop modeled after the Proportional-Integral-Derivative
++(PID) controller monitors refaults over anon and file types and
++decides which type to evict when both types are available from the
++same generation.
++
++The PID controller uses generations rather than the wall clock as the
++time domain because a CPU can scan pages at different rates under
++varying memory pressure. It calculates a moving average for each new
++generation to avoid being permanently locked in a suboptimal state.
 +
 +Memcg LRU
 +---------
@@ -141,6 +182,15 @@ index d7062c6a8946..5f1f6ecbb79b 100644
  
  * Generations
  * Rmap walks
+-* Page table walks
+-* Bloom filters
+-* PID controller
++* Page table walks via ``mm_struct`` list
++* Bloom filters for rmap/PT walk feedback
++* PID controller for refault feedback
+ 
+ The aging and the eviction form a producer-consumer model;
+ specifically, the latter drives the former by the sliding window over
 diff --git a/include/linux/fs.h b/include/linux/fs.h
 index c1769a2c5d70..d353c262d669 100644
 --- a/include/linux/fs.h
@@ -271,7 +321,7 @@ index ff3f3f23f649..de1e622dd366 100644
 +
  #endif
 diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
-index cd28a100d9e4..977be526c939 100644
+index cd28a100d9e4..70bd7f55bdd2 100644
 --- a/include/linux/mmzone.h
 +++ b/include/linux/mmzone.h
 @@ -7,6 +7,7 @@
@@ -476,20 +526,32 @@ index cd28a100d9e4..977be526c939 100644
  	/* to concurrently iterate lru_gen_mm_list */
  	struct lru_gen_mm_state		mm_state;
  #endif
-@@ -1243,6 +1345,8 @@ typedef struct pglist_data {
+@@ -1242,7 +1344,9 @@ typedef struct pglist_data {
+ 
  #ifdef CONFIG_LRU_GEN
  	/* kswap mm walk data */
- 	struct lru_gen_mm_walk	mm_walk;
+-	struct lru_gen_mm_walk	mm_walk;
++	struct lru_gen_mm_walk mm_walk;
 +	/* lru_gen_folio list */
 +	struct lru_gen_memcg memcg_lru;
  #endif
  
  	CACHELINE_PADDING(_pad2_);
 diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index 5a976393c9ae..b95652b79b55 100644
+index 5a976393c9ae..caa7bb73451f 100644
 --- a/lib/maple_tree.c
 +++ b/lib/maple_tree.c
-@@ -149,13 +149,12 @@ struct maple_subtree_state {
+@@ -146,16 +146,22 @@ struct maple_subtree_state {
+ 	struct maple_big_node *bn;
+ };
+ 
++#ifdef CONFIG_KASAN_STACK
++/* Prevent mas_wr_bnode() from exceeding the stack frame limit */
++#define noinline_for_kasan noinline_for_stack
++#else
++#define noinline_for_kasan inline
++#endif
++
  /* Functions */
  static inline struct maple_node *mt_alloc_one(gfp_t gfp)
  {
@@ -505,7 +567,7 @@ index 5a976393c9ae..b95652b79b55 100644
  }
  
  static inline void mt_free_bulk(size_t size, void __rcu **nodes)
-@@ -183,7 +182,6 @@ static void ma_free_rcu(struct maple_node *node)
+@@ -183,7 +189,6 @@ static void ma_free_rcu(struct maple_node *node)
  	call_rcu(&node->rcu, mt_free_rcu);
  }
  
@@ -513,7 +575,7 @@ index 5a976393c9ae..b95652b79b55 100644
  static void mas_set_height(struct ma_state *mas)
  {
  	unsigned int new_flags = mas->tree->ma_flags;
-@@ -468,7 +466,7 @@ static inline
+@@ -468,7 +473,7 @@ static inline
  void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
  		    unsigned char slot)
  {
@@ -522,7 +584,7 @@ index 5a976393c9ae..b95652b79b55 100644
  	unsigned long shift;
  	unsigned long type;
  	enum maple_type p_type = mte_node_type(parent);
-@@ -502,10 +500,9 @@ void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
+@@ -502,10 +507,9 @@ void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
   */
  static inline unsigned int mte_parent_slot(const struct maple_enode *enode)
  {
@@ -535,7 +597,7 @@ index 5a976393c9ae..b95652b79b55 100644
  		return 0;
  
  	/*
-@@ -1128,9 +1125,10 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
+@@ -1128,9 +1132,10 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
  {
  	struct maple_alloc *ret, *node = mas->alloc;
  	unsigned long total = mas_allocated(mas);
@@ -547,7 +609,7 @@ index 5a976393c9ae..b95652b79b55 100644
  		return NULL;
  
  	if (total == 1) {
-@@ -1140,27 +1138,25 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
+@@ -1140,27 +1145,25 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
  		goto single_node;
  	}
  
@@ -583,7 +645,7 @@ index 5a976393c9ae..b95652b79b55 100644
  	return (struct maple_node *)ret;
  }
  
-@@ -1179,21 +1175,20 @@ static inline void mas_push_node(struct ma_state *mas, struct maple_node *used)
+@@ -1179,21 +1182,20 @@ static inline void mas_push_node(struct ma_state *mas, struct maple_node *used)
  	unsigned long count;
  	unsigned int requested = mas_alloc_req(mas);
  
@@ -610,7 +672,7 @@ index 5a976393c9ae..b95652b79b55 100644
  		reuse->total += head->total;
  	}
  
-@@ -1212,7 +1207,6 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+@@ -1212,7 +1214,6 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
  {
  	struct maple_alloc *node;
  	unsigned long allocated = mas_allocated(mas);
@@ -618,7 +680,7 @@ index 5a976393c9ae..b95652b79b55 100644
  	unsigned int requested = mas_alloc_req(mas);
  	unsigned int count;
  	void **slots = NULL;
-@@ -1228,24 +1222,29 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+@@ -1228,24 +1229,29 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
  		WARN_ON(!allocated);
  	}
  
@@ -653,7 +715,7 @@ index 5a976393c9ae..b95652b79b55 100644
  
  			slots = (void **)&node->slot[offset];
  			max_req -= offset;
-@@ -1259,15 +1258,13 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+@@ -1259,15 +1265,13 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
  			goto nomem_bulk;
  
  		node->node_count += count;
@@ -673,7 +735,7 @@ index 5a976393c9ae..b95652b79b55 100644
  	return;
  
  nomem_bulk:
-@@ -1276,10 +1273,8 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+@@ -1276,10 +1280,8 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
  nomem_one:
  	mas_set_alloc_req(mas, requested);
  	if (mas->alloc && !(((unsigned long)mas->alloc & 0x1)))
@@ -685,7 +747,7 @@ index 5a976393c9ae..b95652b79b55 100644
  }
  
  /*
-@@ -1887,10 +1882,9 @@ static inline int mab_calc_split(struct ma_state *mas,
+@@ -1887,10 +1889,9 @@ static inline int mab_calc_split(struct ma_state *mas,
  
  	/* Avoid ending a node on a NULL entry */
  	split = mab_no_null_split(bn, split, slot_count);
@@ -698,7 +760,16 @@ index 5a976393c9ae..b95652b79b55 100644
  
  	return split;
  }
-@@ -2947,7 +2941,7 @@ static inline void *mtree_range_walk(struct ma_state *mas)
+@@ -2113,7 +2114,7 @@ static inline void mas_bulk_rebalance(struct ma_state *mas, unsigned char end,
+  *
+  * Return: The actual end of the data stored in @b_node
+  */
+-static inline void mas_store_b_node(struct ma_wr_state *wr_mas,
++static noinline_for_kasan void mas_store_b_node(struct ma_wr_state *wr_mas,
+ 		struct maple_big_node *b_node, unsigned char offset_end)
+ {
+ 	unsigned char slot;
+@@ -2947,7 +2948,7 @@ static inline void *mtree_range_walk(struct ma_state *mas)
  	mas->min = prev_min;
  	mas->max = prev_max;
  	mas->node = last;
@@ -707,7 +778,7 @@ index 5a976393c9ae..b95652b79b55 100644
  
  dead_node:
  	mas_reset(mas);
-@@ -3467,7 +3461,6 @@ static inline bool mas_push_data(struct ma_state *mas, int height,
+@@ -3467,7 +3468,6 @@ static inline bool mas_push_data(struct ma_state *mas, int height,
   */
  static int mas_split(struct ma_state *mas, struct maple_big_node *b_node)
  {
@@ -715,7 +786,16 @@ index 5a976393c9ae..b95652b79b55 100644
  	struct maple_subtree_state mast;
  	int height = 0;
  	unsigned char mid_split, split = 0;
-@@ -3893,7 +3886,7 @@ static inline void *mtree_lookup_walk(struct ma_state *mas)
+@@ -3586,7 +3586,7 @@ static inline bool mas_reuse_node(struct ma_wr_state *wr_mas,
+  * @b_node: The maple big node
+  * @end: The end of the data.
+  */
+-static inline int mas_commit_b_node(struct ma_wr_state *wr_mas,
++static noinline_for_kasan int mas_commit_b_node(struct ma_wr_state *wr_mas,
+ 			    struct maple_big_node *b_node, unsigned char end)
+ {
+ 	struct maple_node *node;
+@@ -3893,7 +3893,7 @@ static inline void *mtree_lookup_walk(struct ma_state *mas)
  			goto dead_node;
  	} while (!ma_is_leaf(type));
  
@@ -724,7 +804,7 @@ index 5a976393c9ae..b95652b79b55 100644
  
  dead_node:
  	mas_reset(mas);
-@@ -4711,15 +4704,11 @@ static inline void *mas_next_nentry(struct ma_state *mas,
+@@ -4711,15 +4711,11 @@ static inline void *mas_next_nentry(struct ma_state *mas,
  
  static inline void mas_rewalk(struct ma_state *mas, unsigned long index)
  {
@@ -740,7 +820,52 @@ index 5a976393c9ae..b95652b79b55 100644
  }
  
  /*
-@@ -5590,8 +5579,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5093,34 +5089,29 @@ static inline bool mas_rewind_node(struct ma_state *mas)
+  */
+ static inline bool mas_skip_node(struct ma_state *mas)
+ {
+-	unsigned char slot, slot_count;
+ 	unsigned long *pivots;
+ 	enum maple_type mt;
+ 
+-	mt = mte_node_type(mas->node);
+-	slot_count = mt_slots[mt] - 1;
++	if (mas_is_err(mas))
++		return false;
++
+ 	do {
+ 		if (mte_is_root(mas->node)) {
+-			slot = mas->offset;
+-			if (slot > slot_count) {
++			if (mas->offset >= mas_data_end(mas)) {
+ 				mas_set_err(mas, -EBUSY);
+ 				return false;
+ 			}
+ 		} else {
+ 			mas_ascend(mas);
+-			slot = mas->offset;
+-			mt = mte_node_type(mas->node);
+-			slot_count = mt_slots[mt] - 1;
+ 		}
+-	} while (slot > slot_count);
++	} while (mas->offset >= mas_data_end(mas));
+ 
+-	mas->offset = ++slot;
++	mt = mte_node_type(mas->node);
+ 	pivots = ma_pivots(mas_mn(mas), mt);
+-	if (slot > 0)
+-		mas->min = pivots[slot - 1] + 1;
+-
+-	if (slot <= slot_count)
+-		mas->max = pivots[slot];
++	mas->min = pivots[mas->offset] + 1;
++	mas->offset++;
++	if (mas->offset < mt_slots[mt])
++		mas->max = pivots[mas->offset];
+ 
+ 	return true;
+ }
+@@ -5590,8 +5581,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
  
  /*
   * mte_destroy_walk() - Free a tree or sub-tree.
@@ -751,7 +876,7 @@ index 5a976393c9ae..b95652b79b55 100644
   *
   * Must hold the write lock.
   */
-@@ -5620,7 +5609,6 @@ static void mas_wr_store_setup(struct ma_wr_state *wr_mas)
+@@ -5620,7 +5611,6 @@ static void mas_wr_store_setup(struct ma_wr_state *wr_mas)
  				mas_reset(wr_mas->mas);
  		}
  	}
@@ -759,7 +884,15 @@ index 5a976393c9ae..b95652b79b55 100644
  }
  
  /* Interface */
-@@ -5745,6 +5733,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
+@@ -5733,6 +5723,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
+ 	mas_reset(mas);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(mas_preallocate);
+ 
+ /*
+  * mas_destroy() - destroy a maple state.
+@@ -5745,6 +5736,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
  void mas_destroy(struct ma_state *mas)
  {
  	struct maple_alloc *node;
@@ -767,7 +900,7 @@ index 5a976393c9ae..b95652b79b55 100644
  
  	/*
  	 * When using mas_for_each() to insert an expected number of elements,
-@@ -5767,14 +5756,20 @@ void mas_destroy(struct ma_state *mas)
+@@ -5767,14 +5759,20 @@ void mas_destroy(struct ma_state *mas)
  	}
  	mas->mas_flags &= ~(MA_STATE_BULK|MA_STATE_PREALLOC);
  
@@ -792,7 +925,7 @@ index 5a976393c9ae..b95652b79b55 100644
  	mas->alloc = NULL;
  }
  EXPORT_SYMBOL_GPL(mas_destroy);
-@@ -6734,7 +6729,7 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
+@@ -6734,7 +6732,7 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
  
  		if (i < (MAPLE_RANGE64_SLOTS - 1))
  			last = node->pivot[i];
@@ -801,7 +934,7 @@ index 5a976393c9ae..b95652b79b55 100644
  			break;
  		if (last == 0 && i > 0)
  			break;
-@@ -6841,7 +6836,7 @@ void mt_dump(const struct maple_tree *mt)
+@@ -6841,7 +6839,7 @@ void mt_dump(const struct maple_tree *mt)
  	if (!xa_is_node(entry))
  		mt_dump_entry(entry, 0, 0, 0);
  	else if (entry)
@@ -1001,7 +1134,7 @@ index b616870a09be..7b9205cb7d87 100644
  	*vm_flags = pra.vm_flags;
  
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 160acbbdf111..04a54656b6b7 100644
+index 160acbbdf111..1a8f3b1c0bad 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -55,6 +55,8 @@
@@ -1271,6 +1404,15 @@ index 160acbbdf111..04a54656b6b7 100644
  static void reset_mm_stats(struct lruvec *lruvec, struct lru_gen_mm_walk *walk, bool last)
  {
  	int i;
+@@ -3592,7 +3608,7 @@ static bool iterate_mm_list_nowalk(struct lruvec *lruvec, unsigned long max_seq)
+ }
+ 
+ /******************************************************************************
+- *                          refault feedback loop
++ *                          PID controller
+  ******************************************************************************/
+ 
+ /*
 @@ -3623,7 +3639,7 @@ struct ctrl_pos {
  static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,
  			  struct ctrl_pos *pos)
@@ -2544,7 +2686,69 @@ index 160acbbdf111..04a54656b6b7 100644
  
  		while (!list_empty(head)) {
  			bool success;
-@@ -5545,7 +5814,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
+@@ -5402,14 +5671,14 @@ static void lru_gen_change_state(bool enabled)
+  *                          sysfs interface
+  ******************************************************************************/
+ 
+-static ssize_t show_min_ttl(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++static ssize_t min_ttl_ms_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+ {
+-	return sprintf(buf, "%u\n", jiffies_to_msecs(READ_ONCE(lru_gen_min_ttl)));
++	return sysfs_emit(buf, "%u\n", jiffies_to_msecs(READ_ONCE(lru_gen_min_ttl)));
+ }
+ 
+ /* see Documentation/admin-guide/mm/multigen_lru.rst for details */
+-static ssize_t store_min_ttl(struct kobject *kobj, struct kobj_attribute *attr,
+-			     const char *buf, size_t len)
++static ssize_t min_ttl_ms_store(struct kobject *kobj, struct kobj_attribute *attr,
++				const char *buf, size_t len)
+ {
+ 	unsigned int msecs;
+ 
+@@ -5421,11 +5690,9 @@ static ssize_t store_min_ttl(struct kobject *kobj, struct kobj_attribute *attr,
+ 	return len;
+ }
+ 
+-static struct kobj_attribute lru_gen_min_ttl_attr = __ATTR(
+-	min_ttl_ms, 0644, show_min_ttl, store_min_ttl
+-);
++static struct kobj_attribute lru_gen_min_ttl_attr = __ATTR_RW(min_ttl_ms);
+ 
+-static ssize_t show_enabled(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+ {
+ 	unsigned int caps = 0;
+ 
+@@ -5442,7 +5709,7 @@ static ssize_t show_enabled(struct kobject *kobj, struct kobj_attribute *attr, c
+ }
+ 
+ /* see Documentation/admin-guide/mm/multigen_lru.rst for details */
+-static ssize_t store_enabled(struct kobject *kobj, struct kobj_attribute *attr,
++static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 			     const char *buf, size_t len)
+ {
+ 	int i;
+@@ -5469,9 +5736,7 @@ static ssize_t store_enabled(struct kobject *kobj, struct kobj_attribute *attr,
+ 	return len;
+ }
+ 
+-static struct kobj_attribute lru_gen_enabled_attr = __ATTR(
+-	enabled, 0644, show_enabled, store_enabled
+-);
++static struct kobj_attribute lru_gen_enabled_attr = __ATTR_RW(enabled);
+ 
+ static struct attribute *lru_gen_attrs[] = {
+ 	&lru_gen_min_ttl_attr.attr,
+@@ -5479,7 +5744,7 @@ static struct attribute *lru_gen_attrs[] = {
+ 	NULL
+ };
+ 
+-static struct attribute_group lru_gen_attr_group = {
++static const struct attribute_group lru_gen_attr_group = {
+ 	.name = "lru_gen",
+ 	.attrs = lru_gen_attrs,
+ };
+@@ -5545,7 +5810,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
  	int i;
  	int type, tier;
  	int hist = lru_hist_from_seq(seq);
@@ -2553,7 +2757,7 @@ index 160acbbdf111..04a54656b6b7 100644
  
  	for (tier = 0; tier < MAX_NR_TIERS; tier++) {
  		seq_printf(m, "            %10d", tier);
-@@ -5595,7 +5864,7 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
+@@ -5595,7 +5860,7 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
  	unsigned long seq;
  	bool full = !debugfs_real_fops(m->file)->write;
  	struct lruvec *lruvec = v;
@@ -2562,7 +2766,7 @@ index 160acbbdf111..04a54656b6b7 100644
  	int nid = lruvec_pgdat(lruvec)->node_id;
  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
  	DEFINE_MAX_SEQ(lruvec);
-@@ -5692,7 +5961,7 @@ static int run_eviction(struct lruvec *lruvec, unsigned long seq, struct scan_co
+@@ -5692,7 +5957,7 @@ static int run_eviction(struct lruvec *lruvec, unsigned long seq, struct scan_co
  		if (sc->nr_reclaimed >= nr_to_reclaim)
  			return 0;
  
@@ -2571,7 +2775,7 @@ index 160acbbdf111..04a54656b6b7 100644
  			return 0;
  
  		cond_resched();
-@@ -5713,11 +5982,11 @@ static int run_cmd(char cmd, int memcg_id, int nid, unsigned long seq,
+@@ -5713,11 +5978,11 @@ static int run_cmd(char cmd, int memcg_id, int nid, unsigned long seq,
  
  	if (!mem_cgroup_disabled()) {
  		rcu_read_lock();
@@ -2586,7 +2790,7 @@ index 160acbbdf111..04a54656b6b7 100644
  		rcu_read_unlock();
  
  		if (!memcg)
-@@ -5777,7 +6046,7 @@ static ssize_t lru_gen_seq_write(struct file *file, const char __user *src,
+@@ -5777,7 +6042,7 @@ static ssize_t lru_gen_seq_write(struct file *file, const char __user *src,
  	set_task_reclaim_state(current, &sc.reclaim_state);
  	flags = memalloc_noreclaim_save();
  	blk_start_plug(&plug);
@@ -2595,7 +2799,7 @@ index 160acbbdf111..04a54656b6b7 100644
  		err = -ENOMEM;
  		goto done;
  	}
-@@ -5849,7 +6118,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+@@ -5849,7 +6114,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
  {
  	int i;
  	int gen, type, zone;
@@ -2604,7 +2808,7 @@ index 160acbbdf111..04a54656b6b7 100644
  
  	lrugen->max_seq = MIN_NR_GENS + 1;
  	lrugen->enabled = lru_gen_enabled();
-@@ -5858,13 +6127,26 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+@@ -5858,13 +6123,26 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
  		lrugen->timestamps[i] = jiffies;
  
  	for_each_gen_type_zone(gen, type, zone)
@@ -2632,7 +2836,7 @@ index 160acbbdf111..04a54656b6b7 100644
  void lru_gen_init_memcg(struct mem_cgroup *memcg)
  {
  	INIT_LIST_HEAD(&memcg->mm_list.fifo);
-@@ -5876,19 +6158,25 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
+@@ -5876,19 +6154,25 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
  	int i;
  	int nid;
  
@@ -2659,7 +2863,7 @@ index 160acbbdf111..04a54656b6b7 100644
  
  static int __init init_lru_gen(void)
  {
-@@ -5915,6 +6203,10 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
+@@ -5915,6 +6199,10 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
  {
  }
  
@@ -2670,7 +2874,7 @@ index 160acbbdf111..04a54656b6b7 100644
  #endif /* CONFIG_LRU_GEN */
  
  static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
-@@ -5928,7 +6220,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5928,7 +6216,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  	bool proportional_reclaim;
  	struct blk_plug plug;
  
@@ -2679,7 +2883,7 @@ index 160acbbdf111..04a54656b6b7 100644
  		lru_gen_shrink_lruvec(lruvec, sc);
  		return;
  	}
-@@ -6171,6 +6463,11 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -6171,6 +6459,11 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
  
