@@ -1,6 +1,6 @@
-From 16bf2955b4a159c567a9209418f0bd2aa7f7cff5 Mon Sep 17 00:00:00 2001
+From 7bc151926a2aaa530941c434cb72d7040928e0d7 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 13 Mar 2023 21:26:31 +0100
+Date: Mon, 20 Mar 2023 20:14:19 +0100
 Subject: [PATCH 7/9] Per-VMA locks
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -192,9 +192,11 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  arch/arm64/Kconfig                     |   1 +
  arch/arm64/mm/fault.c                  |  36 ++++
- arch/powerpc/mm/fault.c                |  41 ++++
+ arch/powerpc/mm/fault.c                |  37 ++++
  arch/powerpc/platforms/powernv/Kconfig |   1 +
  arch/powerpc/platforms/pseries/Kconfig |   1 +
+ arch/s390/Kconfig                      |   1 +
+ arch/s390/mm/fault.c                   |  24 +++
  arch/x86/Kconfig                       |   1 +
  arch/x86/mm/fault.c                    |  36 ++++
  include/linux/mm.h                     | 127 +++++++++++-
@@ -215,7 +217,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  mm/rmap.c                              |  31 +--
  mm/vmstat.c                            |   6 +
  tools/testing/radix-tree/maple.c       |  16 ++
- 25 files changed, 754 insertions(+), 149 deletions(-)
+ 27 files changed, 775 insertions(+), 149 deletions(-)
 
 diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
 index 1023e896d46b..6f104c829731 100644
@@ -291,10 +293,10 @@ index f4cb0f85ccf4..9e0db5c387e3 100644
  	 * Handle the "normal" (no error) case first.
  	 */
 diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
-index 2bef19cc1b98..c7ae86b04b8a 100644
+index af46aa88422b..531177a4ee08 100644
 --- a/arch/powerpc/mm/fault.c
 +++ b/arch/powerpc/mm/fault.c
-@@ -469,6 +469,44 @@ static int ___do_page_fault(struct pt_regs *regs, unsigned long address,
+@@ -474,6 +474,40 @@ static int ___do_page_fault(struct pt_regs *regs, unsigned long address,
  	if (is_exec)
  		flags |= FAULT_FLAG_INSTRUCTION;
  
@@ -308,17 +310,13 @@ index 2bef19cc1b98..c7ae86b04b8a 100644
 +
 +	if (unlikely(access_pkey_error(is_write, is_exec,
 +				       (error_code & DSISR_KEYFAULT), vma))) {
-+		int rc = bad_access_pkey(regs, address, vma);
-+
 +		vma_end_read(vma);
-+		return rc;
++		goto lock_mmap;
 +	}
 +
 +	if (unlikely(access_error(is_write, is_exec, vma))) {
-+		int rc = bad_access(regs, address);
-+
 +		vma_end_read(vma);
-+		return rc;
++		goto lock_mmap;
 +	}
 +
 +	fault = handle_mm_fault(vma, address, flags | FAULT_FLAG_VMA_LOCK, regs);
@@ -339,7 +337,7 @@ index 2bef19cc1b98..c7ae86b04b8a 100644
  	/* When running in the kernel we expect faults to occur only to
  	 * addresses in user space.  All other faults represent errors in the
  	 * kernel and should generate an OOPS.  Unfortunately, in the case of an
-@@ -545,6 +583,9 @@ static int ___do_page_fault(struct pt_regs *regs, unsigned long address,
+@@ -550,6 +584,9 @@ static int ___do_page_fault(struct pt_regs *regs, unsigned long address,
  
  	mmap_read_unlock(current->mm);
  
@@ -362,10 +360,10 @@ index ae248a161b43..70a46acc70d6 100644
  
  config OPAL_PRD
 diff --git a/arch/powerpc/platforms/pseries/Kconfig b/arch/powerpc/platforms/pseries/Kconfig
-index b481c5c8bae1..9c205fe0e619 100644
+index 21b22bf16ce6..4ebf2ef2845d 100644
 --- a/arch/powerpc/platforms/pseries/Kconfig
 +++ b/arch/powerpc/platforms/pseries/Kconfig
-@@ -21,6 +21,7 @@ config PPC_PSERIES
+@@ -22,6 +22,7 @@ config PPC_PSERIES
  	select HOTPLUG_CPU
  	select FORCE_SMP
  	select SWIOTLB
@@ -373,6 +371,53 @@ index b481c5c8bae1..9c205fe0e619 100644
  	default y
  
  config PARAVIRT
+diff --git a/arch/s390/Kconfig b/arch/s390/Kconfig
+index 9809c74e1240..548b5b587003 100644
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -120,6 +120,7 @@ config S390
+ 	select ARCH_SUPPORTS_DEBUG_PAGEALLOC
+ 	select ARCH_SUPPORTS_HUGETLBFS
+ 	select ARCH_SUPPORTS_NUMA_BALANCING
++	select ARCH_SUPPORTS_PER_VMA_LOCK
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF
+ 	select ARCH_WANTS_DYNAMIC_TASK_STRUCT
+diff --git a/arch/s390/mm/fault.c b/arch/s390/mm/fault.c
+index a2632fd97d00..b65144c392b0 100644
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@ -407,6 +407,30 @@ static inline vm_fault_t do_exception(struct pt_regs *regs, int access)
+ 		access = VM_WRITE;
+ 	if (access == VM_WRITE)
+ 		flags |= FAULT_FLAG_WRITE;
++#ifdef CONFIG_PER_VMA_LOCK
++	if (!(flags & FAULT_FLAG_USER))
++		goto lock_mmap;
++	vma = lock_vma_under_rcu(mm, address);
++	if (!vma)
++		goto lock_mmap;
++	if (!(vma->vm_flags & access)) {
++		vma_end_read(vma);
++		goto lock_mmap;
++	}
++	fault = handle_mm_fault(vma, address, flags | FAULT_FLAG_VMA_LOCK, regs);
++	vma_end_read(vma);
++	if (!(fault & VM_FAULT_RETRY)) {
++		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
++		goto out;
++	}
++	count_vm_vma_lock_event(VMA_LOCK_RETRY);
++	/* Quick path to respond to signals */
++	if (fault_signal_pending(fault, regs)) {
++		fault = VM_FAULT_SIGNAL;
++		goto out;
++	}
++lock_mmap:
++#endif /* CONFIG_PER_VMA_LOCK */
+ 	mmap_read_lock(mm);
+ 
+ 	gmap = NULL;
 diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
 index a825bf031f49..df21fba77db1 100644
 --- a/arch/x86/Kconfig
@@ -985,7 +1030,7 @@ index 763e26dbf14e..bdc28ffb0cdf 100644
  	nsproxy_cache_init();
  }
 diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index ae37a167e25d..556ca46a9b44 100644
+index 3477993e5396..91a7a9950429 100644
 --- a/lib/maple_tree.c
 +++ b/lib/maple_tree.c
 @@ -185,7 +185,7 @@ static void mt_free_rcu(struct rcu_head *head)
@@ -1161,7 +1206,7 @@ index ae37a167e25d..556ca46a9b44 100644
  }
  
  /*
-@@ -4164,6 +4230,7 @@ static inline bool mas_wr_node_store(struct ma_wr_state *wr_mas)
+@@ -4134,6 +4200,7 @@ static inline bool mas_wr_node_store(struct ma_wr_state *wr_mas)
  done:
  	mas_leaf_set_meta(mas, newnode, dst_pivots, maple_leaf_64, new_end);
  	if (in_rcu) {
@@ -1169,7 +1214,7 @@ index ae37a167e25d..556ca46a9b44 100644
  		mas->node = mt_mk_node(newnode, wr_mas->type);
  		mas_replace(mas, false);
  	} else {
-@@ -4505,6 +4572,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
+@@ -4475,6 +4542,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
  	node = mas_mn(mas);
  	slots = ma_slots(node, mt);
  	pivots = ma_pivots(node, mt);
@@ -1179,7 +1224,7 @@ index ae37a167e25d..556ca46a9b44 100644
  	mas->max = pivots[offset];
  	if (offset)
  		mas->min = pivots[offset - 1] + 1;
-@@ -4526,6 +4596,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
+@@ -4496,6 +4566,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
  		slots = ma_slots(node, mt);
  		pivots = ma_pivots(node, mt);
  		offset = ma_data_end(node, mt, pivots, mas->max);
@@ -1189,7 +1234,7 @@ index ae37a167e25d..556ca46a9b44 100644
  		if (offset)
  			mas->min = pivots[offset - 1] + 1;
  
-@@ -4574,6 +4647,7 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
+@@ -4544,6 +4617,7 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
  	struct maple_enode *enode;
  	int level = 0;
  	unsigned char offset;
@@ -1197,7 +1242,7 @@ index ae37a167e25d..556ca46a9b44 100644
  	enum maple_type mt;
  	void __rcu **slots;
  
-@@ -4597,7 +4671,11 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
+@@ -4567,7 +4641,11 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
  		node = mas_mn(mas);
  		mt = mte_node_type(mas->node);
  		pivots = ma_pivots(node, mt);
@@ -1210,7 +1255,7 @@ index ae37a167e25d..556ca46a9b44 100644
  
  	slots = ma_slots(node, mt);
  	pivot = mas_safe_pivot(mas, pivots, ++offset, mt);
-@@ -4613,6 +4691,9 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
+@@ -4583,6 +4661,9 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
  		mt = mte_node_type(mas->node);
  		slots = ma_slots(node, mt);
  		pivots = ma_pivots(node, mt);
@@ -1220,7 +1265,7 @@ index ae37a167e25d..556ca46a9b44 100644
  		offset = 0;
  		pivot = pivots[0];
  	}
-@@ -4659,11 +4740,14 @@ static inline void *mas_next_nentry(struct ma_state *mas,
+@@ -4629,11 +4710,14 @@ static inline void *mas_next_nentry(struct ma_state *mas,
  		return NULL;
  	}
  
@@ -1238,7 +1283,7 @@ index ae37a167e25d..556ca46a9b44 100644
  		return NULL;
  
  	if (mas->index > max)
-@@ -4817,6 +4901,11 @@ static inline void *mas_prev_nentry(struct ma_state *mas, unsigned long limit,
+@@ -4787,6 +4871,11 @@ static inline void *mas_prev_nentry(struct ma_state *mas, unsigned long limit,
  
  	slots = ma_slots(mn, mt);
  	pivots = ma_pivots(mn, mt);
@@ -1250,7 +1295,7 @@ index ae37a167e25d..556ca46a9b44 100644
  	if (offset == mt_pivots[mt])
  		pivot = mas->max;
  	else
-@@ -5400,24 +5489,26 @@ static inline int mas_rev_alloc(struct ma_state *mas, unsigned long min,
+@@ -5370,24 +5459,26 @@ static inline int mas_rev_alloc(struct ma_state *mas, unsigned long min,
  }
  
  /*
@@ -1281,7 +1326,7 @@ index ae37a167e25d..556ca46a9b44 100644
  		type = mte_node_type(entry);
  		node = mte_to_node(entry);
  		/* Use both node and type to catch LE & BE metadata */
-@@ -5425,7 +5516,6 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
+@@ -5395,7 +5486,6 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
  			break;
  
  		mte_set_node_dead(entry);
@@ -1289,7 +1334,7 @@ index ae37a167e25d..556ca46a9b44 100644
  		node->type = type;
  		rcu_assign_pointer(slots[offset], node);
  	}
-@@ -5433,151 +5523,160 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
+@@ -5403,151 +5493,160 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
  	return offset;
  }
  
@@ -1514,7 +1559,7 @@ index ae37a167e25d..556ca46a9b44 100644
  }
  
  /*
-@@ -5593,10 +5692,10 @@ static inline void mte_destroy_walk(struct maple_enode *enode,
+@@ -5563,10 +5662,10 @@ static inline void mte_destroy_walk(struct maple_enode *enode,
  	struct maple_node *node = mte_to_node(enode);
  
  	if (mt_in_rcu(mt)) {
@@ -1527,7 +1572,7 @@ index ae37a167e25d..556ca46a9b44 100644
  	}
  }
  
-@@ -6618,11 +6717,11 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
+@@ -6588,11 +6687,11 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
  	while (likely(!ma_is_leaf(mt))) {
  		MT_BUG_ON(mas->tree, mte_dead_node(mas->node));
  		slots = ma_slots(mn, mt);
@@ -1541,7 +1586,7 @@ index ae37a167e25d..556ca46a9b44 100644
  		mas->node = entry;
  		mn = mas_mn(mas);
  		mt = mte_node_type(mas->node);
-@@ -6642,13 +6741,13 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
+@@ -6612,13 +6711,13 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
  	if (likely(entry))
  		return entry;
  
