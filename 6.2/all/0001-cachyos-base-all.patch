@@ -51702,3 +51702,155 @@ index 000000000000..d855a3796554
 -- 
 2.40.0
 
+From 85f1bc5b6321c2a44a649dd0a88f41fe9198ae0d Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Thu, 23 Mar 2023 17:58:35 +0100
+Subject: [PATCH] revert block: count 'ios' and 'sectors' when io is done for
+ bio-based device
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ block/blk-core.c              | 16 ++++++++++------
+ drivers/block/zram/zram_drv.c |  4 ++--
+ drivers/md/dm.c               |  6 +++---
+ drivers/nvme/host/multipath.c |  8 ++++----
+ include/linux/blkdev.h        |  5 +++--
+ 5 files changed, 22 insertions(+), 17 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 597293151cd1..5a0049215ee7 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -946,11 +946,16 @@ void update_io_ticks(struct block_device *part, unsigned long now, bool end)
+ 	}
+ }
+
+-unsigned long bdev_start_io_acct(struct block_device *bdev, enum req_op op,
++unsigned long bdev_start_io_acct(struct block_device *bdev,
++				 unsigned int sectors, enum req_op op,
+ 				 unsigned long start_time)
+ {
++	const int sgrp = op_stat_group(op);
++
+ 	part_stat_lock();
+ 	update_io_ticks(bdev, start_time, false);
++	part_stat_inc(bdev, ios[sgrp]);
++	part_stat_add(bdev, sectors[sgrp], sectors);
+ 	part_stat_local_inc(bdev, in_flight[op_is_write(op)]);
+ 	part_stat_unlock();
+
+@@ -966,12 +971,13 @@ EXPORT_SYMBOL(bdev_start_io_acct);
+  */
+ unsigned long bio_start_io_acct(struct bio *bio)
+ {
+-	return bdev_start_io_acct(bio->bi_bdev, bio_op(bio), jiffies);
++	return bdev_start_io_acct(bio->bi_bdev, bio_sectors(bio),
++				  bio_op(bio), jiffies);
+ }
+ EXPORT_SYMBOL_GPL(bio_start_io_acct);
+
+ void bdev_end_io_acct(struct block_device *bdev, enum req_op op,
+-		      unsigned int sectors, unsigned long start_time)
++		      unsigned long start_time)
+ {
+ 	const int sgrp = op_stat_group(op);
+ 	unsigned long now = READ_ONCE(jiffies);
+@@ -979,8 +985,6 @@ void bdev_end_io_acct(struct block_device *bdev, enum req_op op,
+
+ 	part_stat_lock();
+ 	update_io_ticks(bdev, now, true);
+-	part_stat_inc(bdev, ios[sgrp]);
+-	part_stat_add(bdev, sectors[sgrp], sectors);
+ 	part_stat_add(bdev, nsecs[sgrp], jiffies_to_nsecs(duration));
+ 	part_stat_local_dec(bdev, in_flight[op_is_write(op)]);
+ 	part_stat_unlock();
+@@ -990,7 +994,7 @@ EXPORT_SYMBOL(bdev_end_io_acct);
+ void bio_end_io_acct_remapped(struct bio *bio, unsigned long start_time,
+ 			      struct block_device *orig_bdev)
+ {
+-	bdev_end_io_acct(orig_bdev, bio_op(bio), bio_sectors(bio), start_time);
++	bdev_end_io_acct(orig_bdev, bio_op(bio), start_time);
+ }
+ EXPORT_SYMBOL_GPL(bio_end_io_acct_remapped);
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 4671be36c737..084f8f830bde 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -2411,9 +2411,9 @@ static int zram_rw_page(struct block_device *bdev, sector_t sector,
+ 	bv.bv_offset = 0;
+
+ 	start_time = bdev_start_io_acct(bdev->bd_disk->part0,
+-			op, jiffies);
++			SECTORS_PER_PAGE, op, jiffies);
+ 	ret = zram_bvec_rw(zram, &bv, index, offset, op, NULL);
+-	bdev_end_io_acct(bdev->bd_disk->part0, op, SECTORS_PER_PAGE, start_time);
++	bdev_end_io_acct(bdev->bd_disk->part0, op, start_time);
+ out:
+ 	/*
+ 	 * If I/O fails, just return error(ie, non-zero) without
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index fdcf42554e2a..605662935ce9 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -510,10 +510,10 @@ static void dm_io_acct(struct dm_io *io, bool end)
+ 		sectors = io->sectors;
+
+ 	if (!end)
+-		bdev_start_io_acct(bio->bi_bdev, bio_op(bio), start_time);
++		bdev_start_io_acct(bio->bi_bdev, sectors, bio_op(bio),
++				   start_time);
+ 	else
+-		bdev_end_io_acct(bio->bi_bdev, bio_op(bio), sectors,
+-				 start_time);
++		bdev_end_io_acct(bio->bi_bdev, bio_op(bio), start_time);
+
+ 	if (static_branch_unlikely(&stats_enabled) &&
+ 	    unlikely(dm_stats_used(&md->stats))) {
+diff --git a/drivers/nvme/host/multipath.c b/drivers/nvme/host/multipath.c
+index 9171452e2f6d..fc39d01e7b63 100644
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@ -123,8 +123,9 @@ void nvme_mpath_start_request(struct request *rq)
+ 		return;
+
+ 	nvme_req(rq)->flags |= NVME_MPATH_IO_STATS;
+-	nvme_req(rq)->start_time = bdev_start_io_acct(disk->part0, req_op(rq),
+-						      jiffies);
++	nvme_req(rq)->start_time = bdev_start_io_acct(disk->part0,
++					blk_rq_bytes(rq) >> SECTOR_SHIFT,
++					req_op(rq), jiffies);
+ }
+ EXPORT_SYMBOL_GPL(nvme_mpath_start_request);
+
+@@ -135,8 +136,7 @@ void nvme_mpath_end_request(struct request *rq)
+ 	if (!(nvme_req(rq)->flags & NVME_MPATH_IO_STATS))
+ 		return;
+ 	bdev_end_io_acct(ns->head->disk->part0, req_op(rq),
+-			 blk_rq_bytes(rq) >> SECTOR_SHIFT,
+-			 nvme_req(rq)->start_time);
++		nvme_req(rq)->start_time);
+ }
+
+ void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl)
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index c3e066242941..43d4e073b111 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1434,10 +1434,11 @@ static inline void blk_wake_io_task(struct task_struct *waiter)
+ 		wake_up_process(waiter);
+ }
+
+-unsigned long bdev_start_io_acct(struct block_device *bdev, enum req_op op,
++unsigned long bdev_start_io_acct(struct block_device *bdev,
++				 unsigned int sectors, enum req_op op,
+ 				 unsigned long start_time);
+ void bdev_end_io_acct(struct block_device *bdev, enum req_op op,
+-		      unsigned int sectors, unsigned long start_time);
++		unsigned long start_time);
+
+ unsigned long bio_start_io_acct(struct bio *bio);
+ void bio_end_io_acct_remapped(struct bio *bio, unsigned long start_time,
+--
+2.40.0
+
