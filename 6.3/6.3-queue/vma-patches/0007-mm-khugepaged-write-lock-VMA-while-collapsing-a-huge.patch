@@ -1,0 +1,100 @@
+From ba893256d3fec9dca2891f810e9fed34c2d48bda Mon Sep 17 00:00:00 2001
+From: Suren Baghdasaryan <surenb@google.com>
+Date: Mon, 27 Feb 2023 09:36:14 -0800
+Subject: [PATCH 07/31] mm/khugepaged: write-lock VMA while collapsing a huge
+ page
+
+Protect VMA from concurrent page fault handler while collapsing a huge
+page. Page fault handler needs a stable PMD to use PTL and relies on
+per-VMA lock to prevent concurrent PMD changes. pmdp_collapse_flush(),
+set_huge_pmd() and collapse_and_free_pmd() can modify a PMD, which will
+not be detected by a page fault handler without proper locking.
+
+Before this patch, page tables can be walked under any one of the
+mmap_lock, the mapping lock, and the anon_vma lock; so when khugepaged
+unlinks and frees page tables, it must ensure that all of those either
+are locked or don't exist. This patch adds a fourth lock under which
+page tables can be traversed, and so khugepaged must also lock out that
+one.
+
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+---
+ mm/khugepaged.c |  5 +++++
+ mm/rmap.c       | 31 ++++++++++++++++---------------
+ 2 files changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 92e6f56a9..edaa5d21f 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1049,6 +1049,7 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
+ 	if (result != SCAN_SUCCEED)
+ 		goto out_up_write;
+ 
++	vma_start_write(vma);
+ 	anon_vma_lock_write(vma->anon_vma);
+ 
+ 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm, address,
+@@ -1512,6 +1513,9 @@ int collapse_pte_mapped_thp(struct mm_struct *mm, unsigned long addr,
+ 		goto drop_hpage;
+ 	}
+ 
++	/* Lock the vma before taking i_mmap and page table locks */
++	vma_start_write(vma);
++
+ 	/*
+ 	 * We need to lock the mapping so that from here on, only GUP-fast and
+ 	 * hardware page walks can access the parts of the page tables that
+@@ -1717,6 +1721,7 @@ static int retract_page_tables(struct address_space *mapping, pgoff_t pgoff,
+ 				result = SCAN_PTE_UFFD_WP;
+ 				goto unlock_next;
+ 			}
++			vma_start_write(vma);
+ 			collapse_and_free_pmd(mm, vma, addr, pmd);
+ 			if (!cc->is_khugepaged && is_target)
+ 				result = set_huge_pmd(vma, addr, pmd, hpage);
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 8632e0266..cfdaa56ca 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -25,21 +25,22 @@
+  *     mapping->invalidate_lock (in filemap_fault)
+  *       page->flags PG_locked (lock_page)
+  *         hugetlbfs_i_mmap_rwsem_key (in huge_pmd_share, see hugetlbfs below)
+- *           mapping->i_mmap_rwsem
+- *             anon_vma->rwsem
+- *               mm->page_table_lock or pte_lock
+- *                 swap_lock (in swap_duplicate, swap_info_get)
+- *                   mmlist_lock (in mmput, drain_mmlist and others)
+- *                   mapping->private_lock (in block_dirty_folio)
+- *                     folio_lock_memcg move_lock (in block_dirty_folio)
+- *                       i_pages lock (widely used)
+- *                         lruvec->lru_lock (in folio_lruvec_lock_irq)
+- *                   inode->i_lock (in set_page_dirty's __mark_inode_dirty)
+- *                   bdi.wb->list_lock (in set_page_dirty's __mark_inode_dirty)
+- *                     sb_lock (within inode_lock in fs/fs-writeback.c)
+- *                     i_pages lock (widely used, in set_page_dirty,
+- *                               in arch-dependent flush_dcache_mmap_lock,
+- *                               within bdi.wb->list_lock in __sync_single_inode)
++ *           vma_start_write
++ *             mapping->i_mmap_rwsem
++ *               anon_vma->rwsem
++ *                 mm->page_table_lock or pte_lock
++ *                   swap_lock (in swap_duplicate, swap_info_get)
++ *                     mmlist_lock (in mmput, drain_mmlist and others)
++ *                     mapping->private_lock (in block_dirty_folio)
++ *                       folio_lock_memcg move_lock (in block_dirty_folio)
++ *                         i_pages lock (widely used)
++ *                           lruvec->lru_lock (in folio_lruvec_lock_irq)
++ *                     inode->i_lock (in set_page_dirty's __mark_inode_dirty)
++ *                     bdi.wb->list_lock (in set_page_dirty's __mark_inode_dirty)
++ *                       sb_lock (within inode_lock in fs/fs-writeback.c)
++ *                       i_pages lock (widely used, in set_page_dirty,
++ *                                 in arch-dependent flush_dcache_mmap_lock,
++ *                                 within bdi.wb->list_lock in __sync_single_inode)
+  *
+  * anon_vma->rwsem,mapping->i_mmap_rwsem   (memory_failure, collect_procs_anon)
+  *   ->tasklist_lock
+-- 
+2.40.0.71.g950264636c
+
