@@ -1,7 +1,7 @@
-From b10cd96d163754eaf567567aaa35465e01e48860 Mon Sep 17 00:00:00 2001
+From c9249daec15495e2d4e2a0519e75421784e31ddc Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Tue, 4 Apr 2023 19:23:59 +0200
-Subject: [PATCH 7/9] Per-VMA locks
+Date: Sun, 9 Apr 2023 21:25:25 +0200
+Subject: [PATCH 08/10] Per-VMA locks
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -190,35 +190,69 @@ Suren Baghdasaryan (23):
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- arch/arm64/Kconfig                     |   1 +
- arch/arm64/mm/fault.c                  |  36 ++++
- arch/powerpc/mm/fault.c                |  37 ++++
- arch/powerpc/platforms/powernv/Kconfig |   1 +
- arch/powerpc/platforms/pseries/Kconfig |   1 +
- arch/s390/Kconfig                      |   1 +
- arch/s390/mm/fault.c                   |  24 +++
- arch/x86/Kconfig                       |   1 +
- arch/x86/mm/fault.c                    |  36 ++++
- include/linux/mm.h                     | 127 +++++++++++-
- include/linux/mm_types.h               |  33 ++-
- include/linux/mmap_lock.h              |  37 ++--
- include/linux/vm_event_item.h          |   6 +
- include/linux/vmstat.h                 |   6 +
- kernel/fork.c                          |  99 +++++++--
- lib/maple_tree.c                       | 269 +++++++++++++++++--------
- mm/Kconfig                             |  12 ++
- mm/Kconfig.debug                       |   6 +
- mm/init-mm.c                           |   3 +
- mm/internal.h                          |   2 +-
- mm/khugepaged.c                        |   8 +
- mm/memory.c                            |  72 ++++++-
- mm/mmap.c                              |  51 +++--
- mm/mremap.c                            |   1 +
- mm/rmap.c                              |  31 +--
- mm/vmstat.c                            |   6 +
- tools/testing/radix-tree/maple.c       |  16 ++
- 27 files changed, 774 insertions(+), 149 deletions(-)
+ Documentation/admin-guide/mm/userfaultfd.rst |  17 +++
+ arch/arm64/Kconfig                           |   1 +
+ arch/arm64/mm/fault.c                        |  36 +++++
+ arch/powerpc/mm/fault.c                      |  37 +++++
+ arch/powerpc/platforms/powernv/Kconfig       |   1 +
+ arch/powerpc/platforms/pseries/Kconfig       |   1 +
+ arch/s390/Kconfig                            |   1 +
+ arch/s390/mm/fault.c                         |  24 +++
+ arch/x86/Kconfig                             |   1 +
+ arch/x86/mm/fault.c                          |  36 +++++
+ fs/userfaultfd.c                             |  16 ++
+ include/linux/mm.h                           | 127 +++++++++++++++-
+ include/linux/mm_inline.h                    |   6 +
+ include/linux/mm_types.h                     |  30 +++-
+ include/linux/mmap_lock.h                    |  37 +++--
+ include/linux/userfaultfd_k.h                |  23 +++
+ include/linux/vm_event_item.h                |   6 +
+ include/linux/vmstat.h                       |   6 +
+ include/uapi/linux/userfaultfd.h             |  10 +-
+ kernel/fork.c                                |  96 ++++++++++--
+ mm/Kconfig                                   |  12 ++
+ mm/Kconfig.debug                             |   6 +
+ mm/hugetlb.c                                 |   4 +
+ mm/init-mm.c                                 |   3 +
+ mm/internal.h                                |   2 +-
+ mm/khugepaged.c                              |  10 +-
+ mm/memory.c                                  | 146 ++++++++++++++++---
+ mm/mmap.c                                    |  48 ++++--
+ mm/mprotect.c                                |  51 +++++--
+ mm/mremap.c                                  |   1 +
+ mm/rmap.c                                    |  31 ++--
+ mm/vmstat.c                                  |   6 +
+ tools/testing/selftests/mm/userfaultfd.c     |  45 +++++-
+ 33 files changed, 783 insertions(+), 94 deletions(-)
 
+diff --git a/Documentation/admin-guide/mm/userfaultfd.rst b/Documentation/admin-guide/mm/userfaultfd.rst
+index 7dc823b56ca4..bd2226299583 100644
+--- a/Documentation/admin-guide/mm/userfaultfd.rst
++++ b/Documentation/admin-guide/mm/userfaultfd.rst
+@@ -219,6 +219,23 @@ former will have ``UFFD_PAGEFAULT_FLAG_WP`` set, the latter
+ you still need to supply a page when ``UFFDIO_REGISTER_MODE_MISSING`` was
+ used.
+ 
++Userfaultfd write-protect mode currently behave differently on none ptes
++(when e.g. page is missing) over different types of memories.
++
++For anonymous memory, ``ioctl(UFFDIO_WRITEPROTECT)`` will ignore none ptes
++(e.g. when pages are missing and not populated).  For file-backed memories
++like shmem and hugetlbfs, none ptes will be write protected just like a
++present pte.  In other words, there will be a userfaultfd write fault
++message generated when writing to a missing page on file typed memories,
++as long as the page range was write-protected before.  Such a message will
++not be generated on anonymous memories by default.
++
++If the application wants to be able to write protect none ptes on anonymous
++memory, one can pre-populate the memory with e.g. MADV_POPULATE_READ.  On
++newer kernels, one can also detect the feature UFFD_FEATURE_WP_UNPOPULATED
++and set the feature bit in advance to make sure none ptes will also be
++write protected even upon anonymous memory.
++
+ QEMU/KVM
+ ========
+ 
 diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
 index 1023e896d46b..6f104c829731 100644
 --- a/arch/arm64/Kconfig
@@ -491,6 +525,40 @@ index a498ae1fbe66..e4399983c50c 100644
  	if (likely(!(fault & VM_FAULT_ERROR)))
  		return;
  
+diff --git a/fs/userfaultfd.c b/fs/userfaultfd.c
+index 44d1ee429eb0..881e9c82b9d1 100644
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@ -108,6 +108,21 @@ static bool userfaultfd_is_initialized(struct userfaultfd_ctx *ctx)
+ 	return ctx->features & UFFD_FEATURE_INITIALIZED;
+ }
+ 
++/*
++ * Whether WP_UNPOPULATED is enabled on the uffd context.  It is only
++ * meaningful when userfaultfd_wp()==true on the vma and when it's
++ * anonymous.
++ */
++bool userfaultfd_wp_unpopulated(struct vm_area_struct *vma)
++{
++	struct userfaultfd_ctx *ctx = vma->vm_userfaultfd_ctx.ctx;
++
++	if (!ctx)
++		return false;
++
++	return ctx->features & UFFD_FEATURE_WP_UNPOPULATED;
++}
++
+ static void userfaultfd_set_vm_flags(struct vm_area_struct *vma,
+ 				     vm_flags_t flags)
+ {
+@@ -1971,6 +1986,7 @@ static int userfaultfd_api(struct userfaultfd_ctx *ctx,
+ #endif
+ #ifndef CONFIG_PTE_MARKER_UFFD_WP
+ 	uffdio_api.features &= ~UFFD_FEATURE_WP_HUGETLBFS_SHMEM;
++	uffdio_api.features &= ~UFFD_FEATURE_WP_UNPOPULATED;
+ #endif
+ 	uffdio_api.ioctls = UFFD_API_IOCTLS;
+ 	ret = -EFAULT;
 diff --git a/include/linux/mm.h b/include/linux/mm.h
 index 1f79667824eb..c4c9de7d1916 100644
 --- a/include/linux/mm.h
@@ -682,8 +750,25 @@ index 1f79667824eb..c4c9de7d1916 100644
  	__vm_flags_mod(vma, set, clear);
  }
  
+diff --git a/include/linux/mm_inline.h b/include/linux/mm_inline.h
+index de1e622dd366..0e1d239a882c 100644
+--- a/include/linux/mm_inline.h
++++ b/include/linux/mm_inline.h
+@@ -557,6 +557,12 @@ pte_install_uffd_wp_if_needed(struct vm_area_struct *vma, unsigned long addr,
+ 	/* The current status of the pte should be "cleared" before calling */
+ 	WARN_ON_ONCE(!pte_none(*pte));
+ 
++	/*
++	 * NOTE: userfaultfd_wp_unpopulated() doesn't need this whole
++	 * thing, because when zapping either it means it's dropping the
++	 * page, or in TTU where the present pte will be quickly replaced
++	 * with a swap pte.  There's no way of leaking the bit.
++	 */
+ 	if (vma_is_anonymous(vma) || !userfaultfd_wp(vma))
+ 		return;
+ 
 diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
-index 417d25c6a262..ef74ea892c5b 100644
+index 22b2ac82bffd..ef74ea892c5b 100644
 --- a/include/linux/mm_types.h
 +++ b/include/linux/mm_types.h
 @@ -471,6 +471,10 @@ struct anon_vma_name {
@@ -742,17 +827,7 @@ index 417d25c6a262..ef74ea892c5b 100644
  
  
  		unsigned long hiwater_rss; /* High-watermark of RSS usage */
-@@ -779,7 +801,8 @@ struct mm_struct {
- 	unsigned long cpu_bitmap[];
- };
- 
--#define MM_MT_FLAGS	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_LOCK_EXTERN)
-+#define MM_MT_FLAGS	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_LOCK_EXTERN | \
-+			 MT_FLAGS_USE_RCU)
- extern struct mm_struct init_mm;
- 
- /* Pointer magic because the dynamic array size confuses some compilers. */
-@@ -1041,6 +1064,7 @@ typedef struct {
+@@ -1042,6 +1064,7 @@ typedef struct {
   *                      mapped after the fault.
   * @FAULT_FLAG_ORIG_PTE_VALID: whether the fault has vmf->orig_pte cached.
   *                        We should only access orig_pte if this flag set.
@@ -760,7 +835,7 @@ index 417d25c6a262..ef74ea892c5b 100644
   *
   * About @FAULT_FLAG_ALLOW_RETRY and @FAULT_FLAG_TRIED: we can specify
   * whether we would allow page faults to retry by specifying these two
-@@ -1078,6 +1102,7 @@ enum fault_flag {
+@@ -1079,6 +1102,7 @@ enum fault_flag {
  	FAULT_FLAG_INTERRUPTIBLE =	1 << 9,
  	FAULT_FLAG_UNSHARE =		1 << 10,
  	FAULT_FLAG_ORIG_PTE_VALID =	1 << 11,
@@ -836,6 +911,49 @@ index 96e113e23d04..aab8f1b28d26 100644
  static inline int mmap_lock_is_contended(struct mm_struct *mm)
  {
  	return rwsem_is_contended(&mm->mmap_lock);
+diff --git a/include/linux/userfaultfd_k.h b/include/linux/userfaultfd_k.h
+index 3767f18114ef..0cf8880219da 100644
+--- a/include/linux/userfaultfd_k.h
++++ b/include/linux/userfaultfd_k.h
+@@ -179,6 +179,7 @@ extern int userfaultfd_unmap_prep(struct mm_struct *mm, unsigned long start,
+ 				  unsigned long end, struct list_head *uf);
+ extern void userfaultfd_unmap_complete(struct mm_struct *mm,
+ 				       struct list_head *uf);
++extern bool userfaultfd_wp_unpopulated(struct vm_area_struct *vma);
+ 
+ #else /* CONFIG_USERFAULTFD */
+ 
+@@ -274,8 +275,30 @@ static inline bool uffd_disable_fault_around(struct vm_area_struct *vma)
+ 	return false;
+ }
+ 
++static inline bool userfaultfd_wp_unpopulated(struct vm_area_struct *vma)
++{
++	return false;
++}
++
+ #endif /* CONFIG_USERFAULTFD */
+ 
++static inline bool userfaultfd_wp_use_markers(struct vm_area_struct *vma)
++{
++	/* Only wr-protect mode uses pte markers */
++	if (!userfaultfd_wp(vma))
++		return false;
++
++	/* File-based uffd-wp always need markers */
++	if (!vma_is_anonymous(vma))
++		return true;
++
++	/*
++	 * Anonymous uffd-wp only needs the markers if WP_UNPOPULATED
++	 * enabled (to apply markers on zero pages).
++	 */
++	return userfaultfd_wp_unpopulated(vma);
++}
++
+ static inline bool pte_marker_entry_uffd_wp(swp_entry_t entry)
+ {
+ #ifdef CONFIG_PTE_MARKER_UFFD_WP
 diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
 index 7f5d1caf5890..8abfa1240040 100644
 --- a/include/linux/vm_event_item.h
@@ -870,8 +988,43 @@ index 19cf5b6892ce..fed855bae6d8 100644
  #define __count_zid_vm_events(item, zid, delta) \
  	__count_vm_events(item##_NORMAL - ZONE_NORMAL + zid, delta)
  
+diff --git a/include/uapi/linux/userfaultfd.h b/include/uapi/linux/userfaultfd.h
+index 005e5e306266..90c958952bfc 100644
+--- a/include/uapi/linux/userfaultfd.h
++++ b/include/uapi/linux/userfaultfd.h
+@@ -38,7 +38,8 @@
+ 			   UFFD_FEATURE_MINOR_HUGETLBFS |	\
+ 			   UFFD_FEATURE_MINOR_SHMEM |		\
+ 			   UFFD_FEATURE_EXACT_ADDRESS |		\
+-			   UFFD_FEATURE_WP_HUGETLBFS_SHMEM)
++			   UFFD_FEATURE_WP_HUGETLBFS_SHMEM |	\
++			   UFFD_FEATURE_WP_UNPOPULATED)
+ #define UFFD_API_IOCTLS				\
+ 	((__u64)1 << _UFFDIO_REGISTER |		\
+ 	 (__u64)1 << _UFFDIO_UNREGISTER |	\
+@@ -203,6 +204,12 @@ struct uffdio_api {
+ 	 *
+ 	 * UFFD_FEATURE_WP_HUGETLBFS_SHMEM indicates that userfaultfd
+ 	 * write-protection mode is supported on both shmem and hugetlbfs.
++	 *
++	 * UFFD_FEATURE_WP_UNPOPULATED indicates that userfaultfd
++	 * write-protection mode will always apply to unpopulated pages
++	 * (i.e. empty ptes).  This will be the default behavior for shmem
++	 * & hugetlbfs, so this flag only affects anonymous memory behavior
++	 * when userfault write-protection mode is registered.
+ 	 */
+ #define UFFD_FEATURE_PAGEFAULT_FLAG_WP		(1<<0)
+ #define UFFD_FEATURE_EVENT_FORK			(1<<1)
+@@ -217,6 +224,7 @@ struct uffdio_api {
+ #define UFFD_FEATURE_MINOR_SHMEM		(1<<10)
+ #define UFFD_FEATURE_EXACT_ADDRESS		(1<<11)
+ #define UFFD_FEATURE_WP_HUGETLBFS_SHMEM		(1<<12)
++#define UFFD_FEATURE_WP_UNPOPULATED		(1<<13)
+ 	__u64 features;
+ 
+ 	__u64 ioctls;
 diff --git a/kernel/fork.c b/kernel/fork.c
-index dd509df25907..346ce90d1f33 100644
+index 49c173e367d2..346ce90d1f33 100644
 --- a/kernel/fork.c
 +++ b/kernel/fork.c
 @@ -455,13 +455,49 @@ static struct kmem_cache *vm_area_cachep;
@@ -992,24 +1145,7 @@ index dd509df25907..346ce90d1f33 100644
  static void account_kernel_stack(struct task_struct *tsk, int account)
  {
  	if (IS_ENABLED(CONFIG_VMAP_STACK)) {
-@@ -621,6 +685,7 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
- 	if (retval)
- 		goto out;
- 
-+	mt_clear_in_rcu(vmi.mas.tree);
- 	for_each_vma(old_vmi, mpnt) {
- 		struct file *file;
- 
-@@ -704,6 +769,8 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
- 	retval = arch_dup_mmap(oldmm, mm);
- loop_out:
- 	vma_iter_free(&vmi);
-+	if (!retval)
-+		mt_set_in_rcu(vmi.mas.tree);
- out:
- 	mmap_write_unlock(mm);
- 	flush_tlb_mm(oldmm);
-@@ -1129,6 +1196,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+@@ -1132,6 +1196,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
  	seqcount_init(&mm->write_protect_seq);
  	mmap_init_lock(mm);
  	INIT_LIST_HEAD(&mm->mmlist);
@@ -1019,7 +1155,7 @@ index dd509df25907..346ce90d1f33 100644
  	mm_pgtables_bytes_init(mm);
  	mm->map_count = 0;
  	mm->locked_vm = 0;
-@@ -3070,6 +3140,9 @@ void __init proc_caches_init(void)
+@@ -3073,6 +3140,9 @@ void __init proc_caches_init(void)
  			NULL);
  
  	vm_area_cachep = KMEM_CACHE(vm_area_struct, SLAB_PANIC|SLAB_ACCOUNT);
@@ -1029,579 +1165,6 @@ index dd509df25907..346ce90d1f33 100644
  	mmap_init();
  	nsproxy_cache_init();
  }
-diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index 3477993e5396..91a7a9950429 100644
---- a/lib/maple_tree.c
-+++ b/lib/maple_tree.c
-@@ -185,7 +185,7 @@ static void mt_free_rcu(struct rcu_head *head)
-  */
- static void ma_free_rcu(struct maple_node *node)
- {
--	node->parent = ma_parent_ptr(node);
-+	WARN_ON(node->parent != ma_parent_ptr(node));
- 	call_rcu(&node->rcu, mt_free_rcu);
- }
- 
-@@ -539,11 +539,14 @@ static inline struct maple_node *mte_parent(const struct maple_enode *enode)
-  */
- static inline bool ma_dead_node(const struct maple_node *node)
- {
--	struct maple_node *parent = (void *)((unsigned long)
--					     node->parent & ~MAPLE_NODE_MASK);
-+	struct maple_node *parent;
- 
-+	/* Do not reorder reads from the node prior to the parent check */
-+	smp_rmb();
-+	parent = (void *)((unsigned long) node->parent & ~MAPLE_NODE_MASK);
- 	return (parent == node);
- }
-+
- /*
-  * mte_dead_node() - check if the @enode is dead.
-  * @enode: The encoded maple node
-@@ -555,6 +558,8 @@ static inline bool mte_dead_node(const struct maple_enode *enode)
- 	struct maple_node *parent, *node;
- 
- 	node = mte_to_node(enode);
-+	/* Do not reorder reads from the node prior to the parent check */
-+	smp_rmb();
- 	parent = mte_parent(enode);
- 	return (parent == node);
- }
-@@ -625,6 +630,8 @@ static inline unsigned int mas_alloc_req(const struct ma_state *mas)
-  * @node - the maple node
-  * @type - the node type
-  *
-+ * In the event of a dead node, this array may be %NULL
-+ *
-  * Return: A pointer to the maple node pivots
-  */
- static inline unsigned long *ma_pivots(struct maple_node *node,
-@@ -817,6 +824,11 @@ static inline void *mt_slot(const struct maple_tree *mt,
- 	return rcu_dereference_check(slots[offset], mt_locked(mt));
- }
- 
-+static inline void *mt_slot_locked(struct maple_tree *mt, void __rcu **slots,
-+				   unsigned char offset)
-+{
-+	return rcu_dereference_protected(slots[offset], mt_locked(mt));
-+}
- /*
-  * mas_slot_locked() - Get the slot value when holding the maple tree lock.
-  * @mas: The maple state
-@@ -828,7 +840,7 @@ static inline void *mt_slot(const struct maple_tree *mt,
- static inline void *mas_slot_locked(struct ma_state *mas, void __rcu **slots,
- 				       unsigned char offset)
- {
--	return rcu_dereference_protected(slots[offset], mt_locked(mas->tree));
-+	return mt_slot_locked(mas->tree, slots, offset);
- }
- 
- /*
-@@ -899,6 +911,45 @@ static inline void ma_set_meta(struct maple_node *mn, enum maple_type mt,
- 	meta->end = end;
- }
- 
-+/*
-+ * mt_clear_meta() - clear the metadata information of a node, if it exists
-+ * @mt: The maple tree
-+ * @mn: The maple node
-+ * @type: The maple node type
-+ * @offset: The offset of the highest sub-gap in this node.
-+ * @end: The end of the data in this node.
-+ */
-+static inline void mt_clear_meta(struct maple_tree *mt, struct maple_node *mn,
-+				  enum maple_type type)
-+{
-+	struct maple_metadata *meta;
-+	unsigned long *pivots;
-+	void __rcu **slots;
-+	void *next;
-+
-+	switch (type) {
-+	case maple_range_64:
-+		pivots = mn->mr64.pivot;
-+		if (unlikely(pivots[MAPLE_RANGE64_SLOTS - 2])) {
-+			slots = mn->mr64.slot;
-+			next = mt_slot_locked(mt, slots,
-+					      MAPLE_RANGE64_SLOTS - 1);
-+			if (unlikely((mte_to_node(next) &&
-+				      mte_node_type(next))))
-+				return; /* no metadata, could be node */
-+		}
-+		fallthrough;
-+	case maple_arange_64:
-+		meta = ma_meta(mn, type);
-+		break;
-+	default:
-+		return;
-+	}
-+
-+	meta->gap = 0;
-+	meta->end = 0;
-+}
-+
- /*
-  * ma_meta_end() - Get the data end of a node from the metadata
-  * @mn: The maple node
-@@ -1096,8 +1147,11 @@ static int mas_ascend(struct ma_state *mas)
- 		a_type = mas_parent_enum(mas, p_enode);
- 		a_node = mte_parent(p_enode);
- 		a_slot = mte_parent_slot(p_enode);
--		pivots = ma_pivots(a_node, a_type);
- 		a_enode = mt_mk_node(a_node, a_type);
-+		pivots = ma_pivots(a_node, a_type);
-+
-+		if (unlikely(ma_dead_node(a_node)))
-+			return 1;
- 
- 		if (!set_min && a_slot) {
- 			set_min = true;
-@@ -1354,12 +1408,16 @@ static inline struct maple_enode *mas_start(struct ma_state *mas)
- 		mas->max = ULONG_MAX;
- 		mas->depth = 0;
- 
-+retry:
- 		root = mas_root(mas);
- 		/* Tree with nodes */
- 		if (likely(xa_is_node(root))) {
- 			mas->depth = 1;
- 			mas->node = mte_safe_root(root);
- 			mas->offset = 0;
-+			if (mte_dead_node(mas->node))
-+				goto retry;
-+
- 			return NULL;
- 		}
- 
-@@ -1401,6 +1459,9 @@ static inline unsigned char ma_data_end(struct maple_node *node,
- {
- 	unsigned char offset;
- 
-+	if (!pivots)
-+		return 0;
-+
- 	if (type == maple_arange_64)
- 		return ma_meta_end(node, type);
- 
-@@ -1436,6 +1497,9 @@ static inline unsigned char mas_data_end(struct ma_state *mas)
- 		return ma_meta_end(node, type);
- 
- 	pivots = ma_pivots(node, type);
-+	if (unlikely(ma_dead_node(node)))
-+		return 0;
-+
- 	offset = mt_pivots[type] - 1;
- 	if (likely(!pivots[offset]))
- 		return ma_meta_end(node, type);
-@@ -1724,8 +1788,10 @@ static inline void mas_replace(struct ma_state *mas, bool advanced)
- 		rcu_assign_pointer(slots[offset], mas->node);
- 	}
- 
--	if (!advanced)
-+	if (!advanced) {
-+		mte_set_node_dead(old_enode);
- 		mas_free(mas, old_enode);
-+	}
- }
- 
- /*
-@@ -4134,6 +4200,7 @@ static inline bool mas_wr_node_store(struct ma_wr_state *wr_mas)
- done:
- 	mas_leaf_set_meta(mas, newnode, dst_pivots, maple_leaf_64, new_end);
- 	if (in_rcu) {
-+		mte_set_node_dead(mas->node);
- 		mas->node = mt_mk_node(newnode, wr_mas->type);
- 		mas_replace(mas, false);
- 	} else {
-@@ -4475,6 +4542,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
- 	node = mas_mn(mas);
- 	slots = ma_slots(node, mt);
- 	pivots = ma_pivots(node, mt);
-+	if (unlikely(ma_dead_node(node)))
-+		return 1;
-+
- 	mas->max = pivots[offset];
- 	if (offset)
- 		mas->min = pivots[offset - 1] + 1;
-@@ -4496,6 +4566,9 @@ static inline int mas_prev_node(struct ma_state *mas, unsigned long min)
- 		slots = ma_slots(node, mt);
- 		pivots = ma_pivots(node, mt);
- 		offset = ma_data_end(node, mt, pivots, mas->max);
-+		if (unlikely(ma_dead_node(node)))
-+			return 1;
-+
- 		if (offset)
- 			mas->min = pivots[offset - 1] + 1;
- 
-@@ -4544,6 +4617,7 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
- 	struct maple_enode *enode;
- 	int level = 0;
- 	unsigned char offset;
-+	unsigned char node_end;
- 	enum maple_type mt;
- 	void __rcu **slots;
- 
-@@ -4567,7 +4641,11 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
- 		node = mas_mn(mas);
- 		mt = mte_node_type(mas->node);
- 		pivots = ma_pivots(node, mt);
--	} while (unlikely(offset == ma_data_end(node, mt, pivots, mas->max)));
-+		node_end = ma_data_end(node, mt, pivots, mas->max);
-+		if (unlikely(ma_dead_node(node)))
-+			return 1;
-+
-+	} while (unlikely(offset == node_end));
- 
- 	slots = ma_slots(node, mt);
- 	pivot = mas_safe_pivot(mas, pivots, ++offset, mt);
-@@ -4583,6 +4661,9 @@ static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
- 		mt = mte_node_type(mas->node);
- 		slots = ma_slots(node, mt);
- 		pivots = ma_pivots(node, mt);
-+		if (unlikely(ma_dead_node(node)))
-+			return 1;
-+
- 		offset = 0;
- 		pivot = pivots[0];
- 	}
-@@ -4629,11 +4710,14 @@ static inline void *mas_next_nentry(struct ma_state *mas,
- 		return NULL;
- 	}
- 
--	pivots = ma_pivots(node, type);
- 	slots = ma_slots(node, type);
--	mas->index = mas_safe_min(mas, pivots, mas->offset);
-+	pivots = ma_pivots(node, type);
- 	count = ma_data_end(node, type, pivots, mas->max);
--	if (ma_dead_node(node))
-+	if (unlikely(ma_dead_node(node)))
-+		return NULL;
-+
-+	mas->index = mas_safe_min(mas, pivots, mas->offset);
-+	if (unlikely(ma_dead_node(node)))
- 		return NULL;
- 
- 	if (mas->index > max)
-@@ -4787,6 +4871,11 @@ static inline void *mas_prev_nentry(struct ma_state *mas, unsigned long limit,
- 
- 	slots = ma_slots(mn, mt);
- 	pivots = ma_pivots(mn, mt);
-+	if (unlikely(ma_dead_node(mn))) {
-+		mas_rewalk(mas, index);
-+		goto retry;
-+	}
-+
- 	if (offset == mt_pivots[mt])
- 		pivot = mas->max;
- 	else
-@@ -5370,24 +5459,26 @@ static inline int mas_rev_alloc(struct ma_state *mas, unsigned long min,
- }
- 
- /*
-- * mas_dead_leaves() - Mark all leaves of a node as dead.
-+ * mte_dead_leaves() - Mark all leaves of a node as dead.
-  * @mas: The maple state
-  * @slots: Pointer to the slot array
-+ * @type: The maple node type
-  *
-  * Must hold the write lock.
-  *
-  * Return: The number of leaves marked as dead.
-  */
- static inline
--unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
-+unsigned char mte_dead_leaves(struct maple_enode *enode, struct maple_tree *mt,
-+			      void __rcu **slots)
- {
- 	struct maple_node *node;
- 	enum maple_type type;
- 	void *entry;
- 	int offset;
- 
--	for (offset = 0; offset < mt_slot_count(mas->node); offset++) {
--		entry = mas_slot_locked(mas, slots, offset);
-+	for (offset = 0; offset < mt_slot_count(enode); offset++) {
-+		entry = mt_slot(mt, slots, offset);
- 		type = mte_node_type(entry);
- 		node = mte_to_node(entry);
- 		/* Use both node and type to catch LE & BE metadata */
-@@ -5395,7 +5486,6 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
- 			break;
- 
- 		mte_set_node_dead(entry);
--		smp_wmb(); /* Needed for RCU */
- 		node->type = type;
- 		rcu_assign_pointer(slots[offset], node);
- 	}
-@@ -5403,151 +5493,160 @@ unsigned char mas_dead_leaves(struct ma_state *mas, void __rcu **slots)
- 	return offset;
- }
- 
--static void __rcu **mas_dead_walk(struct ma_state *mas, unsigned char offset)
-+/**
-+ * mte_dead_walk() - Walk down a dead tree to just before the leaves
-+ * @enode: The maple encoded node
-+ * @offset: The starting offset
-+ *
-+ * Note: This can only be used from the RCU callback context.
-+ */
-+static void __rcu **mte_dead_walk(struct maple_enode **enode, unsigned char offset)
- {
- 	struct maple_node *node, *next;
- 	void __rcu **slots = NULL;
- 
--	next = mas_mn(mas);
-+	next = mte_to_node(*enode);
- 	do {
--		mas->node = ma_enode_ptr(next);
--		node = mas_mn(mas);
-+		*enode = ma_enode_ptr(next);
-+		node = mte_to_node(*enode);
- 		slots = ma_slots(node, node->type);
--		next = mas_slot_locked(mas, slots, offset);
-+		next = rcu_dereference_protected(slots[offset],
-+					lock_is_held(&rcu_callback_map));
- 		offset = 0;
- 	} while (!ma_is_leaf(next->type));
- 
- 	return slots;
- }
- 
-+/**
-+ * mt_free_walk() - Walk & free a tree in the RCU callback context
-+ * @head: The RCU head that's within the node.
-+ *
-+ * Note: This can only be used from the RCU callback context.
-+ */
- static void mt_free_walk(struct rcu_head *head)
- {
- 	void __rcu **slots;
- 	struct maple_node *node, *start;
--	struct maple_tree mt;
-+	struct maple_enode *enode;
- 	unsigned char offset;
- 	enum maple_type type;
--	MA_STATE(mas, &mt, 0, 0);
- 
- 	node = container_of(head, struct maple_node, rcu);
- 
- 	if (ma_is_leaf(node->type))
- 		goto free_leaf;
- 
--	mt_init_flags(&mt, node->ma_flags);
--	mas_lock(&mas);
- 	start = node;
--	mas.node = mt_mk_node(node, node->type);
--	slots = mas_dead_walk(&mas, 0);
--	node = mas_mn(&mas);
-+	enode = mt_mk_node(node, node->type);
-+	slots = mte_dead_walk(&enode, 0);
-+	node = mte_to_node(enode);
- 	do {
- 		mt_free_bulk(node->slot_len, slots);
- 		offset = node->parent_slot + 1;
--		mas.node = node->piv_parent;
--		if (mas_mn(&mas) == node)
--			goto start_slots_free;
--
--		type = mte_node_type(mas.node);
--		slots = ma_slots(mte_to_node(mas.node), type);
--		if ((offset < mt_slots[type]) && (slots[offset]))
--			slots = mas_dead_walk(&mas, offset);
--
--		node = mas_mn(&mas);
-+		enode = node->piv_parent;
-+		if (mte_to_node(enode) == node)
-+			goto free_leaf;
-+
-+		type = mte_node_type(enode);
-+		slots = ma_slots(mte_to_node(enode), type);
-+		if ((offset < mt_slots[type]) &&
-+		    rcu_dereference_protected(slots[offset],
-+					      lock_is_held(&rcu_callback_map)))
-+			slots = mte_dead_walk(&enode, offset);
-+		node = mte_to_node(enode);
- 	} while ((node != start) || (node->slot_len < offset));
- 
- 	slots = ma_slots(node, node->type);
- 	mt_free_bulk(node->slot_len, slots);
- 
--start_slots_free:
--	mas_unlock(&mas);
- free_leaf:
- 	mt_free_rcu(&node->rcu);
- }
- 
--static inline void __rcu **mas_destroy_descend(struct ma_state *mas,
--			struct maple_enode *prev, unsigned char offset)
-+static inline void __rcu **mte_destroy_descend(struct maple_enode **enode,
-+	struct maple_tree *mt, struct maple_enode *prev, unsigned char offset)
- {
- 	struct maple_node *node;
--	struct maple_enode *next = mas->node;
-+	struct maple_enode *next = *enode;
- 	void __rcu **slots = NULL;
-+	enum maple_type type;
-+	unsigned char next_offset = 0;
- 
- 	do {
--		mas->node = next;
--		node = mas_mn(mas);
--		slots = ma_slots(node, mte_node_type(mas->node));
--		next = mas_slot_locked(mas, slots, 0);
-+		*enode = next;
-+		node = mte_to_node(*enode);
-+		type = mte_node_type(*enode);
-+		slots = ma_slots(node, type);
-+		next = mt_slot_locked(mt, slots, next_offset);
- 		if ((mte_dead_node(next)))
--			next = mas_slot_locked(mas, slots, 1);
-+			next = mt_slot_locked(mt, slots, ++next_offset);
- 
--		mte_set_node_dead(mas->node);
--		node->type = mte_node_type(mas->node);
-+		mte_set_node_dead(*enode);
-+		node->type = type;
- 		node->piv_parent = prev;
- 		node->parent_slot = offset;
--		offset = 0;
--		prev = mas->node;
-+		offset = next_offset;
-+		next_offset = 0;
-+		prev = *enode;
- 	} while (!mte_is_leaf(next));
- 
- 	return slots;
- }
- 
--static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
-+static void mt_destroy_walk(struct maple_enode *enode, struct maple_tree *mt,
- 			    bool free)
- {
- 	void __rcu **slots;
- 	struct maple_node *node = mte_to_node(enode);
- 	struct maple_enode *start;
--	struct maple_tree mt;
--
--	MA_STATE(mas, &mt, 0, 0);
- 
--	if (mte_is_leaf(enode))
-+	if (mte_is_leaf(enode)) {
-+		node->type = mte_node_type(enode);
- 		goto free_leaf;
-+	}
- 
--	mt_init_flags(&mt, ma_flags);
--	mas_lock(&mas);
--
--	mas.node = start = enode;
--	slots = mas_destroy_descend(&mas, start, 0);
--	node = mas_mn(&mas);
-+	start = enode;
-+	slots = mte_destroy_descend(&enode, mt, start, 0);
-+	node = mte_to_node(enode); // Updated in the above call.
- 	do {
- 		enum maple_type type;
- 		unsigned char offset;
- 		struct maple_enode *parent, *tmp;
- 
--		node->slot_len = mas_dead_leaves(&mas, slots);
-+		node->slot_len = mte_dead_leaves(enode, mt, slots);
- 		if (free)
- 			mt_free_bulk(node->slot_len, slots);
- 		offset = node->parent_slot + 1;
--		mas.node = node->piv_parent;
--		if (mas_mn(&mas) == node)
--			goto start_slots_free;
-+		enode = node->piv_parent;
-+		if (mte_to_node(enode) == node)
-+			goto free_leaf;
- 
--		type = mte_node_type(mas.node);
--		slots = ma_slots(mte_to_node(mas.node), type);
-+		type = mte_node_type(enode);
-+		slots = ma_slots(mte_to_node(enode), type);
- 		if (offset >= mt_slots[type])
- 			goto next;
- 
--		tmp = mas_slot_locked(&mas, slots, offset);
-+		tmp = mt_slot_locked(mt, slots, offset);
- 		if (mte_node_type(tmp) && mte_to_node(tmp)) {
--			parent = mas.node;
--			mas.node = tmp;
--			slots = mas_destroy_descend(&mas, parent, offset);
-+			parent = enode;
-+			enode = tmp;
-+			slots = mte_destroy_descend(&enode, mt, parent, offset);
- 		}
- next:
--		node = mas_mn(&mas);
--	} while (start != mas.node);
-+		node = mte_to_node(enode);
-+	} while (start != enode);
- 
--	node = mas_mn(&mas);
--	node->slot_len = mas_dead_leaves(&mas, slots);
-+	node = mte_to_node(enode);
-+	node->slot_len = mte_dead_leaves(enode, mt, slots);
- 	if (free)
- 		mt_free_bulk(node->slot_len, slots);
- 
--start_slots_free:
--	mas_unlock(&mas);
--
- free_leaf:
- 	if (free)
- 		mt_free_rcu(&node->rcu);
-+	else
-+		mt_clear_meta(mt, node, node->type);
- }
- 
- /*
-@@ -5563,10 +5662,10 @@ static inline void mte_destroy_walk(struct maple_enode *enode,
- 	struct maple_node *node = mte_to_node(enode);
- 
- 	if (mt_in_rcu(mt)) {
--		mt_destroy_walk(enode, mt->ma_flags, false);
-+		mt_destroy_walk(enode, mt, false);
- 		call_rcu(&node->rcu, mt_free_walk);
- 	} else {
--		mt_destroy_walk(enode, mt->ma_flags, true);
-+		mt_destroy_walk(enode, mt, true);
- 	}
- }
- 
-@@ -6588,11 +6687,11 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
- 	while (likely(!ma_is_leaf(mt))) {
- 		MT_BUG_ON(mas->tree, mte_dead_node(mas->node));
- 		slots = ma_slots(mn, mt);
--		pivots = ma_pivots(mn, mt);
--		max = pivots[0];
- 		entry = mas_slot(mas, slots, 0);
-+		pivots = ma_pivots(mn, mt);
- 		if (unlikely(ma_dead_node(mn)))
- 			return NULL;
-+		max = pivots[0];
- 		mas->node = entry;
- 		mn = mas_mn(mas);
- 		mt = mte_node_type(mas->node);
-@@ -6612,13 +6711,13 @@ static inline void *mas_first_entry(struct ma_state *mas, struct maple_node *mn,
- 	if (likely(entry))
- 		return entry;
- 
--	pivots = ma_pivots(mn, mt);
--	mas->index = pivots[0] + 1;
- 	mas->offset = 1;
- 	entry = mas_slot(mas, slots, 1);
-+	pivots = ma_pivots(mn, mt);
- 	if (unlikely(ma_dead_node(mn)))
- 		return NULL;
- 
-+	mas->index = pivots[0] + 1;
- 	if (mas->index > limit)
- 		goto none;
- 
 diff --git a/mm/Kconfig b/mm/Kconfig
 index cf2e47030fe8..459af2123189 100644
 --- a/mm/Kconfig
@@ -1639,6 +1202,21 @@ index c3547a373c9c..4965a7333a3f 100644
 +	default y
 +	help
 +	  Statistics for per-vma locks.
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 245038a9fe4e..4d860b53a14a 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -6004,6 +6004,10 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	int need_wait_lock = 0;
+ 	unsigned long haddr = address & huge_page_mask(h);
+ 
++	/* TODO: Handle faults under the VMA lock */
++	if (flags & FAULT_FLAG_VMA_LOCK)
++		return VM_FAULT_RETRY;
++
+ 	/*
+ 	 * Serialize hugepage allocation and instantiation, so that we don't
+ 	 * get spurious allocation failures if two CPUs race to instantiate
 diff --git a/mm/init-mm.c b/mm/init-mm.c
 index c9327abb771c..33269314e060 100644
 --- a/mm/init-mm.c
@@ -1667,7 +1245,7 @@ index 7920a8b7982e..0c455d6e4e3e 100644
  
  struct zap_details;
 diff --git a/mm/khugepaged.c b/mm/khugepaged.c
-index 92e6f56a932d..4df27ffed84c 100644
+index 92e6f56a932d..042007f0bfa1 100644
 --- a/mm/khugepaged.c
 +++ b/mm/khugepaged.c
 @@ -1049,6 +1049,7 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
@@ -1678,6 +1256,15 @@ index 92e6f56a932d..4df27ffed84c 100644
  	anon_vma_lock_write(vma->anon_vma);
  
  	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm, address,
+@@ -1172,7 +1173,7 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+ 				 * enabled swap entries.  Please see
+ 				 * comment below for pte_uffd_wp().
+ 				 */
+-				if (pte_swp_uffd_wp(pteval)) {
++				if (pte_swp_uffd_wp_any(pteval)) {
+ 					result = SCAN_PTE_UFFD_WP;
+ 					goto out_unmap;
+ 				}
 @@ -1512,6 +1513,9 @@ int collapse_pte_mapped_thp(struct mm_struct *mm, unsigned long addr,
  		goto drop_hpage;
  	}
@@ -1700,10 +1287,31 @@ index 92e6f56a932d..4df27ffed84c 100644
  			 * Re-check whether we have an ->anon_vma, because
  			 * collapse_and_free_pmd() requires that either no
 diff --git a/mm/memory.c b/mm/memory.c
-index f456f3b5049c..94194a45ffa7 100644
+index 01a23ad48a04..e7ffdadb684d 100644
 --- a/mm/memory.c
 +++ b/mm/memory.c
-@@ -348,7 +348,7 @@ void free_pgd_range(struct mmu_gather *tlb,
+@@ -104,6 +104,20 @@ EXPORT_SYMBOL(mem_map);
+ #endif
+ 
+ static vm_fault_t do_fault(struct vm_fault *vmf);
++static vm_fault_t do_anonymous_page(struct vm_fault *vmf);
++static bool vmf_pte_changed(struct vm_fault *vmf);
++
++/*
++ * Return true if the original pte was a uffd-wp pte marker (so the pte was
++ * wr-protected).
++ */
++static bool vmf_orig_pte_uffd_wp(struct vm_fault *vmf)
++{
++	if (!(vmf->flags & FAULT_FLAG_ORIG_PTE_VALID))
++		return false;
++
++	return pte_marker_uffd_wp(vmf->orig_pte);
++}
+ 
+ /*
+  * A number of key systems in x86 including ioremap() rely on the assumption
+@@ -348,7 +362,7 @@ void free_pgd_range(struct mmu_gather *tlb,
  
  void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
  		   struct vm_area_struct *vma, unsigned long floor,
@@ -1712,7 +1320,7 @@ index f456f3b5049c..94194a45ffa7 100644
  {
  	MA_STATE(mas, mt, vma->vm_end, vma->vm_end);
  
-@@ -366,6 +366,8 @@ void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
+@@ -366,6 +380,8 @@ void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
  		 * Hide vma from rmap and truncate_pagecache before freeing
  		 * pgtables
  		 */
@@ -1721,7 +1329,7 @@ index f456f3b5049c..94194a45ffa7 100644
  		unlink_anon_vmas(vma);
  		unlink_file_vma(vma);
  
-@@ -380,6 +382,8 @@ void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
+@@ -380,6 +396,8 @@ void free_pgtables(struct mmu_gather *tlb, struct maple_tree *mt,
  			       && !is_vm_hugetlb_page(next)) {
  				vma = next;
  				next = mas_find(&mas, ceiling - 1);
@@ -1730,7 +1338,72 @@ index f456f3b5049c..94194a45ffa7 100644
  				unlink_anon_vmas(vma);
  				unlink_file_vma(vma);
  			}
-@@ -3684,6 +3688,11 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+@@ -1345,6 +1363,10 @@ zap_install_uffd_wp_if_needed(struct vm_area_struct *vma,
+ 			      unsigned long addr, pte_t *pte,
+ 			      struct zap_details *details, pte_t pteval)
+ {
++	/* Zap on anonymous always means dropping everything */
++	if (vma_is_anonymous(vma))
++		return;
++
+ 	if (zap_drop_file_uffd_wp(details))
+ 		return;
+ 
+@@ -1451,8 +1473,12 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 				continue;
+ 			rss[mm_counter(page)]--;
+ 		} else if (pte_marker_entry_uffd_wp(entry)) {
+-			/* Only drop the uffd-wp marker if explicitly requested */
+-			if (!zap_drop_file_uffd_wp(details))
++			/*
++			 * For anon: always drop the marker; for file: only
++			 * drop the marker if explicitly requested.
++			 */
++			if (!vma_is_anonymous(vma) &&
++			    !zap_drop_file_uffd_wp(details))
+ 				continue;
+ 		} else if (is_hwpoison_entry(entry) ||
+ 			   is_swapin_error_entry(entry)) {
+@@ -3322,6 +3348,9 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct folio *folio = NULL;
+ 
++	if ((vmf->flags & FAULT_FLAG_VMA_LOCK) && !vma_is_anonymous(vma))
++		return VM_FAULT_RETRY;
++
+ 	if (likely(!unshare)) {
+ 		if (userfaultfd_pte_wp(vma, *vmf->pte)) {
+ 			pte_unmap_unlock(vmf->pte, vmf->ptl);
+@@ -3633,6 +3662,14 @@ static vm_fault_t pte_marker_clear(struct vm_fault *vmf)
+ 	return 0;
+ }
+ 
++static vm_fault_t do_pte_missing(struct vm_fault *vmf)
++{
++	if (vma_is_anonymous(vmf->vma))
++		return do_anonymous_page(vmf);
++	else
++		return do_fault(vmf);
++}
++
+ /*
+  * This is actually a page-missing access, but with uffd-wp special pte
+  * installed.  It means this pte was wr-protected before being unmapped.
+@@ -3643,11 +3680,10 @@ static vm_fault_t pte_marker_handle_uffd_wp(struct vm_fault *vmf)
+ 	 * Just in case there're leftover special ptes even after the region
+ 	 * got unregistered - we can simply clear them.
+ 	 */
+-	if (unlikely(!userfaultfd_wp(vmf->vma) || vma_is_anonymous(vmf->vma)))
++	if (unlikely(!userfaultfd_wp(vmf->vma)))
+ 		return pte_marker_clear(vmf);
+ 
+-	/* do_fault() can handle pte markers too like none pte */
+-	return do_fault(vmf);
++	return do_pte_missing(vmf);
+ }
+ 
+ static vm_fault_t handle_pte_marker(struct vm_fault *vmf)
+@@ -3698,6 +3734,11 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
  	if (!pte_unmap_same(vmf))
  		goto out;
  
@@ -1742,7 +1415,120 @@ index f456f3b5049c..94194a45ffa7 100644
  	entry = pte_to_swp_entry(vmf->orig_pte);
  	if (unlikely(non_swap_entry(entry))) {
  		if (is_migration_entry(entry)) {
-@@ -5216,6 +5225,67 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+@@ -4012,6 +4053,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+  */
+ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ {
++	bool uffd_wp = vmf_orig_pte_uffd_wp(vmf);
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct folio *folio;
+ 	vm_fault_t ret = 0;
+@@ -4045,7 +4087,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 						vma->vm_page_prot));
+ 		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+ 				vmf->address, &vmf->ptl);
+-		if (!pte_none(*vmf->pte)) {
++		if (vmf_pte_changed(vmf)) {
+ 			update_mmu_tlb(vma, vmf->address, vmf->pte);
+ 			goto unlock;
+ 		}
+@@ -4085,7 +4127,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 
+ 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
+ 			&vmf->ptl);
+-	if (!pte_none(*vmf->pte)) {
++	if (vmf_pte_changed(vmf)) {
+ 		update_mmu_tlb(vma, vmf->address, vmf->pte);
+ 		goto release;
+ 	}
+@@ -4105,6 +4147,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	folio_add_new_anon_rmap(folio, vma, vmf->address);
+ 	folio_add_lru_vma(folio, vma);
+ setpte:
++	if (uffd_wp)
++		entry = pte_mkuffd_wp(entry);
+ 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+ 
+ 	/* No need to invalidate - it was non-present before */
+@@ -4272,7 +4316,7 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct page *page)
+ void do_set_pte(struct vm_fault *vmf, struct page *page, unsigned long addr)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+-	bool uffd_wp = pte_marker_uffd_wp(vmf->orig_pte);
++	bool uffd_wp = vmf_orig_pte_uffd_wp(vmf);
+ 	bool write = vmf->flags & FAULT_FLAG_WRITE;
+ 	bool prefault = vmf->address != addr;
+ 	pte_t entry;
+@@ -4503,6 +4547,8 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
+ 			return ret;
+ 	}
+ 
++	if (vmf->flags & FAULT_FLAG_VMA_LOCK)
++		return VM_FAULT_RETRY;
+ 	ret = __do_fault(vmf);
+ 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+ 		return ret;
+@@ -4519,6 +4565,9 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	vm_fault_t ret;
+ 
++	if (vmf->flags & FAULT_FLAG_VMA_LOCK)
++		return VM_FAULT_RETRY;
++
+ 	if (unlikely(anon_vma_prepare(vma)))
+ 		return VM_FAULT_OOM;
+ 
+@@ -4558,6 +4607,9 @@ static vm_fault_t do_shared_fault(struct vm_fault *vmf)
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	vm_fault_t ret, tmp;
+ 
++	if (vmf->flags & FAULT_FLAG_VMA_LOCK)
++		return VM_FAULT_RETRY;
++
+ 	ret = __do_fault(vmf);
+ 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+ 		return ret;
+@@ -4916,12 +4968,8 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 		}
+ 	}
+ 
+-	if (!vmf->pte) {
+-		if (vma_is_anonymous(vmf->vma))
+-			return do_anonymous_page(vmf);
+-		else
+-			return do_fault(vmf);
+-	}
++	if (!vmf->pte)
++		return do_pte_missing(vmf);
+ 
+ 	if (!pte_present(vmf->orig_pte))
+ 		return do_swap_page(vmf);
+@@ -4929,6 +4977,9 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
+ 		return do_numa_page(vmf);
+ 
++	if ((vmf->flags & FAULT_FLAG_VMA_LOCK) && !vma_is_anonymous(vmf->vma))
++		return VM_FAULT_RETRY;
++
+ 	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
+ 	spin_lock(vmf->ptl);
+ 	entry = vmf->orig_pte;
+@@ -4965,10 +5016,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ }
+ 
+ /*
+- * By the time we get here, we already hold the mm semaphore
+- *
+- * The mmap_lock may have been released depending on flags and our
+- * return value.  See filemap_fault() and __folio_lock_or_retry().
++ * On entry, we hold either the VMA lock or the mmap_lock
++ * (FAULT_FLAG_VMA_LOCK tells you which).  If VM_FAULT_RETRY is set in
++ * the result, the mmap_lock is not held on exit.  See filemap_fault()
++ * and __folio_lock_or_retry().
+  */
+ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 		unsigned long address, unsigned int flags)
+@@ -5230,6 +5281,63 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
  }
  EXPORT_SYMBOL_GPL(handle_mm_fault);
  
@@ -1764,12 +1550,8 @@ index f456f3b5049c..94194a45ffa7 100644
 +	if (!vma)
 +		goto inval;
 +
-+	/* Only anonymous vmas are supported for now */
-+	if (!vma_is_anonymous(vma))
-+		goto inval;
-+
 +	/* find_mergeable_anon_vma uses adjacent vmas which are not locked */
-+	if (!vma->anon_vma)
++	if (vma_is_anonymous(vma) && !vma->anon_vma)
 +		goto inval;
 +
 +	if (!vma_start_read(vma))
@@ -1811,7 +1593,7 @@ index f456f3b5049c..94194a45ffa7 100644
  /*
   * Allocate p4d page table.
 diff --git a/mm/mmap.c b/mm/mmap.c
-index ad499f7b767f..a2bc2d9432b8 100644
+index ff68a67a2a7c..a2bc2d9432b8 100644
 --- a/mm/mmap.c
 +++ b/mm/mmap.c
 @@ -133,7 +133,7 @@ void unlink_file_vma(struct vm_area_struct *vma)
@@ -1941,15 +1723,6 @@ index ad499f7b767f..a2bc2d9432b8 100644
  	if (vma->vm_flags & VM_LOCKED)
  		vma->vm_mm->locked_vm -= vma_pages(vma);
  
-@@ -2277,7 +2293,7 @@ do_vmi_align_munmap(struct vma_iterator *vmi, struct vm_area_struct *vma,
- 	int count = 0;
- 	int error = -ENOMEM;
- 	MA_STATE(mas_detach, &mt_detach, 0, 0);
--	mt_init_flags(&mt_detach, MT_FLAGS_LOCK_EXTERN);
-+	mt_init_flags(&mt_detach, vmi->mas.tree->ma_flags & MT_FLAGS_LOCK_MASK);
- 	mt_set_external_lock(&mt_detach, &mm->mmap_lock);
- 
- 	/*
 @@ -2904,9 +2920,9 @@ static int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
  		if (vma_iter_prealloc(vmi))
  			goto unacct_fail;
@@ -1961,18 +1734,16 @@ index ad499f7b767f..a2bc2d9432b8 100644
  		vma->vm_end = addr + len;
  		vm_flags_set(vma, VM_SOFTDIRTY);
  		vma_iter_store(vmi, vma);
-@@ -3037,8 +3053,9 @@ void exit_mmap(struct mm_struct *mm)
- 	 */
- 	set_bit(MMF_OOM_SKIP, &mm->flags);
+@@ -3039,7 +3055,7 @@ void exit_mmap(struct mm_struct *mm)
  	mmap_write_lock(mm);
-+	mt_clear_in_rcu(&mm->mm_mt);
+ 	mt_clear_in_rcu(&mm->mm_mt);
  	free_pgtables(&tlb, &mm->mm_mt, vma, FIRST_USER_ADDRESS,
 -		      USER_PGTABLES_CEILING);
 +		      USER_PGTABLES_CEILING, true);
  	tlb_finish_mmu(&tlb);
  
  	/*
-@@ -3049,7 +3066,7 @@ void exit_mmap(struct mm_struct *mm)
+@@ -3050,7 +3066,7 @@ void exit_mmap(struct mm_struct *mm)
  	do {
  		if (vma->vm_flags & VM_ACCOUNT)
  			nr_accounted += vma_pages(vma);
@@ -1981,7 +1752,7 @@ index ad499f7b767f..a2bc2d9432b8 100644
  		count++;
  		cond_resched();
  	} while ((vma = mas_find(&mas, ULONG_MAX)) != NULL);
-@@ -3172,6 +3189,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+@@ -3173,6 +3189,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
  			get_file(new_vma->vm_file);
  		if (new_vma->vm_ops && new_vma->vm_ops->open)
  			new_vma->vm_ops->open(new_vma);
@@ -1989,7 +1760,7 @@ index ad499f7b767f..a2bc2d9432b8 100644
  		if (vma_link(mm, new_vma))
  			goto out_vma_link;
  		*need_rmap_locks = false;
-@@ -3466,6 +3484,7 @@ static void vm_lock_mapping(struct mm_struct *mm, struct address_space *mapping)
+@@ -3467,6 +3484,7 @@ static void vm_lock_mapping(struct mm_struct *mm, struct address_space *mapping)
   * of mm/rmap.c:
   *   - all hugetlbfs_i_mmap_rwsem_key locks (aka mapping->i_mmap_rwsem for
   *     hugetlb mapping);
@@ -1997,7 +1768,7 @@ index ad499f7b767f..a2bc2d9432b8 100644
   *   - all i_mmap_rwsem locks;
   *   - all anon_vma->rwseml
   *
-@@ -3488,6 +3507,13 @@ int mm_take_all_locks(struct mm_struct *mm)
+@@ -3489,6 +3507,13 @@ int mm_take_all_locks(struct mm_struct *mm)
  
  	mutex_lock(&mm_all_locks_mutex);
  
@@ -2011,7 +1782,7 @@ index ad499f7b767f..a2bc2d9432b8 100644
  	mas_for_each(&mas, vma, ULONG_MAX) {
  		if (signal_pending(current))
  			goto out_unlock;
-@@ -3577,6 +3603,7 @@ void mm_drop_all_locks(struct mm_struct *mm)
+@@ -3578,6 +3603,7 @@ void mm_drop_all_locks(struct mm_struct *mm)
  		if (vma->vm_file && vma->vm_file->f_mapping)
  			vm_unlock_mapping(vma->vm_file->f_mapping);
  	}
@@ -2019,6 +1790,99 @@ index ad499f7b767f..a2bc2d9432b8 100644
  
  	mutex_unlock(&mm_all_locks_mutex);
  }
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 13e84d8c0797..b9da9a5f87fe 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -276,7 +276,15 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 		} else {
+ 			/* It must be an none page, or what else?.. */
+ 			WARN_ON_ONCE(!pte_none(oldpte));
+-			if (unlikely(uffd_wp && !vma_is_anonymous(vma))) {
++
++			/*
++			 * Nobody plays with any none ptes besides
++			 * userfaultfd when applying the protections.
++			 */
++			if (likely(!uffd_wp))
++				continue;
++
++			if (userfaultfd_wp_use_markers(vma)) {
+ 				/*
+ 				 * For file-backed mem, we need to be able to
+ 				 * wr-protect a none pte, because even if the
+@@ -320,23 +328,46 @@ static inline int pmd_none_or_clear_bad_unless_trans_huge(pmd_t *pmd)
+ 	return 0;
+ }
+ 
+-/* Return true if we're uffd wr-protecting file-backed memory, or false */
++/*
++ * Return true if we want to split THPs into PTE mappings in change
++ * protection procedure, false otherwise.
++ */
+ static inline bool
+-uffd_wp_protect_file(struct vm_area_struct *vma, unsigned long cp_flags)
++pgtable_split_needed(struct vm_area_struct *vma, unsigned long cp_flags)
+ {
++	/*
++	 * pte markers only resides in pte level, if we need pte markers,
++	 * we need to split.  We cannot wr-protect shmem thp because file
++	 * thp is handled differently when split by erasing the pmd so far.
++	 */
+ 	return (cp_flags & MM_CP_UFFD_WP) && !vma_is_anonymous(vma);
+ }
+ 
+ /*
+- * If wr-protecting the range for file-backed, populate pgtable for the case
+- * when pgtable is empty but page cache exists.  When {pte|pmd|...}_alloc()
+- * failed we treat it the same way as pgtable allocation failures during
+- * page faults by kicking OOM and returning error.
++ * Return true if we want to populate pgtables in change protection
++ * procedure, false otherwise
++ */
++static inline bool
++pgtable_populate_needed(struct vm_area_struct *vma, unsigned long cp_flags)
++{
++	/* If not within ioctl(UFFDIO_WRITEPROTECT), then don't bother */
++	if (!(cp_flags & MM_CP_UFFD_WP))
++		return false;
++
++	/* Populate if the userfaultfd mode requires pte markers */
++	return userfaultfd_wp_use_markers(vma);
++}
++
++/*
++ * Populate the pgtable underneath for whatever reason if requested.
++ * When {pte|pmd|...}_alloc() failed we treat it the same way as pgtable
++ * allocation failures during page faults by kicking OOM and returning
++ * error.
+  */
+ #define  change_pmd_prepare(vma, pmd, cp_flags)				\
+ 	({								\
+ 		long err = 0;						\
+-		if (unlikely(uffd_wp_protect_file(vma, cp_flags))) {	\
++		if (unlikely(pgtable_populate_needed(vma, cp_flags))) {	\
+ 			if (pte_alloc(vma->vm_mm, pmd))			\
+ 				err = -ENOMEM;				\
+ 		}							\
+@@ -351,7 +382,7 @@ uffd_wp_protect_file(struct vm_area_struct *vma, unsigned long cp_flags)
+ #define  change_prepare(vma, high, low, addr, cp_flags)			\
+ 	  ({								\
+ 		long err = 0;						\
+-		if (unlikely(uffd_wp_protect_file(vma, cp_flags))) {	\
++		if (unlikely(pgtable_populate_needed(vma, cp_flags))) {	\
+ 			low##_t *p = low##_alloc(vma->vm_mm, high, addr); \
+ 			if (p == NULL)					\
+ 				err = -ENOMEM;				\
+@@ -404,7 +435,7 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 
+ 		if (is_swap_pmd(*pmd) || pmd_trans_huge(*pmd) || pmd_devmap(*pmd)) {
+ 			if ((next - addr != HPAGE_PMD_SIZE) ||
+-			    uffd_wp_protect_file(vma, cp_flags)) {
++			    pgtable_split_needed(vma, cp_flags)) {
+ 				__split_huge_pmd(vma, pmd, addr, false, NULL);
+ 				/*
+ 				 * For file-backed, the pmd could have been
 diff --git a/mm/mremap.c b/mm/mremap.c
 index 411a85682b58..dd541e59edda 100644
 --- a/mm/mremap.c
@@ -2090,125 +1954,83 @@ index 1ea6a5ce1c41..4f1089a1860e 100644
  #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
  };
  #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA || CONFIG_MEMCG */
-diff --git a/tools/testing/radix-tree/maple.c b/tools/testing/radix-tree/maple.c
-index 958ee9bdb316..4c89ff333f6f 100644
---- a/tools/testing/radix-tree/maple.c
-+++ b/tools/testing/radix-tree/maple.c
-@@ -108,6 +108,7 @@ static noinline void check_new_node(struct maple_tree *mt)
- 	MT_BUG_ON(mt, mn->slot[1] != NULL);
- 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
+diff --git a/tools/testing/selftests/mm/userfaultfd.c b/tools/testing/selftests/mm/userfaultfd.c
+index 7f22844ed704..e030d63c031a 100644
+--- a/tools/testing/selftests/mm/userfaultfd.c
++++ b/tools/testing/selftests/mm/userfaultfd.c
+@@ -1444,6 +1444,43 @@ static int pagemap_test_fork(bool present)
+ 	return result;
+ }
  
-+	mn->parent = ma_parent_ptr(mn);
- 	ma_free_rcu(mn);
- 	mas.node = MAS_START;
- 	mas_nomem(&mas, GFP_KERNEL);
-@@ -160,6 +161,7 @@ static noinline void check_new_node(struct maple_tree *mt)
- 		MT_BUG_ON(mt, mas_allocated(&mas) != i);
- 		MT_BUG_ON(mt, !mn);
- 		MT_BUG_ON(mt, not_empty(mn));
-+		mn->parent = ma_parent_ptr(mn);
- 		ma_free_rcu(mn);
- 	}
++static void userfaultfd_wp_unpopulated_test(int pagemap_fd)
++{
++	uint64_t value;
++
++	/* Test applying pte marker to anon unpopulated */
++	wp_range(uffd, (uint64_t)area_dst, page_size, true);
++	value = pagemap_read_vaddr(pagemap_fd, area_dst);
++	pagemap_check_wp(value, true);
++
++	/* Test unprotect on anon pte marker */
++	wp_range(uffd, (uint64_t)area_dst, page_size, false);
++	value = pagemap_read_vaddr(pagemap_fd, area_dst);
++	pagemap_check_wp(value, false);
++
++	/* Test zap on anon marker */
++	wp_range(uffd, (uint64_t)area_dst, page_size, true);
++	if (madvise(area_dst, page_size, MADV_DONTNEED))
++		err("madvise(MADV_DONTNEED) failed");
++	value = pagemap_read_vaddr(pagemap_fd, area_dst);
++	pagemap_check_wp(value, false);
++
++	/* Test fault in after marker removed */
++	*area_dst = 1;
++	value = pagemap_read_vaddr(pagemap_fd, area_dst);
++	pagemap_check_wp(value, false);
++	/* Drop it to make pte none again */
++	if (madvise(area_dst, page_size, MADV_DONTNEED))
++		err("madvise(MADV_DONTNEED) failed");
++
++	/* Test read-zero-page upon pte marker */
++	wp_range(uffd, (uint64_t)area_dst, page_size, true);
++	*(volatile char *)area_dst;
++	/* Drop it to make pte none again */
++	if (madvise(area_dst, page_size, MADV_DONTNEED))
++		err("madvise(MADV_DONTNEED) failed");
++}
++
+ static void userfaultfd_pagemap_test(unsigned int test_pgsize)
+ {
+ 	struct uffdio_register uffdio_register;
+@@ -1462,7 +1499,7 @@ static void userfaultfd_pagemap_test(unsigned int test_pgsize)
+ 	/* Flush so it doesn't flush twice in parent/child later */
+ 	fflush(stdout);
  
-@@ -192,6 +194,7 @@ static noinline void check_new_node(struct maple_tree *mt)
- 		MT_BUG_ON(mt, not_empty(mn));
- 		MT_BUG_ON(mt, mas_allocated(&mas) != i - 1);
- 		MT_BUG_ON(mt, !mn);
-+		mn->parent = ma_parent_ptr(mn);
- 		ma_free_rcu(mn);
- 	}
+-	uffd_test_ctx_init(0);
++	uffd_test_ctx_init(UFFD_FEATURE_WP_UNPOPULATED);
  
-@@ -210,6 +213,7 @@ static noinline void check_new_node(struct maple_tree *mt)
- 			mn = mas_pop_node(&mas);
- 			MT_BUG_ON(mt, not_empty(mn));
- 			MT_BUG_ON(mt, mas_allocated(&mas) != j - 1);
-+			mn->parent = ma_parent_ptr(mn);
- 			ma_free_rcu(mn);
- 		}
- 		MT_BUG_ON(mt, mas_allocated(&mas) != 0);
-@@ -233,6 +237,7 @@ static noinline void check_new_node(struct maple_tree *mt)
- 			MT_BUG_ON(mt, mas_allocated(&mas) != i - j);
- 			mn = mas_pop_node(&mas);
- 			MT_BUG_ON(mt, not_empty(mn));
-+			mn->parent = ma_parent_ptr(mn);
- 			ma_free_rcu(mn);
- 			MT_BUG_ON(mt, mas_allocated(&mas) != i - j - 1);
- 		}
-@@ -269,6 +274,7 @@ static noinline void check_new_node(struct maple_tree *mt)
- 			mn = mas_pop_node(&mas); /* get the next node. */
- 			MT_BUG_ON(mt, mn == NULL);
- 			MT_BUG_ON(mt, not_empty(mn));
-+			mn->parent = ma_parent_ptr(mn);
- 			ma_free_rcu(mn);
- 		}
- 		MT_BUG_ON(mt, mas_allocated(&mas) != 0);
-@@ -294,6 +300,7 @@ static noinline void check_new_node(struct maple_tree *mt)
- 			mn = mas_pop_node(&mas2); /* get the next node. */
- 			MT_BUG_ON(mt, mn == NULL);
- 			MT_BUG_ON(mt, not_empty(mn));
-+			mn->parent = ma_parent_ptr(mn);
- 			ma_free_rcu(mn);
- 		}
- 		MT_BUG_ON(mt, mas_allocated(&mas2) != 0);
-@@ -334,10 +341,12 @@ static noinline void check_new_node(struct maple_tree *mt)
- 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 2);
- 	mn = mas_pop_node(&mas);
- 	MT_BUG_ON(mt, not_empty(mn));
-+	mn->parent = ma_parent_ptr(mn);
- 	ma_free_rcu(mn);
- 	for (i = 1; i <= MAPLE_ALLOC_SLOTS + 1; i++) {
- 		mn = mas_pop_node(&mas);
- 		MT_BUG_ON(mt, not_empty(mn));
-+		mn->parent = ma_parent_ptr(mn);
- 		ma_free_rcu(mn);
- 	}
- 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
-@@ -375,6 +384,7 @@ static noinline void check_new_node(struct maple_tree *mt)
- 		mas_node_count(&mas, i); /* Request */
- 		mas_nomem(&mas, GFP_KERNEL); /* Fill request */
- 		mn = mas_pop_node(&mas); /* get the next node. */
-+		mn->parent = ma_parent_ptr(mn);
- 		ma_free_rcu(mn);
- 		mas_destroy(&mas);
+ 	if (test_pgsize > page_size) {
+ 		/* This is a thp test */
+@@ -1482,6 +1519,10 @@ static void userfaultfd_pagemap_test(unsigned int test_pgsize)
  
-@@ -382,10 +392,13 @@ static noinline void check_new_node(struct maple_tree *mt)
- 		mas_node_count(&mas, i); /* Request */
- 		mas_nomem(&mas, GFP_KERNEL); /* Fill request */
- 		mn = mas_pop_node(&mas); /* get the next node. */
-+		mn->parent = ma_parent_ptr(mn);
- 		ma_free_rcu(mn);
- 		mn = mas_pop_node(&mas); /* get the next node. */
-+		mn->parent = ma_parent_ptr(mn);
- 		ma_free_rcu(mn);
- 		mn = mas_pop_node(&mas); /* get the next node. */
-+		mn->parent = ma_parent_ptr(mn);
- 		ma_free_rcu(mn);
- 		mas_destroy(&mas);
- 	}
-@@ -35369,6 +35382,7 @@ static noinline void check_prealloc(struct maple_tree *mt)
- 	MT_BUG_ON(mt, allocated != 1 + height * 3);
- 	mn = mas_pop_node(&mas);
- 	MT_BUG_ON(mt, mas_allocated(&mas) != allocated - 1);
-+	mn->parent = ma_parent_ptr(mn);
- 	ma_free_rcu(mn);
- 	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
- 	mas_destroy(&mas);
-@@ -35386,6 +35400,7 @@ static noinline void check_prealloc(struct maple_tree *mt)
- 	mas_destroy(&mas);
- 	allocated = mas_allocated(&mas);
- 	MT_BUG_ON(mt, allocated != 0);
-+	mn->parent = ma_parent_ptr(mn);
- 	ma_free_rcu(mn);
+ 	pagemap_fd = pagemap_open();
  
- 	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
-@@ -35756,6 +35771,7 @@ void farmer_tests(void)
- 	tree.ma_root = mt_mk_node(node, maple_leaf_64);
- 	mt_dump(&tree);
++	/* Smoke test WP_UNPOPULATED first when it's still empty */
++	if (test_pgsize == page_size)
++		userfaultfd_wp_unpopulated_test(pagemap_fd);
++
+ 	/* Touch the page */
+ 	*area_dst = 1;
+ 	wp_range(uffd, (uint64_t)area_dst, test_pgsize, true);
+@@ -1526,7 +1567,7 @@ static int userfaultfd_stress(void)
+ 	struct uffdio_register uffdio_register;
+ 	struct uffd_stats uffd_stats[nr_cpus];
  
-+	node->parent = ma_parent_ptr(node);
- 	ma_free_rcu(node);
+-	uffd_test_ctx_init(0);
++	uffd_test_ctx_init(UFFD_FEATURE_WP_UNPOPULATED);
  
- 	/* Check things that will make lockdep angry */
+ 	if (posix_memalign(&area, page_size, page_size))
+ 		err("out of memory");
 -- 
 2.40.0
 
