@@ -1,26 +1,47 @@
-From 46acfaabd002a62a40f1ca0c4abf8a3d4313486b Mon Sep 17 00:00:00 2001
+From 5e1a0be395f154252ed7d0c8212923a7ac0381c4 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Fri, 17 Mar 2023 17:41:09 +0100
-Subject: [PATCH 10/16] maple-lru
+Date: Thu, 13 Apr 2023 18:17:33 +0200
+Subject: [PATCH 10/15] maple-lru
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- Documentation/mm/multigen_lru.rst |  128 +++-
- include/linux/fs.h                |    2 +
- include/linux/maple_tree.h        |    6 -
- include/linux/memcontrol.h        |   10 +
- include/linux/mm_inline.h         |   19 +-
- include/linux/mmzone.h            |  124 +++-
- lib/maple_tree.c                  |  177 ++---
- mm/fadvise.c                      |    5 +-
- mm/memcontrol.c                   |   12 +
- mm/memory.c                       |    7 +-
- mm/page_alloc.c                   |    1 +
- mm/rmap.c                         |   42 +-
- mm/vmscan.c                       | 1083 ++++++++++++++++++-----------
- mm/workingset.c                   |    4 +-
- tools/testing/radix-tree/maple.c  |   18 +-
- 15 files changed, 1072 insertions(+), 566 deletions(-)
+ Documentation/mm/multigen_lru.rst       |  128 ++-
+ arch/arm64/include/asm/kvm_host.h       |    7 +
+ arch/arm64/include/asm/kvm_pgtable.h    |    8 +
+ arch/arm64/include/asm/stage2_pgtable.h |   43 +
+ arch/arm64/kvm/arm.c                    |    1 +
+ arch/arm64/kvm/hyp/pgtable.c            |   51 +-
+ arch/arm64/kvm/mmu.c                    |   77 +-
+ arch/powerpc/include/asm/kvm_host.h     |   18 +
+ arch/powerpc/include/asm/kvm_ppc.h      |   14 +-
+ arch/powerpc/kvm/book3s.c               |    7 +
+ arch/powerpc/kvm/book3s.h               |    2 +
+ arch/powerpc/kvm/book3s_64_mmu_radix.c  |   78 +-
+ arch/powerpc/kvm/book3s_hv.c            |   10 +-
+ arch/x86/include/asm/kvm_host.h         |   27 +
+ arch/x86/kvm/mmu/spte.h                 |   12 -
+ arch/x86/kvm/mmu/tdp_mmu.c              |   41 +
+ include/linux/fs.h                      |    2 +
+ include/linux/kvm_host.h                |   29 +
+ include/linux/maple_tree.h              |    8 +-
+ include/linux/memcontrol.h              |   10 +
+ include/linux/mm_inline.h               |   19 +-
+ include/linux/mmu_notifier.h            |   40 +
+ include/linux/mmzone.h                  |  130 ++-
+ lib/maple_tree.c                        |  103 +-
+ mm/fadvise.c                            |    5 +-
+ mm/memcontrol.c                         |   12 +
+ mm/memory.c                             |    7 +-
+ mm/mmap.c                               |   16 +-
+ mm/mmu_notifier.c                       |   26 +
+ mm/nommu.c                              |    8 +-
+ mm/page_alloc.c                         |    1 +
+ mm/rmap.c                               |   48 +-
+ mm/vmscan.c                             | 1210 +++++++++++++++--------
+ mm/workingset.c                         |    4 +-
+ tools/testing/radix-tree/maple.c        |   56 +-
+ virt/kvm/kvm_main.c                     |   58 ++
+ 36 files changed, 1668 insertions(+), 648 deletions(-)
 
 diff --git a/Documentation/mm/multigen_lru.rst b/Documentation/mm/multigen_lru.rst
 index d7062c6a8946..52ed5092022f 100644
@@ -191,6 +212,655 @@ index d7062c6a8946..52ed5092022f 100644
  
  The aging and the eviction form a producer-consumer model;
  specifically, the latter drives the former by the sliding window over
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 35a159d131b5..572bcd321586 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -1031,4 +1031,11 @@ static inline void kvm_hyp_reserve(void) { }
+ void kvm_arm_vcpu_power_off(struct kvm_vcpu *vcpu);
+ bool kvm_arm_vcpu_stopped(struct kvm_vcpu *vcpu);
+ 
++/* see the comments on the generic kvm_arch_has_test_clear_young() */
++#define kvm_arch_has_test_clear_young kvm_arch_has_test_clear_young
++static inline bool kvm_arch_has_test_clear_young(void)
++{
++	return IS_ENABLED(CONFIG_KVM) && cpu_has_hw_af() && !is_protected_kvm_enabled();
++}
++
+ #endif /* __ARM64_KVM_HOST_H__ */
+diff --git a/arch/arm64/include/asm/kvm_pgtable.h b/arch/arm64/include/asm/kvm_pgtable.h
+index 63f81b27a4e3..8c9a04388c88 100644
+--- a/arch/arm64/include/asm/kvm_pgtable.h
++++ b/arch/arm64/include/asm/kvm_pgtable.h
+@@ -105,6 +105,7 @@ static inline bool kvm_level_supports_block_mapping(u32 level)
+  * @put_page:			Decrement the refcount on a page. When the
+  *				refcount reaches 0 the page is automatically
+  *				freed.
++ * @put_page_rcu:		RCU variant of put_page().
+  * @page_count:			Return the refcount of a page.
+  * @phys_to_virt:		Convert a physical address into a virtual
+  *				address	mapped in the current context.
+@@ -122,6 +123,7 @@ struct kvm_pgtable_mm_ops {
+ 	void		(*free_removed_table)(void *addr, u32 level);
+ 	void		(*get_page)(void *addr);
+ 	void		(*put_page)(void *addr);
++	void		(*put_page_rcu)(void *addr);
+ 	int		(*page_count)(void *addr);
+ 	void*		(*phys_to_virt)(phys_addr_t phys);
+ 	phys_addr_t	(*virt_to_phys)(void *addr);
+@@ -188,6 +190,12 @@ typedef bool (*kvm_pgtable_force_pte_cb_t)(u64 addr, u64 end,
+  *					children.
+  * @KVM_PGTABLE_WALK_SHARED:		Indicates the page-tables may be shared
+  *					with other software walkers.
++ *
++ * kvm_arch_test_clear_young() is a special case. It relies on two
++ * techniques, RCU and cmpxchg, to safely test and clear the accessed
++ * bit without taking the MMU lock. The former protects KVM page tables
++ * from being freed while the latter clears the accessed bit atomically
++ * against both the hardware and other software page table walkers.
+  */
+ enum kvm_pgtable_walk_flags {
+ 	KVM_PGTABLE_WALK_LEAF			= BIT(0),
+diff --git a/arch/arm64/include/asm/stage2_pgtable.h b/arch/arm64/include/asm/stage2_pgtable.h
+index c8dca8ae359c..350437661d4b 100644
+--- a/arch/arm64/include/asm/stage2_pgtable.h
++++ b/arch/arm64/include/asm/stage2_pgtable.h
+@@ -30,4 +30,47 @@
+  */
+ #define kvm_mmu_cache_min_pages(kvm)	(kvm_stage2_levels(kvm) - 1)
+ 
++#define KVM_PTE_TYPE			BIT(1)
++#define KVM_PTE_TYPE_BLOCK		0
++#define KVM_PTE_TYPE_PAGE		1
++#define KVM_PTE_TYPE_TABLE		1
++
++#define KVM_PTE_LEAF_ATTR_LO		GENMASK(11, 2)
++
++#define KVM_PTE_LEAF_ATTR_LO_S1_ATTRIDX	GENMASK(4, 2)
++#define KVM_PTE_LEAF_ATTR_LO_S1_AP	GENMASK(7, 6)
++#define KVM_PTE_LEAF_ATTR_LO_S1_AP_RO	3
++#define KVM_PTE_LEAF_ATTR_LO_S1_AP_RW	1
++#define KVM_PTE_LEAF_ATTR_LO_S1_SH	GENMASK(9, 8)
++#define KVM_PTE_LEAF_ATTR_LO_S1_SH_IS	3
++#define KVM_PTE_LEAF_ATTR_LO_S1_AF	BIT(10)
++
++#define KVM_PTE_LEAF_ATTR_LO_S2_MEMATTR	GENMASK(5, 2)
++#define KVM_PTE_LEAF_ATTR_LO_S2_S2AP_R	BIT(6)
++#define KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W	BIT(7)
++#define KVM_PTE_LEAF_ATTR_LO_S2_SH	GENMASK(9, 8)
++#define KVM_PTE_LEAF_ATTR_LO_S2_SH_IS	3
++#define KVM_PTE_LEAF_ATTR_LO_S2_AF	BIT(10)
++
++#define KVM_PTE_LEAF_ATTR_HI		GENMASK(63, 51)
++
++#define KVM_PTE_LEAF_ATTR_HI_SW		GENMASK(58, 55)
++
++#define KVM_PTE_LEAF_ATTR_HI_S1_XN	BIT(54)
++
++#define KVM_PTE_LEAF_ATTR_HI_S2_XN	BIT(54)
++
++#define KVM_PTE_LEAF_ATTR_S2_PERMS	(KVM_PTE_LEAF_ATTR_LO_S2_S2AP_R | \
++					 KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W | \
++					 KVM_PTE_LEAF_ATTR_HI_S2_XN)
++
++#define KVM_INVALID_PTE_OWNER_MASK	GENMASK(9, 2)
++#define KVM_MAX_OWNER_ID		1
++
++/*
++ * Used to indicate a pte for which a 'break-before-make' sequence is in
++ * progress.
++ */
++#define KVM_INVALID_PTE_LOCKED		BIT(10)
++
+ #endif	/* __ARM64_S2_PGTABLE_H_ */
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 9c5573bc4614..6770bc47f5c9 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -191,6 +191,7 @@ vm_fault_t kvm_arch_vcpu_fault(struct kvm_vcpu *vcpu, struct vm_fault *vmf)
+  */
+ void kvm_arch_destroy_vm(struct kvm *kvm)
+ {
++	kvm_free_stage2_pgd(&kvm->arch.mmu);
+ 	bitmap_free(kvm->arch.pmu_filter);
+ 	free_cpumask_var(kvm->arch.supported_cpus);
+ 
+diff --git a/arch/arm64/kvm/hyp/pgtable.c b/arch/arm64/kvm/hyp/pgtable.c
+index b11cf2c618a6..8d65ee4767f1 100644
+--- a/arch/arm64/kvm/hyp/pgtable.c
++++ b/arch/arm64/kvm/hyp/pgtable.c
+@@ -12,49 +12,6 @@
+ #include <asm/stage2_pgtable.h>
+ 
+ 
+-#define KVM_PTE_TYPE			BIT(1)
+-#define KVM_PTE_TYPE_BLOCK		0
+-#define KVM_PTE_TYPE_PAGE		1
+-#define KVM_PTE_TYPE_TABLE		1
+-
+-#define KVM_PTE_LEAF_ATTR_LO		GENMASK(11, 2)
+-
+-#define KVM_PTE_LEAF_ATTR_LO_S1_ATTRIDX	GENMASK(4, 2)
+-#define KVM_PTE_LEAF_ATTR_LO_S1_AP	GENMASK(7, 6)
+-#define KVM_PTE_LEAF_ATTR_LO_S1_AP_RO	3
+-#define KVM_PTE_LEAF_ATTR_LO_S1_AP_RW	1
+-#define KVM_PTE_LEAF_ATTR_LO_S1_SH	GENMASK(9, 8)
+-#define KVM_PTE_LEAF_ATTR_LO_S1_SH_IS	3
+-#define KVM_PTE_LEAF_ATTR_LO_S1_AF	BIT(10)
+-
+-#define KVM_PTE_LEAF_ATTR_LO_S2_MEMATTR	GENMASK(5, 2)
+-#define KVM_PTE_LEAF_ATTR_LO_S2_S2AP_R	BIT(6)
+-#define KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W	BIT(7)
+-#define KVM_PTE_LEAF_ATTR_LO_S2_SH	GENMASK(9, 8)
+-#define KVM_PTE_LEAF_ATTR_LO_S2_SH_IS	3
+-#define KVM_PTE_LEAF_ATTR_LO_S2_AF	BIT(10)
+-
+-#define KVM_PTE_LEAF_ATTR_HI		GENMASK(63, 51)
+-
+-#define KVM_PTE_LEAF_ATTR_HI_SW		GENMASK(58, 55)
+-
+-#define KVM_PTE_LEAF_ATTR_HI_S1_XN	BIT(54)
+-
+-#define KVM_PTE_LEAF_ATTR_HI_S2_XN	BIT(54)
+-
+-#define KVM_PTE_LEAF_ATTR_S2_PERMS	(KVM_PTE_LEAF_ATTR_LO_S2_S2AP_R | \
+-					 KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W | \
+-					 KVM_PTE_LEAF_ATTR_HI_S2_XN)
+-
+-#define KVM_INVALID_PTE_OWNER_MASK	GENMASK(9, 2)
+-#define KVM_MAX_OWNER_ID		1
+-
+-/*
+- * Used to indicate a pte for which a 'break-before-make' sequence is in
+- * progress.
+- */
+-#define KVM_INVALID_PTE_LOCKED		BIT(10)
+-
+ struct kvm_pgtable_walk_data {
+ 	struct kvm_pgtable_walker	*walker;
+ 
+@@ -994,8 +951,12 @@ static int stage2_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 		mm_ops->dcache_clean_inval_poc(kvm_pte_follow(ctx->old, mm_ops),
+ 					       kvm_granule_size(ctx->level));
+ 
+-	if (childp)
+-		mm_ops->put_page(childp);
++	if (childp) {
++		if (mm_ops->put_page_rcu)
++			mm_ops->put_page_rcu(childp);
++		else
++			mm_ops->put_page(childp);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index 3c24178bd493..f5b05287daf4 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -171,6 +171,21 @@ static int kvm_host_page_count(void *addr)
+ 	return page_count(virt_to_page(addr));
+ }
+ 
++static void kvm_s2_rcu_put_page(struct rcu_head *head)
++{
++	put_page(container_of(head, struct page, rcu_head));
++}
++
++static void kvm_s2_put_page_rcu(void *addr)
++{
++	struct page *page = virt_to_page(addr);
++
++	if (kvm_host_page_count(addr) == 1)
++		kvm_account_pgtable_pages(addr, -1);
++
++	call_rcu(&page->rcu_head, kvm_s2_rcu_put_page);
++}
++
+ static phys_addr_t kvm_host_pa(void *addr)
+ {
+ 	return __pa(addr);
+@@ -703,6 +718,7 @@ static struct kvm_pgtable_mm_ops kvm_s2_mm_ops = {
+ 	.free_removed_table	= stage2_free_removed_table,
+ 	.get_page		= kvm_host_get_page,
+ 	.put_page		= kvm_s2_put_page,
++	.put_page_rcu		= kvm_s2_put_page_rcu,
+ 	.page_count		= kvm_host_page_count,
+ 	.phys_to_virt		= kvm_host_va,
+ 	.virt_to_phys		= kvm_host_pa,
+@@ -1653,6 +1669,66 @@ bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ 	return pte_valid(pte) && pte_young(pte);
+ }
+ 
++struct test_clear_young_arg {
++	struct kvm_gfn_range *range;
++	gfn_t lsb_gfn;
++	unsigned long *bitmap;
++};
++
++static int stage2_test_clear_young(const struct kvm_pgtable_visit_ctx *ctx,
++				   enum kvm_pgtable_walk_flags flags)
++{
++	struct test_clear_young_arg *arg = ctx->arg;
++	gfn_t gfn = ctx->addr / PAGE_SIZE;
++	kvm_pte_t new = ctx->old & ~KVM_PTE_LEAF_ATTR_LO_S2_AF;
++
++	VM_WARN_ON_ONCE(!page_count(virt_to_page(ctx->ptep)));
++	VM_WARN_ON_ONCE(gfn < arg->range->start || gfn >= arg->range->end);
++
++	if (!kvm_pte_valid(new))
++		return 0;
++
++	if (new == ctx->old)
++		return 0;
++
++	/* see the comments on the generic kvm_arch_has_test_clear_young() */
++	if (__test_and_change_bit(arg->lsb_gfn - gfn, arg->bitmap))
++		cmpxchg64(ctx->ptep, ctx->old, new);
++
++	return 0;
++}
++
++bool kvm_arch_test_clear_young(struct kvm *kvm, struct kvm_gfn_range *range,
++			       gfn_t lsb_gfn, unsigned long *bitmap)
++{
++	u64 start = range->start * PAGE_SIZE;
++	u64 end = range->end * PAGE_SIZE;
++	struct test_clear_young_arg arg = {
++		.range		= range,
++		.lsb_gfn	= lsb_gfn,
++		.bitmap		= bitmap,
++	};
++	struct kvm_pgtable_walker walker = {
++		.cb		= stage2_test_clear_young,
++		.arg		= &arg,
++		.flags		= KVM_PGTABLE_WALK_LEAF,
++	};
++
++	BUILD_BUG_ON(is_hyp_code());
++
++	if (WARN_ON_ONCE(!kvm_arch_has_test_clear_young()))
++		return false;
++
++	/* see the comments on kvm_pgtable_walk_flags */
++	rcu_read_lock();
++
++	kvm_pgtable_walk(kvm->arch.mmu.pgt, start, end - start, &walker);
++
++	rcu_read_unlock();
++
++	return true;
++}
++
+ bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+ 	if (!kvm->arch.mmu.pgt)
+@@ -1877,7 +1953,6 @@ void kvm_arch_memslots_updated(struct kvm *kvm, u64 gen)
+ 
+ void kvm_arch_flush_shadow_all(struct kvm *kvm)
+ {
+-	kvm_free_stage2_pgd(&kvm->arch.mmu);
+ }
+ 
+ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index caea15dcb91d..996850029ce0 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -886,4 +886,22 @@ static inline void kvm_arch_exit(void) {}
+ static inline void kvm_arch_vcpu_blocking(struct kvm_vcpu *vcpu) {}
+ static inline void kvm_arch_vcpu_unblocking(struct kvm_vcpu *vcpu) {}
+ 
++static inline int kvmppc_radix_possible(void)
++{
++	return cpu_has_feature(CPU_FTR_ARCH_300) && radix_enabled();
++}
++
++static inline bool kvmhv_on_pseries(void)
++{
++	return IS_ENABLED(CONFIG_PPC_PSERIES) && !cpu_has_feature(CPU_FTR_HVMODE);
++}
++
++/* see the comments on the generic kvm_arch_has_test_clear_young() */
++#define kvm_arch_has_test_clear_young kvm_arch_has_test_clear_young
++static inline bool kvm_arch_has_test_clear_young(void)
++{
++	return IS_ENABLED(CONFIG_KVM) && IS_ENABLED(CONFIG_KVM_BOOK3S_HV_POSSIBLE) &&
++	       kvmppc_radix_possible() && !kvmhv_on_pseries();
++}
++
+ #endif /* __POWERPC_KVM_HOST_H__ */
+diff --git a/arch/powerpc/include/asm/kvm_ppc.h b/arch/powerpc/include/asm/kvm_ppc.h
+index eae9619b6190..0bb772fc12b1 100644
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -277,6 +277,8 @@ struct kvmppc_ops {
+ 	bool (*unmap_gfn_range)(struct kvm *kvm, struct kvm_gfn_range *range);
+ 	bool (*age_gfn)(struct kvm *kvm, struct kvm_gfn_range *range);
+ 	bool (*test_age_gfn)(struct kvm *kvm, struct kvm_gfn_range *range);
++	bool (*test_clear_young)(struct kvm *kvm, struct kvm_gfn_range *range,
++				 gfn_t lsb_gfn, unsigned long *bitmap);
+ 	bool (*set_spte_gfn)(struct kvm *kvm, struct kvm_gfn_range *range);
+ 	void (*free_memslot)(struct kvm_memory_slot *slot);
+ 	int (*init_vm)(struct kvm *kvm);
+@@ -580,18 +582,6 @@ static inline bool kvm_hv_mode_active(void)		{ return false; }
+ 
+ #endif
+ 
+-#ifdef CONFIG_PPC_PSERIES
+-static inline bool kvmhv_on_pseries(void)
+-{
+-	return !cpu_has_feature(CPU_FTR_HVMODE);
+-}
+-#else
+-static inline bool kvmhv_on_pseries(void)
+-{
+-	return false;
+-}
+-#endif
+-
+ #ifdef CONFIG_KVM_XICS
+ static inline int kvmppc_xics_enabled(struct kvm_vcpu *vcpu)
+ {
+diff --git a/arch/powerpc/kvm/book3s.c b/arch/powerpc/kvm/book3s.c
+index 6d525285dbe8..f4cf330e3e81 100644
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@ -877,6 +877,13 @@ bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ 	return kvm->arch.kvm_ops->test_age_gfn(kvm, range);
+ }
+ 
++bool kvm_arch_test_clear_young(struct kvm *kvm, struct kvm_gfn_range *range,
++			       gfn_t lsb_gfn, unsigned long *bitmap)
++{
++	return kvm->arch.kvm_ops->test_clear_young &&
++	       kvm->arch.kvm_ops->test_clear_young(kvm, range, lsb_gfn, bitmap);
++}
++
+ bool kvm_set_spte_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ {
+ 	return kvm->arch.kvm_ops->set_spte_gfn(kvm, range);
+diff --git a/arch/powerpc/kvm/book3s.h b/arch/powerpc/kvm/book3s.h
+index 58391b4b32ed..fe9cac423817 100644
+--- a/arch/powerpc/kvm/book3s.h
++++ b/arch/powerpc/kvm/book3s.h
+@@ -12,6 +12,8 @@ extern void kvmppc_core_flush_memslot_hv(struct kvm *kvm,
+ extern bool kvm_unmap_gfn_range_hv(struct kvm *kvm, struct kvm_gfn_range *range);
+ extern bool kvm_age_gfn_hv(struct kvm *kvm, struct kvm_gfn_range *range);
+ extern bool kvm_test_age_gfn_hv(struct kvm *kvm, struct kvm_gfn_range *range);
++extern bool kvmhv_test_clear_young(struct kvm *kvm, struct kvm_gfn_range *range,
++				   gfn_t lsb_gfn, unsigned long *bitmap);
+ extern bool kvm_set_spte_gfn_hv(struct kvm *kvm, struct kvm_gfn_range *range);
+ 
+ extern int kvmppc_mmu_init_pr(struct kvm_vcpu *vcpu);
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_radix.c b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+index 9d3743ca16d5..8476646c554c 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_radix.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+@@ -1083,6 +1083,78 @@ bool kvm_test_age_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 	return ref;
+ }
+ 
++bool kvmhv_test_clear_young(struct kvm *kvm, struct kvm_gfn_range *range,
++			    gfn_t lsb_gfn, unsigned long *bitmap)
++{
++	bool success;
++	gfn_t gfn = range->start;
++
++	if (WARN_ON_ONCE(!kvm_arch_has_test_clear_young()))
++		return false;
++
++	/*
++	 * This function relies on two techniques, RCU and cmpxchg, to safely
++	 * test and clear the accessed bit without taking the MMU lock. The
++	 * former protects KVM page tables from being freed while the latter
++	 * clears the accessed bit atomically against both the hardware and
++	 * other software page table walkers.
++	 */
++	rcu_read_lock();
++
++	success = kvm_is_radix(kvm);
++	if (!success)
++		goto unlock;
++
++	/*
++	 * case 1:  this function          kvmppc_switch_mmu_to_hpt()
++	 *
++	 *          rcu_read_lock()
++	 *          test kvm_is_radix()    kvm->arch.radix = 0
++	 *          use kvm->arch.pgtable
++	 *          rcu_read_unlock()
++	 *                                 synchronize_rcu()
++	 *                                 kvmppc_free_radix()
++	 *
++	 *
++	 * case 2:  this function          kvmppc_switch_mmu_to_radix()
++	 *
++	 *                                 kvmppc_init_vm_radix()
++	 *                                 smp_wmb()
++	 *          test kvm_is_radix()    kvm->arch.radix = 1
++	 *          smp_rmb()
++	 *          use kvm->arch.pgtable
++	 */
++	smp_rmb();
++
++	while (gfn < range->end) {
++		pte_t *ptep;
++		pte_t old, new;
++		unsigned int shift;
++
++		ptep = find_kvm_secondary_pte_unlocked(kvm, gfn * PAGE_SIZE, &shift);
++		if (!ptep)
++			goto next;
++
++		VM_WARN_ON_ONCE(!page_count(virt_to_page(ptep)));
++
++		old = READ_ONCE(*ptep);
++		if (!pte_present(old) || !pte_young(old))
++			goto next;
++
++		new = pte_mkold(old);
++
++		/* see the comments on the generic kvm_arch_has_test_clear_young() */
++		if (__test_and_change_bit(lsb_gfn - gfn, bitmap))
++			pte_xchg(ptep, old, new);
++next:
++		gfn += shift ? BIT(shift - PAGE_SHIFT) : 1;
++	}
++unlock:
++	rcu_read_unlock();
++
++	return success;
++}
++
+ /* Returns the number of PAGE_SIZE pages that are dirty */
+ static int kvm_radix_test_clear_dirty(struct kvm *kvm,
+ 				struct kvm_memory_slot *memslot, int pagenum)
+@@ -1464,13 +1536,15 @@ int kvmppc_radix_init(void)
+ {
+ 	unsigned long size = sizeof(void *) << RADIX_PTE_INDEX_SIZE;
+ 
+-	kvm_pte_cache = kmem_cache_create("kvm-pte", size, size, 0, pte_ctor);
++	kvm_pte_cache = kmem_cache_create("kvm-pte", size, size,
++					  SLAB_TYPESAFE_BY_RCU, pte_ctor);
+ 	if (!kvm_pte_cache)
+ 		return -ENOMEM;
+ 
+ 	size = sizeof(void *) << RADIX_PMD_INDEX_SIZE;
+ 
+-	kvm_pmd_cache = kmem_cache_create("kvm-pmd", size, size, 0, pmd_ctor);
++	kvm_pmd_cache = kmem_cache_create("kvm-pmd", size, size,
++					  SLAB_TYPESAFE_BY_RCU, pmd_ctor);
+ 	if (!kvm_pmd_cache) {
+ 		kmem_cache_destroy(kvm_pte_cache);
+ 		return -ENOMEM;
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 6ba68dd6190b..17b415661282 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -5242,6 +5242,8 @@ int kvmppc_switch_mmu_to_hpt(struct kvm *kvm)
+ 	spin_lock(&kvm->mmu_lock);
+ 	kvm->arch.radix = 0;
+ 	spin_unlock(&kvm->mmu_lock);
++	/* see the comments in kvmhv_test_clear_young() */
++	synchronize_rcu();
+ 	kvmppc_free_radix(kvm);
+ 
+ 	lpcr = LPCR_VPM1;
+@@ -5266,6 +5268,8 @@ int kvmppc_switch_mmu_to_radix(struct kvm *kvm)
+ 	if (err)
+ 		return err;
+ 	kvmppc_rmap_reset(kvm);
++	/* see the comments in kvmhv_test_clear_young() */
++	smp_wmb();
+ 	/* Mutual exclusion with kvm_unmap_gfn_range etc. */
+ 	spin_lock(&kvm->mmu_lock);
+ 	kvm->arch.radix = 1;
+@@ -6165,6 +6169,7 @@ static struct kvmppc_ops kvm_ops_hv = {
+ 	.unmap_gfn_range = kvm_unmap_gfn_range_hv,
+ 	.age_gfn = kvm_age_gfn_hv,
+ 	.test_age_gfn = kvm_test_age_gfn_hv,
++	.test_clear_young = kvmhv_test_clear_young,
+ 	.set_spte_gfn = kvm_set_spte_gfn_hv,
+ 	.free_memslot = kvmppc_core_free_memslot_hv,
+ 	.init_vm =  kvmppc_core_init_vm_hv,
+@@ -6225,11 +6230,6 @@ static int kvm_init_subcore_bitmap(void)
+ 	return 0;
+ }
+ 
+-static int kvmppc_radix_possible(void)
+-{
+-	return cpu_has_feature(CPU_FTR_ARCH_300) && radix_enabled();
+-}
+-
+ static int kvmppc_book3s_init_hv(void)
+ {
+ 	int r;
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 24480b4f1c57..a076e337b3db 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1367,6 +1367,12 @@ struct kvm_arch {
+ 	 *	the MMU lock in read mode + the tdp_mmu_pages_lock or
+ 	 *	the MMU lock in write mode
+ 	 *
++	 * kvm_arch_test_clear_young() is a special case. It relies on two
++	 * techniques, RCU and cmpxchg, to safely test and clear the accessed
++	 * bit without taking the MMU lock. The former protects KVM page tables
++	 * from being freed while the latter clears the accessed bit atomically
++	 * against both the hardware and other software page table walkers.
++	 *
+ 	 * Roots will remain in the list until their tdp_mmu_root_count
+ 	 * drops to zero, at which point the thread that decremented the
+ 	 * count to zero should removed the root from the list and clean
+@@ -2174,4 +2180,25 @@ int memslot_rmap_alloc(struct kvm_memory_slot *slot, unsigned long npages);
+ 	 KVM_X86_QUIRK_FIX_HYPERCALL_INSN |	\
+ 	 KVM_X86_QUIRK_MWAIT_NEVER_UD_FAULTS)
+ 
++extern u64 __read_mostly shadow_accessed_mask;
++
++/*
++ * Returns true if A/D bits are supported in hardware and are enabled by KVM.
++ * When enabled, KVM uses A/D bits for all non-nested MMUs.  Because L1 can
++ * disable A/D bits in EPTP12, SP and SPTE variants are needed to handle the
++ * scenario where KVM is using A/D bits for L1, but not L2.
++ */
++static inline bool kvm_ad_enabled(void)
++{
++	return shadow_accessed_mask;
++}
++
++/* see the comments on the generic kvm_arch_has_test_clear_young() */
++#define kvm_arch_has_test_clear_young kvm_arch_has_test_clear_young
++static inline bool kvm_arch_has_test_clear_young(void)
++{
++	return IS_ENABLED(CONFIG_KVM) && IS_ENABLED(CONFIG_X86_64) &&
++	       (!IS_REACHABLE(CONFIG_KVM) || (kvm_ad_enabled() && tdp_enabled));
++}
++
+ #endif /* _ASM_X86_KVM_HOST_H */
+diff --git a/arch/x86/kvm/mmu/spte.h b/arch/x86/kvm/mmu/spte.h
+index 6f54dc9409c9..0dc7fed1f3fd 100644
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@ -153,7 +153,6 @@ extern u64 __read_mostly shadow_mmu_writable_mask;
+ extern u64 __read_mostly shadow_nx_mask;
+ extern u64 __read_mostly shadow_x_mask; /* mutual exclusive with nx_mask */
+ extern u64 __read_mostly shadow_user_mask;
+-extern u64 __read_mostly shadow_accessed_mask;
+ extern u64 __read_mostly shadow_dirty_mask;
+ extern u64 __read_mostly shadow_mmio_value;
+ extern u64 __read_mostly shadow_mmio_mask;
+@@ -247,17 +246,6 @@ static inline bool is_shadow_present_pte(u64 pte)
+ 	return !!(pte & SPTE_MMU_PRESENT_MASK);
+ }
+ 
+-/*
+- * Returns true if A/D bits are supported in hardware and are enabled by KVM.
+- * When enabled, KVM uses A/D bits for all non-nested MMUs.  Because L1 can
+- * disable A/D bits in EPTP12, SP and SPTE variants are needed to handle the
+- * scenario where KVM is using A/D bits for L1, but not L2.
+- */
+-static inline bool kvm_ad_enabled(void)
+-{
+-	return !!shadow_accessed_mask;
+-}
+-
+ static inline bool sp_ad_disabled(struct kvm_mmu_page *sp)
+ {
+ 	return sp->role.ad_disabled;
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index d6df38d371a0..9028e09f1aab 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1309,6 +1309,47 @@ bool kvm_tdp_mmu_age_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
+ 	return kvm_tdp_mmu_handle_gfn(kvm, range, age_gfn_range);
+ }
+ 
++bool kvm_arch_test_clear_young(struct kvm *kvm, struct kvm_gfn_range *range,
++			       gfn_t lsb_gfn, unsigned long *bitmap)
++{
++	struct kvm_mmu_page *root;
++
++	if (WARN_ON_ONCE(!kvm_arch_has_test_clear_young()))
++		return false;
++
++	if (kvm_memslots_have_rmaps(kvm))
++		return false;
++
++	/* see the comments on kvm_arch->tdp_mmu_roots */
++	rcu_read_lock();
++
++	list_for_each_entry_rcu(root, &kvm->arch.tdp_mmu_roots, link) {
++		struct tdp_iter iter;
++
++		if (kvm_mmu_page_as_id(root) != range->slot->as_id)
++			continue;
++
++		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end) {
++			u64 *sptep = rcu_dereference(iter.sptep);
++			u64 new_spte = iter.old_spte & ~shadow_accessed_mask;
++
++			VM_WARN_ON_ONCE(!page_count(virt_to_page(sptep)));
++			VM_WARN_ON_ONCE(iter.gfn < range->start || iter.gfn >= range->end);
++
++			if (new_spte == iter.old_spte)
++				continue;
++
++			/* see the comments on the generic kvm_arch_has_test_clear_young() */
++			if (__test_and_change_bit(lsb_gfn - iter.gfn, bitmap))
++				cmpxchg64(sptep, iter.old_spte, new_spte);
++		}
++	}
++
++	rcu_read_unlock();
++
++	return true;
++}
++
+ static bool test_age_gfn(struct kvm *kvm, struct tdp_iter *iter,
+ 			 struct kvm_gfn_range *range)
+ {
 diff --git a/include/linux/fs.h b/include/linux/fs.h
 index c1769a2c5d70..d353c262d669 100644
 --- a/include/linux/fs.h
@@ -204,8 +874,46 @@ index c1769a2c5d70..d353c262d669 100644
  /* File was opened by fanotify and shouldn't generate fanotify events */
  #define FMODE_NONOTIFY		((__force fmode_t)0x4000000)
  
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 4f26b244f6d0..df46fc815c8b 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -2281,4 +2281,33 @@ static inline void kvm_account_pgtable_pages(void *virt, int nr)
+ /* Max number of entries allowed for each kvm dirty ring */
+ #define  KVM_DIRTY_RING_MAX_ENTRIES  65536
+ 
++/*
++ * Architectures that implement kvm_arch_test_clear_young() should override
++ * kvm_arch_has_test_clear_young().
++ *
++ * kvm_arch_has_test_clear_young() is allowed to return false positive. It can
++ * return true if kvm_arch_test_clear_young() is supported but disabled due to
++ * some runtime constraint. In this case, kvm_arch_test_clear_young() should
++ * return false.
++ *
++ * The last parameter to kvm_arch_test_clear_young() is a bitmap with the
++ * following specifications:
++ * 1. The offset of each bit is relative to the second to the last parameter
++ *    lsb_gfn. E.g., the offset corresponding to gfn is lsb_gfn-gfn. This is to
++ *    better suit batching while forward looping.
++ * 2. For each KVM PTE with the accessed bit set, the implementation should flip
++ *    the corresponding bit in the bitmap. It should only clear the accessed bit
++ *    if the old value is 1. This allows the caller to test or test and clear
++ *    the accessed bit.
++ */
++#ifndef kvm_arch_has_test_clear_young
++static inline bool kvm_arch_has_test_clear_young(void)
++{
++	return false;
++}
++#endif
++
++bool kvm_arch_test_clear_young(struct kvm *kvm, struct kvm_gfn_range *range,
++			       gfn_t lsb_gfn, unsigned long *bitmap);
++
+ #endif
 diff --git a/include/linux/maple_tree.h b/include/linux/maple_tree.h
-index e594db58a0f1..815a27661517 100644
+index e594db58a0f1..a7bf58fd7cc6 100644
 --- a/include/linux/maple_tree.h
 +++ b/include/linux/maple_tree.h
 @@ -12,7 +12,6 @@
@@ -216,6 +924,15 @@ index e594db58a0f1..815a27661517 100644
  
  /*
   * Allocated nodes are mutable until they have been inserted into the tree,
+@@ -456,7 +455,7 @@ int mas_store_gfp(struct ma_state *mas, void *entry, gfp_t gfp);
+ void mas_store_prealloc(struct ma_state *mas, void *entry);
+ void *mas_find(struct ma_state *mas, unsigned long max);
+ void *mas_find_rev(struct ma_state *mas, unsigned long min);
+-int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp);
++int mas_preallocate(struct ma_state *mas, gfp_t gfp);
+ bool mas_is_err(struct ma_state *mas);
+ 
+ bool mas_nomem(struct ma_state *mas, gfp_t gfp);
 @@ -483,9 +482,6 @@ static inline bool mas_is_paused(struct ma_state *mas)
  	return mas->node == MAS_PAUSE;
  }
@@ -320,8 +1037,80 @@ index ff3f3f23f649..de1e622dd366 100644
 +}
 +
  #endif
+diff --git a/include/linux/mmu_notifier.h b/include/linux/mmu_notifier.h
+index d6c06e140277..521f71ad0467 100644
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@ -122,6 +122,11 @@ struct mmu_notifier_ops {
+ 			  struct mm_struct *mm,
+ 			  unsigned long address);
+ 
++	/* see the comments on mmu_notifier_test_clear_young() */
++	bool (*test_clear_young)(struct mmu_notifier *mn, struct mm_struct *mm,
++				 unsigned long start, unsigned long end,
++				 unsigned long *bitmap);
++
+ 	/*
+ 	 * change_pte is called in cases that pte mapping to page is changed:
+ 	 * for example, when ksm remaps pte to point to a new shared page.
+@@ -391,6 +396,9 @@ extern int __mmu_notifier_clear_flush_young(struct mm_struct *mm,
+ extern int __mmu_notifier_clear_young(struct mm_struct *mm,
+ 				      unsigned long start,
+ 				      unsigned long end);
++extern int __mmu_notifier_test_clear_young(struct mm_struct *mm,
++					   unsigned long start, unsigned long end,
++					   bool fallback, unsigned long *bitmap);
+ extern int __mmu_notifier_test_young(struct mm_struct *mm,
+ 				     unsigned long address);
+ extern void __mmu_notifier_change_pte(struct mm_struct *mm,
+@@ -433,6 +441,31 @@ static inline int mmu_notifier_clear_young(struct mm_struct *mm,
+ 	return 0;
+ }
+ 
++/*
++ * This function always returns 0 if fallback is not allowed. If fallback
++ * happens, its return value is similar to that of mmu_notifier_clear_young().
++ *
++ * The bitmap has the following specifications:
++ * 1. The number of bits should be at least (end-start)/PAGE_SIZE.
++ * 2. The offset of each bit is relative to the end. E.g., the offset
++ *    corresponding to addr is (end-addr)/PAGE_SIZE-1. This is to better suit
++ *    batching while forward looping.
++ * 3. For each KVM PTE with the accessed bit set (young), this function flips
++ *    the corresponding bit in the bitmap. It only clears the accessed bit if
++ *    the old value is 1. A caller can test or test and clear the accessed bit
++ *    by setting the corresponding bit in the bitmap to 0 or 1, and the new
++ *    value will be 1 or 0 for a young KVM PTE.
++ */
++static inline int mmu_notifier_test_clear_young(struct mm_struct *mm,
++						unsigned long start, unsigned long end,
++						bool fallback, unsigned long *bitmap)
++{
++	if (mm_has_notifiers(mm))
++		return __mmu_notifier_test_clear_young(mm, start, end, fallback, bitmap);
++
++	return 0;
++}
++
+ static inline int mmu_notifier_test_young(struct mm_struct *mm,
+ 					  unsigned long address)
+ {
+@@ -687,6 +720,13 @@ static inline int mmu_notifier_clear_flush_young(struct mm_struct *mm,
+ 	return 0;
+ }
+ 
++static inline int mmu_notifier_test_clear_young(struct mm_struct *mm,
++						unsigned long start, unsigned long end,
++						bool fallback, unsigned long *bitmap)
++{
++	return 0;
++}
++
+ static inline int mmu_notifier_test_young(struct mm_struct *mm,
+ 					  unsigned long address)
+ {
 diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
-index cd28a100d9e4..70bd7f55bdd2 100644
+index cd28a100d9e4..0ddbf712708d 100644
 --- a/include/linux/mmzone.h
 +++ b/include/linux/mmzone.h
 @@ -7,6 +7,7 @@
@@ -352,7 +1141,15 @@ index cd28a100d9e4..70bd7f55bdd2 100644
   * considered active is isolated for non-reclaiming purposes, e.g., migration.
   * See lru_gen_add_folio() and lru_gen_del_folio().
   *
-@@ -404,7 +405,7 @@ enum {
+@@ -378,6 +379,7 @@ enum {
+ 	LRU_GEN_CORE,
+ 	LRU_GEN_MM_WALK,
+ 	LRU_GEN_NONLEAF_YOUNG,
++	LRU_GEN_SPTE_WALK,
+ 	NR_LRU_GEN_CAPS
+ };
+ 
+@@ -404,7 +406,7 @@ enum {
   * The number of pages in each generation is eventually consistent and therefore
   * can be transiently negative when reset_batch_size() is pending.
   */
@@ -361,7 +1158,7 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  	/* the aging increments the youngest generation number */
  	unsigned long max_seq;
  	/* the eviction increments the oldest generation numbers */
-@@ -412,7 +413,7 @@ struct lru_gen_struct {
+@@ -412,7 +414,7 @@ struct lru_gen_struct {
  	/* the birth time of each generation in jiffies */
  	unsigned long timestamps[MAX_NR_GENS];
  	/* the multi-gen LRU lists, lazily sorted on eviction */
@@ -370,7 +1167,7 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  	/* the multi-gen LRU sizes, eventually consistent */
  	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
  	/* the exponential moving average of refaulted */
-@@ -426,6 +427,14 @@ struct lru_gen_struct {
+@@ -426,6 +428,14 @@ struct lru_gen_struct {
  	atomic_long_t refaulted[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
  	/* whether the multi-gen LRU is enabled */
  	bool enabled;
@@ -385,7 +1182,7 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  };
  
  enum {
-@@ -461,7 +470,7 @@ struct lru_gen_mm_state {
+@@ -461,7 +471,7 @@ struct lru_gen_mm_state {
  struct lru_gen_mm_walk {
  	/* the lruvec under reclaim */
  	struct lruvec *lruvec;
@@ -394,8 +1191,12 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  	unsigned long max_seq;
  	/* the next address within an mm to scan */
  	unsigned long next_addr;
-@@ -479,12 +488,87 @@ void lru_gen_init_lruvec(struct lruvec *lruvec);
- void lru_gen_look_around(struct page_vma_mapped_walk *pvmw);
+@@ -476,24 +486,101 @@ struct lru_gen_mm_walk {
+ };
+ 
+ void lru_gen_init_lruvec(struct lruvec *lruvec);
+-void lru_gen_look_around(struct page_vma_mapped_walk *pvmw);
++bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw);
  
  #ifdef CONFIG_MEMCG
 +
@@ -483,7 +1284,11 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  static inline void lru_gen_init_lruvec(struct lruvec *lruvec)
  {
  }
-@@ -494,6 +578,7 @@ static inline void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
+ 
+-static inline void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
++static inline bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
+ {
++	return false;
  }
  
  #ifdef CONFIG_MEMCG
@@ -491,7 +1296,7 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  static inline void lru_gen_init_memcg(struct mem_cgroup *memcg)
  {
  }
-@@ -501,7 +586,24 @@ static inline void lru_gen_init_memcg(struct mem_cgroup *memcg)
+@@ -501,7 +588,24 @@ static inline void lru_gen_init_memcg(struct mem_cgroup *memcg)
  static inline void lru_gen_exit_memcg(struct mem_cgroup *memcg)
  {
  }
@@ -517,7 +1322,7 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  
  #endif /* CONFIG_LRU_GEN */
  
-@@ -524,7 +626,7 @@ struct lruvec {
+@@ -524,7 +628,7 @@ struct lruvec {
  	unsigned long			flags;
  #ifdef CONFIG_LRU_GEN
  	/* evictable pages divided into generations */
@@ -526,7 +1331,7 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  	/* to concurrently iterate lru_gen_mm_list */
  	struct lru_gen_mm_state		mm_state;
  #endif
-@@ -1242,7 +1344,9 @@ typedef struct pglist_data {
+@@ -1242,7 +1346,9 @@ typedef struct pglist_data {
  
  #ifdef CONFIG_LRU_GEN
  	/* kswap mm walk data */
@@ -538,10 +1343,10 @@ index cd28a100d9e4..70bd7f55bdd2 100644
  
  	CACHELINE_PADDING(_pad2_);
 diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index a63594bef72e..bf025e800216 100644
+index fb452873914f..c167efc70e60 100644
 --- a/lib/maple_tree.c
 +++ b/lib/maple_tree.c
-@@ -146,16 +146,22 @@ struct maple_subtree_state {
+@@ -146,6 +146,13 @@ struct maple_subtree_state {
  	struct maple_big_node *bn;
  };
  
@@ -555,19 +1360,7 @@ index a63594bef72e..bf025e800216 100644
  /* Functions */
  static inline struct maple_node *mt_alloc_one(gfp_t gfp)
  {
--	return kmem_cache_alloc(maple_node_cache, gfp | __GFP_ZERO);
-+	return kmem_cache_alloc(maple_node_cache, gfp);
- }
- 
- static inline int mt_alloc_bulk(gfp_t gfp, size_t size, void **nodes)
- {
--	return kmem_cache_alloc_bulk(maple_node_cache, gfp | __GFP_ZERO, size,
--				     nodes);
-+	return kmem_cache_alloc_bulk(maple_node_cache, gfp, size, nodes);
- }
- 
- static inline void mt_free_bulk(size_t size, void __rcu **nodes)
-@@ -183,7 +189,6 @@ static void ma_free_rcu(struct maple_node *node)
+@@ -182,7 +189,6 @@ static void ma_free_rcu(struct maple_node *node)
  	call_rcu(&node->rcu, mt_free_rcu);
  }
  
@@ -575,7 +1368,7 @@ index a63594bef72e..bf025e800216 100644
  static void mas_set_height(struct ma_state *mas)
  {
  	unsigned int new_flags = mas->tree->ma_flags;
-@@ -468,7 +473,7 @@ static inline
+@@ -467,7 +473,7 @@ static inline
  void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
  		    unsigned char slot)
  {
@@ -584,7 +1377,7 @@ index a63594bef72e..bf025e800216 100644
  	unsigned long shift;
  	unsigned long type;
  	enum maple_type p_type = mte_node_type(parent);
-@@ -502,10 +507,9 @@ void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
+@@ -501,10 +507,9 @@ void mte_set_parent(struct maple_enode *enode, const struct maple_enode *parent,
   */
  static inline unsigned int mte_parent_slot(const struct maple_enode *enode)
  {
@@ -597,157 +1390,50 @@ index a63594bef72e..bf025e800216 100644
  		return 0;
  
  	/*
-@@ -1128,9 +1132,10 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
- {
- 	struct maple_alloc *ret, *node = mas->alloc;
- 	unsigned long total = mas_allocated(mas);
-+	unsigned int req = mas_alloc_req(mas);
- 
- 	/* nothing or a request pending. */
--	if (unlikely(!total))
-+	if (WARN_ON(!total))
- 		return NULL;
- 
- 	if (total == 1) {
-@@ -1140,27 +1145,25 @@ static inline struct maple_node *mas_pop_node(struct ma_state *mas)
- 		goto single_node;
- 	}
- 
--	if (!node->node_count) {
-+	if (node->node_count == 1) {
- 		/* Single allocation in this node. */
- 		mas->alloc = node->slot[0];
--		node->slot[0] = NULL;
- 		mas->alloc->total = node->total - 1;
- 		ret = node;
- 		goto new_head;
- 	}
--
- 	node->total--;
--	ret = node->slot[node->node_count];
--	node->slot[node->node_count--] = NULL;
-+	ret = node->slot[--node->node_count];
-+	node->slot[node->node_count] = NULL;
- 
- single_node:
- new_head:
--	ret->total = 0;
--	ret->node_count = 0;
--	if (ret->request_count) {
--		mas_set_alloc_req(mas, ret->request_count + 1);
--		ret->request_count = 0;
-+	if (req) {
-+		req++;
-+		mas_set_alloc_req(mas, req);
- 	}
-+
-+	memset(ret, 0, sizeof(*ret));
- 	return (struct maple_node *)ret;
- }
- 
-@@ -1179,21 +1182,20 @@ static inline void mas_push_node(struct ma_state *mas, struct maple_node *used)
- 	unsigned long count;
- 	unsigned int requested = mas_alloc_req(mas);
- 
--	memset(reuse, 0, sizeof(*reuse));
- 	count = mas_allocated(mas);
- 
--	if (count && (head->node_count < MAPLE_ALLOC_SLOTS - 1)) {
--		if (head->slot[0])
--			head->node_count++;
--		head->slot[head->node_count] = reuse;
-+	reuse->request_count = 0;
-+	reuse->node_count = 0;
-+	if (count && (head->node_count < MAPLE_ALLOC_SLOTS)) {
-+		head->slot[head->node_count++] = reuse;
- 		head->total++;
- 		goto done;
- 	}
- 
- 	reuse->total = 1;
- 	if ((head) && !((unsigned long)head & 0x1)) {
--		head->request_count = 0;
- 		reuse->slot[0] = head;
-+		reuse->node_count = 1;
- 		reuse->total += head->total;
- 	}
- 
-@@ -1212,7 +1214,6 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
- {
- 	struct maple_alloc *node;
- 	unsigned long allocated = mas_allocated(mas);
--	unsigned long success = allocated;
- 	unsigned int requested = mas_alloc_req(mas);
- 	unsigned int count;
- 	void **slots = NULL;
-@@ -1228,24 +1229,29 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
- 		WARN_ON(!allocated);
- 	}
- 
--	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS - 1) {
-+	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS) {
- 		node = (struct maple_alloc *)mt_alloc_one(gfp);
- 		if (!node)
- 			goto nomem_one;
- 
--		if (allocated)
-+		if (allocated) {
- 			node->slot[0] = mas->alloc;
-+			node->node_count = 1;
-+		} else {
-+			node->node_count = 0;
-+		}
- 
--		success++;
- 		mas->alloc = node;
-+		node->total = ++allocated;
- 		requested--;
- 	}
- 
+@@ -1298,26 +1303,21 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
  	node = mas->alloc;
-+	node->request_count = 0;
+ 	node->request_count = 0;
  	while (requested) {
- 		max_req = MAPLE_ALLOC_SLOTS;
--		if (node->slot[0]) {
--			unsigned int offset = node->node_count + 1;
-+		if (node->node_count) {
-+			unsigned int offset = node->node_count;
- 
- 			slots = (void **)&node->slot[offset];
- 			max_req -= offset;
-@@ -1259,15 +1265,13 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+-		max_req = MAPLE_ALLOC_SLOTS;
+-		if (node->node_count) {
+-			unsigned int offset = node->node_count;
+-
+-			slots = (void **)&node->slot[offset];
+-			max_req -= offset;
+-		} else {
+-			slots = (void **)&node->slot;
+-		}
+-
++		max_req = MAPLE_ALLOC_SLOTS - node->node_count;
++		slots = (void **)&node->slot[node->node_count];
+ 		max_req = min(requested, max_req);
+ 		count = mt_alloc_bulk(gfp, max_req, slots);
+ 		if (!count)
  			goto nomem_bulk;
  
++		if (node->node_count == 0) {
++			node->slot[0]->node_count = 0;
++			node->slot[0]->request_count = 0;
++		}
++
  		node->node_count += count;
--		/* zero indexed. */
--		if (slots == (void **)&node->slot)
--			node->node_count--;
--
--		success += count;
-+		allocated += count;
+ 		allocated += count;
  		node = node->slot[0];
-+		node->node_count = 0;
-+		node->request_count = 0;
+-		node->node_count = 0;
+-		node->request_count = 0;
  		requested -= count;
  	}
--	mas->alloc->total = success;
-+	mas->alloc->total = allocated;
- 	return;
- 
- nomem_bulk:
-@@ -1276,10 +1280,8 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
- nomem_one:
- 	mas_set_alloc_req(mas, requested);
+ 	mas->alloc->total = allocated;
+@@ -1331,8 +1331,6 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
  	if (mas->alloc && !(((unsigned long)mas->alloc & 0x1)))
--		mas->alloc->total = success;
-+		mas->alloc->total = allocated;
+ 		mas->alloc->total = allocated;
  	mas_set_err(mas, -ENOMEM);
 -	return;
 -
  }
  
  /*
-@@ -1887,10 +1889,9 @@ static inline int mab_calc_split(struct ma_state *mas,
+@@ -1950,10 +1948,9 @@ static inline int mab_calc_split(struct ma_state *mas,
  
  	/* Avoid ending a node on a NULL entry */
  	split = mab_no_null_split(bn, split, slot_count);
@@ -760,7 +1446,7 @@ index a63594bef72e..bf025e800216 100644
  
  	return split;
  }
-@@ -2113,7 +2114,7 @@ static inline void mas_bulk_rebalance(struct ma_state *mas, unsigned char end,
+@@ -2176,7 +2173,7 @@ static inline void mas_bulk_rebalance(struct ma_state *mas, unsigned char end,
   *
   * Return: The actual end of the data stored in @b_node
   */
@@ -769,7 +1455,7 @@ index a63594bef72e..bf025e800216 100644
  		struct maple_big_node *b_node, unsigned char offset_end)
  {
  	unsigned char slot;
-@@ -2250,9 +2251,7 @@ static inline struct maple_enode *mte_node_or_none(struct maple_enode *enode)
+@@ -2313,9 +2310,7 @@ static inline struct maple_enode *mte_node_or_none(struct maple_enode *enode)
  static inline void mas_wr_node_walk(struct ma_wr_state *wr_mas)
  {
  	struct ma_state *mas = wr_mas->mas;
@@ -780,7 +1466,7 @@ index a63594bef72e..bf025e800216 100644
  
  	if (unlikely(ma_is_dense(wr_mas->type))) {
  		wr_mas->r_max = wr_mas->r_min = mas->index;
-@@ -2265,34 +2264,12 @@ static inline void mas_wr_node_walk(struct ma_wr_state *wr_mas)
+@@ -2328,34 +2323,12 @@ static inline void mas_wr_node_walk(struct ma_wr_state *wr_mas)
  	count = wr_mas->node_end = ma_data_end(wr_mas->node, wr_mas->type,
  					       wr_mas->pivots, mas->max);
  	offset = mas->offset;
@@ -795,9 +1481,7 @@ index a63594bef72e..bf025e800216 100644
 -
 -	if (unlikely(!max && offset))
 -		goto max;
-+	while (offset < count && mas->index > wr_mas->pivots[offset])
-+		offset++;
- 
+-
 -	min = max + 1;
 -	while (++offset < count) {
 -		max = wr_mas->pivots[offset];
@@ -805,7 +1489,9 @@ index a63594bef72e..bf025e800216 100644
 -			goto done;
 -		else if (unlikely(!max))
 -			break;
--
++	while (offset < count && mas->index > wr_mas->pivots[offset])
++		offset++;
+ 
 -		min = max + 1;
 -	}
 -
@@ -819,7 +1505,7 @@ index a63594bef72e..bf025e800216 100644
  	wr_mas->offset_end = mas->offset = offset;
  }
  
-@@ -2947,7 +2924,7 @@ static inline void *mtree_range_walk(struct ma_state *mas)
+@@ -3010,7 +2983,7 @@ static inline void *mtree_range_walk(struct ma_state *mas)
  	mas->min = prev_min;
  	mas->max = prev_max;
  	mas->node = last;
@@ -828,7 +1514,16 @@ index a63594bef72e..bf025e800216 100644
  
  dead_node:
  	mas_reset(mas);
-@@ -3467,7 +3444,6 @@ static inline bool mas_push_data(struct ma_state *mas, int height,
+@@ -3283,7 +3256,7 @@ static inline void mas_destroy_rebalance(struct ma_state *mas, unsigned char end
+ 
+ 		if (tmp < max_p)
+ 			memset(pivs + tmp, 0,
+-			       sizeof(unsigned long *) * (max_p - tmp));
++			       sizeof(unsigned long) * (max_p - tmp));
+ 
+ 		if (tmp < mt_slots[mt])
+ 			memset(slots + tmp, 0, sizeof(void *) * (max_s - tmp));
+@@ -3530,7 +3503,6 @@ static inline bool mas_push_data(struct ma_state *mas, int height,
   */
  static int mas_split(struct ma_state *mas, struct maple_big_node *b_node)
  {
@@ -836,7 +1531,7 @@ index a63594bef72e..bf025e800216 100644
  	struct maple_subtree_state mast;
  	int height = 0;
  	unsigned char mid_split, split = 0;
-@@ -3586,7 +3562,7 @@ static inline bool mas_reuse_node(struct ma_wr_state *wr_mas,
+@@ -3649,7 +3621,7 @@ static inline bool mas_reuse_node(struct ma_wr_state *wr_mas,
   * @b_node: The maple big node
   * @end: The end of the data.
   */
@@ -845,42 +1540,7 @@ index a63594bef72e..bf025e800216 100644
  			    struct maple_big_node *b_node, unsigned char end)
  {
  	struct maple_node *node;
-@@ -3659,10 +3635,9 @@ static inline int mas_root_expand(struct ma_state *mas, void *entry)
- 		slot++;
- 	mas->depth = 1;
- 	mas_set_height(mas);
--
-+	ma_set_meta(node, maple_leaf_64, 0, slot);
- 	/* swap the new root into the tree */
- 	rcu_assign_pointer(mas->tree->ma_root, mte_mk_root(mas->node));
--	ma_set_meta(node, maple_leaf_64, 0, slot);
- 	return slot;
- }
- 
-@@ -3875,25 +3850,20 @@ static inline void *mtree_lookup_walk(struct ma_state *mas)
- 		end = ma_data_end(node, type, pivots, max);
- 		if (unlikely(ma_dead_node(node)))
- 			goto dead_node;
--
--		if (pivots[offset] >= mas->index)
--			goto next;
--
- 		do {
--			offset++;
--		} while ((offset < end) && (pivots[offset] < mas->index));
--
--		if (likely(offset > end))
--			max = pivots[offset];
-+			if (pivots[offset] >= mas->index) {
-+				max = pivots[offset];
-+				break;
-+			}
-+		} while (++offset < end);
- 
--next:
- 		slots = ma_slots(node, type);
- 		next = mt_slot(mas->tree, slots, offset);
- 		if (unlikely(ma_dead_node(node)))
+@@ -3950,7 +3922,7 @@ static inline void *mtree_lookup_walk(struct ma_state *mas)
  			goto dead_node;
  	} while (!ma_is_leaf(type));
  
@@ -889,7 +1549,7 @@ index a63594bef72e..bf025e800216 100644
  
  dead_node:
  	mas_reset(mas);
-@@ -4711,15 +4681,11 @@ static inline void *mas_next_nentry(struct ma_state *mas,
+@@ -4785,15 +4757,11 @@ static inline void *mas_next_nentry(struct ma_state *mas,
  
  static inline void mas_rewalk(struct ma_state *mas, unsigned long index)
  {
@@ -905,7 +1565,7 @@ index a63594bef72e..bf025e800216 100644
  }
  
  /*
-@@ -5576,8 +5542,8 @@ static void mt_destroy_walk(struct maple_enode *enode, unsigned char ma_flags,
+@@ -5675,8 +5643,8 @@ static void mt_destroy_walk(struct maple_enode *enode, struct maple_tree *mt,
  
  /*
   * mte_destroy_walk() - Free a tree or sub-tree.
@@ -916,7 +1576,7 @@ index a63594bef72e..bf025e800216 100644
   *
   * Must hold the write lock.
   */
-@@ -5606,7 +5572,6 @@ static void mas_wr_store_setup(struct ma_wr_state *wr_mas)
+@@ -5708,7 +5676,6 @@ static void mas_wr_store_setup(struct ma_wr_state *wr_mas)
  				mas_reset(wr_mas->mas);
  		}
  	}
@@ -924,7 +1584,21 @@ index a63594bef72e..bf025e800216 100644
  }
  
  /* Interface */
-@@ -5719,6 +5684,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
+@@ -5800,12 +5767,11 @@ EXPORT_SYMBOL_GPL(mas_store_prealloc);
+ /**
+  * mas_preallocate() - Preallocate enough nodes for a store operation
+  * @mas: The maple state
+- * @entry: The entry that will be stored
+  * @gfp: The GFP_FLAGS to use for allocations.
+  *
+  * Return: 0 on success, -ENOMEM if memory could not be allocated.
+  */
+-int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
++int mas_preallocate(struct ma_state *mas, gfp_t gfp)
+ {
+ 	int ret;
+ 
+@@ -5821,6 +5787,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
  	mas_reset(mas);
  	return ret;
  }
@@ -932,40 +1606,7 @@ index a63594bef72e..bf025e800216 100644
  
  /*
   * mas_destroy() - destroy a maple state.
-@@ -5731,6 +5697,7 @@ int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
- void mas_destroy(struct ma_state *mas)
- {
- 	struct maple_alloc *node;
-+	unsigned long total;
- 
- 	/*
- 	 * When using mas_for_each() to insert an expected number of elements,
-@@ -5753,14 +5720,20 @@ void mas_destroy(struct ma_state *mas)
- 	}
- 	mas->mas_flags &= ~(MA_STATE_BULK|MA_STATE_PREALLOC);
- 
--	while (mas->alloc && !((unsigned long)mas->alloc & 0x1)) {
-+	total = mas_allocated(mas);
-+	while (total) {
- 		node = mas->alloc;
- 		mas->alloc = node->slot[0];
--		if (node->node_count > 0)
--			mt_free_bulk(node->node_count,
--				     (void __rcu **)&node->slot[1]);
-+		if (node->node_count > 1) {
-+			size_t count = node->node_count - 1;
-+
-+			mt_free_bulk(count, (void __rcu **)&node->slot[1]);
-+			total -= count;
-+		}
- 		kmem_cache_free(maple_node_cache, node);
-+		total--;
- 	}
-+
- 	mas->alloc = NULL;
- }
- EXPORT_SYMBOL_GPL(mas_destroy);
-@@ -6720,7 +6693,7 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
+@@ -6833,7 +6800,7 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
  
  		if (i < (MAPLE_RANGE64_SLOTS - 1))
  			last = node->pivot[i];
@@ -974,7 +1615,7 @@ index a63594bef72e..bf025e800216 100644
  			break;
  		if (last == 0 && i > 0)
  			break;
-@@ -6827,7 +6800,7 @@ void mt_dump(const struct maple_tree *mt)
+@@ -6940,7 +6907,7 @@ void mt_dump(const struct maple_tree *mt)
  	if (!xa_is_node(entry))
  		mt_dump_entry(entry, 0, 0, 0);
  	else if (entry)
@@ -1058,7 +1699,7 @@ index 2eee092f8f11..802d3868d097 100644
  
  static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
 diff --git a/mm/memory.c b/mm/memory.c
-index f526b9152bef..4ad62eba3cb7 100644
+index 6a99e9dc07e6..8a26ee4dc4d4 100644
 --- a/mm/memory.c
 +++ b/mm/memory.c
 @@ -1392,8 +1392,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
@@ -1071,7 +1712,7 @@ index f526b9152bef..4ad62eba3cb7 100644
  					mark_page_accessed(page);
  			}
  			rss[mm_counter(page)]--;
-@@ -5140,8 +5139,8 @@ static inline void mm_account_fault(struct pt_regs *regs,
+@@ -5154,8 +5153,8 @@ static inline void mm_account_fault(struct pt_regs *regs,
  #ifdef CONFIG_LRU_GEN
  static void lru_gen_enter_fault(struct vm_area_struct *vma)
  {
@@ -1082,6 +1723,159 @@ index f526b9152bef..4ad62eba3cb7 100644
  }
  
  static void lru_gen_exit_fault(void)
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 1931da077b2f..c1a09b21a22a 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -472,7 +472,7 @@ static int vma_link(struct mm_struct *mm, struct vm_area_struct *vma)
+ 	MA_STATE(mas, &mm->mm_mt, 0, 0);
+ 	struct address_space *mapping = NULL;
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL))
++	if (mas_preallocate(&mas, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+ 	if (vma->vm_file) {
+@@ -538,7 +538,7 @@ inline int vma_expand(struct ma_state *mas, struct vm_area_struct *vma,
+ 	/* Only handles expanding */
+ 	VM_BUG_ON(vma->vm_start < start || vma->vm_end > end);
+ 
+-	if (mas_preallocate(mas, vma, GFP_KERNEL))
++	if (mas_preallocate(mas, GFP_KERNEL))
+ 		goto nomem;
+ 
+ 	vma_adjust_trans_huge(vma, start, end, 0);
+@@ -712,7 +712,7 @@ int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
+ 		}
+ 	}
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL))
++	if (mas_preallocate(&mas, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+ 	vma_adjust_trans_huge(orig_vma, start, end, adjust_next);
+@@ -1938,7 +1938,7 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
+ 		/* Check that both stack segments have the same anon_vma? */
+ 	}
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL))
++	if (mas_preallocate(&mas, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+ 	/* We must make sure the anon_vma is allocated. */
+@@ -2019,7 +2019,7 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
+ 			return -ENOMEM;
+ 	}
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL))
++	if (mas_preallocate(&mas, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+ 	/* We must make sure the anon_vma is allocated. */
+@@ -2311,7 +2311,7 @@ do_mas_align_munmap(struct ma_state *mas, struct vm_area_struct *vma,
+ 	mt_init_flags(&mt_detach, mas->tree->ma_flags & MT_FLAGS_LOCK_MASK);
+ 	mt_set_external_lock(&mt_detach, &mm->mmap_lock);
+ 
+-	if (mas_preallocate(mas, vma, GFP_KERNEL))
++	if (mas_preallocate(mas, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+ 	mas->last = end - 1;
+@@ -2680,7 +2680,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
+ 			goto free_vma;
+ 	}
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL)) {
++	if (mas_preallocate(&mas, GFP_KERNEL)) {
+ 		error = -ENOMEM;
+ 		if (file)
+ 			goto close_and_free_vma;
+@@ -2953,7 +2953,7 @@ static int do_brk_flags(struct ma_state *mas, struct vm_area_struct *vma,
+ 	    can_vma_merge_after(vma, flags, NULL, NULL,
+ 				addr >> PAGE_SHIFT, NULL_VM_UFFD_CTX, NULL)) {
+ 		mas_set_range(mas, vma->vm_start, addr + len - 1);
+-		if (mas_preallocate(mas, vma, GFP_KERNEL))
++		if (mas_preallocate(mas, GFP_KERNEL))
+ 			goto unacct_fail;
+ 
+ 		vma_adjust_trans_huge(vma, vma->vm_start, addr + len, 0);
+diff --git a/mm/mmu_notifier.c b/mm/mmu_notifier.c
+index f45ff1b7626a..324799848fed 100644
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@ -402,6 +402,32 @@ int __mmu_notifier_clear_young(struct mm_struct *mm,
+ 	return young;
+ }
+ 
++/* see the comments on mmu_notifier_test_clear_young() */
++int __mmu_notifier_test_clear_young(struct mm_struct *mm,
++				    unsigned long start, unsigned long end,
++				    bool fallback, unsigned long *bitmap)
++{
++	int key;
++	struct mmu_notifier *mn;
++	int young = 0;
++
++	key = srcu_read_lock(&srcu);
++
++	hlist_for_each_entry_srcu(mn, &mm->notifier_subscriptions->list,
++				  hlist, srcu_read_lock_held(&srcu)) {
++		if (mn->ops->test_clear_young &&
++		    mn->ops->test_clear_young(mn, mm, start, end, bitmap))
++			continue;
++
++		if (fallback && mn->ops->clear_young)
++			young |= mn->ops->clear_young(mn, mm, start, end);
++	}
++
++	srcu_read_unlock(&srcu, key);
++
++	return young;
++}
++
+ int __mmu_notifier_test_young(struct mm_struct *mm,
+ 			      unsigned long address)
+ {
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 5b83938ecb67..aaa0efdb3e0e 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -602,7 +602,7 @@ static int add_vma_to_mm(struct mm_struct *mm, struct vm_area_struct *vma)
+ {
+ 	MA_STATE(mas, &mm->mm_mt, vma->vm_start, vma->vm_end);
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL)) {
++	if (mas_preallocate(&mas, GFP_KERNEL)) {
+ 		pr_warn("Allocation of vma tree for process %d failed\n",
+ 		       current->pid);
+ 		return -ENOMEM;
+@@ -633,7 +633,7 @@ static int delete_vma_from_mm(struct vm_area_struct *vma)
+ {
+ 	MA_STATE(mas, &vma->vm_mm->mm_mt, 0, 0);
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL)) {
++	if (mas_preallocate(&mas, GFP_KERNEL)) {
+ 		pr_warn("Allocation of vma tree for process %d failed\n",
+ 		       current->pid);
+ 		return -ENOMEM;
+@@ -1081,7 +1081,7 @@ unsigned long do_mmap(struct file *file,
+ 	if (!vma)
+ 		goto error_getting_vma;
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL))
++	if (mas_preallocate(&mas, GFP_KERNEL))
+ 		goto error_maple_preallocate;
+ 
+ 	region->vm_usage = 1;
+@@ -1359,7 +1359,7 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
+ 	if (!new)
+ 		goto err_vma_dup;
+ 
+-	if (mas_preallocate(&mas, vma, GFP_KERNEL)) {
++	if (mas_preallocate(&mas, GFP_KERNEL)) {
+ 		pr_warn("Allocation of vma tree for process %d failed\n",
+ 			current->pid);
+ 		goto err_mas_preallocate;
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
 index 65d01266a95b..0ceb0de31247 100644
 --- a/mm/page_alloc.c
@@ -1095,20 +1889,23 @@ index 65d01266a95b..0ceb0de31247 100644
  
  static void __init free_area_init_memoryless_node(int nid)
 diff --git a/mm/rmap.c b/mm/rmap.c
-index 3b45d049069e..c8701608bb0d 100644
+index 3b45d049069e..8ecbbadab752 100644
 --- a/mm/rmap.c
 +++ b/mm/rmap.c
-@@ -823,25 +823,14 @@ static bool folio_referenced_one(struct folio *folio,
+@@ -822,26 +822,13 @@ static bool folio_referenced_one(struct folio *folio,
+ 			return false; /* To break the loop */
  		}
  
- 		if (pvmw.pte) {
+-		if (pvmw.pte) {
 -			if (lru_gen_enabled() && pte_young(*pvmw.pte) &&
 -			    !(vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ))) {
-+			if (lru_gen_enabled() && pte_young(*pvmw.pte)) {
- 				lru_gen_look_around(&pvmw);
+-				lru_gen_look_around(&pvmw);
++		if (lru_gen_enabled() && pvmw.pte) {
++			if (lru_gen_look_around(&pvmw))
  				referenced++;
- 			}
- 
+-			}
+-
++		} else if (pvmw.pte) {
  			if (ptep_clear_flush_young_notify(vma, address,
 -						pvmw.pte)) {
 -				/*
@@ -1127,7 +1924,7 @@ index 3b45d049069e..c8701608bb0d 100644
  		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
  			if (pmdp_clear_flush_young_notify(vma, address,
  						pvmw.pmd))
-@@ -875,7 +864,20 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
+@@ -875,7 +862,20 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
  	struct folio_referenced_arg *pra = arg;
  	struct mem_cgroup *memcg = pra->memcg;
  
@@ -1149,7 +1946,7 @@ index 3b45d049069e..c8701608bb0d 100644
  		return true;
  
  	return false;
-@@ -906,6 +908,7 @@ int folio_referenced(struct folio *folio, int is_locked,
+@@ -906,6 +906,7 @@ int folio_referenced(struct folio *folio, int is_locked,
  		.arg = (void *)&pra,
  		.anon_lock = folio_lock_anon_vma_read,
  		.try_lock = true,
@@ -1157,7 +1954,7 @@ index 3b45d049069e..c8701608bb0d 100644
  	};
  
  	*vm_flags = 0;
-@@ -921,15 +924,6 @@ int folio_referenced(struct folio *folio, int is_locked,
+@@ -921,15 +922,6 @@ int folio_referenced(struct folio *folio, int is_locked,
  			return 1;
  	}
  
@@ -1174,19 +1971,21 @@ index 3b45d049069e..c8701608bb0d 100644
  	*vm_flags = pra.vm_flags;
  
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 160acbbdf111..1a8f3b1c0bad 100644
+index 160acbbdf111..ec0142165ce7 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
-@@ -55,6 +55,8 @@
+@@ -55,6 +55,10 @@
  #include <linux/ctype.h>
  #include <linux/debugfs.h>
  #include <linux/khugepaged.h>
 +#include <linux/rculist_nulls.h>
 +#include <linux/random.h>
++#include <linux/mmu_notifier.h>
++#include <linux/kvm_host.h>
  
  #include <asm/tlbflush.h>
  #include <asm/div64.h>
-@@ -135,12 +137,6 @@ struct scan_control {
+@@ -135,12 +139,6 @@ struct scan_control {
  	/* Always discard instead of demoting to lower tier memory */
  	unsigned int no_demotion:1;
  
@@ -1199,7 +1998,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	/* Allocation order */
  	s8 order;
  
-@@ -453,6 +449,11 @@ static bool cgroup_reclaim(struct scan_control *sc)
+@@ -453,6 +451,11 @@ static bool cgroup_reclaim(struct scan_control *sc)
  	return sc->target_mem_cgroup;
  }
  
@@ -1211,7 +2010,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  /**
   * writeback_throttling_sane - is the usual dirty throttling mechanism available?
   * @sc: scan_control in question
-@@ -503,6 +504,11 @@ static bool cgroup_reclaim(struct scan_control *sc)
+@@ -503,6 +506,11 @@ static bool cgroup_reclaim(struct scan_control *sc)
  	return false;
  }
  
@@ -1223,7 +2022,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  static bool writeback_throttling_sane(struct scan_control *sc)
  {
  	return true;
-@@ -3184,6 +3190,9 @@ DEFINE_STATIC_KEY_ARRAY_FALSE(lru_gen_caps, NR_LRU_GEN_CAPS);
+@@ -3184,6 +3192,9 @@ DEFINE_STATIC_KEY_ARRAY_FALSE(lru_gen_caps, NR_LRU_GEN_CAPS);
  		for ((type) = 0; (type) < ANON_AND_FILE; (type)++)	\
  			for ((zone) = 0; (zone) < MAX_NR_ZONES; (zone)++)
  
@@ -1233,7 +2032,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  static struct lruvec *get_lruvec(struct mem_cgroup *memcg, int nid)
  {
  	struct pglist_data *pgdat = NODE_DATA(nid);
-@@ -3209,6 +3218,9 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
+@@ -3209,6 +3220,9 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
  	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
  
@@ -1243,7 +2042,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	if (!can_demote(pgdat->node_id, sc) &&
  	    mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)
  		return 0;
-@@ -3223,12 +3235,104 @@ static int get_nr_gens(struct lruvec *lruvec, int type)
+@@ -3223,12 +3237,104 @@ static int get_nr_gens(struct lruvec *lruvec, int type)
  
  static bool __maybe_unused seq_is_valid(struct lruvec *lruvec)
  {
@@ -1349,7 +2148,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  /******************************************************************************
   *                          mm_struct list
   ******************************************************************************/
-@@ -3348,94 +3452,6 @@ void lru_gen_migrate_mm(struct mm_struct *mm)
+@@ -3348,94 +3454,6 @@ void lru_gen_migrate_mm(struct mm_struct *mm)
  }
  #endif
  
@@ -1444,7 +2243,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  static void reset_mm_stats(struct lruvec *lruvec, struct lru_gen_mm_walk *walk, bool last)
  {
  	int i;
-@@ -3592,7 +3608,7 @@ static bool iterate_mm_list_nowalk(struct lruvec *lruvec, unsigned long max_seq)
+@@ -3592,7 +3610,7 @@ static bool iterate_mm_list_nowalk(struct lruvec *lruvec, unsigned long max_seq)
  }
  
  /******************************************************************************
@@ -1453,7 +2252,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
   ******************************************************************************/
  
  /*
-@@ -3623,7 +3639,7 @@ struct ctrl_pos {
+@@ -3623,7 +3641,7 @@ struct ctrl_pos {
  static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,
  			  struct ctrl_pos *pos)
  {
@@ -1462,7 +2261,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	int hist = lru_hist_from_seq(lrugen->min_seq[type]);
  
  	pos->refaulted = lrugen->avg_refaulted[type][tier] +
-@@ -3638,7 +3654,7 @@ static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,
+@@ -3638,7 +3656,7 @@ static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,
  static void reset_ctrl_pos(struct lruvec *lruvec, int type, bool carryover)
  {
  	int hist, tier;
@@ -1471,7 +2270,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	bool clear = carryover ? NR_HIST_GENS == 1 : NR_HIST_GENS > 1;
  	unsigned long seq = carryover ? lrugen->min_seq[type] : lrugen->max_seq + 1;
  
-@@ -3715,7 +3731,7 @@ static int folio_update_gen(struct folio *folio, int gen)
+@@ -3715,7 +3733,7 @@ static int folio_update_gen(struct folio *folio, int gen)
  static int folio_inc_gen(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
  {
  	int type = folio_is_file_lru(folio);
@@ -1480,7 +2279,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
  	unsigned long new_flags, old_flags = READ_ONCE(folio->flags);
  
-@@ -3760,7 +3776,7 @@ static void update_batch_size(struct lru_gen_mm_walk *walk, struct folio *folio,
+@@ -3760,7 +3778,7 @@ static void update_batch_size(struct lru_gen_mm_walk *walk, struct folio *folio,
  static void reset_batch_size(struct lruvec *lruvec, struct lru_gen_mm_walk *walk)
  {
  	int gen, type, zone;
@@ -1489,7 +2288,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	walk->batched = 0;
  
-@@ -3793,7 +3809,10 @@ static int should_skip_vma(unsigned long start, unsigned long end, struct mm_wal
+@@ -3793,7 +3811,10 @@ static int should_skip_vma(unsigned long start, unsigned long end, struct mm_wal
  	if (is_vm_hugetlb_page(vma))
  		return true;
  
@@ -1501,7 +2300,113 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  		return true;
  
  	if (vma == get_gate_vma(vma->vm_mm))
-@@ -3988,8 +4007,8 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
+@@ -3908,6 +3929,55 @@ static struct folio *get_pfn_folio(unsigned long pfn, struct mem_cgroup *memcg,
+ 	return folio;
+ }
+ 
++static bool test_spte_young(struct mm_struct *mm, unsigned long addr, unsigned long end,
++			    unsigned long *bitmap, unsigned long *last)
++{
++	if (!kvm_arch_has_test_clear_young() || !get_cap(LRU_GEN_SPTE_WALK))
++		return false;
++
++	if (*last > addr)
++		goto done;
++
++	*last = end - addr > MIN_LRU_BATCH * PAGE_SIZE ?
++		addr + MIN_LRU_BATCH * PAGE_SIZE - 1 : end - 1;
++	bitmap_zero(bitmap, MIN_LRU_BATCH);
++
++	mmu_notifier_test_clear_young(mm, addr, *last + 1, false, bitmap);
++done:
++	return test_bit((*last - addr) / PAGE_SIZE, bitmap);
++}
++
++static void clear_spte_young(struct mm_struct *mm, unsigned long addr,
++			     unsigned long *bitmap, unsigned long *last)
++{
++	int i;
++	unsigned long start, end = *last + 1;
++
++	if (addr + PAGE_SIZE != end)
++		return;
++
++	i = find_last_bit(bitmap, MIN_LRU_BATCH);
++	if (i == MIN_LRU_BATCH)
++		return;
++
++	start = end - (i + 1) * PAGE_SIZE;
++
++	i = find_first_bit(bitmap, MIN_LRU_BATCH);
++
++	end -= i * PAGE_SIZE;
++
++	mmu_notifier_test_clear_young(mm, start, end, false, bitmap);
++}
++
++static void skip_spte_young(struct mm_struct *mm, unsigned long addr,
++			    unsigned long *bitmap, unsigned long *last)
++{
++	if (*last > addr)
++		__clear_bit((*last - addr) / PAGE_SIZE, bitmap);
++
++	clear_spte_young(mm, addr, bitmap, last);
++}
++
+ static bool suitable_to_scan(int total, int young)
+ {
+ 	int n = clamp_t(int, cache_line_size() / sizeof(pte_t), 2, 8);
+@@ -3923,6 +3993,8 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
+ 	pte_t *pte;
+ 	spinlock_t *ptl;
+ 	unsigned long addr;
++	unsigned long bitmap[BITS_TO_LONGS(MIN_LRU_BATCH)];
++	unsigned long last = 0;
+ 	int total = 0;
+ 	int young = 0;
+ 	struct lru_gen_mm_walk *walk = args->private;
+@@ -3941,6 +4013,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
+ 	pte = pte_offset_map(pmd, start & PMD_MASK);
+ restart:
+ 	for (i = pte_index(start), addr = start; addr != end; i++, addr += PAGE_SIZE) {
++		bool success;
+ 		unsigned long pfn;
+ 		struct folio *folio;
+ 
+@@ -3948,20 +4021,27 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
+ 		walk->mm_stats[MM_LEAF_TOTAL]++;
+ 
+ 		pfn = get_pte_pfn(pte[i], args->vma, addr);
+-		if (pfn == -1)
++		if (pfn == -1) {
++			skip_spte_young(args->vma->vm_mm, addr, bitmap, &last);
+ 			continue;
++		}
+ 
+-		if (!pte_young(pte[i])) {
++		success = test_spte_young(args->vma->vm_mm, addr, end, bitmap, &last);
++		if (!success && !pte_young(pte[i])) {
++			skip_spte_young(args->vma->vm_mm, addr, bitmap, &last);
+ 			walk->mm_stats[MM_LEAF_OLD]++;
+ 			continue;
+ 		}
+ 
+ 		folio = get_pfn_folio(pfn, memcg, pgdat, walk->can_swap);
+-		if (!folio)
++		if (!folio) {
++			skip_spte_young(args->vma->vm_mm, addr, bitmap, &last);
+ 			continue;
++		}
+ 
+-		if (!ptep_test_and_clear_young(args->vma, addr, pte + i))
+-			VM_WARN_ON_ONCE(true);
++		clear_spte_young(args->vma->vm_mm, addr, bitmap, &last);
++		if (pte_young(pte[i]))
++			ptep_test_and_clear_young(args->vma, addr, pte + i);
+ 
+ 		young++;
+ 		walk->mm_stats[MM_LEAF_YOUNG]++;
+@@ -3988,8 +4068,8 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
  }
  
  #if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG)
@@ -1512,7 +2417,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  {
  	int i;
  	pmd_t *pmd;
-@@ -4002,18 +4021,19 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
+@@ -4002,18 +4082,19 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
  	VM_WARN_ON_ONCE(pud_leaf(*pud));
  
  	/* try to batch at most 1+MIN_LRU_BATCH+1 entries */
@@ -1536,7 +2441,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	ptl = pmd_lockptr(args->mm, pmd);
  	if (!spin_trylock(ptl))
-@@ -4024,15 +4044,16 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
+@@ -4024,15 +4105,16 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
  	do {
  		unsigned long pfn;
  		struct folio *folio;
@@ -1556,7 +2461,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  				pmdp_test_and_clear_young(vma, addr, pmd + i);
  			goto next;
  		}
-@@ -4061,12 +4082,11 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
+@@ -4061,12 +4143,11 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
  	arch_leave_lazy_mmu_mode();
  	spin_unlock(ptl);
  done:
@@ -1572,7 +2477,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  {
  }
  #endif
-@@ -4079,9 +4099,9 @@ static void walk_pmd_range(pud_t *pud, unsigned long start, unsigned long end,
+@@ -4079,9 +4160,9 @@ static void walk_pmd_range(pud_t *pud, unsigned long start, unsigned long end,
  	unsigned long next;
  	unsigned long addr;
  	struct vm_area_struct *vma;
@@ -1584,7 +2489,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	VM_WARN_ON_ONCE(pud_leaf(*pud));
  
-@@ -4120,18 +4140,17 @@ static void walk_pmd_range(pud_t *pud, unsigned long start, unsigned long end,
+@@ -4120,18 +4201,17 @@ static void walk_pmd_range(pud_t *pud, unsigned long start, unsigned long end,
  			if (pfn < pgdat->node_start_pfn || pfn >= pgdat_end_pfn(pgdat))
  				continue;
  
@@ -1606,7 +2511,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  		}
  
  		if (!walk->force_scan && !test_bloom_filter(walk->lruvec, walk->max_seq, pmd + i))
-@@ -4148,7 +4167,7 @@ static void walk_pmd_range(pud_t *pud, unsigned long start, unsigned long end,
+@@ -4148,7 +4228,7 @@ static void walk_pmd_range(pud_t *pud, unsigned long start, unsigned long end,
  		update_bloom_filter(walk->lruvec, walk->max_seq + 1, pmd + i);
  	}
  
@@ -1615,7 +2520,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	if (i < PTRS_PER_PMD && get_next_vma(PUD_MASK, PMD_SIZE, args, &start, &end))
  		goto restart;
-@@ -4238,7 +4257,7 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
+@@ -4238,7 +4318,7 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
  	} while (err == -EAGAIN);
  }
  
@@ -1624,7 +2529,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  {
  	struct lru_gen_mm_walk *walk = current->reclaim_state->mm_walk;
  
-@@ -4246,7 +4265,7 @@ static struct lru_gen_mm_walk *set_mm_walk(struct pglist_data *pgdat)
+@@ -4246,7 +4326,7 @@ static struct lru_gen_mm_walk *set_mm_walk(struct pglist_data *pgdat)
  		VM_WARN_ON_ONCE(walk);
  
  		walk = &pgdat->mm_walk;
@@ -1633,7 +2538,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  		VM_WARN_ON_ONCE(current_is_kswapd());
  
  		walk = kzalloc(sizeof(*walk), __GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN);
-@@ -4274,7 +4293,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+@@ -4274,7 +4354,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
  {
  	int zone;
  	int remaining = MAX_LRU_BATCH;
@@ -1642,7 +2547,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
  
  	if (type == LRU_GEN_ANON && !can_swap)
-@@ -4282,7 +4301,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+@@ -4282,7 +4362,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
  
  	/* prevent cold/hot inversion if force_scan is true */
  	for (zone = 0; zone < MAX_NR_ZONES; zone++) {
@@ -1651,7 +2556,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  		while (!list_empty(head)) {
  			struct folio *folio = lru_to_folio(head);
-@@ -4293,7 +4312,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
+@@ -4293,7 +4373,7 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
  			VM_WARN_ON_ONCE_FOLIO(folio_zonenum(folio) != zone, folio);
  
  			new_gen = folio_inc_gen(lruvec, folio, false);
@@ -1660,7 +2565,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  			if (!--remaining)
  				return false;
-@@ -4310,7 +4329,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
+@@ -4310,7 +4390,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
  {
  	int gen, type, zone;
  	bool success = false;
@@ -1669,7 +2574,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	DEFINE_MIN_SEQ(lruvec);
  
  	VM_WARN_ON_ONCE(!seq_is_valid(lruvec));
-@@ -4321,7 +4340,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
+@@ -4321,7 +4401,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
  			gen = lru_gen_from_seq(min_seq[type]);
  
  			for (zone = 0; zone < MAX_NR_ZONES; zone++) {
@@ -1678,7 +2583,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  					goto next;
  			}
  
-@@ -4331,7 +4350,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
+@@ -4331,7 +4411,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
  		;
  	}
  
@@ -1687,7 +2592,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	if (can_swap) {
  		min_seq[LRU_GEN_ANON] = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_FILE]);
  		min_seq[LRU_GEN_FILE] = max(min_seq[LRU_GEN_ANON], lrugen->min_seq[LRU_GEN_FILE]);
-@@ -4353,7 +4372,7 @@ static void inc_max_seq(struct lruvec *lruvec, bool can_swap, bool force_scan)
+@@ -4353,7 +4433,7 @@ static void inc_max_seq(struct lruvec *lruvec, bool can_swap, bool force_scan)
  {
  	int prev, next;
  	int type, zone;
@@ -1696,7 +2601,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	spin_lock_irq(&lruvec->lru_lock);
  
-@@ -4411,7 +4430,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+@@ -4411,7 +4491,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
  	bool success;
  	struct lru_gen_mm_walk *walk;
  	struct mm_struct *mm = NULL;
@@ -1705,7 +2610,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	VM_WARN_ON_ONCE(max_seq > READ_ONCE(lrugen->max_seq));
  
-@@ -4427,12 +4446,12 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+@@ -4427,12 +4507,12 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
  	 * handful of PTEs. Spreading the work out over a period of time usually
  	 * is less efficient, but it avoids bursty page faults.
  	 */
@@ -1720,7 +2625,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	if (!walk) {
  		success = iterate_mm_list_nowalk(lruvec, max_seq);
  		goto done;
-@@ -4455,8 +4474,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+@@ -4455,8 +4535,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
  		if (sc->priority <= DEF_PRIORITY - 2)
  			wait_event_killable(lruvec->mm_state.wait,
  					    max_seq < READ_ONCE(lrugen->max_seq));
@@ -1730,7 +2635,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	}
  
  	VM_WARN_ON_ONCE(max_seq != READ_ONCE(lrugen->max_seq));
-@@ -4469,97 +4487,56 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+@@ -4469,97 +4548,56 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
  	return true;
  }
  
@@ -1775,7 +2680,10 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
 -	/* try to scrape all its memory if this memcg was deleted */
 -	*nr_to_scan = mem_cgroup_online(memcg) ? (total >> sc->priority) : total;
--
++	/* whether the size is big enough to be helpful */
++	return mem_cgroup_online(memcg) ? (total >> sc->priority) : total;
++}
+ 
 -	/*
 -	 * The aging tries to be lazy to reduce the overhead, while the eviction
 -	 * stalls when the number of generations reaches MIN_NR_GENS. Hence, the
@@ -1799,10 +2707,8 @@ index 160acbbdf111..1a8f3b1c0bad 100644
 -		return true;
 -
 -	return false;
-+	/* whether the size is big enough to be helpful */
-+	return mem_cgroup_online(memcg) ? (total >> sc->priority) : total;
- }
- 
+-}
+-
 -static bool age_lruvec(struct lruvec *lruvec, struct scan_control *sc, unsigned long min_ttl)
 +static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc,
 +				  unsigned long min_ttl)
@@ -1817,12 +2723,12 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	DEFINE_MIN_SEQ(lruvec);
  
 -	VM_WARN_ON_ONCE(sc->memcg_low_reclaim);
--
--	mem_cgroup_calculate_protection(NULL, memcg);
 +	/* see the comment on lru_gen_folio */
 +	gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);
 +	birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
  
+-	mem_cgroup_calculate_protection(NULL, memcg);
+-
 -	if (mem_cgroup_below_min(NULL, memcg))
 +	if (time_is_after_jiffies(birth + min_ttl))
  		return false;
@@ -1852,7 +2758,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  }
  
  /* to protect the working set of the last N jiffies */
-@@ -4572,46 +4549,30 @@ static unsigned long lru_gen_min_ttl __read_mostly;
+@@ -4572,46 +4610,30 @@ static unsigned long lru_gen_min_ttl __read_mostly;
  static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  {
  	struct mem_cgroup *memcg;
@@ -1906,7 +2812,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	 */
  	if (mutex_trylock(&oom_lock)) {
  		struct oom_control oc = {
-@@ -4624,6 +4585,10 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+@@ -4624,6 +4646,28 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  	}
  }
  
@@ -1914,11 +2820,33 @@ index 160acbbdf111..1a8f3b1c0bad 100644
 + *                          rmap/PT walk feedback
 + ******************************************************************************/
 +
++static bool should_look_around(struct vm_area_struct *vma, unsigned long addr,
++			       pte_t *pte, int *young)
++{
++	unsigned long old = true;
++
++	*young = mmu_notifier_test_clear_young(vma->vm_mm, addr, addr + PAGE_SIZE, true, &old);
++	if (!old)
++		*young = true;
++
++	if (pte_young(*pte)) {
++		ptep_test_and_clear_young(vma, addr, pte);
++		*young = true;
++		return true;
++	}
++
++	return !old && get_cap(LRU_GEN_SPTE_WALK);
++}
++
  /*
   * This function exploits spatial locality when shrink_folio_list() walks the
   * rmap. It scans the adjacent PTEs of a young PTE and promotes hot pages. If
-@@ -4634,13 +4599,12 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
- void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
+@@ -4631,16 +4675,17 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+  * the PTE table to the Bloom filter. This forms a feedback loop between the
+  * eviction and the aging.
+  */
+-void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
++bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
  {
  	int i;
 -	pte_t *pte;
@@ -1926,6 +2854,8 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	unsigned long end;
 -	unsigned long addr;
  	struct lru_gen_mm_walk *walk;
++	unsigned long bitmap[BITS_TO_LONGS(MIN_LRU_BATCH)];
++	unsigned long last = 0;
  	int young = 0;
 -	unsigned long bitmap[BITS_TO_LONGS(MIN_LRU_BATCH)] = {};
 +	pte_t *pte = pvmw->pte;
@@ -1933,7 +2863,17 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	struct folio *folio = pfn_folio(pvmw->pfn);
  	struct mem_cgroup *memcg = folio_memcg(folio);
  	struct pglist_data *pgdat = folio_pgdat(folio);
-@@ -4657,25 +4621,28 @@ void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
+@@ -4651,47 +4696,65 @@ void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
+ 	lockdep_assert_held(pvmw->ptl);
+ 	VM_WARN_ON_ONCE_FOLIO(folio_test_lru(folio), folio);
+ 
++	if (!should_look_around(pvmw->vma, addr, pte, &young))
++		return young;
++
+ 	if (spin_is_contended(pvmw->ptl))
+-		return;
++		return young;
+ 
  	/* avoid taking the LRU lock under the PTL when possible */
  	walk = current->reclaim_state ? current->reclaim_state->mm_walk : NULL;
  
@@ -1941,6 +2881,9 @@ index 160acbbdf111..1a8f3b1c0bad 100644
 -	end = min(pvmw->address | ~PMD_MASK, pvmw->vma->vm_end - 1) + 1;
 +	start = max(addr & PMD_MASK, pvmw->vma->vm_start);
 +	end = min(addr | ~PMD_MASK, pvmw->vma->vm_end - 1) + 1;
++
++	if (end - start == PAGE_SIZE)
++		return young;
  
  	if (end - start > MIN_LRU_BATCH * PAGE_SIZE) {
 -		if (pvmw->address - start < MIN_LRU_BATCH * PAGE_SIZE / 2)
@@ -1960,7 +2903,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
 -	pte = pvmw->pte - (pvmw->address - start) / PAGE_SIZE;
 +	/* folio_update_gen() requires stable folio_memcg() */
 +	if (!mem_cgroup_trylock_pages(memcg))
-+		return;
++		return young;
  
 -	rcu_read_lock();
  	arch_enter_lazy_mmu_mode();
@@ -1968,9 +2911,39 @@ index 160acbbdf111..1a8f3b1c0bad 100644
 +	pte -= (addr - start) / PAGE_SIZE;
 +
  	for (i = 0, addr = start; addr != end; i++, addr += PAGE_SIZE) {
++		bool success;
  		unsigned long pfn;
  
-@@ -4700,58 +4667,171 @@ void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
+ 		pfn = get_pte_pfn(pte[i], pvmw->vma, addr);
+-		if (pfn == -1)
++		if (pfn == -1) {
++			skip_spte_young(pvmw->vma->vm_mm, addr, bitmap, &last);
+ 			continue;
++		}
+ 
+-		if (!pte_young(pte[i]))
++		success = test_spte_young(pvmw->vma->vm_mm, addr, end, bitmap, &last);
++		if (!success && !pte_young(pte[i])) {
++			skip_spte_young(pvmw->vma->vm_mm, addr, bitmap, &last);
+ 			continue;
++		}
+ 
+ 		folio = get_pfn_folio(pfn, memcg, pgdat, !walk || walk->can_swap);
+-		if (!folio)
++		if (!folio) {
++			skip_spte_young(pvmw->vma->vm_mm, addr, bitmap, &last);
+ 			continue;
++		}
+ 
+-		if (!ptep_test_and_clear_young(pvmw->vma, addr, pte + i))
+-			VM_WARN_ON_ONCE(true);
++		clear_spte_young(pvmw->vma->vm_mm, addr, bitmap, &last);
++		if (pte_young(pte[i]))
++			ptep_test_and_clear_young(pvmw->vma, addr, pte + i);
+ 
+ 		young++;
+ 
+@@ -4700,58 +4763,173 @@ void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
  		      !folio_test_swapcache(folio)))
  			folio_mark_dirty(folio);
  
@@ -1997,7 +2970,6 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	/* feedback from rmap walkers to page table walkers */
  	if (suitable_to_scan(i, young))
  		update_bloom_filter(lruvec, max_seq, pvmw->pmd);
-+}
  
 -	if (!walk && bitmap_weight(bitmap, MIN_LRU_BATCH) < PAGEVEC_SIZE) {
 -		for_each_set_bit(i, bitmap, MIN_LRU_BATCH) {
@@ -2005,6 +2977,9 @@ index 160acbbdf111..1a8f3b1c0bad 100644
 -			folio_activate(folio);
 -		}
 -		return;
++	return young;
++}
++
 +/******************************************************************************
 + *                          memcg LRU
 + ******************************************************************************/
@@ -2170,7 +3145,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  /******************************************************************************
   *                          the eviction
   ******************************************************************************/
-@@ -4765,7 +4845,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
+@@ -4765,7 +4943,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
  	int delta = folio_nr_pages(folio);
  	int refs = folio_lru_refs(folio);
  	int tier = lru_tier_from_refs(refs);
@@ -2179,7 +3154,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	VM_WARN_ON_ONCE_FOLIO(gen >= MAX_NR_GENS, folio);
  
-@@ -4790,7 +4870,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
+@@ -4790,7 +4968,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
  
  	/* promoted */
  	if (gen != lru_gen_from_seq(lrugen->min_seq[type])) {
@@ -2188,7 +3163,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  		return true;
  	}
  
-@@ -4799,7 +4879,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
+@@ -4799,7 +4977,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
  		int hist = lru_hist_from_seq(lrugen->min_seq[type]);
  
  		gen = folio_inc_gen(lruvec, folio, false);
@@ -2197,7 +3172,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  		WRITE_ONCE(lrugen->protected[hist][type][tier - 1],
  			   lrugen->protected[hist][type][tier - 1] + delta);
-@@ -4811,7 +4891,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
+@@ -4811,7 +4989,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, int tier_idx)
  	if (folio_test_locked(folio) || folio_test_writeback(folio) ||
  	    (type == LRU_GEN_FILE && folio_test_dirty(folio))) {
  		gen = folio_inc_gen(lruvec, folio, true);
@@ -2206,7 +3181,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  		return true;
  	}
  
-@@ -4822,12 +4902,8 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
+@@ -4822,12 +5000,8 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
  {
  	bool success;
  
@@ -2220,7 +3195,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	    (folio_test_dirty(folio) ||
  	     (folio_test_anon(folio) && !folio_test_swapcache(folio))))
  		return false;
-@@ -4865,7 +4941,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+@@ -4865,7 +5039,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
  	int scanned = 0;
  	int isolated = 0;
  	int remaining = MAX_LRU_BATCH;
@@ -2229,7 +3204,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
  
  	VM_WARN_ON_ONCE(!list_empty(list));
-@@ -4878,7 +4954,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+@@ -4878,7 +5052,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
  	for (zone = sc->reclaim_idx; zone >= 0; zone--) {
  		LIST_HEAD(moved);
  		int skipped = 0;
@@ -2238,7 +3213,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  		while (!list_empty(head)) {
  			struct folio *folio = lru_to_folio(head);
-@@ -4924,9 +5000,8 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
+@@ -4924,9 +5098,8 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
  	__count_vm_events(PGSCAN_ANON + type, isolated);
  
  	/*
@@ -2250,7 +3225,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	 */
  	return isolated || !remaining ? scanned : 0;
  }
-@@ -5021,8 +5096,7 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
+@@ -5021,8 +5194,7 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
  	return scanned;
  }
  
@@ -2260,7 +3235,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  {
  	int type;
  	int scanned;
-@@ -5111,153 +5185,348 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
+@@ -5111,153 +5283,348 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
  		goto retry;
  	}
  
@@ -2699,7 +3674,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  }
  
  /******************************************************************************
-@@ -5266,7 +5535,7 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
+@@ -5266,7 +5633,7 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
  
  static bool __maybe_unused state_is_valid(struct lruvec *lruvec)
  {
@@ -2708,7 +3683,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	if (lrugen->enabled) {
  		enum lru_list lru;
-@@ -5279,7 +5548,7 @@ static bool __maybe_unused state_is_valid(struct lruvec *lruvec)
+@@ -5279,7 +5646,7 @@ static bool __maybe_unused state_is_valid(struct lruvec *lruvec)
  		int gen, type, zone;
  
  		for_each_gen_type_zone(gen, type, zone) {
@@ -2717,7 +3692,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  				return false;
  		}
  	}
-@@ -5324,7 +5593,7 @@ static bool drain_evictable(struct lruvec *lruvec)
+@@ -5324,7 +5691,7 @@ static bool drain_evictable(struct lruvec *lruvec)
  	int remaining = MAX_LRU_BATCH;
  
  	for_each_gen_type_zone(gen, type, zone) {
@@ -2726,7 +3701,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  		while (!list_empty(head)) {
  			bool success;
-@@ -5402,14 +5671,14 @@ static void lru_gen_change_state(bool enabled)
+@@ -5402,14 +5769,14 @@ static void lru_gen_change_state(bool enabled)
   *                          sysfs interface
   ******************************************************************************/
  
@@ -2745,7 +3720,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  {
  	unsigned int msecs;
  
-@@ -5421,11 +5690,9 @@ static ssize_t store_min_ttl(struct kobject *kobj, struct kobj_attribute *attr,
+@@ -5421,11 +5788,9 @@ static ssize_t store_min_ttl(struct kobject *kobj, struct kobj_attribute *attr,
  	return len;
  }
  
@@ -2759,7 +3734,14 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  {
  	unsigned int caps = 0;
  
-@@ -5442,7 +5709,7 @@ static ssize_t show_enabled(struct kobject *kobj, struct kobj_attribute *attr, c
+@@ -5438,11 +5803,14 @@ static ssize_t show_enabled(struct kobject *kobj, struct kobj_attribute *attr, c
+ 	if (arch_has_hw_nonleaf_pmd_young() && get_cap(LRU_GEN_NONLEAF_YOUNG))
+ 		caps |= BIT(LRU_GEN_NONLEAF_YOUNG);
+ 
++	if (kvm_arch_has_test_clear_young() && get_cap(LRU_GEN_SPTE_WALK))
++		caps |= BIT(LRU_GEN_SPTE_WALK);
++
+ 	return sysfs_emit(buf, "0x%04x\n", caps);
  }
  
  /* see Documentation/admin-guide/mm/multigen_lru.rst for details */
@@ -2768,7 +3750,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  			     const char *buf, size_t len)
  {
  	int i;
-@@ -5469,9 +5736,7 @@ static ssize_t store_enabled(struct kobject *kobj, struct kobj_attribute *attr,
+@@ -5469,9 +5837,7 @@ static ssize_t store_enabled(struct kobject *kobj, struct kobj_attribute *attr,
  	return len;
  }
  
@@ -2779,7 +3761,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  static struct attribute *lru_gen_attrs[] = {
  	&lru_gen_min_ttl_attr.attr,
-@@ -5479,7 +5744,7 @@ static struct attribute *lru_gen_attrs[] = {
+@@ -5479,7 +5845,7 @@ static struct attribute *lru_gen_attrs[] = {
  	NULL
  };
  
@@ -2788,7 +3770,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	.name = "lru_gen",
  	.attrs = lru_gen_attrs,
  };
-@@ -5545,7 +5810,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
+@@ -5545,7 +5911,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
  	int i;
  	int type, tier;
  	int hist = lru_hist_from_seq(seq);
@@ -2797,7 +3779,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	for (tier = 0; tier < MAX_NR_TIERS; tier++) {
  		seq_printf(m, "            %10d", tier);
-@@ -5595,7 +5860,7 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
+@@ -5595,7 +5961,7 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
  	unsigned long seq;
  	bool full = !debugfs_real_fops(m->file)->write;
  	struct lruvec *lruvec = v;
@@ -2806,7 +3788,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  	int nid = lruvec_pgdat(lruvec)->node_id;
  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
  	DEFINE_MAX_SEQ(lruvec);
-@@ -5692,7 +5957,7 @@ static int run_eviction(struct lruvec *lruvec, unsigned long seq, struct scan_co
+@@ -5692,7 +6058,7 @@ static int run_eviction(struct lruvec *lruvec, unsigned long seq, struct scan_co
  		if (sc->nr_reclaimed >= nr_to_reclaim)
  			return 0;
  
@@ -2815,7 +3797,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  			return 0;
  
  		cond_resched();
-@@ -5713,11 +5978,11 @@ static int run_cmd(char cmd, int memcg_id, int nid, unsigned long seq,
+@@ -5713,11 +6079,11 @@ static int run_cmd(char cmd, int memcg_id, int nid, unsigned long seq,
  
  	if (!mem_cgroup_disabled()) {
  		rcu_read_lock();
@@ -2830,7 +3812,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  		rcu_read_unlock();
  
  		if (!memcg)
-@@ -5777,7 +6042,7 @@ static ssize_t lru_gen_seq_write(struct file *file, const char __user *src,
+@@ -5777,7 +6143,7 @@ static ssize_t lru_gen_seq_write(struct file *file, const char __user *src,
  	set_task_reclaim_state(current, &sc.reclaim_state);
  	flags = memalloc_noreclaim_save();
  	blk_start_plug(&plug);
@@ -2839,7 +3821,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  		err = -ENOMEM;
  		goto done;
  	}
-@@ -5849,7 +6114,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+@@ -5849,7 +6215,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
  {
  	int i;
  	int gen, type, zone;
@@ -2848,7 +3830,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  	lrugen->max_seq = MIN_NR_GENS + 1;
  	lrugen->enabled = lru_gen_enabled();
-@@ -5858,13 +6123,26 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+@@ -5858,13 +6224,26 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
  		lrugen->timestamps[i] = jiffies;
  
  	for_each_gen_type_zone(gen, type, zone)
@@ -2876,7 +3858,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  void lru_gen_init_memcg(struct mem_cgroup *memcg)
  {
  	INIT_LIST_HEAD(&memcg->mm_list.fifo);
-@@ -5876,19 +6154,25 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
+@@ -5876,19 +6255,25 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
  	int i;
  	int nid;
  
@@ -2903,7 +3885,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  
  static int __init init_lru_gen(void)
  {
-@@ -5915,6 +6199,10 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
+@@ -5915,6 +6300,10 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
  {
  }
  
@@ -2914,7 +3896,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  #endif /* CONFIG_LRU_GEN */
  
  static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
-@@ -5928,7 +6216,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5928,7 +6317,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  	bool proportional_reclaim;
  	struct blk_plug plug;
  
@@ -2923,7 +3905,7 @@ index 160acbbdf111..1a8f3b1c0bad 100644
  		lru_gen_shrink_lruvec(lruvec, sc);
  		return;
  	}
-@@ -6171,6 +6459,11 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -6171,6 +6560,11 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
  
@@ -2958,63 +3940,250 @@ index 1a86645b7b3c..fd666584515c 100644
  	struct pglist_data *pgdat;
  	int type = folio_is_file_lru(folio);
 diff --git a/tools/testing/radix-tree/maple.c b/tools/testing/radix-tree/maple.c
-index 81fa7ec2e66a..1f36bc1c5d36 100644
+index 1f36bc1c5d36..26389e0dcfff 100644
 --- a/tools/testing/radix-tree/maple.c
 +++ b/tools/testing/radix-tree/maple.c
-@@ -173,11 +173,11 @@ static noinline void check_new_node(struct maple_tree *mt)
+@@ -55,6 +55,28 @@ struct rcu_reader_struct {
+ 	struct rcu_test_struct2 *test;
+ };
  
- 		if (!MAPLE_32BIT) {
- 			if (i >= 35)
--				e = i - 35;
-+				e = i - 34;
- 			else if (i >= 5)
--				e = i - 5;
-+				e = i - 4;
- 			else if (i >= 2)
--				e = i - 2;
-+				e = i - 1;
- 		} else {
- 			if (i >= 4)
- 				e = i - 4;
-@@ -305,17 +305,17 @@ static noinline void check_new_node(struct maple_tree *mt)
- 	MT_BUG_ON(mt, mas.node != MA_ERROR(-ENOMEM));
- 	MT_BUG_ON(mt, !mas_nomem(&mas, GFP_KERNEL));
- 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
--	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
-+	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS);
++static int get_alloc_node_count(struct ma_state *mas)
++{
++	int count = 1;
++	struct maple_alloc *node = mas->alloc;
++
++	if (!node || ((unsigned long)node & 0x1))
++		return 0;
++	while (node->node_count) {
++		count += node->node_count;
++		node = node->slot[0];
++	}
++	return count;
++}
++
++static void check_mas_alloc_node_count(struct ma_state *mas)
++{
++	mas_node_count_gfp(mas, MAPLE_ALLOC_SLOTS + 1, GFP_KERNEL);
++	mas_node_count_gfp(mas, MAPLE_ALLOC_SLOTS + 3, GFP_KERNEL);
++	MT_BUG_ON(mas->tree, get_alloc_node_count(mas) != mas->alloc->total);
++	mas_destroy(mas);
++}
++
+ /*
+  * check_new_node() - Check the creation of new nodes and error path
+  * verification.
+@@ -69,6 +91,8 @@ static noinline void check_new_node(struct maple_tree *mt)
  
- 	mn = mas_pop_node(&mas); /* get the next node. */
- 	MT_BUG_ON(mt, mn == NULL);
- 	MT_BUG_ON(mt, not_empty(mn));
- 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS);
--	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 2);
-+	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
+ 	MA_STATE(mas, mt, 0, 0);
  
- 	mas_push_node(&mas, mn);
- 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
--	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS - 1);
-+	MT_BUG_ON(mt, mas.alloc->node_count != MAPLE_ALLOC_SLOTS);
++	check_mas_alloc_node_count(&mas);
++
+ 	/* Try allocating 3 nodes */
+ 	mtree_lock(mt);
+ 	mt_set_non_kernel(0);
+@@ -35342,7 +35366,7 @@ static noinline void check_prealloc(struct maple_tree *mt)
+ 	for (i = 0; i <= max; i++)
+ 		mtree_test_store_range(mt, i * 10, i * 10 + 5, &i);
  
- 	/* Check the limit of pop/push/pop */
- 	mas_node_count(&mas, MAPLE_ALLOC_SLOTS + 2); /* Request */
-@@ -323,14 +323,14 @@ static noinline void check_new_node(struct maple_tree *mt)
- 	MT_BUG_ON(mt, mas.node != MA_ERROR(-ENOMEM));
- 	MT_BUG_ON(mt, !mas_nomem(&mas, GFP_KERNEL));
- 	MT_BUG_ON(mt, mas_alloc_req(&mas));
--	MT_BUG_ON(mt, mas.alloc->node_count);
-+	MT_BUG_ON(mt, mas.alloc->node_count != 1);
- 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 2);
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+@@ -35351,18 +35375,18 @@ static noinline void check_prealloc(struct maple_tree *mt)
+ 	allocated = mas_allocated(&mas);
+ 	MT_BUG_ON(mt, allocated != 0);
+ 
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+ 	MT_BUG_ON(mt, allocated != 1 + height * 3);
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	mas_destroy(&mas);
+ 	allocated = mas_allocated(&mas);
+ 	MT_BUG_ON(mt, allocated != 0);
+ 
+ 
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+@@ -35370,25 +35394,25 @@ static noinline void check_prealloc(struct maple_tree *mt)
  	mn = mas_pop_node(&mas);
- 	MT_BUG_ON(mt, not_empty(mn));
- 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 1);
--	MT_BUG_ON(mt, mas.alloc->node_count  != MAPLE_ALLOC_SLOTS - 1);
-+	MT_BUG_ON(mt, mas.alloc->node_count  != MAPLE_ALLOC_SLOTS);
- 	mas_push_node(&mas, mn);
--	MT_BUG_ON(mt, mas.alloc->node_count);
-+	MT_BUG_ON(mt, mas.alloc->node_count != 1);
- 	MT_BUG_ON(mt, mas_allocated(&mas) != MAPLE_ALLOC_SLOTS + 2);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != allocated - 1);
+ 	ma_free_rcu(mn);
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	mas_destroy(&mas);
+ 	allocated = mas_allocated(&mas);
+ 	MT_BUG_ON(mt, allocated != 0);
+ 
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+ 	MT_BUG_ON(mt, allocated != 1 + height * 3);
  	mn = mas_pop_node(&mas);
- 	MT_BUG_ON(mt, not_empty(mn));
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != allocated - 1);
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	mas_destroy(&mas);
+ 	allocated = mas_allocated(&mas);
+ 	MT_BUG_ON(mt, allocated != 0);
+ 	ma_free_rcu(mn);
+ 
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+@@ -35397,12 +35421,12 @@ static noinline void check_prealloc(struct maple_tree *mt)
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != allocated - 1);
+ 	mas_push_node(&mas, mn);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != allocated);
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	mas_destroy(&mas);
+ 	allocated = mas_allocated(&mas);
+ 	MT_BUG_ON(mt, allocated != 0);
+ 
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+@@ -35410,21 +35434,21 @@ static noinline void check_prealloc(struct maple_tree *mt)
+ 	mas_store_prealloc(&mas, ptr);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
+ 
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+ 	MT_BUG_ON(mt, allocated != 1 + height * 3);
+ 	mas_store_prealloc(&mas, ptr);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+ 	MT_BUG_ON(mt, allocated != 1 + height * 3);
+ 	mas_store_prealloc(&mas, ptr);
+ 
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+@@ -35432,14 +35456,14 @@ static noinline void check_prealloc(struct maple_tree *mt)
+ 	mas_store_prealloc(&mas, ptr);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
+ 	mt_set_non_kernel(1);
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL & GFP_NOWAIT) == 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL & GFP_NOWAIT) == 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated != 0);
+ 	mas_destroy(&mas);
+ 
+ 
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL) != 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated == 0);
+@@ -35447,7 +35471,7 @@ static noinline void check_prealloc(struct maple_tree *mt)
+ 	mas_store_prealloc(&mas, ptr);
+ 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
+ 	mt_set_non_kernel(1);
+-	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL & GFP_NOWAIT) == 0);
++	MT_BUG_ON(mt, mas_preallocate(&mas, GFP_KERNEL & GFP_NOWAIT) == 0);
+ 	allocated = mas_allocated(&mas);
+ 	height = mas_mt_height(&mas);
+ 	MT_BUG_ON(mt, allocated != 0);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 07aae60288f9..a115a27b375e 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -875,6 +875,63 @@ static int kvm_mmu_notifier_clear_young(struct mmu_notifier *mn,
+ 	return kvm_handle_hva_range_no_flush(mn, start, end, kvm_age_gfn);
+ }
+ 
++static bool kvm_test_clear_young(struct kvm *kvm, unsigned long start,
++				 unsigned long end, unsigned long *bitmap)
++{
++	int i;
++	int key;
++	bool success = true;
++
++	trace_kvm_age_hva(start, end);
++
++	key = srcu_read_lock(&kvm->srcu);
++
++	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++		struct interval_tree_node *node;
++		struct kvm_memslots *slots = __kvm_memslots(kvm, i);
++
++		kvm_for_each_memslot_in_hva_range(node, slots, start, end - 1) {
++			gfn_t lsb_gfn;
++			unsigned long hva_start, hva_end;
++			struct kvm_gfn_range range = {
++				.slot = container_of(node, struct kvm_memory_slot,
++						     hva_node[slots->node_idx]),
++			};
++
++			hva_start = max(start, range.slot->userspace_addr);
++			hva_end = min(end - 1, range.slot->userspace_addr +
++					       range.slot->npages * PAGE_SIZE - 1);
++
++			range.start = hva_to_gfn_memslot(hva_start, range.slot);
++			range.end = hva_to_gfn_memslot(hva_end, range.slot) + 1;
++
++			if (WARN_ON_ONCE(range.end <= range.start))
++				continue;
++
++			/* see the comments on the generic kvm_arch_has_test_clear_young() */
++			lsb_gfn = hva_to_gfn_memslot(end - 1, range.slot);
++
++			success = kvm_arch_test_clear_young(kvm, &range, lsb_gfn, bitmap);
++			if (!success)
++				break;
++		}
++	}
++
++	srcu_read_unlock(&kvm->srcu, key);
++
++	return success;
++}
++
++static bool kvm_mmu_notifier_test_clear_young(struct mmu_notifier *mn, struct mm_struct *mm,
++					      unsigned long start, unsigned long end,
++					      unsigned long *bitmap)
++{
++	if (kvm_arch_has_test_clear_young())
++		return kvm_test_clear_young(mmu_notifier_to_kvm(mn), start, end, bitmap);
++
++	return false;
++}
++
+ static int kvm_mmu_notifier_test_young(struct mmu_notifier *mn,
+ 				       struct mm_struct *mm,
+ 				       unsigned long address)
+@@ -903,6 +960,7 @@ static const struct mmu_notifier_ops kvm_mmu_notifier_ops = {
+ 	.clear_flush_young	= kvm_mmu_notifier_clear_flush_young,
+ 	.clear_young		= kvm_mmu_notifier_clear_young,
+ 	.test_young		= kvm_mmu_notifier_test_young,
++	.test_clear_young	= kvm_mmu_notifier_test_clear_young,
+ 	.change_pte		= kvm_mmu_notifier_change_pte,
+ 	.release		= kvm_mmu_notifier_release,
+ };
 -- 
 2.40.0
 
