@@ -1,0 +1,153 @@
+From 9a01605cfacd1f833fab8dd284faebeec1192157 Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Sat, 21 Jan 2023 07:50:29 +0100
+Subject: [PATCH 077/117] btrfs: calculate file system wide queue limit for
+ zoned mode
+
+To be able to split a write into properly sized zone append commands,
+we need a queue_limits structure that contains the least common
+denominator suitable for all devices.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/fs.h    |  5 ++++-
+ fs/btrfs/zoned.c | 52 ++++++++++++++++++++++++------------------------
+ fs/btrfs/zoned.h |  1 -
+ 3 files changed, 30 insertions(+), 28 deletions(-)
+
+diff --git a/fs/btrfs/fs.h b/fs/btrfs/fs.h
+index f180ca061..24cd49229 100644
+--- a/fs/btrfs/fs.h
++++ b/fs/btrfs/fs.h
+@@ -3,6 +3,7 @@
+ #ifndef BTRFS_FS_H
+ #define BTRFS_FS_H
+ 
++#include <linux/blkdev.h>
+ #include <linux/fs.h>
+ #include <linux/btrfs_tree.h>
+ #include <linux/sizes.h>
+@@ -745,8 +746,10 @@ struct btrfs_fs_info {
+ 	 */
+ 	u64 zone_size;
+ 
+-	/* Max size to emit ZONE_APPEND write command */
++	/* Constraints for ZONE_APPEND commands: */
++	struct queue_limits limits;
+ 	u64 max_zone_append_size;
++
+ 	struct mutex zoned_meta_io_lock;
+ 	spinlock_t treelog_bg_lock;
+ 	u64 treelog_bg;
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+index c45d0749b..2cd1c9efd 100644
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -421,25 +421,6 @@ int btrfs_get_dev_zone_info(struct btrfs_device *device, bool populate_cache)
+ 	nr_sectors = bdev_nr_sectors(bdev);
+ 	zone_info->zone_size_shift = ilog2(zone_info->zone_size);
+ 	zone_info->nr_zones = nr_sectors >> ilog2(zone_sectors);
+-	/*
+-	 * We limit max_zone_append_size also by max_segments *
+-	 * PAGE_SIZE. Technically, we can have multiple pages per segment. But,
+-	 * since btrfs adds the pages one by one to a bio, and btrfs cannot
+-	 * increase the metadata reservation even if it increases the number of
+-	 * extents, it is safe to stick with the limit.
+-	 *
+-	 * With the zoned emulation, we can have non-zoned device on the zoned
+-	 * mode. In this case, we don't have a valid max zone append size. So,
+-	 * use max_segments * PAGE_SIZE as the pseudo max_zone_append_size.
+-	 */
+-	if (bdev_is_zoned(bdev)) {
+-		zone_info->max_zone_append_size = min_t(u64,
+-			(u64)bdev_max_zone_append_sectors(bdev) << SECTOR_SHIFT,
+-			(u64)bdev_max_segments(bdev) << PAGE_SHIFT);
+-	} else {
+-		zone_info->max_zone_append_size =
+-			(u64)bdev_max_segments(bdev) << PAGE_SHIFT;
+-	}
+ 	if (!IS_ALIGNED(nr_sectors, zone_sectors))
+ 		zone_info->nr_zones++;
+ 
+@@ -718,9 +699,9 @@ static int btrfs_check_for_zoned_device(struct btrfs_fs_info *fs_info)
+ 
+ int btrfs_check_zoned_mode(struct btrfs_fs_info *fs_info)
+ {
++	struct queue_limits *lim = &fs_info->limits;
+ 	struct btrfs_device *device;
+ 	u64 zone_size = 0;
+-	u64 max_zone_append_size = 0;
+ 	int ret;
+ 
+ 	/*
+@@ -730,6 +711,8 @@ int btrfs_check_zoned_mode(struct btrfs_fs_info *fs_info)
+ 	if (!btrfs_fs_incompat(fs_info, ZONED))
+ 		return btrfs_check_for_zoned_device(fs_info);
+ 
++	blk_set_stacking_limits(lim);
++
+ 	list_for_each_entry(device, &fs_info->fs_devices->devices, dev_list) {
+ 		struct btrfs_zoned_device_info *zone_info = device->zone_info;
+ 
+@@ -744,10 +727,17 @@ int btrfs_check_zoned_mode(struct btrfs_fs_info *fs_info)
+ 				  zone_info->zone_size, zone_size);
+ 			return -EINVAL;
+ 		}
+-		if (!max_zone_append_size ||
+-		    (zone_info->max_zone_append_size &&
+-		     zone_info->max_zone_append_size < max_zone_append_size))
+-			max_zone_append_size = zone_info->max_zone_append_size;
++
++		/*
++		 * With the zoned emulation, we can have non-zoned device on the
++		 * zoned mode. In this case, we don't have a valid max zone
++		 * append size.
++		 */
++		if (bdev_is_zoned(device->bdev)) {
++			blk_stack_limits(lim,
++					 &bdev_get_queue(device->bdev)->limits,
++					 0);
++		}
+ 	}
+ 
+ 	/*
+@@ -768,8 +758,18 @@ int btrfs_check_zoned_mode(struct btrfs_fs_info *fs_info)
+ 	}
+ 
+ 	fs_info->zone_size = zone_size;
+-	fs_info->max_zone_append_size = ALIGN_DOWN(max_zone_append_size,
+-						   fs_info->sectorsize);
++	/*
++	 * Also limit max_zone_append_size by max_segments * PAGE_SIZE.
++	 * Technically, we can have multiple pages per segment. But, since
++	 * we add the pages one by one to a bio, and cannot increase the
++	 * metadata reservation even if it increases the number of extents, it
++	 * is safe to stick with the limit.
++	 */
++	fs_info->max_zone_append_size = ALIGN_DOWN(
++		min3((u64)lim->max_zone_append_sectors << SECTOR_SHIFT,
++		     (u64)lim->max_sectors << SECTOR_SHIFT,
++		     (u64)lim->max_segments << PAGE_SHIFT),
++		fs_info->sectorsize);
+ 	fs_info->fs_devices->chunk_alloc_policy = BTRFS_CHUNK_ALLOC_ZONED;
+ 	if (fs_info->max_zone_append_size < fs_info->max_extent_size)
+ 		fs_info->max_extent_size = fs_info->max_zone_append_size;
+diff --git a/fs/btrfs/zoned.h b/fs/btrfs/zoned.h
+index bc93a740e..f25f332b7 100644
+--- a/fs/btrfs/zoned.h
++++ b/fs/btrfs/zoned.h
+@@ -20,7 +20,6 @@ struct btrfs_zoned_device_info {
+ 	 */
+ 	u64 zone_size;
+ 	u8  zone_size_shift;
+-	u64 max_zone_append_size;
+ 	u32 nr_zones;
+ 	unsigned int max_active_zones;
+ 	atomic_t active_zones_left;
+-- 
+2.40.0.71.g950264636c
+

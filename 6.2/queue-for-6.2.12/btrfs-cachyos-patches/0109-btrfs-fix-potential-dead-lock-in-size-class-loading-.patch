@@ -1,0 +1,238 @@
+From efb55b6756305483d496c582401c743ae2d01de7 Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Wed, 15 Feb 2023 12:59:50 -0800
+Subject: [PATCH 109/117] btrfs: fix potential dead lock in size class loading
+ logic
+
+As reported by Filipe, there's a potential deadlock caused by
+using btrfs_search_forward on commit_root. The locking there is
+unconditional, even if ->skip_locking and ->search_commit_root is set.
+It's not meant to be used for commit roots, so it always needs to do
+locking.
+
+So if another task is COWing a child node of the same root node and
+then needs to wait for block group caching to complete when trying to
+allocate a metadata extent, it deadlocks.
+
+For example:
+
+[539604.239315] sysrq: Show Blocked State
+[539604.240133] task:kworker/u16:6   state:D stack:0     pid:2119594 ppid:2      flags:0x00004000
+[539604.241613] Workqueue: btrfs-cache btrfs_work_helper [btrfs]
+[539604.242673] Call Trace:
+[539604.243129]  <TASK>
+[539604.243925]  __schedule+0x41d/0xee0
+[539604.244797]  ? rcu_read_lock_sched_held+0x12/0x70
+[539604.245399]  ? rwsem_down_read_slowpath+0x185/0x490
+[539604.246111]  schedule+0x5d/0xf0
+[539604.246593]  rwsem_down_read_slowpath+0x2da/0x490
+[539604.247290]  ? rcu_barrier_tasks_trace+0x10/0x20
+[539604.248090]  __down_read_common+0x3d/0x150
+[539604.248702]  down_read_nested+0xc3/0x140
+[539604.249280]  __btrfs_tree_read_lock+0x24/0x100 [btrfs]
+[539604.250097]  btrfs_read_lock_root_node+0x48/0x60 [btrfs]
+[539604.250915]  btrfs_search_forward+0x59/0x460 [btrfs]
+[539604.251781]  ? btrfs_global_root+0x50/0x70 [btrfs]
+[539604.252476]  caching_thread+0x1be/0x920 [btrfs]
+[539604.253167]  btrfs_work_helper+0xf6/0x400 [btrfs]
+[539604.253848]  process_one_work+0x24f/0x5a0
+[539604.254476]  worker_thread+0x52/0x3b0
+[539604.255166]  ? __pfx_worker_thread+0x10/0x10
+[539604.256047]  kthread+0xf0/0x120
+[539604.256591]  ? __pfx_kthread+0x10/0x10
+[539604.257212]  ret_from_fork+0x29/0x50
+[539604.257822]  </TASK>
+[539604.258233] task:btrfs-transacti state:D stack:0     pid:2236474 ppid:2      flags:0x00004000
+[539604.259802] Call Trace:
+[539604.260243]  <TASK>
+[539604.260615]  __schedule+0x41d/0xee0
+[539604.261205]  ? rcu_read_lock_sched_held+0x12/0x70
+[539604.262000]  ? rwsem_down_read_slowpath+0x185/0x490
+[539604.262822]  schedule+0x5d/0xf0
+[539604.263374]  rwsem_down_read_slowpath+0x2da/0x490
+[539604.266228]  ? lock_acquire+0x160/0x310
+[539604.266917]  ? rcu_read_lock_sched_held+0x12/0x70
+[539604.267996]  ? lock_contended+0x19e/0x500
+[539604.268720]  __down_read_common+0x3d/0x150
+[539604.269400]  down_read_nested+0xc3/0x140
+[539604.270057]  __btrfs_tree_read_lock+0x24/0x100 [btrfs]
+[539604.271129]  btrfs_read_lock_root_node+0x48/0x60 [btrfs]
+[539604.272372]  btrfs_search_slot+0x143/0xf70 [btrfs]
+[539604.273295]  update_block_group_item+0x9e/0x190 [btrfs]
+[539604.274282]  btrfs_start_dirty_block_groups+0x1c4/0x4f0 [btrfs]
+[539604.275381]  ? __mutex_unlock_slowpath+0x45/0x280
+[539604.276390]  btrfs_commit_transaction+0xee/0xed0 [btrfs]
+[539604.277391]  ? lock_acquire+0x1a4/0x310
+[539604.278080]  ? start_transaction+0xcb/0x6c0 [btrfs]
+[539604.279099]  transaction_kthread+0x142/0x1c0 [btrfs]
+[539604.279996]  ? __pfx_transaction_kthread+0x10/0x10 [btrfs]
+[539604.280673]  kthread+0xf0/0x120
+[539604.281050]  ? __pfx_kthread+0x10/0x10
+[539604.281496]  ret_from_fork+0x29/0x50
+[539604.281966]  </TASK>
+[539604.282255] task:fsstress        state:D stack:0     pid:2236483 ppid:1      flags:0x00004006
+[539604.283897] Call Trace:
+[539604.284700]  <TASK>
+[539604.285088]  __schedule+0x41d/0xee0
+[539604.285660]  schedule+0x5d/0xf0
+[539604.286175]  btrfs_wait_block_group_cache_progress+0xf2/0x170 [btrfs]
+[539604.287342]  ? __pfx_autoremove_wake_function+0x10/0x10
+[539604.288450]  find_free_extent+0xd93/0x1750 [btrfs]
+[539604.289256]  ? _raw_spin_unlock+0x29/0x50
+[539604.289911]  ? btrfs_get_alloc_profile+0x127/0x2a0 [btrfs]
+[539604.290843]  btrfs_reserve_extent+0x147/0x290 [btrfs]
+[539604.291943]  btrfs_alloc_tree_block+0xcb/0x3e0 [btrfs]
+[539604.292903]  __btrfs_cow_block+0x138/0x580 [btrfs]
+[539604.293773]  btrfs_cow_block+0x10e/0x240 [btrfs]
+[539604.294595]  btrfs_search_slot+0x7f3/0xf70 [btrfs]
+[539604.295585]  btrfs_update_device+0x71/0x1b0 [btrfs]
+[539604.296459]  btrfs_chunk_alloc_add_chunk_item+0xe0/0x340 [btrfs]
+[539604.297489]  btrfs_chunk_alloc+0x1bf/0x490 [btrfs]
+[539604.298335]  find_free_extent+0x6fa/0x1750 [btrfs]
+[539604.299174]  ? _raw_spin_unlock+0x29/0x50
+[539604.299950]  ? btrfs_get_alloc_profile+0x127/0x2a0 [btrfs]
+[539604.300918]  btrfs_reserve_extent+0x147/0x290 [btrfs]
+[539604.301797]  btrfs_alloc_tree_block+0xcb/0x3e0 [btrfs]
+[539604.303017]  ? lock_release+0x224/0x4a0
+[539604.303855]  __btrfs_cow_block+0x138/0x580 [btrfs]
+[539604.304789]  btrfs_cow_block+0x10e/0x240 [btrfs]
+[539604.305611]  btrfs_search_slot+0x7f3/0xf70 [btrfs]
+[539604.306682]  ? btrfs_global_root+0x50/0x70 [btrfs]
+[539604.308198]  lookup_inline_extent_backref+0x17b/0x7a0 [btrfs]
+[539604.309254]  lookup_extent_backref+0x43/0xd0 [btrfs]
+[539604.310122]  __btrfs_free_extent+0xf8/0x810 [btrfs]
+[539604.310874]  ? lock_release+0x224/0x4a0
+[539604.311724]  ? btrfs_merge_delayed_refs+0x17b/0x1d0 [btrfs]
+[539604.313023]  __btrfs_run_delayed_refs+0x2ba/0x1260 [btrfs]
+[539604.314271]  btrfs_run_delayed_refs+0x8f/0x1c0 [btrfs]
+[539604.315445]  ? rcu_read_lock_sched_held+0x12/0x70
+[539604.316706]  btrfs_commit_transaction+0xa2/0xed0 [btrfs]
+[539604.317855]  ? do_raw_spin_unlock+0x4b/0xa0
+[539604.318544]  ? _raw_spin_unlock+0x29/0x50
+[539604.319240]  create_subvol+0x53d/0x6e0 [btrfs]
+[539604.320283]  btrfs_mksubvol+0x4f5/0x590 [btrfs]
+[539604.321220]  __btrfs_ioctl_snap_create+0x11b/0x180 [btrfs]
+[539604.322307]  btrfs_ioctl_snap_create_v2+0xc6/0x150 [btrfs]
+[539604.323295]  btrfs_ioctl+0x9f7/0x33e0 [btrfs]
+[539604.324331]  ? rcu_read_lock_sched_held+0x12/0x70
+[539604.325137]  ? lock_release+0x224/0x4a0
+[539604.325808]  ? __x64_sys_ioctl+0x87/0xc0
+[539604.326467]  __x64_sys_ioctl+0x87/0xc0
+[539604.327109]  do_syscall_64+0x38/0x90
+[539604.327875]  entry_SYSCALL_64_after_hwframe+0x72/0xdc
+[539604.328792] RIP: 0033:0x7f05a7babaeb
+
+This needs to use regular btrfs_search_slot() with some skip and stop
+logic.
+
+Since we only consider five samples (five search slots), don't bother
+with the complexity of looking for commit_root_sem contention. If
+necessary, it can be added to the load function in between samples.
+
+Reported-by: Filipe Manana <fdmanana@kernel.org>
+Link: https://lore.kernel.org/linux-btrfs/CAL3q7H7eKMD44Z1+=Kb-1RFMMeZpAm2fwyO59yeBwCcSOU80Pg@mail.gmail.com/
+Fixes: c7eec3d9aa95 ("btrfs: load block group size class when caching")
+Signed-off-by: Boris Burkov <boris@bur.io>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/block-group.c | 42 ++++++++++++++++--------------------------
+ 1 file changed, 16 insertions(+), 26 deletions(-)
+
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index 940c711e9..5fc670c27 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -558,14 +558,15 @@ u64 add_new_free_space(struct btrfs_block_group *block_group, u64 start, u64 end
+ static int sample_block_group_extent_item(struct btrfs_caching_control *caching_ctl,
+ 					  struct btrfs_block_group *block_group,
+ 					  int index, int max_index,
+-					  struct btrfs_key *key)
++					  struct btrfs_key *found_key)
+ {
+ 	struct btrfs_fs_info *fs_info = block_group->fs_info;
+ 	struct btrfs_root *extent_root;
+-	int ret = 0;
+ 	u64 search_offset;
+ 	u64 search_end = block_group->start + block_group->length;
+ 	struct btrfs_path *path;
++	struct btrfs_key search_key;
++	int ret = 0;
+ 
+ 	ASSERT(index >= 0);
+ 	ASSERT(index <= max_index);
+@@ -585,37 +586,24 @@ static int sample_block_group_extent_item(struct btrfs_caching_control *caching_
+ 	path->reada = READA_FORWARD;
+ 
+ 	search_offset = index * div_u64(block_group->length, max_index);
+-	key->objectid = block_group->start + search_offset;
+-	key->type = BTRFS_EXTENT_ITEM_KEY;
+-	key->offset = 0;
++	search_key.objectid = block_group->start + search_offset;
++	search_key.type = BTRFS_EXTENT_ITEM_KEY;
++	search_key.offset = 0;
+ 
+-	while (1) {
+-		ret = btrfs_search_forward(extent_root, key, path, 0);
+-		if (ret != 0)
+-			goto out;
++	btrfs_for_each_slot(extent_root, &search_key, found_key, path, ret) {
+ 		/* Success; sampled an extent item in the block group */
+-		if (key->type == BTRFS_EXTENT_ITEM_KEY &&
+-		    key->objectid >= block_group->start &&
+-		    key->objectid + key->offset <= search_end)
+-			goto out;
++		if (found_key->type == BTRFS_EXTENT_ITEM_KEY &&
++		    found_key->objectid >= block_group->start &&
++		    found_key->objectid + found_key->offset <= search_end)
++			break;
+ 
+ 		/* We can't possibly find a valid extent item anymore */
+-		if (key->objectid >= search_end) {
++		if (found_key->objectid >= search_end) {
+ 			ret = 1;
+ 			break;
+ 		}
+-		if (key->type < BTRFS_EXTENT_ITEM_KEY)
+-			key->type = BTRFS_EXTENT_ITEM_KEY;
+-		else
+-			key->objectid++;
+-		btrfs_release_path(path);
+-		up_read(&fs_info->commit_root_sem);
+-		mutex_unlock(&caching_ctl->mutex);
+-		cond_resched();
+-		mutex_lock(&caching_ctl->mutex);
+-		down_read(&fs_info->commit_root_sem);
+ 	}
+-out:
++
+ 	lockdep_assert_held(&caching_ctl->mutex);
+ 	lockdep_assert_held_read(&fs_info->commit_root_sem);
+ 	btrfs_free_path(path);
+@@ -659,6 +647,7 @@ static int sample_block_group_extent_item(struct btrfs_caching_control *caching_
+ static int load_block_group_size_class(struct btrfs_caching_control *caching_ctl,
+ 				       struct btrfs_block_group *block_group)
+ {
++	struct btrfs_fs_info *fs_info = block_group->fs_info;
+ 	struct btrfs_key key;
+ 	int i;
+ 	u64 min_size = block_group->length;
+@@ -668,6 +657,8 @@ static int load_block_group_size_class(struct btrfs_caching_control *caching_ctl
+ 	if (!btrfs_block_group_should_use_size_class(block_group))
+ 		return 0;
+ 
++	lockdep_assert_held(&caching_ctl->mutex);
++	lockdep_assert_held_read(&fs_info->commit_root_sem);
+ 	for (i = 0; i < 5; ++i) {
+ 		ret = sample_block_group_extent_item(caching_ctl, block_group, i, 5, &key);
+ 		if (ret < 0)
+@@ -682,7 +673,6 @@ static int load_block_group_size_class(struct btrfs_caching_control *caching_ctl
+ 		block_group->size_class = size_class;
+ 		spin_unlock(&block_group->lock);
+ 	}
+-
+ out:
+ 	return ret;
+ }
+-- 
+2.40.0.71.g950264636c
+
