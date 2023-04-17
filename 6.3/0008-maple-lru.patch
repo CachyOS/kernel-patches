@@ -1,0 +1,752 @@
+From 1300046c6d7d6110fa0da7db293f028382ee4c16 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Sun, 9 Apr 2023 21:24:33 +0200
+Subject: [PATCH 08/12] maple-lru
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ Documentation/mm/multigen_lru.rst |  44 ++++++++--
+ include/linux/mmzone.h            |  10 +--
+ lib/maple_tree.c                  | 103 +++++++++-------------
+ mm/mmap.c                         |  48 +++++++++--
+ mm/vmscan.c                       | 136 +++++++++++-------------------
+ tools/testing/radix-tree/maple.c  |  24 ++++++
+ 6 files changed, 197 insertions(+), 168 deletions(-)
+
+diff --git a/Documentation/mm/multigen_lru.rst b/Documentation/mm/multigen_lru.rst
+index 5f1f6ecbb79b..52ed5092022f 100644
+--- a/Documentation/mm/multigen_lru.rst
++++ b/Documentation/mm/multigen_lru.rst
+@@ -103,7 +103,8 @@ moving across tiers only involves atomic operations on
+ ``folio->flags`` and therefore has a negligible cost. A feedback loop
+ modeled after the PID controller monitors refaults over all the tiers
+ from anon and file types and decides which tiers from which types to
+-evict or protect.
++evict or protect. The desired effect is to balance refault percentages
++between anon and file types proportional to the swappiness level.
+ 
+ There are two conceptually independent procedures: the aging and the
+ eviction. They form a closed-loop system, i.e., the page reclaim.
+@@ -156,6 +157,27 @@ This time-based approach has the following advantages:
+    and memory sizes.
+ 2. It is more reliable because it is directly wired to the OOM killer.
+ 
++``mm_struct`` list
++------------------
++An ``mm_struct`` list is maintained for each memcg, and an
++``mm_struct`` follows its owner task to the new memcg when this task
++is migrated.
++
++A page table walker iterates ``lruvec_memcg()->mm_list`` and calls
++``walk_page_range()`` with each ``mm_struct`` on this list to scan
++PTEs. When multiple page table walkers iterate the same list, each of
++them gets a unique ``mm_struct``, and therefore they can run in
++parallel.
++
++Page table walkers ignore any misplaced pages, e.g., if an
++``mm_struct`` was migrated, pages left in the previous memcg will be
++ignored when the current memcg is under reclaim. Similarly, page table
++walkers will ignore pages from nodes other than the one under reclaim.
++
++This infrastructure also tracks the usage of ``mm_struct`` between
++context switches so that page table walkers can skip processes that
++have been sleeping since the last iteration.
++
+ Rmap/PT walk feedback
+ ---------------------
+ Searching the rmap for PTEs mapping each page on an LRU list (to test
+@@ -170,7 +192,7 @@ promotes hot pages. If the scan was done cacheline efficiently, it
+ adds the PMD entry pointing to the PTE table to the Bloom filter. This
+ forms a feedback loop between the eviction and the aging.
+ 
+-Bloom Filters
++Bloom filters
+ -------------
+ Bloom filters are a space and memory efficient data structure for set
+ membership test, i.e., test if an element is not in the set or may be
+@@ -186,6 +208,18 @@ is false positive, the cost is an additional scan of a range of PTEs,
+ which may yield hot pages anyway. Parameters of the filter itself can
+ control the false positive rate in the limit.
+ 
++PID controller
++--------------
++A feedback loop modeled after the Proportional-Integral-Derivative
++(PID) controller monitors refaults over anon and file types and
++decides which type to evict when both types are available from the
++same generation.
++
++The PID controller uses generations rather than the wall clock as the
++time domain because a CPU can scan pages at different rates under
++varying memory pressure. It calculates a moving average for each new
++generation to avoid being permanently locked in a suboptimal state.
++
+ Memcg LRU
+ ---------
+ An memcg LRU is a per-node LRU of memcgs. It is also an LRU of LRUs,
+@@ -223,9 +257,9 @@ parts:
+ 
+ * Generations
+ * Rmap walks
+-* Page table walks
+-* Bloom filters
+-* PID controller
++* Page table walks via ``mm_struct`` list
++* Bloom filters for rmap/PT walk feedback
++* PID controller for refault feedback
+ 
+ The aging and the eviction form a producer-consumer model;
+ specifically, the latter drives the former by the sliding window over
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 9fb1b03b83b2..cabe7f51ea66 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -453,18 +453,14 @@ enum {
+ struct lru_gen_mm_state {
+ 	/* set to max_seq after each iteration */
+ 	unsigned long seq;
+-	/* where the current iteration continues (inclusive) */
++	/* where the current iteration continues after */
+ 	struct list_head *head;
+-	/* where the last iteration ended (exclusive) */
++	/* where the last iteration ended before */
+ 	struct list_head *tail;
+-	/* to wait for the last page table walker to finish */
+-	struct wait_queue_head wait;
+ 	/* Bloom filters flip after each iteration */
+ 	unsigned long *filters[NR_BLOOM_FILTERS];
+ 	/* the mm stats for debugging */
+ 	unsigned long stats[NR_HIST_GENS][NR_MM_STATS];
+-	/* the number of concurrent page table walkers */
+-	int nr_walkers;
+ };
+ 
+ struct lru_gen_mm_walk {
+@@ -1369,7 +1365,7 @@ typedef struct pglist_data {
+ 
+ #ifdef CONFIG_LRU_GEN
+ 	/* kswap mm walk data */
+-	struct lru_gen_mm_walk	mm_walk;
++	struct lru_gen_mm_walk mm_walk;
+ 	/* lru_gen_folio list */
+ 	struct lru_gen_memcg memcg_lru;
+ #endif
+diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+index db60edb55f2f..9172bcee94b4 100644
+--- a/lib/maple_tree.c
++++ b/lib/maple_tree.c
+@@ -1303,26 +1303,21 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
+ 	node = mas->alloc;
+ 	node->request_count = 0;
+ 	while (requested) {
+-		max_req = MAPLE_ALLOC_SLOTS;
+-		if (node->node_count) {
+-			unsigned int offset = node->node_count;
+-
+-			slots = (void **)&node->slot[offset];
+-			max_req -= offset;
+-		} else {
+-			slots = (void **)&node->slot;
+-		}
+-
++		max_req = MAPLE_ALLOC_SLOTS - node->node_count;
++		slots = (void **)&node->slot[node->node_count];
+ 		max_req = min(requested, max_req);
+ 		count = mt_alloc_bulk(gfp, max_req, slots);
+ 		if (!count)
+ 			goto nomem_bulk;
+ 
++		if (node->node_count == 0) {
++			node->slot[0]->node_count = 0;
++			node->slot[0]->request_count = 0;
++		}
++
+ 		node->node_count += count;
+ 		allocated += count;
+ 		node = node->slot[0];
+-		node->node_count = 0;
+-		node->request_count = 0;
+ 		requested -= count;
+ 	}
+ 	mas->alloc->total = allocated;
+@@ -2317,9 +2312,7 @@ static inline struct maple_enode *mte_node_or_none(struct maple_enode *enode)
+ static inline void mas_wr_node_walk(struct ma_wr_state *wr_mas)
+ {
+ 	struct ma_state *mas = wr_mas->mas;
+-	unsigned char count;
+-	unsigned char offset;
+-	unsigned long index, min, max;
++	unsigned char count, offset;
+ 
+ 	if (unlikely(ma_is_dense(wr_mas->type))) {
+ 		wr_mas->r_max = wr_mas->r_min = mas->index;
+@@ -2332,34 +2325,12 @@ static inline void mas_wr_node_walk(struct ma_wr_state *wr_mas)
+ 	count = wr_mas->node_end = ma_data_end(wr_mas->node, wr_mas->type,
+ 					       wr_mas->pivots, mas->max);
+ 	offset = mas->offset;
+-	min = mas_safe_min(mas, wr_mas->pivots, offset);
+-	if (unlikely(offset == count))
+-		goto max;
+-
+-	max = wr_mas->pivots[offset];
+-	index = mas->index;
+-	if (unlikely(index <= max))
+-		goto done;
+-
+-	if (unlikely(!max && offset))
+-		goto max;
+ 
+-	min = max + 1;
+-	while (++offset < count) {
+-		max = wr_mas->pivots[offset];
+-		if (index <= max)
+-			goto done;
+-		else if (unlikely(!max))
+-			break;
+-
+-		min = max + 1;
+-	}
++	while (offset < count && mas->index > wr_mas->pivots[offset])
++		offset++;
+ 
+-max:
+-	max = mas->max;
+-done:
+-	wr_mas->r_max = max;
+-	wr_mas->r_min = min;
++	wr_mas->r_max = offset < count ? wr_mas->pivots[offset] : mas->max;
++	wr_mas->r_min = mas_safe_min(mas, wr_mas->pivots, offset);
+ 	wr_mas->offset_end = mas->offset = offset;
+ }
+ 
+@@ -3287,7 +3258,7 @@ static inline void mas_destroy_rebalance(struct ma_state *mas, unsigned char end
+ 
+ 		if (tmp < max_p)
+ 			memset(pivs + tmp, 0,
+-			       sizeof(unsigned long *) * (max_p - tmp));
++			       sizeof(unsigned long) * (max_p - tmp));
+ 
+ 		if (tmp < mt_slots[mt])
+ 			memset(slots + tmp, 0, sizeof(void *) * (max_s - tmp));
+@@ -4970,7 +4941,8 @@ static inline void *mas_prev_entry(struct ma_state *mas, unsigned long min)
+  * Return: True if found in a leaf, false otherwise.
+  *
+  */
+-static bool mas_rev_awalk(struct ma_state *mas, unsigned long size)
++static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
++		unsigned long *gap_min, unsigned long *gap_max)
+ {
+ 	enum maple_type type = mte_node_type(mas->node);
+ 	struct maple_node *node = mas_mn(mas);
+@@ -5035,8 +5007,8 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size)
+ 
+ 	if (unlikely(ma_is_leaf(type))) {
+ 		mas->offset = offset;
+-		mas->min = min;
+-		mas->max = min + gap - 1;
++		*gap_min = min;
++		*gap_max = min + gap - 1;
+ 		return true;
+ 	}
+ 
+@@ -5060,10 +5032,10 @@ static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
+ {
+ 	enum maple_type type = mte_node_type(mas->node);
+ 	unsigned long pivot, min, gap = 0;
+-	unsigned char offset;
+-	unsigned long *gaps;
+-	unsigned long *pivots = ma_pivots(mas_mn(mas), type);
+-	void __rcu **slots = ma_slots(mas_mn(mas), type);
++	unsigned char offset, data_end;
++	unsigned long *gaps, *pivots;
++	void __rcu **slots;
++	struct maple_node *node;
+ 	bool found = false;
+ 
+ 	if (ma_is_dense(type)) {
+@@ -5071,13 +5043,15 @@ static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
+ 		return true;
+ 	}
+ 
+-	gaps = ma_gaps(mte_to_node(mas->node), type);
++	node = mas_mn(mas);
++	pivots = ma_pivots(node, type);
++	slots = ma_slots(node, type);
++	gaps = ma_gaps(node, type);
+ 	offset = mas->offset;
+ 	min = mas_safe_min(mas, pivots, offset);
+-	for (; offset < mt_slots[type]; offset++) {
+-		pivot = mas_safe_pivot(mas, pivots, offset, type);
+-		if (offset && !pivot)
+-			break;
++	data_end = ma_data_end(node, type, pivots, mas->max);
++	for (; offset <= data_end; offset++) {
++		pivot = mas_logical_pivot(mas, pivots, offset, type);
+ 
+ 		/* Not within lower bounds */
+ 		if (mas->index > pivot)
+@@ -5312,6 +5286,9 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
+ 	unsigned long *pivots;
+ 	enum maple_type mt;
+ 
++	if (min >= max)
++		return -EINVAL;
++
+ 	if (mas_is_start(mas))
+ 		mas_start(mas);
+ 	else if (mas->offset >= 2)
+@@ -5366,6 +5343,9 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+ {
+ 	struct maple_enode *last = mas->node;
+ 
++	if (min >= max)
++		return -EINVAL;
++
+ 	if (mas_is_start(mas)) {
+ 		mas_start(mas);
+ 		mas->offset = mas_data_end(mas);
+@@ -5385,7 +5365,7 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+ 	mas->index = min;
+ 	mas->last = max;
+ 
+-	while (!mas_rev_awalk(mas, size)) {
++	while (!mas_rev_awalk(mas, size, &min, &max)) {
+ 		if (last == mas->node) {
+ 			if (!mas_rewind_node(mas))
+ 				return -EBUSY;
+@@ -5400,17 +5380,9 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+ 	if (unlikely(mas->offset == MAPLE_NODE_SLOTS))
+ 		return -EBUSY;
+ 
+-	/*
+-	 * mas_rev_awalk() has set mas->min and mas->max to the gap values.  If
+-	 * the maximum is outside the window we are searching, then use the last
+-	 * location in the search.
+-	 * mas->max and mas->min is the range of the gap.
+-	 * mas->index and mas->last are currently set to the search range.
+-	 */
+-
+ 	/* Trim the upper limit to the max. */
+-	if (mas->max <= mas->last)
+-		mas->last = mas->max;
++	if (max <= mas->last)
++		mas->last = max;
+ 
+ 	mas->index = mas->last - size + 1;
+ 	return 0;
+@@ -5819,6 +5791,7 @@ int mas_preallocate(struct ma_state *mas, gfp_t gfp)
+ 	mas_reset(mas);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(mas_preallocate);
+ 
+ /*
+  * mas_destroy() - destroy a maple state.
+diff --git a/mm/mmap.c b/mm/mmap.c
+index ff68a67a2a7c..d5475fbf5729 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1518,7 +1518,8 @@ static inline int accountable_mapping(struct file *file, vm_flags_t vm_flags)
+  */
+ static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
+ {
+-	unsigned long length, gap;
++	unsigned long length, gap, low_limit;
++	struct vm_area_struct *tmp;
+ 
+ 	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
+ 
+@@ -1527,12 +1528,29 @@ static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
+ 	if (length < info->length)
+ 		return -ENOMEM;
+ 
+-	if (mas_empty_area(&mas, info->low_limit, info->high_limit - 1,
+-				  length))
++	low_limit = info->low_limit;
++retry:
++	if (mas_empty_area(&mas, low_limit, info->high_limit - 1, length))
+ 		return -ENOMEM;
+ 
+ 	gap = mas.index;
+ 	gap += (info->align_offset - gap) & info->align_mask;
++	tmp = mas_next(&mas, ULONG_MAX);
++	if (tmp && (tmp->vm_flags & VM_GROWSDOWN)) { /* Avoid prev check if possible */
++		if (vm_start_gap(tmp) < gap + length - 1) {
++			low_limit = tmp->vm_end;
++			mas_reset(&mas);
++			goto retry;
++		}
++	} else {
++		tmp = mas_prev(&mas, 0);
++		if (tmp && vm_end_gap(tmp) > gap) {
++			low_limit = vm_end_gap(tmp);
++			mas_reset(&mas);
++			goto retry;
++		}
++	}
++
+ 	return gap;
+ }
+ 
+@@ -1548,7 +1566,8 @@ static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
+  */
+ static unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
+ {
+-	unsigned long length, gap;
++	unsigned long length, gap, high_limit, gap_end;
++	struct vm_area_struct *tmp;
+ 
+ 	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
+ 	/* Adjust search length to account for worst case alignment overhead */
+@@ -1556,12 +1575,31 @@ static unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
+ 	if (length < info->length)
+ 		return -ENOMEM;
+ 
+-	if (mas_empty_area_rev(&mas, info->low_limit, info->high_limit - 1,
++	high_limit = info->high_limit;
++retry:
++	if (mas_empty_area_rev(&mas, info->low_limit, high_limit - 1,
+ 				length))
+ 		return -ENOMEM;
+ 
+ 	gap = mas.last + 1 - info->length;
+ 	gap -= (gap - info->align_offset) & info->align_mask;
++	gap_end = mas.last;
++	tmp = mas_next(&mas, ULONG_MAX);
++	if (tmp && (tmp->vm_flags & VM_GROWSDOWN)) { /* Avoid prev check if possible */
++		if (vm_start_gap(tmp) <= gap_end) {
++			high_limit = vm_start_gap(tmp);
++			mas_reset(&mas);
++			goto retry;
++		}
++	} else {
++		tmp = mas_prev(&mas, 0);
++		if (tmp && vm_end_gap(tmp) > gap) {
++			high_limit = tmp->vm_start;
++			mas_reset(&mas);
++			goto retry;
++		}
++	}
++
+ 	return gap;
+ }
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 71a7f4517e5a..ae60ddff831a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3398,18 +3398,13 @@ void lru_gen_del_mm(struct mm_struct *mm)
+ 	for_each_node(nid) {
+ 		struct lruvec *lruvec = get_lruvec(memcg, nid);
+ 
+-		/* where the last iteration ended (exclusive) */
++		/* where the current iteration continues after */
++		if (lruvec->mm_state.head == &mm->lru_gen.list)
++			lruvec->mm_state.head = lruvec->mm_state.head->prev;
++
++		/* where the last iteration ended before */
+ 		if (lruvec->mm_state.tail == &mm->lru_gen.list)
+ 			lruvec->mm_state.tail = lruvec->mm_state.tail->next;
+-
+-		/* where the current iteration continues (inclusive) */
+-		if (lruvec->mm_state.head != &mm->lru_gen.list)
+-			continue;
+-
+-		lruvec->mm_state.head = lruvec->mm_state.head->next;
+-		/* the deletion ends the current iteration */
+-		if (lruvec->mm_state.head == &mm_list->fifo)
+-			WRITE_ONCE(lruvec->mm_state.seq, lruvec->mm_state.seq + 1);
+ 	}
+ 
+ 	list_del_init(&mm->lru_gen.list);
+@@ -3505,68 +3500,54 @@ static bool iterate_mm_list(struct lruvec *lruvec, struct lru_gen_mm_walk *walk,
+ 			    struct mm_struct **iter)
+ {
+ 	bool first = false;
+-	bool last = true;
++	bool last = false;
+ 	struct mm_struct *mm = NULL;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 	struct lru_gen_mm_list *mm_list = get_mm_list(memcg);
+ 	struct lru_gen_mm_state *mm_state = &lruvec->mm_state;
+ 
+ 	/*
+-	 * There are four interesting cases for this page table walker:
+-	 * 1. It tries to start a new iteration of mm_list with a stale max_seq;
+-	 *    there is nothing left to do.
+-	 * 2. It's the first of the current generation, and it needs to reset
+-	 *    the Bloom filter for the next generation.
+-	 * 3. It reaches the end of mm_list, and it needs to increment
+-	 *    mm_state->seq; the iteration is done.
+-	 * 4. It's the last of the current generation, and it needs to reset the
+-	 *    mm stats counters for the next generation.
++	 * mm_state->seq is incremented after each iteration of mm_list. There
++	 * are three interesting cases for this page table walker:
++	 * 1. It tries to start a new iteration with a stale max_seq: there is
++	 *    nothing left to do.
++	 * 2. It started the next iteration: it needs to reset the Bloom filter
++	 *    so that a fresh set of PTE tables can be recorded.
++	 * 3. It ended the current iteration: it needs to reset the mm stats
++	 *    counters and tell its caller to increment max_seq.
+ 	 */
+ 	spin_lock(&mm_list->lock);
+ 
+ 	VM_WARN_ON_ONCE(mm_state->seq + 1 < walk->max_seq);
+-	VM_WARN_ON_ONCE(*iter && mm_state->seq > walk->max_seq);
+-	VM_WARN_ON_ONCE(*iter && !mm_state->nr_walkers);
+ 
+-	if (walk->max_seq <= mm_state->seq) {
+-		if (!*iter)
+-			last = false;
++	if (walk->max_seq <= mm_state->seq)
+ 		goto done;
+-	}
+ 
+-	if (!mm_state->nr_walkers) {
+-		VM_WARN_ON_ONCE(mm_state->head && mm_state->head != &mm_list->fifo);
++	if (!mm_state->head)
++		mm_state->head = &mm_list->fifo;
+ 
+-		mm_state->head = mm_list->fifo.next;
++	if (mm_state->head == &mm_list->fifo)
+ 		first = true;
+-	}
+-
+-	while (!mm && mm_state->head != &mm_list->fifo) {
+-		mm = list_entry(mm_state->head, struct mm_struct, lru_gen.list);
+ 
++	do {
+ 		mm_state->head = mm_state->head->next;
++		if (mm_state->head == &mm_list->fifo) {
++			WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
++			last = true;
++			break;
++		}
+ 
+ 		/* force scan for those added after the last iteration */
+-		if (!mm_state->tail || mm_state->tail == &mm->lru_gen.list) {
+-			mm_state->tail = mm_state->head;
++		if (!mm_state->tail || mm_state->tail == mm_state->head) {
++			mm_state->tail = mm_state->head->next;
+ 			walk->force_scan = true;
+ 		}
+ 
++		mm = list_entry(mm_state->head, struct mm_struct, lru_gen.list);
+ 		if (should_skip_mm(mm, walk))
+ 			mm = NULL;
+-	}
+-
+-	if (mm_state->head == &mm_list->fifo)
+-		WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
++	} while (!mm);
+ done:
+-	if (*iter && !mm)
+-		mm_state->nr_walkers--;
+-	if (!*iter && mm)
+-		mm_state->nr_walkers++;
+-
+-	if (mm_state->nr_walkers)
+-		last = false;
+-
+ 	if (*iter || last)
+ 		reset_mm_stats(lruvec, walk, last);
+ 
+@@ -3594,9 +3575,9 @@ static bool iterate_mm_list_nowalk(struct lruvec *lruvec, unsigned long max_seq)
+ 
+ 	VM_WARN_ON_ONCE(mm_state->seq + 1 < max_seq);
+ 
+-	if (max_seq > mm_state->seq && !mm_state->nr_walkers) {
+-		VM_WARN_ON_ONCE(mm_state->head && mm_state->head != &mm_list->fifo);
+-
++	if (max_seq > mm_state->seq) {
++		mm_state->head = NULL;
++		mm_state->tail = NULL;
+ 		WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
+ 		reset_mm_stats(lruvec, NULL, true);
+ 		success = true;
+@@ -3608,7 +3589,7 @@ static bool iterate_mm_list_nowalk(struct lruvec *lruvec, unsigned long max_seq)
+ }
+ 
+ /******************************************************************************
+- *                          refault feedback loop
++ *                          PID controller
+  ******************************************************************************/
+ 
+ /*
+@@ -4196,10 +4177,6 @@ static int walk_pud_range(p4d_t *p4d, unsigned long start, unsigned long end,
+ 
+ 		walk_pmd_range(&val, addr, next, args);
+ 
+-		/* a racy check to curtail the waiting time */
+-		if (wq_has_sleeper(&walk->lruvec->mm_state.wait))
+-			return 1;
+-
+ 		if (need_resched() || walk->batched >= MAX_LRU_BATCH) {
+ 			end = (addr | ~PUD_MASK) + 1;
+ 			goto done;
+@@ -4232,8 +4209,14 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
+ 	walk->next_addr = FIRST_USER_ADDRESS;
+ 
+ 	do {
++		DEFINE_MAX_SEQ(lruvec);
++
+ 		err = -EBUSY;
+ 
++		/* another thread might have called inc_max_seq() */
++		if (walk->max_seq != max_seq)
++			break;
++
+ 		/* folio_update_gen() requires stable folio_memcg() */
+ 		if (!mem_cgroup_trylock_pages(memcg))
+ 			break;
+@@ -4466,25 +4449,12 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
+ 		success = iterate_mm_list(lruvec, walk, &mm);
+ 		if (mm)
+ 			walk_mm(lruvec, mm, walk);
+-
+-		cond_resched();
+ 	} while (mm);
+ done:
+-	if (!success) {
+-		if (sc->priority <= DEF_PRIORITY - 2)
+-			wait_event_killable(lruvec->mm_state.wait,
+-					    max_seq < READ_ONCE(lrugen->max_seq));
+-		return false;
+-	}
+-
+-	VM_WARN_ON_ONCE(max_seq != READ_ONCE(lrugen->max_seq));
++	if (success)
++		inc_max_seq(lruvec, can_swap, force_scan);
+ 
+-	inc_max_seq(lruvec, can_swap, force_scan);
+-	/* either this sees any waiters or they will see updated max_seq */
+-	if (wq_has_sleeper(&lruvec->mm_state.wait))
+-		wake_up_all(&lruvec->mm_state.wait);
+-
+-	return true;
++	return success;
+ }
+ 
+ /******************************************************************************
+@@ -5671,14 +5641,14 @@ static void lru_gen_change_state(bool enabled)
+  *                          sysfs interface
+  ******************************************************************************/
+ 
+-static ssize_t show_min_ttl(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++static ssize_t min_ttl_ms_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+ {
+-	return sprintf(buf, "%u\n", jiffies_to_msecs(READ_ONCE(lru_gen_min_ttl)));
++	return sysfs_emit(buf, "%u\n", jiffies_to_msecs(READ_ONCE(lru_gen_min_ttl)));
+ }
+ 
+ /* see Documentation/admin-guide/mm/multigen_lru.rst for details */
+-static ssize_t store_min_ttl(struct kobject *kobj, struct kobj_attribute *attr,
+-			     const char *buf, size_t len)
++static ssize_t min_ttl_ms_store(struct kobject *kobj, struct kobj_attribute *attr,
++				const char *buf, size_t len)
+ {
+ 	unsigned int msecs;
+ 
+@@ -5690,11 +5660,9 @@ static ssize_t store_min_ttl(struct kobject *kobj, struct kobj_attribute *attr,
+ 	return len;
+ }
+ 
+-static struct kobj_attribute lru_gen_min_ttl_attr = __ATTR(
+-	min_ttl_ms, 0644, show_min_ttl, store_min_ttl
+-);
++static struct kobj_attribute lru_gen_min_ttl_attr = __ATTR_RW(min_ttl_ms);
+ 
+-static ssize_t show_enabled(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+ {
+ 	unsigned int caps = 0;
+ 
+@@ -5711,7 +5679,7 @@ static ssize_t show_enabled(struct kobject *kobj, struct kobj_attribute *attr, c
+ }
+ 
+ /* see Documentation/admin-guide/mm/multigen_lru.rst for details */
+-static ssize_t store_enabled(struct kobject *kobj, struct kobj_attribute *attr,
++static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 			     const char *buf, size_t len)
+ {
+ 	int i;
+@@ -5738,9 +5706,7 @@ static ssize_t store_enabled(struct kobject *kobj, struct kobj_attribute *attr,
+ 	return len;
+ }
+ 
+-static struct kobj_attribute lru_gen_enabled_attr = __ATTR(
+-	enabled, 0644, show_enabled, store_enabled
+-);
++static struct kobj_attribute lru_gen_enabled_attr = __ATTR_RW(enabled);
+ 
+ static struct attribute *lru_gen_attrs[] = {
+ 	&lru_gen_min_ttl_attr.attr,
+@@ -5748,7 +5714,7 @@ static struct attribute *lru_gen_attrs[] = {
+ 	NULL
+ };
+ 
+-static struct attribute_group lru_gen_attr_group = {
++static const struct attribute_group lru_gen_attr_group = {
+ 	.name = "lru_gen",
+ 	.attrs = lru_gen_attrs,
+ };
+@@ -6130,7 +6096,6 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+ 		INIT_LIST_HEAD(&lrugen->folios[gen][type][zone]);
+ 
+ 	lruvec->mm_state.seq = MIN_NR_GENS;
+-	init_waitqueue_head(&lruvec->mm_state.wait);
+ }
+ 
+ #ifdef CONFIG_MEMCG
+@@ -6163,7 +6128,6 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
+ 	for_each_node(nid) {
+ 		struct lruvec *lruvec = get_lruvec(memcg, nid);
+ 
+-		VM_WARN_ON_ONCE(lruvec->mm_state.nr_walkers);
+ 		VM_WARN_ON_ONCE(memchr_inv(lruvec->lrugen.nr_pages, 0,
+ 					   sizeof(lruvec->lrugen.nr_pages)));
+ 
+diff --git a/tools/testing/radix-tree/maple.c b/tools/testing/radix-tree/maple.c
+index 4c89ff333f6f..9286d3baa12d 100644
+--- a/tools/testing/radix-tree/maple.c
++++ b/tools/testing/radix-tree/maple.c
+@@ -55,6 +55,28 @@ struct rcu_reader_struct {
+ 	struct rcu_test_struct2 *test;
+ };
+ 
++static int get_alloc_node_count(struct ma_state *mas)
++{
++	int count = 1;
++	struct maple_alloc *node = mas->alloc;
++
++	if (!node || ((unsigned long)node & 0x1))
++		return 0;
++	while (node->node_count) {
++		count += node->node_count;
++		node = node->slot[0];
++	}
++	return count;
++}
++
++static void check_mas_alloc_node_count(struct ma_state *mas)
++{
++	mas_node_count_gfp(mas, MAPLE_ALLOC_SLOTS + 1, GFP_KERNEL);
++	mas_node_count_gfp(mas, MAPLE_ALLOC_SLOTS + 3, GFP_KERNEL);
++	MT_BUG_ON(mas->tree, get_alloc_node_count(mas) != mas->alloc->total);
++	mas_destroy(mas);
++}
++
+ /*
+  * check_new_node() - Check the creation of new nodes and error path
+  * verification.
+@@ -69,6 +91,8 @@ static noinline void check_new_node(struct maple_tree *mt)
+ 
+ 	MA_STATE(mas, mt, 0, 0);
+ 
++	check_mas_alloc_node_count(&mas);
++
+ 	/* Try allocating 3 nodes */
+ 	mtree_lock(mt);
+ 	mt_set_non_kernel(0);
+-- 
+2.40.0
+

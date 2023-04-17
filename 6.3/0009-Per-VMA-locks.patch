@@ -1,7 +1,7 @@
-From c9249daec15495e2d4e2a0519e75421784e31ddc Mon Sep 17 00:00:00 2001
+From bd89875ebbc1edad43e0af8a2bb9824ff0483cf1 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sun, 9 Apr 2023 21:25:25 +0200
-Subject: [PATCH 08/10] Per-VMA locks
+Date: Mon, 17 Apr 2023 18:33:32 +0200
+Subject: [PATCH 09/12] Per-VMA locks
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -190,40 +190,41 @@ Suren Baghdasaryan (23):
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- Documentation/admin-guide/mm/userfaultfd.rst |  17 +++
+ Documentation/admin-guide/mm/userfaultfd.rst |  17 ++
  arch/arm64/Kconfig                           |   1 +
- arch/arm64/mm/fault.c                        |  36 +++++
- arch/powerpc/mm/fault.c                      |  37 +++++
+ arch/arm64/mm/fault.c                        |  36 ++++
+ arch/powerpc/mm/fault.c                      |  37 ++++
  arch/powerpc/platforms/powernv/Kconfig       |   1 +
  arch/powerpc/platforms/pseries/Kconfig       |   1 +
  arch/s390/Kconfig                            |   1 +
  arch/s390/mm/fault.c                         |  24 +++
  arch/x86/Kconfig                             |   1 +
- arch/x86/mm/fault.c                          |  36 +++++
+ arch/x86/mm/fault.c                          |  36 ++++
  fs/userfaultfd.c                             |  16 ++
- include/linux/mm.h                           | 127 +++++++++++++++-
+ include/linux/mm.h                           | 127 ++++++++++++-
  include/linux/mm_inline.h                    |   6 +
- include/linux/mm_types.h                     |  30 +++-
- include/linux/mmap_lock.h                    |  37 +++--
+ include/linux/mm_types.h                     |  30 ++-
+ include/linux/mmap_lock.h                    |  37 ++--
  include/linux/userfaultfd_k.h                |  23 +++
  include/linux/vm_event_item.h                |   6 +
  include/linux/vmstat.h                       |   6 +
  include/uapi/linux/userfaultfd.h             |  10 +-
- kernel/fork.c                                |  96 ++++++++++--
+ kernel/fork.c                                |  96 ++++++++--
  mm/Kconfig                                   |  12 ++
  mm/Kconfig.debug                             |   6 +
+ mm/filemap.c                                 |   6 +
  mm/hugetlb.c                                 |   4 +
  mm/init-mm.c                                 |   3 +
  mm/internal.h                                |   2 +-
  mm/khugepaged.c                              |  10 +-
- mm/memory.c                                  | 146 ++++++++++++++++---
- mm/mmap.c                                    |  48 ++++--
- mm/mprotect.c                                |  51 +++++--
+ mm/memory.c                                  | 186 +++++++++++++++----
+ mm/mmap.c                                    |  48 +++--
+ mm/mprotect.c                                |  51 ++++-
  mm/mremap.c                                  |   1 +
  mm/rmap.c                                    |  31 ++--
  mm/vmstat.c                                  |   6 +
- tools/testing/selftests/mm/userfaultfd.c     |  45 +++++-
- 33 files changed, 783 insertions(+), 94 deletions(-)
+ tools/testing/selftests/mm/userfaultfd.c     |  45 ++++-
+ 34 files changed, 810 insertions(+), 113 deletions(-)
 
 diff --git a/Documentation/admin-guide/mm/userfaultfd.rst b/Documentation/admin-guide/mm/userfaultfd.rst
 index 7dc823b56ca4..bd2226299583 100644
@@ -1024,7 +1025,7 @@ index 005e5e306266..90c958952bfc 100644
  
  	__u64 ioctls;
 diff --git a/kernel/fork.c b/kernel/fork.c
-index 49c173e367d2..346ce90d1f33 100644
+index 349945168239..ebd353730887 100644
 --- a/kernel/fork.c
 +++ b/kernel/fork.c
 @@ -455,13 +455,49 @@ static struct kmem_cache *vm_area_cachep;
@@ -1155,7 +1156,7 @@ index 49c173e367d2..346ce90d1f33 100644
  	mm_pgtables_bytes_init(mm);
  	mm->map_count = 0;
  	mm->locked_vm = 0;
-@@ -3073,6 +3140,9 @@ void __init proc_caches_init(void)
+@@ -3074,6 +3141,9 @@ void __init proc_caches_init(void)
  			NULL);
  
  	vm_area_cachep = KMEM_CACHE(vm_area_struct, SLAB_PANIC|SLAB_ACCOUNT);
@@ -1202,6 +1203,30 @@ index c3547a373c9c..4965a7333a3f 100644
 +	default y
 +	help
 +	  Statistics for per-vma locks.
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 2723104cc06a..7d898f26755b 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1706,6 +1706,8 @@ static int __folio_lock_async(struct folio *folio, struct wait_page_queue *wait)
+  *     mmap_lock has been released (mmap_read_unlock(), unless flags had both
+  *     FAULT_FLAG_ALLOW_RETRY and FAULT_FLAG_RETRY_NOWAIT set, in
+  *     which case mmap_lock is still held.
++ *     If flags had FAULT_FLAG_VMA_LOCK set, meaning the operation is performed
++ *     with VMA lock only, the VMA lock is still held.
+  *
+  * If neither ALLOW_RETRY nor KILLABLE are set, will always return true
+  * with the folio locked and the mmap_lock unperturbed.
+@@ -1713,6 +1715,10 @@ static int __folio_lock_async(struct folio *folio, struct wait_page_queue *wait)
+ bool __folio_lock_or_retry(struct folio *folio, struct mm_struct *mm,
+ 			 unsigned int flags)
+ {
++	/* Can't do this if not holding mmap_lock */
++	if (flags & FAULT_FLAG_VMA_LOCK)
++		return false;
++
+ 	if (fault_flag_allow_retry_first(flags)) {
+ 		/*
+ 		 * CAUTION! In this case, mmap_lock is not released
 diff --git a/mm/hugetlb.c b/mm/hugetlb.c
 index 245038a9fe4e..4d860b53a14a 100644
 --- a/mm/hugetlb.c
@@ -1287,7 +1312,7 @@ index 92e6f56a932d..042007f0bfa1 100644
  			 * Re-check whether we have an ->anon_vma, because
  			 * collapse_and_free_pmd() requires that either no
 diff --git a/mm/memory.c b/mm/memory.c
-index 01a23ad48a04..e7ffdadb684d 100644
+index 01a23ad48a04..7c8278e8b5df 100644
 --- a/mm/memory.c
 +++ b/mm/memory.c
 @@ -104,6 +104,20 @@ EXPORT_SYMBOL(mem_map);
@@ -1403,19 +1428,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  }
  
  static vm_fault_t handle_pte_marker(struct vm_fault *vmf)
-@@ -3698,6 +3734,11 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
- 	if (!pte_unmap_same(vmf))
- 		goto out;
- 
-+	if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
-+		ret = VM_FAULT_RETRY;
-+		goto out;
-+	}
-+
- 	entry = pte_to_swp_entry(vmf->orig_pte);
- 	if (unlikely(non_swap_entry(entry))) {
- 		if (is_migration_entry(entry)) {
-@@ -4012,6 +4053,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+@@ -4012,6 +4048,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
   */
  static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
  {
@@ -1423,7 +1436,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  	struct vm_area_struct *vma = vmf->vma;
  	struct folio *folio;
  	vm_fault_t ret = 0;
-@@ -4045,7 +4087,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+@@ -4045,7 +4082,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
  						vma->vm_page_prot));
  		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
  				vmf->address, &vmf->ptl);
@@ -1432,7 +1445,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  			update_mmu_tlb(vma, vmf->address, vmf->pte);
  			goto unlock;
  		}
-@@ -4085,7 +4127,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+@@ -4085,7 +4122,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
  
  	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
  			&vmf->ptl);
@@ -1441,7 +1454,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  		update_mmu_tlb(vma, vmf->address, vmf->pte);
  		goto release;
  	}
-@@ -4105,6 +4147,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+@@ -4105,6 +4142,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
  	folio_add_new_anon_rmap(folio, vma, vmf->address);
  	folio_add_lru_vma(folio, vma);
  setpte:
@@ -1450,7 +1463,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
  
  	/* No need to invalidate - it was non-present before */
-@@ -4272,7 +4316,7 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct page *page)
+@@ -4272,7 +4311,7 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct page *page)
  void do_set_pte(struct vm_fault *vmf, struct page *page, unsigned long addr)
  {
  	struct vm_area_struct *vma = vmf->vma;
@@ -1459,7 +1472,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  	bool write = vmf->flags & FAULT_FLAG_WRITE;
  	bool prefault = vmf->address != addr;
  	pte_t entry;
-@@ -4503,6 +4547,8 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
+@@ -4503,6 +4542,8 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
  			return ret;
  	}
  
@@ -1468,7 +1481,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  	ret = __do_fault(vmf);
  	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
  		return ret;
-@@ -4519,6 +4565,9 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
+@@ -4519,6 +4560,9 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
  	struct vm_area_struct *vma = vmf->vma;
  	vm_fault_t ret;
  
@@ -1478,7 +1491,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  	if (unlikely(anon_vma_prepare(vma)))
  		return VM_FAULT_OOM;
  
-@@ -4558,6 +4607,9 @@ static vm_fault_t do_shared_fault(struct vm_fault *vmf)
+@@ -4558,6 +4602,9 @@ static vm_fault_t do_shared_fault(struct vm_fault *vmf)
  	struct vm_area_struct *vma = vmf->vma;
  	vm_fault_t ret, tmp;
  
@@ -1488,7 +1501,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  	ret = __do_fault(vmf);
  	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
  		return ret;
-@@ -4916,12 +4968,8 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+@@ -4916,12 +4963,8 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
  		}
  	}
  
@@ -1503,7 +1516,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  
  	if (!pte_present(vmf->orig_pte))
  		return do_swap_page(vmf);
-@@ -4929,6 +4977,9 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+@@ -4929,6 +4972,9 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
  	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
  		return do_numa_page(vmf);
  
@@ -1513,7 +1526,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
  	spin_lock(vmf->ptl);
  	entry = vmf->orig_pte;
-@@ -4965,10 +5016,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+@@ -4965,10 +5011,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
  }
  
  /*
@@ -1528,7 +1541,87 @@ index 01a23ad48a04..e7ffdadb684d 100644
   */
  static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
  		unsigned long address, unsigned int flags)
-@@ -5230,6 +5281,63 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+@@ -5080,24 +5126,30 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+  * updates.  However, note that the handling of PERF_COUNT_SW_PAGE_FAULTS should
+  * still be in per-arch page fault handlers at the entry of page fault.
+  */
+-static inline void mm_account_fault(struct pt_regs *regs,
++static inline void mm_account_fault(struct mm_struct *mm, struct pt_regs *regs,
+ 				    unsigned long address, unsigned int flags,
+ 				    vm_fault_t ret)
+ {
+ 	bool major;
+ 
+ 	/*
+-	 * We don't do accounting for some specific faults:
+-	 *
+-	 * - Unsuccessful faults (e.g. when the address wasn't valid).  That
+-	 *   includes arch_vma_access_permitted() failing before reaching here.
+-	 *   So this is not a "this many hardware page faults" counter.  We
+-	 *   should use the hw profiling for that.
+-	 *
+-	 * - Incomplete faults (VM_FAULT_RETRY).  They will only be counted
+-	 *   once they're completed.
++	 * Do not account for incomplete faults (VM_FAULT_RETRY). They will be
++	 * counted upon completion.
++	 */
++	if (ret & VM_FAULT_RETRY)
++		return;
++
++	/* Register both successful and failed faults in PGFAULT counters. */
++	count_vm_event(PGFAULT);
++	count_memcg_event_mm(mm, PGFAULT);
++
++	/*
++	 * Do not account for unsuccessful faults (e.g. when the address wasn't
++	 * valid).  That includes arch_vma_access_permitted() failing before
++	 * reaching here. So this is not a "this many hardware page faults"
++	 * counter.  We should use the hw profiling for that.
+ 	 */
+-	if (ret & (VM_FAULT_ERROR | VM_FAULT_RETRY))
++	if (ret & VM_FAULT_ERROR)
+ 		return;
+ 
+ 	/*
+@@ -5180,21 +5232,22 @@ static vm_fault_t sanitize_fault_flags(struct vm_area_struct *vma,
+ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 			   unsigned int flags, struct pt_regs *regs)
+ {
++	/* Copy vma->vm_mm in case mmap_lock is dropped and vma becomes unstable. */
++	struct mm_struct *mm = vma->vm_mm;
+ 	vm_fault_t ret;
+ 
+ 	__set_current_state(TASK_RUNNING);
+ 
+-	count_vm_event(PGFAULT);
+-	count_memcg_event_mm(vma->vm_mm, PGFAULT);
+-
+ 	ret = sanitize_fault_flags(vma, &flags);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	if (!arch_vma_access_permitted(vma, flags & FAULT_FLAG_WRITE,
+ 					    flags & FAULT_FLAG_INSTRUCTION,
+-					    flags & FAULT_FLAG_REMOTE))
+-		return VM_FAULT_SIGSEGV;
++					    flags & FAULT_FLAG_REMOTE)) {
++		ret = VM_FAULT_SIGSEGV;
++		goto out;
++	}
+ 
+ 	/*
+ 	 * Enable the memcg OOM handling for faults triggered in user
+@@ -5223,13 +5276,70 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 		if (task_in_memcg_oom(current) && !(ret & VM_FAULT_OOM))
+ 			mem_cgroup_oom_synchronize(false);
+ 	}
+-
+-	mm_account_fault(regs, address, flags, ret);
++out:
++	mm_account_fault(mm, regs, address, flags, ret);
+ 
+ 	return ret;
  }
  EXPORT_SYMBOL_GPL(handle_mm_fault);
  
@@ -1593,7 +1686,7 @@ index 01a23ad48a04..e7ffdadb684d 100644
  /*
   * Allocate p4d page table.
 diff --git a/mm/mmap.c b/mm/mmap.c
-index ff68a67a2a7c..a2bc2d9432b8 100644
+index d5475fbf5729..cbac45aa39ae 100644
 --- a/mm/mmap.c
 +++ b/mm/mmap.c
 @@ -133,7 +133,7 @@ void unlink_file_vma(struct vm_area_struct *vma)
@@ -1679,7 +1772,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  	if (vma_start < vma->vm_start || vma_end > vma->vm_end)
  		vma_expanded = true;
  
-@@ -2119,7 +2132,7 @@ static inline void remove_mt(struct mm_struct *mm, struct ma_state *mas)
+@@ -2157,7 +2170,7 @@ static inline void remove_mt(struct mm_struct *mm, struct ma_state *mas)
  		if (vma->vm_flags & VM_ACCOUNT)
  			nr_accounted += nrpages;
  		vm_stat_account(mm, vma->vm_flags, -nrpages);
@@ -1688,7 +1781,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  	}
  	vm_unacct_memory(nr_accounted);
  	validate_mm(mm);
-@@ -2142,7 +2155,8 @@ static void unmap_region(struct mm_struct *mm, struct maple_tree *mt,
+@@ -2180,7 +2193,8 @@ static void unmap_region(struct mm_struct *mm, struct maple_tree *mt,
  	update_hiwater_rss(mm);
  	unmap_vmas(&tlb, mt, vma, start, end, mm_wr_locked);
  	free_pgtables(&tlb, mt, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
@@ -1698,7 +1791,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  	tlb_finish_mmu(&tlb);
  }
  
-@@ -2198,10 +2212,10 @@ int __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
+@@ -2236,10 +2250,10 @@ int __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
  	if (new->vm_ops && new->vm_ops->open)
  		new->vm_ops->open(new);
  
@@ -1710,7 +1803,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  
  	if (new_below) {
  		vma->vm_start = addr;
-@@ -2245,10 +2259,12 @@ int split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
+@@ -2283,10 +2297,12 @@ int split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
  static inline int munmap_sidetree(struct vm_area_struct *vma,
  				   struct ma_state *mas_detach)
  {
@@ -1723,7 +1816,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  	if (vma->vm_flags & VM_LOCKED)
  		vma->vm_mm->locked_vm -= vma_pages(vma);
  
-@@ -2904,9 +2920,9 @@ static int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
+@@ -2942,9 +2958,9 @@ static int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
  		if (vma_iter_prealloc(vmi))
  			goto unacct_fail;
  
@@ -1734,7 +1827,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  		vma->vm_end = addr + len;
  		vm_flags_set(vma, VM_SOFTDIRTY);
  		vma_iter_store(vmi, vma);
-@@ -3039,7 +3055,7 @@ void exit_mmap(struct mm_struct *mm)
+@@ -3077,7 +3093,7 @@ void exit_mmap(struct mm_struct *mm)
  	mmap_write_lock(mm);
  	mt_clear_in_rcu(&mm->mm_mt);
  	free_pgtables(&tlb, &mm->mm_mt, vma, FIRST_USER_ADDRESS,
@@ -1743,7 +1836,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  	tlb_finish_mmu(&tlb);
  
  	/*
-@@ -3050,7 +3066,7 @@ void exit_mmap(struct mm_struct *mm)
+@@ -3088,7 +3104,7 @@ void exit_mmap(struct mm_struct *mm)
  	do {
  		if (vma->vm_flags & VM_ACCOUNT)
  			nr_accounted += vma_pages(vma);
@@ -1752,7 +1845,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  		count++;
  		cond_resched();
  	} while ((vma = mas_find(&mas, ULONG_MAX)) != NULL);
-@@ -3173,6 +3189,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+@@ -3211,6 +3227,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
  			get_file(new_vma->vm_file);
  		if (new_vma->vm_ops && new_vma->vm_ops->open)
  			new_vma->vm_ops->open(new_vma);
@@ -1760,7 +1853,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  		if (vma_link(mm, new_vma))
  			goto out_vma_link;
  		*need_rmap_locks = false;
-@@ -3467,6 +3484,7 @@ static void vm_lock_mapping(struct mm_struct *mm, struct address_space *mapping)
+@@ -3505,6 +3522,7 @@ static void vm_lock_mapping(struct mm_struct *mm, struct address_space *mapping)
   * of mm/rmap.c:
   *   - all hugetlbfs_i_mmap_rwsem_key locks (aka mapping->i_mmap_rwsem for
   *     hugetlb mapping);
@@ -1768,7 +1861,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
   *   - all i_mmap_rwsem locks;
   *   - all anon_vma->rwseml
   *
-@@ -3489,6 +3507,13 @@ int mm_take_all_locks(struct mm_struct *mm)
+@@ -3527,6 +3545,13 @@ int mm_take_all_locks(struct mm_struct *mm)
  
  	mutex_lock(&mm_all_locks_mutex);
  
@@ -1782,7 +1875,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  	mas_for_each(&mas, vma, ULONG_MAX) {
  		if (signal_pending(current))
  			goto out_unlock;
-@@ -3578,6 +3603,7 @@ void mm_drop_all_locks(struct mm_struct *mm)
+@@ -3616,6 +3641,7 @@ void mm_drop_all_locks(struct mm_struct *mm)
  		if (vma->vm_file && vma->vm_file->f_mapping)
  			vm_unlock_mapping(vma->vm_file->f_mapping);
  	}
@@ -1791,7 +1884,7 @@ index ff68a67a2a7c..a2bc2d9432b8 100644
  	mutex_unlock(&mm_all_locks_mutex);
  }
 diff --git a/mm/mprotect.c b/mm/mprotect.c
-index 13e84d8c0797..b9da9a5f87fe 100644
+index 36351a00c0e8..204194155863 100644
 --- a/mm/mprotect.c
 +++ b/mm/mprotect.c
 @@ -276,7 +276,15 @@ static long change_pte_range(struct mmu_gather *tlb,
