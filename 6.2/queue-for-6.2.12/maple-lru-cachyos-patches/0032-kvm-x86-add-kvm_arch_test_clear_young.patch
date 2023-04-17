@@ -1,0 +1,150 @@
+From 9cb67cf3a9acdfee367b8fa92b2f47555152057f Mon Sep 17 00:00:00 2001
+From: Yu Zhao <yuzhao@google.com>
+Date: Thu, 16 Feb 2023 21:12:27 -0700
+Subject: [PATCH 32/46] kvm/x86: add kvm_arch_test_clear_young()
+
+This patch adds kvm_arch_test_clear_young() for the vast majority of
+VMs that are not nested and run on hardware that sets the accessed bit
+in TDP MMU page tables.
+
+It relies on two techniques, RCU and cmpxchg, to safely test and clear
+the accessed bit without taking the MMU lock. The former protects KVM
+page tables from being freed while the latter clears the accessed bit
+atomically against both the hardware and other software page table
+walkers.
+
+Signed-off-by: Yu Zhao <yuzhao@google.com>
+---
+ arch/x86/include/asm/kvm_host.h | 27 ++++++++++++++++++++++
+ arch/x86/kvm/mmu/spte.h         | 12 ----------
+ arch/x86/kvm/mmu/tdp_mmu.c      | 41 +++++++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 12 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 24480b4f1..a076e337b 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1367,6 +1367,12 @@ struct kvm_arch {
+ 	 *	the MMU lock in read mode + the tdp_mmu_pages_lock or
+ 	 *	the MMU lock in write mode
+ 	 *
++	 * kvm_arch_test_clear_young() is a special case. It relies on two
++	 * techniques, RCU and cmpxchg, to safely test and clear the accessed
++	 * bit without taking the MMU lock. The former protects KVM page tables
++	 * from being freed while the latter clears the accessed bit atomically
++	 * against both the hardware and other software page table walkers.
++	 *
+ 	 * Roots will remain in the list until their tdp_mmu_root_count
+ 	 * drops to zero, at which point the thread that decremented the
+ 	 * count to zero should removed the root from the list and clean
+@@ -2174,4 +2180,25 @@ int memslot_rmap_alloc(struct kvm_memory_slot *slot, unsigned long npages);
+ 	 KVM_X86_QUIRK_FIX_HYPERCALL_INSN |	\
+ 	 KVM_X86_QUIRK_MWAIT_NEVER_UD_FAULTS)
+ 
++extern u64 __read_mostly shadow_accessed_mask;
++
++/*
++ * Returns true if A/D bits are supported in hardware and are enabled by KVM.
++ * When enabled, KVM uses A/D bits for all non-nested MMUs.  Because L1 can
++ * disable A/D bits in EPTP12, SP and SPTE variants are needed to handle the
++ * scenario where KVM is using A/D bits for L1, but not L2.
++ */
++static inline bool kvm_ad_enabled(void)
++{
++	return shadow_accessed_mask;
++}
++
++/* see the comments on the generic kvm_arch_has_test_clear_young() */
++#define kvm_arch_has_test_clear_young kvm_arch_has_test_clear_young
++static inline bool kvm_arch_has_test_clear_young(void)
++{
++	return IS_ENABLED(CONFIG_KVM) && IS_ENABLED(CONFIG_X86_64) &&
++	       (!IS_REACHABLE(CONFIG_KVM) || (kvm_ad_enabled() && tdp_enabled));
++}
++
+ #endif /* _ASM_X86_KVM_HOST_H */
+diff --git a/arch/x86/kvm/mmu/spte.h b/arch/x86/kvm/mmu/spte.h
+index 6f54dc940..0dc7fed1f 100644
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@ -153,7 +153,6 @@ extern u64 __read_mostly shadow_mmu_writable_mask;
+ extern u64 __read_mostly shadow_nx_mask;
+ extern u64 __read_mostly shadow_x_mask; /* mutual exclusive with nx_mask */
+ extern u64 __read_mostly shadow_user_mask;
+-extern u64 __read_mostly shadow_accessed_mask;
+ extern u64 __read_mostly shadow_dirty_mask;
+ extern u64 __read_mostly shadow_mmio_value;
+ extern u64 __read_mostly shadow_mmio_mask;
+@@ -247,17 +246,6 @@ static inline bool is_shadow_present_pte(u64 pte)
+ 	return !!(pte & SPTE_MMU_PRESENT_MASK);
+ }
+ 
+-/*
+- * Returns true if A/D bits are supported in hardware and are enabled by KVM.
+- * When enabled, KVM uses A/D bits for all non-nested MMUs.  Because L1 can
+- * disable A/D bits in EPTP12, SP and SPTE variants are needed to handle the
+- * scenario where KVM is using A/D bits for L1, but not L2.
+- */
+-static inline bool kvm_ad_enabled(void)
+-{
+-	return !!shadow_accessed_mask;
+-}
+-
+ static inline bool sp_ad_disabled(struct kvm_mmu_page *sp)
+ {
+ 	return sp->role.ad_disabled;
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index d6df38d37..9028e09f1 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1309,6 +1309,47 @@ bool kvm_tdp_mmu_age_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
+ 	return kvm_tdp_mmu_handle_gfn(kvm, range, age_gfn_range);
+ }
+ 
++bool kvm_arch_test_clear_young(struct kvm *kvm, struct kvm_gfn_range *range,
++			       gfn_t lsb_gfn, unsigned long *bitmap)
++{
++	struct kvm_mmu_page *root;
++
++	if (WARN_ON_ONCE(!kvm_arch_has_test_clear_young()))
++		return false;
++
++	if (kvm_memslots_have_rmaps(kvm))
++		return false;
++
++	/* see the comments on kvm_arch->tdp_mmu_roots */
++	rcu_read_lock();
++
++	list_for_each_entry_rcu(root, &kvm->arch.tdp_mmu_roots, link) {
++		struct tdp_iter iter;
++
++		if (kvm_mmu_page_as_id(root) != range->slot->as_id)
++			continue;
++
++		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end) {
++			u64 *sptep = rcu_dereference(iter.sptep);
++			u64 new_spte = iter.old_spte & ~shadow_accessed_mask;
++
++			VM_WARN_ON_ONCE(!page_count(virt_to_page(sptep)));
++			VM_WARN_ON_ONCE(iter.gfn < range->start || iter.gfn >= range->end);
++
++			if (new_spte == iter.old_spte)
++				continue;
++
++			/* see the comments on the generic kvm_arch_has_test_clear_young() */
++			if (__test_and_change_bit(lsb_gfn - iter.gfn, bitmap))
++				cmpxchg64(sptep, iter.old_spte, new_spte);
++		}
++	}
++
++	rcu_read_unlock();
++
++	return true;
++}
++
+ static bool test_age_gfn(struct kvm *kvm, struct tdp_iter *iter,
+ 			 struct kvm_gfn_range *range)
+ {
+-- 
+2.40.0.71.g950264636c
+
