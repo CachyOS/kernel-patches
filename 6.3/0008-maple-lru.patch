@@ -1,17 +1,21 @@
-From 1300046c6d7d6110fa0da7db293f028382ee4c16 Mon Sep 17 00:00:00 2001
+From 94175b03e3ecc1d0bb22dc4ecea1457bc64eb5cd Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sun, 9 Apr 2023 21:24:33 +0200
-Subject: [PATCH 08/12] maple-lru
+Date: Sat, 22 Apr 2023 11:43:59 +0200
+Subject: [PATCH 08/13] maple-lru
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- Documentation/mm/multigen_lru.rst |  44 ++++++++--
- include/linux/mmzone.h            |  10 +--
- lib/maple_tree.c                  | 103 +++++++++-------------
- mm/mmap.c                         |  48 +++++++++--
- mm/vmscan.c                       | 136 +++++++++++-------------------
- tools/testing/radix-tree/maple.c  |  24 ++++++
- 6 files changed, 197 insertions(+), 168 deletions(-)
+ Documentation/mm/multigen_lru.rst |  44 ++++++++-
+ arch/s390/mm/hugetlbpage.c        |   2 +-
+ arch/s390/mm/mmap.c               |   2 +-
+ fs/hugetlbfs/inode.c              |   2 +-
+ include/linux/mmzone.h            |  10 +-
+ lib/maple_tree.c                  | 158 +++++++++++++-----------------
+ lib/test_maple_tree.c             |  27 +++--
+ mm/mmap.c                         |  57 +++++++++--
+ mm/vmscan.c                       | 136 ++++++++++---------------
+ tools/testing/radix-tree/maple.c  |  24 +++++
+ 10 files changed, 258 insertions(+), 204 deletions(-)
 
 diff --git a/Documentation/mm/multigen_lru.rst b/Documentation/mm/multigen_lru.rst
 index 5f1f6ecbb79b..52ed5092022f 100644
@@ -96,6 +100,45 @@ index 5f1f6ecbb79b..52ed5092022f 100644
  
  The aging and the eviction form a producer-consumer model;
  specifically, the latter drives the former by the sliding window over
+diff --git a/arch/s390/mm/hugetlbpage.c b/arch/s390/mm/hugetlbpage.c
+index c299a18273ff..c718f2a0de94 100644
+--- a/arch/s390/mm/hugetlbpage.c
++++ b/arch/s390/mm/hugetlbpage.c
+@@ -273,7 +273,7 @@ static unsigned long hugetlb_get_unmapped_area_topdown(struct file *file,
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = current->mm->mmap_base;
+ 	info.align_mask = PAGE_MASK & ~huge_page_mask(h);
+ 	info.align_offset = 0;
+diff --git a/arch/s390/mm/mmap.c b/arch/s390/mm/mmap.c
+index 3327c47bc181..fc9a7dc26c5e 100644
+--- a/arch/s390/mm/mmap.c
++++ b/arch/s390/mm/mmap.c
+@@ -136,7 +136,7 @@ unsigned long arch_get_unmapped_area_topdown(struct file *filp, unsigned long ad
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = mm->mmap_base;
+ 	if (filp || (flags & MAP_SHARED))
+ 		info.align_mask = MMAP_ALIGN_MASK << PAGE_SHIFT;
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index 9062da6da567..4bff10704e7f 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -208,7 +208,7 @@ hugetlb_get_unmapped_area_topdown(struct file *file, unsigned long addr,
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = arch_get_mmap_base(addr, current->mm->mmap_base);
+ 	info.align_mask = PAGE_MASK & ~huge_page_mask(h);
+ 	info.align_offset = 0;
 diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
 index 9fb1b03b83b2..cabe7f51ea66 100644
 --- a/include/linux/mmzone.h
@@ -131,7 +174,7 @@ index 9fb1b03b83b2..cabe7f51ea66 100644
  	struct lru_gen_memcg memcg_lru;
  #endif
 diff --git a/lib/maple_tree.c b/lib/maple_tree.c
-index db60edb55f2f..9172bcee94b4 100644
+index db60edb55f2f..44f34a51afc0 100644
 --- a/lib/maple_tree.c
 +++ b/lib/maple_tree.c
 @@ -1303,26 +1303,21 @@ static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
@@ -284,27 +327,99 @@ index db60edb55f2f..9172bcee94b4 100644
  
  		/* Not within lower bounds */
  		if (mas->index > pivot)
-@@ -5312,6 +5286,9 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
+@@ -5276,25 +5250,28 @@ static inline void mas_fill_gap(struct ma_state *mas, void *entry,
+  * @size: The size of the gap
+  * @fwd: Searching forward or back
+  */
+-static inline void mas_sparse_area(struct ma_state *mas, unsigned long min,
++static inline int mas_sparse_area(struct ma_state *mas, unsigned long min,
+ 				unsigned long max, unsigned long size, bool fwd)
+ {
+-	unsigned long start = 0;
+-
+-	if (!unlikely(mas_is_none(mas)))
+-		start++;
++	if (!unlikely(mas_is_none(mas)) && min == 0) {
++		min++;
++		/*
++		 * At this time, min is increased, we need to recheck whether
++		 * the size is satisfied.
++		 */
++		if (min > max || max - min + 1 < size)
++			return -EBUSY;
++	}
+ 	/* mas_is_ptr */
+ 
+-	if (start < min)
+-		start = min;
+-
+ 	if (fwd) {
+-		mas->index = start;
+-		mas->last = start + size - 1;
+-		return;
++		mas->index = min;
++		mas->last = min + size - 1;
++	} else {
++		mas->last = max;
++		mas->index = max - size + 1;
+ 	}
+-
+-	mas->index = max;
++	return 0;
+ }
+ 
+ /*
+@@ -5312,6 +5289,12 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
  	unsigned long *pivots;
  	enum maple_type mt;
  
-+	if (min >= max)
++	if (min > max)
++		return -EINVAL;
++
++	if (size == 0 || max - min < size - 1)
 +		return -EINVAL;
 +
  	if (mas_is_start(mas))
  		mas_start(mas);
  	else if (mas->offset >= 2)
-@@ -5366,6 +5343,9 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+@@ -5320,10 +5303,8 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
+ 		return -EBUSY;
+ 
+ 	/* Empty set */
+-	if (mas_is_none(mas) || mas_is_ptr(mas)) {
+-		mas_sparse_area(mas, min, max, size, true);
+-		return 0;
+-	}
++	if (mas_is_none(mas) || mas_is_ptr(mas))
++		return mas_sparse_area(mas, min, max, size, true);
+ 
+ 	/* The start of the window can only be within these values */
+ 	mas->index = min;
+@@ -5366,6 +5347,12 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
  {
  	struct maple_enode *last = mas->node;
  
-+	if (min >= max)
++	if (min > max)
++		return -EINVAL;
++
++	if (size == 0 || max - min < size - 1)
 +		return -EINVAL;
 +
  	if (mas_is_start(mas)) {
  		mas_start(mas);
  		mas->offset = mas_data_end(mas);
-@@ -5385,7 +5365,7 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+@@ -5376,16 +5363,14 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+ 	}
+ 
+ 	/* Empty set. */
+-	if (mas_is_none(mas) || mas_is_ptr(mas)) {
+-		mas_sparse_area(mas, min, max, size, false);
+-		return 0;
+-	}
++	if (mas_is_none(mas) || mas_is_ptr(mas))
++		return mas_sparse_area(mas, min, max, size, false);
+ 
+ 	/* The start of the window can only be within these values. */
  	mas->index = min;
  	mas->last = max;
  
@@ -313,7 +428,7 @@ index db60edb55f2f..9172bcee94b4 100644
  		if (last == mas->node) {
  			if (!mas_rewind_node(mas))
  				return -EBUSY;
-@@ -5400,17 +5380,9 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+@@ -5400,17 +5385,9 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
  	if (unlikely(mas->offset == MAPLE_NODE_SLOTS))
  		return -EBUSY;
  
@@ -328,12 +443,12 @@ index db60edb55f2f..9172bcee94b4 100644
  	/* Trim the upper limit to the max. */
 -	if (mas->max <= mas->last)
 -		mas->last = mas->max;
-+	if (max <= mas->last)
++	if (max < mas->last)
 +		mas->last = max;
  
  	mas->index = mas->last - size + 1;
  	return 0;
-@@ -5819,6 +5791,7 @@ int mas_preallocate(struct ma_state *mas, gfp_t gfp)
+@@ -5819,6 +5796,7 @@ int mas_preallocate(struct ma_state *mas, gfp_t gfp)
  	mas_reset(mas);
  	return ret;
  }
@@ -341,29 +456,145 @@ index db60edb55f2f..9172bcee94b4 100644
  
  /*
   * mas_destroy() - destroy a maple state.
+@@ -6391,7 +6369,7 @@ int mtree_alloc_range(struct maple_tree *mt, unsigned long *startp,
+ {
+ 	int ret = 0;
+ 
+-	MA_STATE(mas, mt, min, max - size);
++	MA_STATE(mas, mt, min, min);
+ 	if (!mt_is_alloc(mt))
+ 		return -EINVAL;
+ 
+@@ -6411,7 +6389,7 @@ int mtree_alloc_range(struct maple_tree *mt, unsigned long *startp,
+ retry:
+ 	mas.offset = 0;
+ 	mas.index = min;
+-	mas.last = max - size;
++	mas.last = max - size + 1;
+ 	ret = mas_alloc(&mas, entry, size, startp);
+ 	if (mas_nomem(&mas, gfp))
+ 		goto retry;
+@@ -6427,14 +6405,14 @@ int mtree_alloc_rrange(struct maple_tree *mt, unsigned long *startp,
+ {
+ 	int ret = 0;
+ 
+-	MA_STATE(mas, mt, min, max - size);
++	MA_STATE(mas, mt, min, max - size + 1);
+ 	if (!mt_is_alloc(mt))
+ 		return -EINVAL;
+ 
+ 	if (WARN_ON_ONCE(mt_is_reserved(entry)))
+ 		return -EINVAL;
+ 
+-	if (min >= max)
++	if (min > max)
+ 		return -EINVAL;
+ 
+ 	if (max < size - 1)
+diff --git a/lib/test_maple_tree.c b/lib/test_maple_tree.c
+index f1db333270e9..4d85d04b26f8 100644
+--- a/lib/test_maple_tree.c
++++ b/lib/test_maple_tree.c
+@@ -102,7 +102,7 @@ static noinline void check_mtree_alloc_rrange(struct maple_tree *mt,
+ 	unsigned long result = expected + 1;
+ 	int ret;
+ 
+-	ret = mtree_alloc_rrange(mt, &result, ptr, size, start, end - 1,
++	ret = mtree_alloc_rrange(mt, &result, ptr, size, start, end,
+ 			GFP_KERNEL);
+ 	MT_BUG_ON(mt, ret != eret);
+ 	if (ret)
+@@ -680,7 +680,7 @@ static noinline void check_alloc_rev_range(struct maple_tree *mt)
+ 		0,              /* Return value success. */
+ 
+ 		0x0,            /* Min */
+-		0x565234AF1 << 12,    /* Max */
++		0x565234AF0 << 12,    /* Max */
+ 		0x3000,         /* Size */
+ 		0x565234AEE << 12,  /* max - 3. */
+ 		0,              /* Return value success. */
+@@ -692,14 +692,14 @@ static noinline void check_alloc_rev_range(struct maple_tree *mt)
+ 		0,              /* Return value success. */
+ 
+ 		0x0,            /* Min */
+-		0x7F36D510A << 12,    /* Max */
++		0x7F36D5109 << 12,    /* Max */
+ 		0x4000,         /* Size */
+ 		0x7F36D5106 << 12,    /* First rev hole of size 0x4000 */
+ 		0,              /* Return value success. */
+ 
+ 		/* Ascend test. */
+ 		0x0,
+-		34148798629 << 12,
++		34148798628 << 12,
+ 		19 << 12,
+ 		34148797418 << 12,
+ 		0x0,
+@@ -711,6 +711,12 @@ static noinline void check_alloc_rev_range(struct maple_tree *mt)
+ 		0x0,
+ 		-EBUSY,
+ 
++		/* Single space test. */
++		34148798725 << 12,
++		34148798725 << 12,
++		1 << 12,
++		34148798725 << 12,
++		0,
+ 	};
+ 
+ 	int i, range_count = ARRAY_SIZE(range);
+@@ -759,9 +765,9 @@ static noinline void check_alloc_rev_range(struct maple_tree *mt)
+ 	mas_unlock(&mas);
+ 	for (i = 0; i < req_range_count; i += 5) {
+ #if DEBUG_REV_RANGE
+-		pr_debug("\tReverse request between %lu-%lu size %lu, should get %lu\n",
+-				req_range[i] >> 12,
+-				(req_range[i + 1] >> 12) - 1,
++		pr_debug("\tReverse request %d between %lu-%lu size %lu, should get %lu\n",
++				i, req_range[i] >> 12,
++				(req_range[i + 1] >> 12),
+ 				req_range[i+2] >> 12,
+ 				req_range[i+3] >> 12);
+ #endif
+@@ -880,6 +886,13 @@ static noinline void check_alloc_range(struct maple_tree *mt)
+ 		4503599618982063UL << 12,  /* Size */
+ 		34359052178 << 12,  /* Expected location */
+ 		-EBUSY,             /* Return failure. */
++
++		/* Test a single entry */
++		34148798648 << 12,		/* Min */
++		34148798648 << 12,		/* Max */
++		4096,			/* Size of 1 */
++		34148798648 << 12,	/* Location is the same as min/max */
++		0,			/* Success */
+ 	};
+ 	int i, range_count = ARRAY_SIZE(range);
+ 	int req_range_count = ARRAY_SIZE(req_range);
 diff --git a/mm/mmap.c b/mm/mmap.c
-index ff68a67a2a7c..d5475fbf5729 100644
+index ff68a67a2a7c..6819eb2b77d7 100644
 --- a/mm/mmap.c
 +++ b/mm/mmap.c
-@@ -1518,7 +1518,8 @@ static inline int accountable_mapping(struct file *file, vm_flags_t vm_flags)
-  */
+@@ -1519,6 +1519,8 @@ static inline int accountable_mapping(struct file *file, vm_flags_t vm_flags)
  static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
  {
--	unsigned long length, gap;
-+	unsigned long length, gap, low_limit;
+ 	unsigned long length, gap;
++	unsigned long low_limit, high_limit;
 +	struct vm_area_struct *tmp;
  
  	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
  
-@@ -1527,12 +1528,29 @@ static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
+@@ -1527,12 +1529,32 @@ static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
  	if (length < info->length)
  		return -ENOMEM;
  
 -	if (mas_empty_area(&mas, info->low_limit, info->high_limit - 1,
 -				  length))
 +	low_limit = info->low_limit;
++	if (low_limit < mmap_min_addr)
++		low_limit = mmap_min_addr;
++	high_limit = info->high_limit;
 +retry:
-+	if (mas_empty_area(&mas, low_limit, info->high_limit - 1, length))
++	if (mas_empty_area(&mas, low_limit, high_limit - 1, length))
  		return -ENOMEM;
  
  	gap = mas.index;
@@ -387,25 +618,29 @@ index ff68a67a2a7c..d5475fbf5729 100644
  	return gap;
  }
  
-@@ -1548,7 +1566,8 @@ static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
+@@ -1548,7 +1570,9 @@ static unsigned long unmapped_area(struct vm_unmapped_area_info *info)
   */
  static unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
  {
 -	unsigned long length, gap;
-+	unsigned long length, gap, high_limit, gap_end;
++	unsigned long length, gap, gap_end;
++	unsigned long low_limit, high_limit;
 +	struct vm_area_struct *tmp;
  
  	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
  	/* Adjust search length to account for worst case alignment overhead */
-@@ -1556,12 +1575,31 @@ static unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
+@@ -1556,12 +1580,33 @@ static unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
  	if (length < info->length)
  		return -ENOMEM;
  
 -	if (mas_empty_area_rev(&mas, info->low_limit, info->high_limit - 1,
+-				length))
++	low_limit = info->low_limit;
++	if (low_limit < mmap_min_addr)
++		low_limit = mmap_min_addr;
 +	high_limit = info->high_limit;
 +retry:
-+	if (mas_empty_area_rev(&mas, info->low_limit, high_limit - 1,
- 				length))
++	if (mas_empty_area_rev(&mas, low_limit, high_limit - 1, length))
  		return -ENOMEM;
  
  	gap = mas.last + 1 - info->length;
@@ -430,6 +665,15 @@ index ff68a67a2a7c..d5475fbf5729 100644
  	return gap;
  }
  
+@@ -1675,7 +1720,7 @@ generic_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = arch_get_mmap_base(addr, mm->mmap_base);
+ 	info.align_mask = 0;
+ 	info.align_offset = 0;
 diff --git a/mm/vmscan.c b/mm/vmscan.c
 index 71a7f4517e5a..ae60ddff831a 100644
 --- a/mm/vmscan.c
