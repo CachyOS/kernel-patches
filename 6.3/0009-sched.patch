@@ -1,6 +1,6 @@
-From 9d501d43ebbad46d54beaa5e0bb64cc27d9d3551 Mon Sep 17 00:00:00 2001
+From 618bb1079e41104cde2777dda19cb34f5336958b Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 22 Apr 2023 11:46:01 +0200
+Date: Mon, 24 Apr 2023 14:35:35 +0200
 Subject: [PATCH 09/12] sched
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -13,13 +13,13 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/sched/core.c            |   4 +-
  kernel/sched/deadline.c        |   1 +
  kernel/sched/debug.c           |   1 +
- kernel/sched/fair.c            | 265 ++++++++++++++++++++-------------
+ kernel/sched/fair.c            | 275 ++++++++++++++++++++-------------
  kernel/sched/features.h        |   1 +
- kernel/sched/pelt.c            |  60 ++++++++
- kernel/sched/pelt.h            |  42 +++++-
+ kernel/sched/pelt.c            |  60 +++++++
+ kernel/sched/pelt.h            |  42 ++++-
  kernel/sched/rt.c              |   4 +
  kernel/sched/sched.h           |  23 ++-
- 14 files changed, 302 insertions(+), 137 deletions(-)
+ 14 files changed, 312 insertions(+), 137 deletions(-)
 
 diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
 index 9ff480e94511..6510883c5e81 100644
@@ -178,7 +178,7 @@ index 1637b65ba07a..8d64fba16cfe 100644
  	P(se.avg.load_sum);
  	P(se.avg.runnable_sum);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 96c66b50ee48..0f92281fbed9 100644
+index 96c66b50ee48..59feda52fb4a 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -1082,6 +1082,23 @@ update_stats_curr_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -256,64 +256,74 @@ index 96c66b50ee48..0f92281fbed9 100644
  	hrtick_update(rq);
  }
  
-@@ -6538,6 +6551,23 @@ static int wake_wide(struct task_struct *p)
+@@ -6538,6 +6551,46 @@ static int wake_wide(struct task_struct *p)
  	return 1;
  }
  
 +/*
-+ * If a task switches in and then voluntarily relinquishes the
-+ * CPU quickly, it is regarded as a short duration task.
++ * Wake up the task on current CPU, if the following conditions are met:
 + *
-+ * SIS_SHORT tries to wake up the short wakee on current CPU. This
-+ * aims to avoid race condition among CPUs due to frequent context
-+ * switch. Besides, the candidate short task should not be the one
-+ * that wakes up more than one tasks, otherwise SIS_SHORT might
-+ * stack too many tasks on current CPU.
++ * 1. waker A is the only running task on this_cpu
++ * 3. A is a short duration task (waker will fall asleep soon)
++ * 4. wakee B is a short duration task (impact of B on A is minor)
++ * 5. A and B wake up each other alternately
 + */
-+static inline int is_short_task(struct task_struct *p)
++static bool
++wake_on_current(int this_cpu, struct task_struct *p)
 +{
-+	return sched_feat(SIS_SHORT) && !p->wakee_flips &&
-+	       p->se.dur_avg &&
-+	       ((p->se.dur_avg * 8) < sysctl_sched_min_granularity);
++	if (!sched_feat(SIS_CURRENT))
++		return false;
++
++	if (cpu_rq(this_cpu)->nr_running > 1)
++		return false;
++
++	/*
++	 * If a task switches in and then voluntarily relinquishes the
++	 * CPU quickly, it is regarded as a short duration task. In that
++	 * way, the short waker is likely to relinquish the CPU soon, which
++	 * provides room for the wakee. Meanwhile, a short wakee would bring
++	 * minor impact to the target rq. Put the short waker and wakee together
++	 * bring benefit to cache-share task pairs and avoid migration overhead.
++	 */
++	if (!current->se.dur_avg || ((current->se.dur_avg * 8) >= sysctl_sched_min_granularity))
++		return false;
++
++	if (!p->se.dur_avg || ((p->se.dur_avg * 8) >= sysctl_sched_min_granularity))
++		return false;
++
++	if (current->wakee_flips || p->wakee_flips)
++		return false;
++
++	if (current->last_wakee != p || p->last_wakee != current)
++		return false;
++
++	return true;
 +}
 +
  /*
   * The purpose of wake_affine() is to quickly determine on which CPU we can run
   * soonest. For the purpose of speed we only consider the waking and previous
-@@ -6574,6 +6604,11 @@ wake_affine_idle(int this_cpu, int prev_cpu, int sync)
- 	if (available_idle_cpu(prev_cpu))
+@@ -6631,6 +6684,9 @@ static int wake_affine(struct sched_domain *sd, struct task_struct *p,
+ 	if (sched_feat(WA_WEIGHT) && target == nr_cpumask_bits)
+ 		target = wake_affine_weight(sd, p, this_cpu, prev_cpu, sync);
+ 
++	if (target == nr_cpumask_bits && wake_on_current(this_cpu, p))
++		target = this_cpu;
++
+ 	schedstat_inc(p->stats.nr_wakeups_affine_attempts);
+ 	if (target == nr_cpumask_bits)
  		return prev_cpu;
- 
-+	/* The only running task is a short duration one. */
-+	if (cpu_rq(this_cpu)->nr_running == 1 &&
-+	    is_short_task(rcu_dereference(cpu_curr(this_cpu))))
-+		return this_cpu;
-+
- 	return nr_cpumask_bits;
- }
- 
-@@ -6948,6 +6983,20 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
- 			/* overloaded LLC is unlikely to have idle cpu/core */
- 			if (nr == 1)
- 				return -1;
-+
-+			/*
-+			 * If the scan number suggested by SIS_UTIL is smaller
-+			 * than 60% of llc_weight, it indicates a util_avg% higher
-+			 * than 50%. System busier than this could lower its bar to
-+			 * choose a compromised "idle" CPU. This co-exists with
-+			 * !has_idle_core to not stack too many tasks on one CPU.
-+			 */
-+			if (!has_idle_core && this == target &&
-+			    (5 * nr < 3 * sd->span_weight) &&
-+			    cpu_rq(target)->nr_running <= 1 &&
-+			    is_short_task(p) &&
-+			    is_short_task(rcu_dereference(cpu_curr(target))))
-+				return target;
+@@ -7152,6 +7208,9 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
  		}
  	}
  
-@@ -9288,96 +9337,65 @@ group_type group_classify(unsigned int imbalance_pct,
++	if (smp_processor_id() == target && wake_on_current(target, p))
++		return target;
++
+ 	i = select_idle_cpu(p, sd, has_idle_core, target);
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+@@ -9288,96 +9347,65 @@ group_type group_classify(unsigned int imbalance_pct,
  }
  
  /**
@@ -325,25 +335,25 @@ index 96c66b50ee48..0f92281fbed9 100644
 - *
 - * Check the state of the SMT siblings of both @sds::local and @sg and decide
 - * if @dst_cpu can pull tasks.
-+ * sched_use_asym_prio - Check whether asym_packing priority must be used
-+ * @sd:		The scheduling domain of the load balancing
-+ * @cpu:	A CPU
-  *
+- *
 - * If @dst_cpu does not have SMT siblings, it can pull tasks if two or more of
 - * the SMT siblings of @sg are busy. If only one CPU in @sg is busy, pull tasks
 - * only if @dst_cpu has higher priority.
-+ * Always use CPU priority when balancing load between SMT siblings. When
-+ * balancing load between cores, it is not sufficient that @cpu is idle. Only
-+ * use CPU priority if the whole core is idle.
-  *
+- *
 - * If both @dst_cpu and @sg have SMT siblings, and @sg has exactly one more
 - * busy CPU than @sds::local, let @dst_cpu pull tasks if it has higher priority.
 - * Bigger imbalances in the number of busy CPUs will be dealt with in
 - * update_sd_pick_busiest().
-- *
++ * sched_use_asym_prio - Check whether asym_packing priority must be used
++ * @sd:		The scheduling domain of the load balancing
++ * @cpu:	A CPU
+  *
 - * If @sg does not have SMT siblings, only pull tasks if all of the SMT siblings
 - * of @dst_cpu are idle and @sg has lower priority.
-- *
++ * Always use CPU priority when balancing load between SMT siblings. When
++ * balancing load between cores, it is not sufficient that @cpu is idle. Only
++ * use CPU priority if the whole core is idle.
+  *
 - * Return: true if @dst_cpu can pull tasks, false otherwise.
 + * Returns: True if the priority of @cpu must be followed. False otherwise.
   */
@@ -455,7 +465,7 @@ index 96c66b50ee48..0f92281fbed9 100644
  
  	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
  }
-@@ -9567,10 +9585,22 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+@@ -9567,10 +9595,22 @@ static bool update_sd_pick_busiest(struct lb_env *env,
  		 * contention when accessing shared HW resources.
  		 *
  		 * XXX for now avg_load is not computed and always 0 so we
@@ -480,7 +490,7 @@ index 96c66b50ee48..0f92281fbed9 100644
  		break;
  
  	case group_has_spare:
-@@ -10045,7 +10075,6 @@ static void update_idle_cpu_scan(struct lb_env *env,
+@@ -10045,7 +10085,6 @@ static void update_idle_cpu_scan(struct lb_env *env,
  
  static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sds)
  {
@@ -488,7 +498,7 @@ index 96c66b50ee48..0f92281fbed9 100644
  	struct sched_group *sg = env->sd->groups;
  	struct sg_lb_stats *local = &sds->local_stat;
  	struct sg_lb_stats tmp_sgs;
-@@ -10086,8 +10115,13 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
+@@ -10086,8 +10125,13 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
  		sg = sg->next;
  	} while (sg != env->sd->groups);
  
@@ -504,7 +514,7 @@ index 96c66b50ee48..0f92281fbed9 100644
  
  
  	if (env->sd->flags & SD_NUMA)
-@@ -10397,7 +10431,10 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
+@@ -10397,7 +10441,10 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
  			goto out_balanced;
  	}
  
@@ -516,7 +526,7 @@ index 96c66b50ee48..0f92281fbed9 100644
  	if (sds.prefer_sibling && local->group_type == group_has_spare &&
  	    busiest->sum_nr_running > local->sum_nr_running + 1)
  		goto force_balance;
-@@ -10499,8 +10536,15 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+@@ -10499,8 +10546,15 @@ static struct rq *find_busiest_queue(struct lb_env *env,
  		    nr_running == 1)
  			continue;
  
@@ -533,7 +543,7 @@ index 96c66b50ee48..0f92281fbed9 100644
  		    sched_asym_prefer(i, env->dst_cpu) &&
  		    nr_running == 1)
  			continue;
-@@ -10589,12 +10633,19 @@ static inline bool
+@@ -10589,12 +10643,19 @@ static inline bool
  asym_active_balance(struct lb_env *env)
  {
  	/*
@@ -557,7 +567,7 @@ index 96c66b50ee48..0f92281fbed9 100644
  }
  
  static inline bool
-@@ -11328,9 +11379,13 @@ static void nohz_balancer_kick(struct rq *rq)
+@@ -11328,9 +11389,13 @@ static void nohz_balancer_kick(struct rq *rq)
  		 * When ASYM_PACKING; see if there's a more preferred CPU
  		 * currently idle; in which case, kick the ILB to move tasks
  		 * around.
@@ -573,14 +583,14 @@ index 96c66b50ee48..0f92281fbed9 100644
  				goto unlock;
  			}
 diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index ee7f23c76bd3..efdc29c42161 100644
+index ee7f23c76bd3..a3e05827f7e8 100644
 --- a/kernel/sched/features.h
 +++ b/kernel/sched/features.h
 @@ -62,6 +62,7 @@ SCHED_FEAT(TTWU_QUEUE, true)
   */
  SCHED_FEAT(SIS_PROP, false)
  SCHED_FEAT(SIS_UTIL, true)
-+SCHED_FEAT(SIS_SHORT, true)
++SCHED_FEAT(SIS_CURRENT, true)
  
  /*
   * Issue a WARN when we do multiple update_rq_clock() calls
