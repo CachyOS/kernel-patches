@@ -1,6 +1,6 @@
-From 017df095f9b6ea3cf7900a6a615b27e9b92ab27d Mon Sep 17 00:00:00 2001
+From 05cec8e53fe7ba0c8b683f4c658c346513656c73 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 1 May 2023 10:08:46 +0200
+Date: Thu, 11 May 2023 16:53:12 +0200
 Subject: [PATCH 04/10] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -9,7 +9,15 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  .../testing/sysfs-class-led-trigger-blkdev    |   78 ++
  Documentation/leds/index.rst                  |    1 +
  Documentation/leds/ledtrig-blkdev.rst         |  158 +++
+ Documentation/x86/topology.rst                |   26 +
+ arch/x86/events/amd/core.c                    |    2 +-
+ arch/x86/events/amd/ibs.c                     |   53 +-
+ arch/x86/include/asm/cacheinfo.h              |    1 +
+ arch/x86/include/asm/perf_event.h             |    2 +
  arch/x86/kernel/acpi/boot.c                   |   11 +-
+ arch/x86/kernel/cpu/amd.c                     |    1 +
+ arch/x86/kernel/cpu/cacheinfo.c               |   36 +
+ arch/x86/kernel/cpu/hygon.c                   |    1 +
  arch/x86/net/bpf_jit_comp.c                   |    5 +-
  drivers/bluetooth/btusb.c                     |    2 +-
  drivers/leds/trigger/Kconfig                  |    9 +
@@ -17,15 +25,21 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  drivers/leds/trigger/ledtrig-blkdev.c         | 1221 +++++++++++++++++
  fs/eventpoll.c                                |  188 ++-
  include/linux/pageblock-flags.h               |    2 +-
- kernel/kheaders.c                             |   10 +-
+ include/linux/perf_event.h                    |   11 +
+ kernel/events/core.c                          |   79 +-
  kernel/padata.c                               |    4 +-
  mm/page_alloc.c                               |   22 +-
  scripts/Makefile.vmlinux_o                    |    2 +-
  sound/pci/hda/cs35l41_hda.c                   |    2 +-
- 17 files changed, 1636 insertions(+), 90 deletions(-)
+ tools/perf/tests/Build                        |    1 +
+ tools/perf/tests/amd-ibs-via-core-pmu.c       |   72 +
+ tools/perf/tests/builtin-test.c               |    1 +
+ tools/perf/tests/tests.h                      |    1 +
+ 30 files changed, 1847 insertions(+), 156 deletions(-)
  create mode 100644 Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
  create mode 100644 Documentation/leds/ledtrig-blkdev.rst
  create mode 100644 drivers/leds/trigger/ledtrig-blkdev.c
+ create mode 100644 tools/perf/tests/amd-ibs-via-core-pmu.c
 
 diff --git a/Documentation/ABI/stable/sysfs-block b/Documentation/ABI/stable/sysfs-block
 index 282de3680367..ac1dd2fbd855 100644
@@ -308,6 +322,191 @@ index 000000000000..9ff5b99de451
 +* The ``blkdev`` LED trigger supports many-to-many device/LED associations.
 +  A device can be associated with multiple LEDs, and an LED can be associated
 +  with multiple devices.
+diff --git a/Documentation/x86/topology.rst b/Documentation/x86/topology.rst
+index 7f58010ea86a..9de14f3f7783 100644
+--- a/Documentation/x86/topology.rst
++++ b/Documentation/x86/topology.rst
+@@ -33,6 +33,7 @@ historical nature and should be cleaned up.
+ The topology of a system is described in the units of:
+ 
+     - packages
++    - cluster
+     - cores
+     - threads
+ 
+@@ -90,6 +91,22 @@ Package-related topology information in the kernel:
+         Cache. In general, it is a number identifying an LLC uniquely on the
+         system.
+ 
++Clusters
++========
++A cluster consists of threads of one or more cores sharing the same L2 cache.
++
++Cluster-related topology information in the kernel:
++
++  - cluster_id:
++
++    A per-CPU variable containing:
++
++      - Upper bits extracted from the APIC ID.  CPUs which have the same value
++        in these bits share an L2 and have the same cluster_id.
++
++        CPUs for which cluster information is unavailable will show 65535
++        (BAD_APICID) as the cluster_id.
++
+ Cores
+ =====
+ A core consists of 1 or more threads. It does not matter whether the threads
+@@ -125,6 +142,11 @@ Thread-related topology information in the kernel:
+ 
+     The number of online threads is also printed in /proc/cpuinfo "siblings."
+ 
++  - topology_cluster_cpumask():
++
++    The cpumask contains all online threads in the cluster to which a thread
++    belongs.
++
+   - topology_sibling_cpumask():
+ 
+     The cpumask contains all online threads in the core to which a thread
+@@ -138,6 +160,10 @@ Thread-related topology information in the kernel:
+ 
+     The physical package ID to which a thread belongs.
+ 
++  - topology_cluster_id();
++
++    The ID of the cluster to which a thread belongs.
++
+   - topology_core_id();
+ 
+     The ID of the core to which a thread belongs. It is also printed in /proc/cpuinfo
+diff --git a/arch/x86/events/amd/core.c b/arch/x86/events/amd/core.c
+index bccea57dee81..abadd5f23425 100644
+--- a/arch/x86/events/amd/core.c
++++ b/arch/x86/events/amd/core.c
+@@ -374,7 +374,7 @@ static int amd_pmu_hw_config(struct perf_event *event)
+ 
+ 	/* pass precise event sampling to ibs: */
+ 	if (event->attr.precise_ip && get_ibs_caps())
+-		return -ENOENT;
++		return forward_event_to_ibs(event);
+ 
+ 	if (has_branch_stack(event) && !x86_pmu.lbr_nr)
+ 		return -EOPNOTSUPP;
+diff --git a/arch/x86/events/amd/ibs.c b/arch/x86/events/amd/ibs.c
+index 64582954b5f6..371014802191 100644
+--- a/arch/x86/events/amd/ibs.c
++++ b/arch/x86/events/amd/ibs.c
+@@ -190,7 +190,7 @@ static struct perf_ibs *get_ibs_pmu(int type)
+ }
+ 
+ /*
+- * Use IBS for precise event sampling:
++ * core pmu config -> IBS config
+  *
+  *  perf record -a -e cpu-cycles:p ...    # use ibs op counting cycle count
+  *  perf record -a -e r076:p ...          # same as -e cpu-cycles:p
+@@ -199,25 +199,9 @@ static struct perf_ibs *get_ibs_pmu(int type)
+  * IbsOpCntCtl (bit 19) of IBS Execution Control Register (IbsOpCtl,
+  * MSRC001_1033) is used to select either cycle or micro-ops counting
+  * mode.
+- *
+- * The rip of IBS samples has skid 0. Thus, IBS supports precise
+- * levels 1 and 2 and the PERF_EFLAGS_EXACT is set. In rare cases the
+- * rip is invalid when IBS was not able to record the rip correctly.
+- * We clear PERF_EFLAGS_EXACT and take the rip from pt_regs then.
+- *
+  */
+-static int perf_ibs_precise_event(struct perf_event *event, u64 *config)
++static int core_pmu_ibs_config(struct perf_event *event, u64 *config)
+ {
+-	switch (event->attr.precise_ip) {
+-	case 0:
+-		return -ENOENT;
+-	case 1:
+-	case 2:
+-		break;
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-
+ 	switch (event->attr.type) {
+ 	case PERF_TYPE_HARDWARE:
+ 		switch (event->attr.config) {
+@@ -243,22 +227,37 @@ static int perf_ibs_precise_event(struct perf_event *event, u64 *config)
+ 	return -EOPNOTSUPP;
+ }
+ 
++/*
++ * The rip of IBS samples has skid 0. Thus, IBS supports precise
++ * levels 1 and 2 and the PERF_EFLAGS_EXACT is set. In rare cases the
++ * rip is invalid when IBS was not able to record the rip correctly.
++ * We clear PERF_EFLAGS_EXACT and take the rip from pt_regs then.
++ */
++int forward_event_to_ibs(struct perf_event *event)
++{
++	u64 config = 0;
++
++	if (!event->attr.precise_ip || event->attr.precise_ip > 2)
++		return -EOPNOTSUPP;
++
++	if (!core_pmu_ibs_config(event, &config)) {
++		event->attr.type = perf_ibs_op.pmu.type;
++		event->attr.config = config;
++	}
++	return -ENOENT;
++}
++
+ static int perf_ibs_init(struct perf_event *event)
+ {
+ 	struct hw_perf_event *hwc = &event->hw;
+ 	struct perf_ibs *perf_ibs;
+ 	u64 max_cnt, config;
+-	int ret;
+ 
+ 	perf_ibs = get_ibs_pmu(event->attr.type);
+-	if (perf_ibs) {
+-		config = event->attr.config;
+-	} else {
+-		perf_ibs = &perf_ibs_op;
+-		ret = perf_ibs_precise_event(event, &config);
+-		if (ret)
+-			return ret;
+-	}
++	if (!perf_ibs)
++		return -ENOENT;
++
++	config = event->attr.config;
+ 
+ 	if (event->pmu != &perf_ibs->pmu)
+ 		return -ENOENT;
+diff --git a/arch/x86/include/asm/cacheinfo.h b/arch/x86/include/asm/cacheinfo.h
+index ce9685fc78d8..2034cd556c07 100644
+--- a/arch/x86/include/asm/cacheinfo.h
++++ b/arch/x86/include/asm/cacheinfo.h
+@@ -7,6 +7,7 @@ extern unsigned int memory_caching_control;
+ #define CACHE_MTRR 0x01
+ #define CACHE_PAT  0x02
+ 
++void cacheinfo_topoext_init_l2c_id(struct cpuinfo_x86 *c, int cpu);
+ void cacheinfo_amd_init_llc_id(struct cpuinfo_x86 *c, int cpu);
+ void cacheinfo_hygon_init_llc_id(struct cpuinfo_x86 *c, int cpu);
+ 
+diff --git a/arch/x86/include/asm/perf_event.h b/arch/x86/include/asm/perf_event.h
+index 8fc15ed5e60b..fc86248215e2 100644
+--- a/arch/x86/include/asm/perf_event.h
++++ b/arch/x86/include/asm/perf_event.h
+@@ -475,8 +475,10 @@ struct pebs_xmm {
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+ extern u32 get_ibs_caps(void);
++extern int forward_event_to_ibs(struct perf_event *event);
+ #else
+ static inline u32 get_ibs_caps(void) { return 0; }
++static inline int forward_event_to_ibs(struct perf_event *event) { return -ENOENT; }
+ #endif
+ 
+ #ifdef CONFIG_PERF_EVENTS
 diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
 index 0dac4ab5b55b..21b542a6866c 100644
 --- a/arch/x86/kernel/acpi/boot.c
@@ -334,6 +533,77 @@ index 0dac4ab5b55b..21b542a6866c 100644
  }
  
  int __acpi_release_global_lock(unsigned int *lock)
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 95cdd08c4cbb..d6594727f924 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -358,6 +358,7 @@ static void amd_get_topology(struct cpuinfo_x86 *c)
+ 		if (!err)
+ 			c->x86_coreid_bits = get_count_order(c->x86_max_cores);
+ 
++		cacheinfo_topoext_init_l2c_id(c, cpu);
+ 		cacheinfo_amd_init_llc_id(c, cpu);
+ 
+ 	} else if (cpu_has(c, X86_FEATURE_NODEID_MSR)) {
+diff --git a/arch/x86/kernel/cpu/cacheinfo.c b/arch/x86/kernel/cpu/cacheinfo.c
+index 4063e8991211..947a1f27278c 100644
+--- a/arch/x86/kernel/cpu/cacheinfo.c
++++ b/arch/x86/kernel/cpu/cacheinfo.c
+@@ -659,6 +659,42 @@ static int find_num_cache_leaves(struct cpuinfo_x86 *c)
+ 	return i;
+ }
+ 
++void cacheinfo_topoext_init_l2c_id(struct cpuinfo_x86 *c, int cpu)
++{
++	u32 eax, ebx, ecx, edx, num_sharing_cache;
++	int i = 0, bits;
++
++	/* Check if L2 cache identifiers exists. */
++	if (!cpuid_ecx(0x80000006))
++		return;
++
++	while (true) {
++		u32 level;
++
++		cpuid_count(0x8000001d, i, &eax, &ebx, &ecx, &edx);
++		if (!eax)
++			return;
++
++		/*
++		 * Check if the current leaf is for L2 cache using
++		 * eax[7:5] used to describe the cache level.
++		 */
++		level = (eax >> 5) & 0x7;
++		if (level == 2)
++			break;
++
++		++i;
++	}
++
++	/*
++	 * L2 ID is calculated from the number of threads
++	 * sharing the L2 cache.
++	 */
++	num_sharing_cache = ((eax >> 14) & 0xfff) + 1;
++	bits = get_count_order(num_sharing_cache);
++	per_cpu(cpu_l2c_id, cpu) = c->apicid >> bits;
++}
++
+ void cacheinfo_amd_init_llc_id(struct cpuinfo_x86 *c, int cpu)
+ {
+ 	/*
+diff --git a/arch/x86/kernel/cpu/hygon.c b/arch/x86/kernel/cpu/hygon.c
+index 5a2962c492d3..cb0025b4a2fd 100644
+--- a/arch/x86/kernel/cpu/hygon.c
++++ b/arch/x86/kernel/cpu/hygon.c
+@@ -89,6 +89,7 @@ static void hygon_get_topology(struct cpuinfo_x86 *c)
+ 		/* Socket ID is ApicId[6] for these processors. */
+ 		c->phys_proc_id = c->apicid >> APICID_SOCKET_ID_BIT;
+ 
++		cacheinfo_topoext_init_l2c_id(c, cpu);
+ 		cacheinfo_hygon_init_llc_id(c, cpu);
+ 	} else if (cpu_has(c, X86_FEATURE_NODEID_MSR)) {
+ 		u64 value;
 diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
 index 1056bbf55b17..212bfd1517ec 100644
 --- a/arch/x86/net/bpf_jit_comp.c
@@ -1986,40 +2256,236 @@ index 5f1ae07d724b..97cda629c9e9 100644
  
  #endif /* CONFIG_HUGETLB_PAGE */
  
-diff --git a/kernel/kheaders.c b/kernel/kheaders.c
-index 8f69772af77b..42163c9e94e5 100644
---- a/kernel/kheaders.c
-+++ b/kernel/kheaders.c
-@@ -26,15 +26,15 @@ asm (
- "	.popsection				\n"
- );
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index d5628a7b5eaa..40647d707fb3 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -322,6 +322,9 @@ struct pmu {
+ 	/* number of address filters this PMU can do */
+ 	unsigned int			nr_addr_filters;
  
--extern char kernel_headers_data;
--extern char kernel_headers_data_end;
-+extern char kernel_headers_data[];
-+extern char kernel_headers_data_end[];
++	/* Skip creating pmu device and sysfs interface. */
++	bool				skip_sysfs_dev;
++
+ 	/*
+ 	 * Fully disable/enable this PMU, can be used to protect from the PMI
+ 	 * as well as for lazy/batch writing of the MSRs.
+@@ -827,6 +830,14 @@ struct perf_event {
+ 	void *security;
+ #endif
+ 	struct list_head		sb_list;
++
++	/*
++	 * Certain events gets forwarded to another pmu internally by over-
++	 * writing kernel copy of event->attr.type without user being aware
++	 * of it. event->orig_type contains original 'type' requested by
++	 * user.
++	 */
++	__u32				orig_type;
+ #endif /* CONFIG_PERF_EVENTS */
+ };
  
- static ssize_t
- ikheaders_read(struct file *file,  struct kobject *kobj,
- 	       struct bin_attribute *bin_attr,
- 	       char *buf, loff_t off, size_t len)
- {
--	memcpy(buf, &kernel_headers_data + off, len);
-+	memcpy(buf, &kernel_headers_data[off], len);
- 	return len;
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 68baa8194d9f..b901a9f3c14a 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -6647,7 +6647,7 @@ static void perf_sigtrap(struct perf_event *event)
+ 		return;
+ 
+ 	send_sig_perf((void __user *)event->pending_addr,
+-		      event->attr.type, event->attr.sig_data);
++		      event->orig_type, event->attr.sig_data);
  }
  
-@@ -48,8 +48,8 @@ static struct bin_attribute kheaders_attr __ro_after_init = {
- 
- static int __init ikheaders_init(void)
- {
--	kheaders_attr.size = (&kernel_headers_data_end -
--			      &kernel_headers_data);
-+	kheaders_attr.size = (kernel_headers_data_end -
-+			      kernel_headers_data);
- 	return sysfs_create_bin_file(kernel_kobj, &kheaders_attr);
+ /*
+@@ -9951,6 +9951,9 @@ static void sw_perf_event_destroy(struct perf_event *event)
+ 	swevent_hlist_put();
  }
  
++static struct pmu perf_cpu_clock; /* fwd declaration */
++static struct pmu perf_task_clock;
++
+ static int perf_swevent_init(struct perf_event *event)
+ {
+ 	u64 event_id = event->attr.config;
+@@ -9966,7 +9969,10 @@ static int perf_swevent_init(struct perf_event *event)
+ 
+ 	switch (event_id) {
+ 	case PERF_COUNT_SW_CPU_CLOCK:
++		event->attr.type = perf_cpu_clock.type;
++		return -ENOENT;
+ 	case PERF_COUNT_SW_TASK_CLOCK:
++		event->attr.type = perf_task_clock.type;
+ 		return -ENOENT;
+ 
+ 	default:
+@@ -11086,7 +11092,7 @@ static void cpu_clock_event_read(struct perf_event *event)
+ 
+ static int cpu_clock_event_init(struct perf_event *event)
+ {
+-	if (event->attr.type != PERF_TYPE_SOFTWARE)
++	if (event->attr.type != perf_cpu_clock.type)
+ 		return -ENOENT;
+ 
+ 	if (event->attr.config != PERF_COUNT_SW_CPU_CLOCK)
+@@ -11107,6 +11113,7 @@ static struct pmu perf_cpu_clock = {
+ 	.task_ctx_nr	= perf_sw_context,
+ 
+ 	.capabilities	= PERF_PMU_CAP_NO_NMI,
++	.skip_sysfs_dev	= true,
+ 
+ 	.event_init	= cpu_clock_event_init,
+ 	.add		= cpu_clock_event_add,
+@@ -11167,7 +11174,7 @@ static void task_clock_event_read(struct perf_event *event)
+ 
+ static int task_clock_event_init(struct perf_event *event)
+ {
+-	if (event->attr.type != PERF_TYPE_SOFTWARE)
++	if (event->attr.type != perf_task_clock.type)
+ 		return -ENOENT;
+ 
+ 	if (event->attr.config != PERF_COUNT_SW_TASK_CLOCK)
+@@ -11188,6 +11195,7 @@ static struct pmu perf_task_clock = {
+ 	.task_ctx_nr	= perf_sw_context,
+ 
+ 	.capabilities	= PERF_PMU_CAP_NO_NMI,
++	.skip_sysfs_dev	= true,
+ 
+ 	.event_init	= task_clock_event_init,
+ 	.add		= task_clock_event_add,
+@@ -11415,31 +11423,31 @@ int perf_pmu_register(struct pmu *pmu, const char *name, int type)
+ 		goto unlock;
+ 
+ 	pmu->type = -1;
+-	if (!name)
+-		goto skip_type;
++	if (WARN_ONCE(!name, "Can not register anonymous pmu.\n")) {
++		ret = -EINVAL;
++		goto free_pdc;
++	}
++
+ 	pmu->name = name;
+ 
+-	if (type != PERF_TYPE_SOFTWARE) {
+-		if (type >= 0)
+-			max = type;
++	if (type >= 0)
++		max = type;
+ 
+-		ret = idr_alloc(&pmu_idr, pmu, max, 0, GFP_KERNEL);
+-		if (ret < 0)
+-			goto free_pdc;
++	ret = idr_alloc(&pmu_idr, pmu, max, 0, GFP_KERNEL);
++	if (ret < 0)
++		goto free_pdc;
+ 
+-		WARN_ON(type >= 0 && ret != type);
++	WARN_ON(type >= 0 && ret != type);
+ 
+-		type = ret;
+-	}
++	type = ret;
+ 	pmu->type = type;
+ 
+-	if (pmu_bus_running) {
++	if (pmu_bus_running && !pmu->skip_sysfs_dev) {
+ 		ret = pmu_dev_alloc(pmu);
+ 		if (ret)
+ 			goto free_idr;
+ 	}
+ 
+-skip_type:
+ 	ret = -ENOMEM;
+ 	pmu->cpu_pmu_context = alloc_percpu(struct perf_cpu_pmu_context);
+ 	if (!pmu->cpu_pmu_context)
+@@ -11481,16 +11489,7 @@ int perf_pmu_register(struct pmu *pmu, const char *name, int type)
+ 	if (!pmu->event_idx)
+ 		pmu->event_idx = perf_event_idx_default;
+ 
+-	/*
+-	 * Ensure the TYPE_SOFTWARE PMUs are at the head of the list,
+-	 * since these cannot be in the IDR. This way the linear search
+-	 * is fast, provided a valid software event is provided.
+-	 */
+-	if (type == PERF_TYPE_SOFTWARE || !name)
+-		list_add_rcu(&pmu->entry, &pmus);
+-	else
+-		list_add_tail_rcu(&pmu->entry, &pmus);
+-
++	list_add_rcu(&pmu->entry, &pmus);
+ 	atomic_set(&pmu->exclusive_cnt, 0);
+ 	ret = 0;
+ unlock:
+@@ -11503,8 +11502,7 @@ int perf_pmu_register(struct pmu *pmu, const char *name, int type)
+ 	put_device(pmu->dev);
+ 
+ free_idr:
+-	if (pmu->type != PERF_TYPE_SOFTWARE)
+-		idr_remove(&pmu_idr, pmu->type);
++	idr_remove(&pmu_idr, pmu->type);
+ 
+ free_pdc:
+ 	free_percpu(pmu->pmu_disable_count);
+@@ -11525,8 +11523,7 @@ void perf_pmu_unregister(struct pmu *pmu)
+ 	synchronize_rcu();
+ 
+ 	free_percpu(pmu->pmu_disable_count);
+-	if (pmu->type != PERF_TYPE_SOFTWARE)
+-		idr_remove(&pmu_idr, pmu->type);
++	idr_remove(&pmu_idr, pmu->type);
+ 	if (pmu_bus_running) {
+ 		if (pmu->nr_addr_filters)
+ 			device_remove_file(pmu->dev, &dev_attr_nr_addr_filters);
+@@ -11601,6 +11598,12 @@ static struct pmu *perf_init_event(struct perf_event *event)
+ 
+ 	idx = srcu_read_lock(&pmus_srcu);
+ 
++	/*
++	 * Save original type before calling pmu->event_init() since certain
++	 * pmus overwrites event->attr.type to forward event to another pmu.
++	 */
++	event->orig_type = event->attr.type;
++
+ 	/* Try parent's PMU first: */
+ 	if (event->parent && event->parent->pmu) {
+ 		pmu = event->parent->pmu;
+@@ -11645,16 +11648,6 @@ static struct pmu *perf_init_event(struct perf_event *event)
+ 		goto unlock;
+ 	}
+ 
+-	list_for_each_entry_rcu(pmu, &pmus, entry, lockdep_is_held(&pmus_srcu)) {
+-		ret = perf_try_init_event(pmu, event);
+-		if (!ret)
+-			goto unlock;
+-
+-		if (ret != -ENOENT) {
+-			pmu = ERR_PTR(ret);
+-			goto unlock;
+-		}
+-	}
+ fail:
+ 	pmu = ERR_PTR(-ENOENT);
+ unlock:
+@@ -13640,8 +13633,8 @@ void __init perf_event_init(void)
+ 	perf_event_init_all_cpus();
+ 	init_srcu_struct(&pmus_srcu);
+ 	perf_pmu_register(&perf_swevent, "software", PERF_TYPE_SOFTWARE);
+-	perf_pmu_register(&perf_cpu_clock, NULL, -1);
+-	perf_pmu_register(&perf_task_clock, NULL, -1);
++	perf_pmu_register(&perf_cpu_clock, "cpu_clock", -1);
++	perf_pmu_register(&perf_task_clock, "task_clock", -1);
+ 	perf_tp_register();
+ 	perf_event_init_cpu(smp_processor_id());
+ 	register_reboot_notifier(&perf_reboot_notifier);
+@@ -13684,7 +13677,7 @@ static int __init perf_event_sysfs_init(void)
+ 		goto unlock;
+ 
+ 	list_for_each_entry(pmu, &pmus, entry) {
+-		if (!pmu->name || pmu->type < 0)
++		if (pmu->skip_sysfs_dev)
+ 			continue;
+ 
+ 		ret = pmu_dev_alloc(pmu);
 diff --git a/kernel/padata.c b/kernel/padata.c
 index e007b8a4b738..7c80301ab084 100644
 --- a/kernel/padata.c
@@ -2043,10 +2509,10 @@ index e007b8a4b738..7c80301ab084 100644
  	struct padata_work *pw = container_of(w, struct padata_work, pw_work);
  	struct padata_mt_job_state *ps = pw->pw_data;
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 8ce8ec922e1d..c869d38980b4 100644
+index 8e39705c7bdc..68d86fd93ef6 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
-@@ -3140,6 +3140,8 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+@@ -3138,6 +3138,8 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
  {
  	unsigned long flags;
  	int i, allocated = 0;
@@ -2055,7 +2521,7 @@ index 8ce8ec922e1d..c869d38980b4 100644
  
  	spin_lock_irqsave(&zone->lock, flags);
  	for (i = 0; i < count; ++i) {
-@@ -3148,9 +3150,6 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+@@ -3146,9 +3148,6 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
  		if (unlikely(page == NULL))
  			break;
  
@@ -2065,7 +2531,7 @@ index 8ce8ec922e1d..c869d38980b4 100644
  		/*
  		 * Split buddy pages returned by expand() are received here in
  		 * physical page order. The page is added to the tail of
-@@ -3162,7 +3161,6 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+@@ -3160,7 +3159,6 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
  		 * pages are ordered properly.
  		 */
  		list_add_tail(&page->pcp_list, list);
@@ -2073,7 +2539,7 @@ index 8ce8ec922e1d..c869d38980b4 100644
  		if (is_migrate_cma(get_pcppage_migratetype(page)))
  			__mod_zone_page_state(zone, NR_FREE_CMA_PAGES,
  					      -(1 << order));
-@@ -3176,6 +3174,22 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+@@ -3174,6 +3172,22 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
  	 */
  	__mod_zone_page_state(zone, NR_FREE_PAGES, -(i << order));
  	spin_unlock_irqrestore(&zone->lock, flags);
@@ -2122,6 +2588,120 @@ index 75020edd39e7..e4455220e9fd 100644
  		hw_cfg->bst_type = CS35L41_EXT_BOOST;
  		hw_cfg->gpio1.func = CS35l41_VSPK_SWITCH;
  		hw_cfg->gpio1.valid = true;
+diff --git a/tools/perf/tests/Build b/tools/perf/tests/Build
+index fb9ac5dc4079..ff7234653503 100644
+--- a/tools/perf/tests/Build
++++ b/tools/perf/tests/Build
+@@ -69,6 +69,7 @@ perf-y += dlfilter-test.o
+ perf-y += sigtrap.o
+ perf-y += event_groups.o
+ perf-y += symbols.o
++perf-y += amd-ibs-via-core-pmu.o
+ 
+ $(OUTPUT)tests/llvm-src-base.c: tests/bpf-script-example.c tests/Build
+ 	$(call rule_mkdir)
+diff --git a/tools/perf/tests/amd-ibs-via-core-pmu.c b/tools/perf/tests/amd-ibs-via-core-pmu.c
+new file mode 100644
+index 000000000000..6f6eb2d84fde
+--- /dev/null
++++ b/tools/perf/tests/amd-ibs-via-core-pmu.c
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: GPL-2.0
++#include "linux/perf_event.h"
++#include "tests.h"
++#include "pmu.h"
++#include "pmus.h"
++#include "../perf-sys.h"
++#include "debug.h"
++
++#define NR_SUB_TESTS 5
++
++static struct sub_tests {
++	int type;
++	unsigned long config;
++	bool valid;
++} sub_tests[NR_SUB_TESTS] = {
++	{ PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, true },
++	{ PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, false },
++	{ PERF_TYPE_RAW, 0x076, true },
++	{ PERF_TYPE_RAW, 0x0C1, true },
++	{ PERF_TYPE_RAW, 0x012, false },
++};
++
++static int event_open(int type, unsigned long config)
++{
++	struct perf_event_attr attr;
++
++	memset(&attr, 0, sizeof(struct perf_event_attr));
++	attr.type = type;
++	attr.size = sizeof(struct perf_event_attr);
++	attr.config = config;
++	attr.disabled = 1;
++	attr.precise_ip = 1;
++	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID;
++	attr.sample_period = 100000;
++
++	return sys_perf_event_open(&attr, -1, 0, -1, 0);
++}
++
++static int test__amd_ibs_via_core_pmu(struct test_suite *text __maybe_unused,
++				      int subtest __maybe_unused)
++{
++	struct perf_pmu *ibs_pmu;
++	int ret = TEST_OK;
++	int fd, i;
++
++	if (list_empty(&pmus))
++		perf_pmu__scan(NULL);
++
++	ibs_pmu = perf_pmu__find("ibs_op");
++	if (!ibs_pmu)
++		return TEST_SKIP;
++
++	for (i = 0; i < NR_SUB_TESTS; i++) {
++		fd = event_open(sub_tests[i].type, sub_tests[i].config);
++		pr_debug("type: 0x%x, config: 0x%lx, fd: %d  -  ", sub_tests[i].type,
++			 sub_tests[i].config, fd);
++		if ((sub_tests[i].valid && fd == -1) ||
++		    (!sub_tests[i].valid && fd > 0)) {
++			pr_debug("Fail\n");
++			ret = TEST_FAIL;
++		} else {
++			pr_debug("Pass\n");
++		}
++
++		if (fd > 0)
++			close(fd);
++	}
++
++	return ret;
++}
++
++DEFINE_SUITE("AMD IBS via core pmu", amd_ibs_via_core_pmu);
+diff --git a/tools/perf/tests/builtin-test.c b/tools/perf/tests/builtin-test.c
+index 35cc3807cc9e..1805a4fae762 100644
+--- a/tools/perf/tests/builtin-test.c
++++ b/tools/perf/tests/builtin-test.c
+@@ -119,6 +119,7 @@ static struct test_suite *generic_tests[] = {
+ 	&suite__sigtrap,
+ 	&suite__event_groups,
+ 	&suite__symbols,
++	&suite__amd_ibs_via_core_pmu,
+ 	NULL,
+ };
+ 
+diff --git a/tools/perf/tests/tests.h b/tools/perf/tests/tests.h
+index 9a0f3904e53d..65589d40638d 100644
+--- a/tools/perf/tests/tests.h
++++ b/tools/perf/tests/tests.h
+@@ -149,6 +149,7 @@ DECLARE_SUITE(dlfilter);
+ DECLARE_SUITE(sigtrap);
+ DECLARE_SUITE(event_groups);
+ DECLARE_SUITE(symbols);
++DECLARE_SUITE(amd_ibs_via_core_pmu);
+ 
+ /*
+  * PowerPC and S390 do not support creation of instruction breakpoints using the
 -- 
 2.40.1
 
