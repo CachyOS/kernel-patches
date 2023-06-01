@@ -1,0 +1,218 @@
+From b3174e61928e44c262b97970fd4f8b9107b57c6e Mon Sep 17 00:00:00 2001
+From: Wyes Karny <wyes.karny@amd.com>
+Date: Tue, 7 Mar 2023 11:27:39 +0000
+Subject: [PATCH 08/14] cpufreq: amd-pstate: Add guided mode control support
+ via sysfs
+
+amd_pstate driver's `status` sysfs entry helps to control the driver's
+mode dynamically by user. After the addition of guided mode the
+combinations of mode transitions have been increased (16 combinations).
+Therefore optimise the amd_pstate_update_status function by implementing
+a state transition table.
+
+There are 4 states amd_pstate supports, namely: 'disable', 'passive',
+'active', and 'guided'.  The transition from any state to any other
+state is possible after this change.
+
+Sysfs interface:
+
+To disable amd_pstate driver:
+ # echo disable > /sys/devices/system/cpu/amd_pstate/status
+
+To enable passive mode:
+ # echo passive > /sys/devices/system/cpu/amd_pstate/status
+
+To change mode to active:
+ # echo active > /sys/devices/system/cpu/amd_pstate/status
+
+To change mode to guided:
+ # echo guided > /sys/devices/system/cpu/amd_pstate/status
+
+Acked-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Mario Limonciello <mario.limonciello@amd.com>
+Tested-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+Signed-off-by: Wyes Karny <wyes.karny@amd.com>
+---
+ drivers/cpufreq/amd-pstate.c | 143 +++++++++++++++++++++++++----------
+ 1 file changed, 101 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 171fd30b5..443384260 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -106,6 +106,8 @@ static unsigned int epp_values[] = {
+ 	[EPP_INDEX_POWERSAVE] = AMD_CPPC_EPP_POWERSAVE,
+  };
+ 
++typedef int (*cppc_mode_transition_fn)(int);
++
+ static inline int get_mode_idx_from_str(const char *str, size_t size)
+ {
+ 	int i;
+@@ -838,6 +840,98 @@ static ssize_t show_energy_performance_preference(
+ 	return sysfs_emit(buf, "%s\n", energy_perf_strings[preference]);
+ }
+ 
++static void amd_pstate_driver_cleanup(void)
++{
++	amd_pstate_enable(false);
++	cppc_state = AMD_PSTATE_DISABLE;
++	current_pstate_driver = NULL;
++}
++
++static int amd_pstate_register_driver(int mode)
++{
++	int ret;
++
++	if (mode == AMD_PSTATE_PASSIVE || mode == AMD_PSTATE_GUIDED)
++		current_pstate_driver = &amd_pstate_driver;
++	else if (mode == AMD_PSTATE_ACTIVE)
++		current_pstate_driver = &amd_pstate_epp_driver;
++	else
++		return -EINVAL;
++
++	cppc_state = mode;
++	ret = cpufreq_register_driver(current_pstate_driver);
++	if (ret) {
++		amd_pstate_driver_cleanup();
++		return ret;
++	}
++	return 0;
++}
++
++static int amd_pstate_unregister_driver(int dummy)
++{
++	cpufreq_unregister_driver(current_pstate_driver);
++	amd_pstate_driver_cleanup();
++	return 0;
++}
++
++static int amd_pstate_change_mode_without_dvr_change(int mode)
++{
++	int cpu = 0;
++
++	cppc_state = mode;
++
++	if (boot_cpu_has(X86_FEATURE_CPPC) || cppc_state == AMD_PSTATE_ACTIVE)
++		return 0;
++
++	for_each_present_cpu(cpu) {
++		cppc_set_auto_sel(cpu, (cppc_state == AMD_PSTATE_PASSIVE) ? 0 : 1);
++	}
++
++	return 0;
++}
++
++static int amd_pstate_change_driver_mode(int mode)
++{
++	int ret;
++
++	ret = amd_pstate_unregister_driver(0);
++	if (ret)
++		return ret;
++
++	ret = amd_pstate_register_driver(mode);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++cppc_mode_transition_fn mode_state_machine[AMD_PSTATE_MAX][AMD_PSTATE_MAX] = {
++	[AMD_PSTATE_DISABLE]         = {
++		[AMD_PSTATE_DISABLE]     = NULL,
++		[AMD_PSTATE_PASSIVE]     = amd_pstate_register_driver,
++		[AMD_PSTATE_ACTIVE]      = amd_pstate_register_driver,
++		[AMD_PSTATE_GUIDED]      = amd_pstate_register_driver,
++	},
++	[AMD_PSTATE_PASSIVE]         = {
++		[AMD_PSTATE_DISABLE]     = amd_pstate_unregister_driver,
++		[AMD_PSTATE_PASSIVE]     = NULL,
++		[AMD_PSTATE_ACTIVE]      = amd_pstate_change_driver_mode,
++		[AMD_PSTATE_GUIDED]      = amd_pstate_change_mode_without_dvr_change,
++	},
++	[AMD_PSTATE_ACTIVE]          = {
++		[AMD_PSTATE_DISABLE]     = amd_pstate_unregister_driver,
++		[AMD_PSTATE_PASSIVE]     = amd_pstate_change_driver_mode,
++		[AMD_PSTATE_ACTIVE]      = NULL,
++		[AMD_PSTATE_GUIDED]      = amd_pstate_change_driver_mode,
++	},
++	[AMD_PSTATE_GUIDED]          = {
++		[AMD_PSTATE_DISABLE]     = amd_pstate_unregister_driver,
++		[AMD_PSTATE_PASSIVE]     = amd_pstate_change_mode_without_dvr_change,
++		[AMD_PSTATE_ACTIVE]      = amd_pstate_change_driver_mode,
++		[AMD_PSTATE_GUIDED]      = NULL,
++	},
++};
++
+ static ssize_t amd_pstate_show_status(char *buf)
+ {
+ 	if (!current_pstate_driver)
+@@ -846,57 +940,22 @@ static ssize_t amd_pstate_show_status(char *buf)
+ 	return sysfs_emit(buf, "%s\n", amd_pstate_mode_string[cppc_state]);
+ }
+ 
+-static void amd_pstate_driver_cleanup(void)
+-{
+-	current_pstate_driver = NULL;
+-}
+-
+ static int amd_pstate_update_status(const char *buf, size_t size)
+ {
+-	int ret = 0;
+ 	int mode_idx;
+ 
+-	if (size > 7 || size < 6)
++	if (size > strlen("passive") || size < strlen("active"))
+ 		return -EINVAL;
+-	mode_idx = get_mode_idx_from_str(buf, size);
+ 
+-	switch(mode_idx) {
+-	case AMD_PSTATE_DISABLE:
+-		if (!current_pstate_driver)
+-			return -EINVAL;
+-		if (cppc_state == AMD_PSTATE_ACTIVE)
+-			return -EBUSY;
+-		cpufreq_unregister_driver(current_pstate_driver);
+-		amd_pstate_driver_cleanup();
+-		break;
+-	case AMD_PSTATE_PASSIVE:
+-		if (current_pstate_driver) {
+-			if (current_pstate_driver == &amd_pstate_driver)
+-				return 0;
+-			cpufreq_unregister_driver(current_pstate_driver);
+-			cppc_state = AMD_PSTATE_PASSIVE;
+-			current_pstate_driver = &amd_pstate_driver;
+-		}
++	mode_idx = get_mode_idx_from_str(buf, size);
+ 
+-		ret = cpufreq_register_driver(current_pstate_driver);
+-		break;
+-	case AMD_PSTATE_ACTIVE:
+-		if (current_pstate_driver) {
+-			if (current_pstate_driver == &amd_pstate_epp_driver)
+-				return 0;
+-			cpufreq_unregister_driver(current_pstate_driver);
+-			current_pstate_driver = &amd_pstate_epp_driver;
+-			cppc_state = AMD_PSTATE_ACTIVE;
+-		}
++	if (mode_idx < 0 || mode_idx >= AMD_PSTATE_MAX)
++		return -EINVAL;
+ 
+-		ret = cpufreq_register_driver(current_pstate_driver);
+-		break;
+-	default:
+-		ret = -EINVAL;
+-		break;
+-	}
++	if (mode_state_machine[cppc_state][mode_idx])
++		return mode_state_machine[cppc_state][mode_idx](mode_idx);
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static ssize_t show_status(struct kobject *kobj,
+-- 
+2.41.0.rc2
+
