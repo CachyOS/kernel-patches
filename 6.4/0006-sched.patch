@@ -1,23 +1,23 @@
-From c5ab9292cff5c64281f5b8e522c67ff7dadc131e Mon Sep 17 00:00:00 2001
+From d9705b7f78a157575856ee08474297f3abe38dfd Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Tue, 9 May 2023 18:39:35 +0200
+Date: Thu, 1 Jun 2023 16:35:57 +0200
 Subject: [PATCH 6/8] sched
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  arch/x86/kernel/itmt.c         |  23 +--
- arch/x86/kernel/smpboot.c      |   7 +-
+ arch/x86/kernel/smpboot.c      |   4 +-
  include/linux/sched/sd_flags.h |   5 +-
  kernel/cgroup/cgroup.c         |  12 ++
- kernel/sched/core.c            |   2 +-
+ kernel/sched/core.c            |  59 ++++++--
+ kernel/sched/deadline.c        |   7 -
  kernel/sched/debug.c           |   2 +-
- kernel/sched/fair.c            | 294 +++++++++++++++++++++------------
- kernel/sched/pelt.c            |  60 +++++++
- kernel/sched/pelt.h            |  42 ++++-
- kernel/sched/psi.c             |   4 +-
- kernel/sched/sched.h           |  23 ++-
+ kernel/sched/fair.c            | 255 +++++++++++++++++++--------------
+ kernel/sched/features.h        |   1 +
+ kernel/sched/psi.c             |  19 +--
+ kernel/sched/sched.h           |  29 ++--
  kernel/sched/topology.c        |   7 +-
- 12 files changed, 336 insertions(+), 145 deletions(-)
+ 12 files changed, 253 insertions(+), 170 deletions(-)
 
 diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
 index 670eb08b972a..ee4fe8cdb857 100644
@@ -62,7 +62,7 @@ index 670eb08b972a..ee4fe8cdb857 100644
 +	per_cpu(sched_core_priority, cpu) = prio;
  }
 diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
-index 352f0ce1ece4..100ea6c95079 100644
+index 352f0ce1ece4..34066f6735dd 100644
 --- a/arch/x86/kernel/smpboot.c
 +++ b/arch/x86/kernel/smpboot.c
 @@ -552,7 +552,7 @@ static int x86_core_flags(void)
@@ -74,13 +74,7 @@ index 352f0ce1ece4..100ea6c95079 100644
  }
  #endif
  #ifdef CONFIG_SCHED_CLUSTER
-@@ -580,10 +580,13 @@ static struct sched_domain_topology_level x86_hybrid_topology[] = {
- #ifdef CONFIG_SCHED_SMT
- 	{ cpu_smt_mask, x86_smt_flags, SD_INIT_NAME(SMT) },
- #endif
-+#ifdef CONFIG_SCHED_CLUSTER
-+	{ cpu_clustergroup_mask, x86_cluster_flags, SD_INIT_NAME(CLS) },
-+#endif
+@@ -583,7 +583,7 @@ static struct sched_domain_topology_level x86_hybrid_topology[] = {
  #ifdef CONFIG_SCHED_MC
  	{ cpu_coregroup_mask, x86_core_flags, SD_INIT_NAME(MC) },
  #endif
@@ -159,18 +153,136 @@ index 625d7483951c..b26ae200abef 100644
  		.write = cgroup_irq_pressure_write,
  		.poll = cgroup_pressure_poll,
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index a68d1276bab0..eb096b79309c 100644
+index a68d1276bab0..bcb3a7e684ca 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -744,7 +744,7 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
- 	if ((irq_delta + steal) && sched_feat(NONTASK_CAPACITY))
- 		update_irq_load_avg(rq, irq_delta + steal);
+@@ -3341,6 +3341,39 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
+ }
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
++static __always_inline
++int __task_state_match(struct task_struct *p, unsigned int state)
++{
++	if (READ_ONCE(p->__state) & state)
++		return 1;
++
++#ifdef CONFIG_PREEMPT_RT
++	if (READ_ONCE(p->saved_state) & state)
++		return -1;
++#endif
++	return 0;
++}
++
++static __always_inline
++int task_state_match(struct task_struct *p, unsigned int state)
++{
++#ifdef CONFIG_PREEMPT_RT
++	int match;
++
++	/*
++	 * Serialize against current_save_and_set_rtlock_wait_state() and
++	 * current_restore_rtlock_saved_state().
++	 */
++	raw_spin_lock_irq(&p->pi_lock);
++	match = __task_state_match(p, state);
++	raw_spin_unlock_irq(&p->pi_lock);
++
++	return match;
++#else
++	return __task_state_match(p, state);
++#endif
++}
++
+ /*
+  * wait_task_inactive - wait for a thread to unschedule.
+  *
+@@ -3359,7 +3392,7 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
+  */
+ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state)
+ {
+-	int running, queued;
++	int running, queued, match;
+ 	struct rq_flags rf;
+ 	unsigned long ncsw;
+ 	struct rq *rq;
+@@ -3385,7 +3418,7 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
+ 		 * is actually now running somewhere else!
+ 		 */
+ 		while (task_on_cpu(rq, p)) {
+-			if (!(READ_ONCE(p->__state) & match_state))
++			if (!task_state_match(p, match_state))
+ 				return 0;
+ 			cpu_relax();
+ 		}
+@@ -3400,8 +3433,15 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
+ 		running = task_on_cpu(rq, p);
+ 		queued = task_on_rq_queued(p);
+ 		ncsw = 0;
+-		if (READ_ONCE(p->__state) & match_state)
++		if ((match = __task_state_match(p, match_state))) {
++			/*
++			 * When matching on p->saved_state, consider this task
++			 * still queued so it will wait.
++			 */
++			if (match < 0)
++				queued = 1;
+ 			ncsw = p->nvcsw | LONG_MIN; /* sets MSB */
++		}
+ 		task_rq_unlock(rq, p, &rf);
+ 
+ 		/*
+@@ -4003,15 +4043,14 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
+ static __always_inline
+ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
+ {
++	int match;
++
+ 	if (IS_ENABLED(CONFIG_DEBUG_PREEMPT)) {
+ 		WARN_ON_ONCE((state & TASK_RTLOCK_WAIT) &&
+ 			     state != TASK_RTLOCK_WAIT);
+ 	}
+ 
+-	if (READ_ONCE(p->__state) & state) {
+-		*success = 1;
+-		return true;
+-	}
++	*success = !!(match = __task_state_match(p, state));
+ 
+ #ifdef CONFIG_PREEMPT_RT
+ 	/*
+@@ -4027,12 +4066,10 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
+ 	 * p::saved_state to TASK_RUNNING so any further tests will
+ 	 * not result in false positives vs. @success
+ 	 */
+-	if (p->saved_state & state) {
++	if (match < 0)
+ 		p->saved_state = TASK_RUNNING;
+-		*success = 1;
+-	}
  #endif
--	update_rq_clock_pelt(rq, delta);
-+	update_rq_clock_task_mult(rq, delta);
+-	return false;
++	return match > 0;
  }
  
- void update_rq_clock(struct rq *rq)
+ /*
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 5a9a4b81c972..f827067ad03b 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -489,13 +489,6 @@ static inline int is_leftmost(struct task_struct *p, struct dl_rq *dl_rq)
+ 
+ static void init_dl_rq_bw_ratio(struct dl_rq *dl_rq);
+ 
+-void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime)
+-{
+-	raw_spin_lock_init(&dl_b->dl_runtime_lock);
+-	dl_b->dl_period = period;
+-	dl_b->dl_runtime = runtime;
+-}
+-
+ void init_dl_bw(struct dl_bw *dl_b)
+ {
+ 	raw_spin_lock_init(&dl_b->lock);
 diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
 index 0b2340a79b65..066ff1c8ae4e 100644
 --- a/kernel/sched/debug.c
@@ -185,7 +297,7 @@ index 0b2340a79b65..066ff1c8ae4e 100644
  		SEQ_printf(m, "  .%-30s: %Ld\n", #x, (long long)(rq->x));\
  } while (0)
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 9671df93d1f5..f003bcbd5a62 100644
+index 9671df93d1f5..9fe8288b1b1f 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -1082,6 +1082,23 @@ update_stats_curr_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -236,7 +348,58 @@ index 9671df93d1f5..f003bcbd5a62 100644
  struct task_numa_env {
  	struct task_struct *p;
  
-@@ -9349,96 +9349,61 @@ group_type group_classify(unsigned int imbalance_pct,
+@@ -7045,6 +7045,37 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 	return idle_cpu;
+ }
+ 
++/*
++ * For the multiple-LLC per node case, make sure to try the other LLC's if the
++ * local LLC comes up empty.
++ */
++static int
++select_idle_node(struct task_struct *p, struct sched_domain *sd, int target)
++{
++	struct sched_domain *parent = sd->parent;
++	struct sched_group *sg;
++
++	/* Make sure to not cross nodes. */
++	if (!parent || parent->flags & SD_NUMA)
++		return -1;
++
++	sg = parent->groups;
++	do {
++		int cpu = cpumask_first(sched_group_span(sg));
++
++		if (!cpus_share_cache(cpu, target)) {
++			int i = select_idle_cpu(p, per_cpu(sd_llc, cpu),
++						test_idle_cores(cpu), cpu);
++			if ((unsigned)i < nr_cpumask_bits)
++				return i;
++		}
++
++		sg = sg->next;
++	} while (sg != parent->groups);
++
++	return -1;
++}
++
+ /*
+  * Scan the asym_capacity domain for idle CPUs; pick the first idle one on which
+  * the task fits. If no CPU is big enough, but there are idle ones, try to
+@@ -7217,6 +7248,12 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+ 
++	if (sched_feat(SIS_NODE)) {
++		i = select_idle_node(p, sd, target);
++		if ((unsigned)i < nr_cpumask_bits)
++			return i;
++	}
++
+ 	return target;
+ }
+ 
+@@ -9349,96 +9386,61 @@ group_type group_classify(unsigned int imbalance_pct,
  }
  
  /**
@@ -376,25 +539,7 @@ index 9671df93d1f5..f003bcbd5a62 100644
  
  	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
  }
-@@ -9543,6 +9508,17 @@ static inline void update_sg_lb_stats(struct lb_env *env,
- 				sgs->group_capacity;
- }
- 
-+/* One group is SMT while the other group is not */
-+static inline bool asymmetric_groups(struct sched_group *sg1,
-+				    struct sched_group *sg2)
-+{
-+	if (!sg1 || !sg2)
-+		return false;
-+
-+	return (sg1->flags & SD_SHARE_CPUCAPACITY) !=
-+		(sg2->flags & SD_SHARE_CPUCAPACITY);
-+}
-+
- /**
-  * update_sd_pick_busiest - return 1 on busiest group
-  * @env: The load balancing environment.
-@@ -9628,13 +9604,37 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+@@ -9628,10 +9630,22 @@ static bool update_sd_pick_busiest(struct lb_env *env,
  		 * contention when accessing shared HW resources.
  		 *
  		 * XXX for now avg_load is not computed and always 0 so we
@@ -419,22 +564,7 @@ index 9671df93d1f5..f003bcbd5a62 100644
  		break;
  
  	case group_has_spare:
-+		/*
-+		 * Do not pick sg with SMT CPUs over sg with pure CPUs,
-+		 * as we do not want to pull task off half empty SMT core
-+		 * and make the core idle.
-+		 */
-+		if (asymmetric_groups(sds->busiest, sg)) {
-+			if (sds->busiest->flags & SD_SHARE_CPUCAPACITY)
-+				return true;
-+			else
-+				return false;
-+		}
-+
- 		/*
- 		 * Select not overloaded group with lowest number of idle cpus
- 		 * and highest number of running tasks. We could also compare
-@@ -10106,7 +10106,6 @@ static void update_idle_cpu_scan(struct lb_env *env,
+@@ -10106,7 +10120,6 @@ static void update_idle_cpu_scan(struct lb_env *env,
  
  static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sds)
  {
@@ -442,7 +572,7 @@ index 9671df93d1f5..f003bcbd5a62 100644
  	struct sched_group *sg = env->sd->groups;
  	struct sg_lb_stats *local = &sds->local_stat;
  	struct sg_lb_stats tmp_sgs;
-@@ -10147,8 +10146,13 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
+@@ -10147,8 +10160,13 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
  		sg = sg->next;
  	} while (sg != env->sd->groups);
  
@@ -458,52 +588,7 @@ index 9671df93d1f5..f003bcbd5a62 100644
  
  
  	if (env->sd->flags & SD_NUMA)
-@@ -10173,6 +10177,31 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
- 	update_idle_cpu_scan(env, sum_util);
- }
- 
-+static inline bool asym_active_balance_busiest(struct lb_env *env, struct sd_lb_stats *sds)
-+{
-+	/*
-+	 * Don't balance to a group without spare capacity.
-+	 *
-+	 * Skip non asymmetric sched group balancing. That check
-+	 * is handled by code path handling imbalanced load between
-+	 * similar groups.
-+	 */
-+	if (env->idle == CPU_NOT_IDLE ||
-+	    sds->local_stat.group_type != group_has_spare ||
-+	    !asymmetric_groups(sds->local, sds->busiest))
-+		return false;
-+
-+	/*
-+	 * For SMT source group, pull when there are two or more
-+	 * tasks over-utilizing a core.
-+	 */
-+	if (sds->busiest->flags & SD_SHARE_CPUCAPACITY &&
-+	    sds->busiest_stat.sum_h_nr_running > 1)
-+		return true;
-+
-+	return false;
-+}
-+
- /**
-  * calculate_imbalance - Calculate the amount of imbalance present within the
-  *			 groups of a given sched_domain during load balance.
-@@ -10258,6 +10287,12 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
- 			return;
- 		}
- 
-+		if (asym_active_balance_busiest(env, sds)) {
-+			env->migration_type = migrate_task;
-+			env->imbalance = 1;
-+			return;
-+		}
-+
- 		if (busiest->group_weight == 1 || sds->prefer_sibling) {
- 			unsigned int nr_diff = busiest->sum_nr_running;
- 			/*
-@@ -10458,8 +10493,15 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
+@@ -10458,7 +10476,10 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
  			goto out_balanced;
  	}
  
@@ -511,26 +596,11 @@ index 9671df93d1f5..f003bcbd5a62 100644
 +	/*
 +	 * Try to move all excess tasks to a sibling domain of the busiest
 +	 * group's child domain.
-+	 *
-+	 * Do not try to move between non smt sched group and smt sched
-+	 * group. Let asym active balance properly handle that case.
 +	 */
  	if (sds.prefer_sibling && local->group_type == group_has_spare &&
-+	    !asymmetric_groups(sds.busiest, sds.local) &&
  	    busiest->sum_nr_running > local->sum_nr_running + 1)
  		goto force_balance;
- 
-@@ -10472,6 +10514,9 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
- 			 */
- 			goto out_balanced;
- 
-+		if (asym_active_balance_busiest(env, &sds))
-+			goto force_balance;
-+
- 		if (busiest->group_weight > 1 &&
- 		    local->idle_cpus <= (busiest->idle_cpus + 1))
- 			/*
-@@ -10560,8 +10605,15 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+@@ -10560,8 +10581,15 @@ static struct rq *find_busiest_queue(struct lb_env *env,
  		    nr_running == 1)
  			continue;
  
@@ -547,7 +617,7 @@ index 9671df93d1f5..f003bcbd5a62 100644
  		    sched_asym_prefer(i, env->dst_cpu) &&
  		    nr_running == 1)
  			continue;
-@@ -10650,12 +10702,19 @@ static inline bool
+@@ -10650,12 +10678,19 @@ static inline bool
  asym_active_balance(struct lb_env *env)
  {
  	/*
@@ -571,43 +641,16 @@ index 9671df93d1f5..f003bcbd5a62 100644
  }
  
  static inline bool
-@@ -10709,7 +10768,7 @@ static int active_load_balance_cpu_stop(void *data);
- static int should_we_balance(struct lb_env *env)
- {
- 	struct sched_group *sg = env->sd->groups;
--	int cpu;
-+	int cpu, idle_smt = -1;
- 
- 	/*
- 	 * Ensure the balancing environment is consistent; can happen
-@@ -10735,11 +10794,26 @@ static int should_we_balance(struct lb_env *env)
- 	for_each_cpu_and(cpu, group_balance_mask(sg), env->cpus) {
- 		if (!idle_cpu(cpu))
- 			continue;
-+		else {
-+			/*
-+			 * Don't balance to idle SMT in busy core right away when
-+			 * balancing cores, but remember the first idle SMT CPU for
-+			 * later consideration.  Find CPU on an idle core first.
-+			 */
-+			if (!(env->sd->flags & SD_SHARE_CPUCAPACITY) && !is_core_idle(cpu)) {
-+				if (idle_smt == -1)
-+					idle_smt = cpu;
-+				continue;
-+			}
-+		}
- 
- 		/* Are we the first idle CPU? */
- 		return cpu == env->dst_cpu;
- 	}
- 
-+	if (idle_smt == env->dst_cpu)
-+		return true;
-+
- 	/* Are we the first CPU of this group ? */
- 	return group_balance_cpu(sg) == env->dst_cpu;
- }
-@@ -11389,9 +11463,13 @@ static void nohz_balancer_kick(struct rq *rq)
+@@ -10762,7 +10797,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 		.sd		= sd,
+ 		.dst_cpu	= this_cpu,
+ 		.dst_rq		= this_rq,
+-		.dst_grpmask    = sched_group_span(sd->groups),
++		.dst_grpmask    = group_balance_mask(sd->groups),
+ 		.idle		= idle,
+ 		.loop_break	= SCHED_NR_MIGRATE_BREAK,
+ 		.cpus		= cpus,
+@@ -11389,9 +11424,13 @@ static void nohz_balancer_kick(struct rq *rq)
  		 * When ASYM_PACKING; see if there's a more preferred CPU
  		 * currently idle; in which case, kick the ILB to move tasks
  		 * around.
@@ -622,162 +665,20 @@ index 9671df93d1f5..f003bcbd5a62 100644
  				flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
  				goto unlock;
  			}
-diff --git a/kernel/sched/pelt.c b/kernel/sched/pelt.c
-index 0f310768260c..036b0e2cd2b4 100644
---- a/kernel/sched/pelt.c
-+++ b/kernel/sched/pelt.c
-@@ -467,3 +467,63 @@ int update_irq_load_avg(struct rq *rq, u64 running)
- 	return ret;
- }
- #endif
-+
-+__read_mostly unsigned int sched_pelt_lshift;
-+
-+#ifdef CONFIG_SYSCTL
-+static unsigned int sysctl_sched_pelt_multiplier = 1;
-+
-+int sched_pelt_multiplier(struct ctl_table *table, int write, void *buffer,
-+			  size_t *lenp, loff_t *ppos)
-+{
-+	static DEFINE_MUTEX(mutex);
-+	unsigned int old;
-+	int ret;
-+
-+	mutex_lock(&mutex);
-+	old = sysctl_sched_pelt_multiplier;
-+	ret = proc_dointvec(table, write, buffer, lenp, ppos);
-+	if (ret)
-+		goto undo;
-+	if (!write)
-+		goto done;
-+
-+	switch (sysctl_sched_pelt_multiplier)  {
-+	case 1:
-+		fallthrough;
-+	case 2:
-+		fallthrough;
-+	case 4:
-+		WRITE_ONCE(sched_pelt_lshift,
-+			   sysctl_sched_pelt_multiplier >> 1);
-+		goto done;
-+	default:
-+		ret = -EINVAL;
-+	}
-+
-+undo:
-+	sysctl_sched_pelt_multiplier = old;
-+done:
-+	mutex_unlock(&mutex);
-+
-+	return ret;
-+}
-+
-+static struct ctl_table sched_pelt_sysctls[] = {
-+	{
-+		.procname       = "sched_pelt_multiplier",
-+		.data           = &sysctl_sched_pelt_multiplier,
-+		.maxlen         = sizeof(unsigned int),
-+		.mode           = 0644,
-+		.proc_handler   = sched_pelt_multiplier,
-+	},
-+	{}
-+};
-+
-+static int __init sched_pelt_sysctl_init(void)
-+{
-+	register_sysctl_init("kernel", sched_pelt_sysctls);
-+	return 0;
-+}
-+late_initcall(sched_pelt_sysctl_init);
-+#endif
-diff --git a/kernel/sched/pelt.h b/kernel/sched/pelt.h
-index 3a0e0dc28721..9b35b5072bae 100644
---- a/kernel/sched/pelt.h
-+++ b/kernel/sched/pelt.h
-@@ -61,6 +61,14 @@ static inline void cfs_se_util_change(struct sched_avg *avg)
- 	WRITE_ONCE(avg->util_est.enqueued, enqueued);
- }
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index ee7f23c76bd3..9e390eb82e38 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -62,6 +62,7 @@ SCHED_FEAT(TTWU_QUEUE, true)
+  */
+ SCHED_FEAT(SIS_PROP, false)
+ SCHED_FEAT(SIS_UTIL, true)
++SCHED_FEAT(SIS_NODE, true)
  
-+static inline u64 rq_clock_task_mult(struct rq *rq)
-+{
-+	lockdep_assert_rq_held(rq);
-+	assert_clock_updated(rq);
-+
-+	return rq->clock_task_mult;
-+}
-+
- static inline u64 rq_clock_pelt(struct rq *rq)
- {
- 	lockdep_assert_rq_held(rq);
-@@ -72,7 +80,7 @@ static inline u64 rq_clock_pelt(struct rq *rq)
- /* The rq is idle, we can sync to clock_task */
- static inline void _update_idle_rq_clock_pelt(struct rq *rq)
- {
--	rq->clock_pelt  = rq_clock_task(rq);
-+	rq->clock_pelt = rq_clock_task_mult(rq);
- 
- 	u64_u32_store(rq->clock_idle, rq_clock(rq));
- 	/* Paired with smp_rmb in migrate_se_pelt_lag() */
-@@ -121,6 +129,27 @@ static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
- 	rq->clock_pelt += delta;
- }
- 
-+extern unsigned int sched_pelt_lshift;
-+
-+/*
-+ * absolute time   |1      |2      |3      |4      |5      |6      |
-+ * @ mult = 1      --------****************--------****************-
-+ * @ mult = 2      --------********----------------********---------
-+ * @ mult = 4      --------****--------------------****-------------
-+ * clock task mult
-+ * @ mult = 2      |   |   |2  |3  |   |   |   |   |5  |6  |   |   |
-+ * @ mult = 4      | | | | |2|3| | | | | | | | | | |5|6| | | | | | |
-+ *
-+ */
-+static inline void update_rq_clock_task_mult(struct rq *rq, s64 delta)
-+{
-+	delta <<= READ_ONCE(sched_pelt_lshift);
-+
-+	rq->clock_task_mult += delta;
-+
-+	update_rq_clock_pelt(rq, delta);
-+}
-+
  /*
-  * When rq becomes idle, we have to check if it has lost idle time
-  * because it was fully busy. A rq is fully used when the /Sum util_sum
-@@ -147,7 +176,7 @@ static inline void update_idle_rq_clock_pelt(struct rq *rq)
- 	 * rq's clock_task.
- 	 */
- 	if (util_sum >= divider)
--		rq->lost_idle_time += rq_clock_task(rq) - rq->clock_pelt;
-+		rq->lost_idle_time += rq_clock_task_mult(rq) - rq->clock_pelt;
- 
- 	_update_idle_rq_clock_pelt(rq);
- }
-@@ -218,13 +247,18 @@ update_irq_load_avg(struct rq *rq, u64 running)
- 	return 0;
- }
- 
--static inline u64 rq_clock_pelt(struct rq *rq)
-+static inline u64 rq_clock_task_mult(struct rq *rq)
- {
- 	return rq_clock_task(rq);
- }
- 
-+static inline u64 rq_clock_pelt(struct rq *rq)
-+{
-+	return rq_clock_task_mult(rq);
-+}
-+
- static inline void
--update_rq_clock_pelt(struct rq *rq, s64 delta) { }
-+update_rq_clock_task_mult(struct rq *rq, s64 delta) { }
- 
- static inline void
- update_idle_rq_clock_pelt(struct rq *rq) { }
+  * Issue a WARN when we do multiple update_rq_clock() calls
 diff --git a/kernel/sched/psi.c b/kernel/sched/psi.c
-index e072f6b31bf3..b49af594ad28 100644
+index e072f6b31bf3..81fca77397f6 100644
 --- a/kernel/sched/psi.c
 +++ b/kernel/sched/psi.c
 @@ -160,7 +160,6 @@ __setup("psi=", setup_psi);
@@ -798,19 +699,46 @@ index e072f6b31bf3..b49af594ad28 100644
  		return ERR_PTR(-EINVAL);
  
  	/*
+@@ -1409,11 +1407,16 @@ void psi_trigger_destroy(struct psi_trigger *t)
+ 			group->rtpoll_nr_triggers[t->state]--;
+ 			if (!group->rtpoll_nr_triggers[t->state])
+ 				group->rtpoll_states &= ~(1 << t->state);
+-			/* reset min update period for the remaining triggers */
+-			list_for_each_entry(tmp, &group->rtpoll_triggers, node)
+-				period = min(period, div_u64(tmp->win.size,
+-						UPDATES_PER_WINDOW));
+-			group->rtpoll_min_period = period;
++			/*
++			 * Reset min update period for the remaining triggers
++			 * iff the destroying trigger had the min window size.
++			 */
++			if (group->rtpoll_min_period == div_u64(t->win.size, UPDATES_PER_WINDOW)) {
++				list_for_each_entry(tmp, &group->rtpoll_triggers, node)
++					period = min(period, div_u64(tmp->win.size,
++							UPDATES_PER_WINDOW));
++				group->rtpoll_min_period = period;
++			}
+ 			/* Destroy rtpoll_task when the last trigger is destroyed */
+ 			if (group->rtpoll_states == 0) {
+ 				group->rtpoll_until = 0;
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index ec7b3e0a2b20..1455cf8cc06e 100644
+index ec7b3e0a2b20..d8ba81c66579 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -1018,6 +1018,7 @@ struct rq {
- 	u64			clock;
- 	/* Ensure that all clocks are in the same cache line */
- 	u64			clock_task ____cacheline_aligned;
-+	u64			clock_task_mult;
- 	u64			clock_pelt;
- 	unsigned long		lost_idle_time;
- 	u64			clock_pelt_idle;
-@@ -1772,6 +1773,13 @@ queue_balance_callback(struct rq *rq,
+@@ -286,12 +286,6 @@ struct rt_bandwidth {
+ 
+ void __dl_clear_params(struct task_struct *p);
+ 
+-struct dl_bandwidth {
+-	raw_spinlock_t		dl_runtime_lock;
+-	u64			dl_runtime;
+-	u64			dl_period;
+-};
+-
+ static inline int dl_bandwidth_enabled(void)
+ {
+ 	return sysctl_sched_rt_runtime >= 0;
+@@ -1772,6 +1766,13 @@ queue_balance_callback(struct rq *rq,
  	for (__sd = rcu_dereference_check_sched_domain(cpu_rq(cpu)->sd); \
  			__sd; __sd = __sd->parent)
  
@@ -824,7 +752,7 @@ index ec7b3e0a2b20..1455cf8cc06e 100644
  /**
   * highest_flag_domain - Return highest sched_domain containing flag.
   * @cpu:	The CPU whose highest level of sched domain is to
-@@ -1779,16 +1787,25 @@ queue_balance_callback(struct rq *rq,
+@@ -1779,16 +1780,25 @@ queue_balance_callback(struct rq *rq,
   * @flag:	The flag to check for the highest sched_domain
   *		for the given CPU.
   *
@@ -853,6 +781,14 @@ index ec7b3e0a2b20..1455cf8cc06e 100644
  	}
  
  	return hsd;
+@@ -2378,7 +2388,6 @@ extern struct rt_bandwidth def_rt_bandwidth;
+ extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
+ extern bool sched_rt_bandwidth_account(struct rt_rq *rt_rq);
+ 
+-extern void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime);
+ extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
+ extern void init_dl_inactive_task_timer(struct sched_dl_entity *dl_se);
+ 
 diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
 index 6682535e37c8..ca4472281c28 100644
 --- a/kernel/sched/topology.c
@@ -873,5 +809,5 @@ index 6682535e37c8..ca4472281c28 100644
  			 * Transfer SD_PREFER_SIBLING down in case of a
  			 * degenerate parent; the spans match for this
 -- 
-2.41.0.rc1
+2.41.0
 
