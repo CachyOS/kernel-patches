@@ -1,0 +1,147 @@
+From 59a105511a72511437da030a66d9082eba877e59 Mon Sep 17 00:00:00 2001
+From: David Sterba <dsterba@suse.com>
+Date: Wed, 1 Mar 2023 21:47:08 +0100
+Subject: [PATCH 051/145] btrfs: locking: use atomic for DREW lock writers
+
+The DREW lock uses percpu variable to track lock counters and for that
+it needs to allocate the structure. In btrfs_read_tree_root() or
+btrfs_init_fs_root() this may add another error case or requires the
+NOFS scope protection.
+
+One way is to preallocate the structure as was suggested in
+https://lore.kernel.org/linux-btrfs/20221214021125.28289-1-robbieko@synology.com/
+
+We may avoid the allocation altogether if we don't use the percpu
+variables but an atomic for the writer counter. This should not make any
+difference, the DREW lock is used for truncate and NOCOW writes along
+with other IO operations.
+
+The percpu counter for writers has been there since the original commit
+8257b2dc3c1a1057 "Btrfs: introduce btrfs_{start, end}_nocow_write() for
+each subvolume". The reason could be to avoid hammering the same
+cacheline from all the readers but then the writers do that anyway.
+
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/disk-io.c | 12 +-----------
+ fs/btrfs/locking.c | 25 ++++++-------------------
+ fs/btrfs/locking.h |  5 ++---
+ 3 files changed, 9 insertions(+), 33 deletions(-)
+
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index a61baaad8..9a42dcf17 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -1341,17 +1341,8 @@ struct btrfs_root *btrfs_read_tree_root(struct btrfs_root *tree_root,
+ static int btrfs_init_fs_root(struct btrfs_root *root, dev_t anon_dev)
+ {
+ 	int ret;
+-	unsigned int nofs_flag;
+ 
+-	/*
+-	 * We might be called under a transaction (e.g. indirect backref
+-	 * resolution) which could deadlock if it triggers memory reclaim
+-	 */
+-	nofs_flag = memalloc_nofs_save();
+-	ret = btrfs_drew_lock_init(&root->snapshot_lock);
+-	memalloc_nofs_restore(nofs_flag);
+-	if (ret)
+-		goto fail;
++	btrfs_drew_lock_init(&root->snapshot_lock);
+ 
+ 	if (root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID &&
+ 	    !btrfs_is_data_reloc_root(root)) {
+@@ -2065,7 +2056,6 @@ void btrfs_put_root(struct btrfs_root *root)
+ 		WARN_ON(test_bit(BTRFS_ROOT_DEAD_RELOC_TREE, &root->state));
+ 		if (root->anon_dev)
+ 			free_anon_bdev(root->anon_dev);
+-		btrfs_drew_lock_destroy(&root->snapshot_lock);
+ 		free_root_extent_buffers(root);
+ #ifdef CONFIG_BTRFS_DEBUG
+ 		spin_lock(&root->fs_info->fs_roots_radix_lock);
+diff --git a/fs/btrfs/locking.c b/fs/btrfs/locking.c
+index 870528d87..3a496b0d3 100644
+--- a/fs/btrfs/locking.c
++++ b/fs/btrfs/locking.c
+@@ -325,24 +325,12 @@ struct extent_buffer *btrfs_try_read_lock_root_node(struct btrfs_root *root)
+  * acquire the lock.
+  */
+ 
+-int btrfs_drew_lock_init(struct btrfs_drew_lock *lock)
++void btrfs_drew_lock_init(struct btrfs_drew_lock *lock)
+ {
+-	int ret;
+-
+-	ret = percpu_counter_init(&lock->writers, 0, GFP_KERNEL);
+-	if (ret)
+-		return ret;
+-
+ 	atomic_set(&lock->readers, 0);
++	atomic_set(&lock->writers, 0);
+ 	init_waitqueue_head(&lock->pending_readers);
+ 	init_waitqueue_head(&lock->pending_writers);
+-
+-	return 0;
+-}
+-
+-void btrfs_drew_lock_destroy(struct btrfs_drew_lock *lock)
+-{
+-	percpu_counter_destroy(&lock->writers);
+ }
+ 
+ /* Return true if acquisition is successful, false otherwise */
+@@ -351,10 +339,10 @@ bool btrfs_drew_try_write_lock(struct btrfs_drew_lock *lock)
+ 	if (atomic_read(&lock->readers))
+ 		return false;
+ 
+-	percpu_counter_inc(&lock->writers);
++	atomic_inc(&lock->writers);
+ 
+ 	/* Ensure writers count is updated before we check for pending readers */
+-	smp_mb();
++	smp_mb__after_atomic();
+ 	if (atomic_read(&lock->readers)) {
+ 		btrfs_drew_write_unlock(lock);
+ 		return false;
+@@ -374,7 +362,7 @@ void btrfs_drew_write_lock(struct btrfs_drew_lock *lock)
+ 
+ void btrfs_drew_write_unlock(struct btrfs_drew_lock *lock)
+ {
+-	percpu_counter_dec(&lock->writers);
++	atomic_dec(&lock->writers);
+ 	cond_wake_up(&lock->pending_readers);
+ }
+ 
+@@ -390,8 +378,7 @@ void btrfs_drew_read_lock(struct btrfs_drew_lock *lock)
+ 	 */
+ 	smp_mb__after_atomic();
+ 
+-	wait_event(lock->pending_readers,
+-		   percpu_counter_sum(&lock->writers) == 0);
++	wait_event(lock->pending_readers, atomic_read(&lock->writers) == 0);
+ }
+ 
+ void btrfs_drew_read_unlock(struct btrfs_drew_lock *lock)
+diff --git a/fs/btrfs/locking.h b/fs/btrfs/locking.h
+index 11c2269b4..edb9b4a0d 100644
+--- a/fs/btrfs/locking.h
++++ b/fs/btrfs/locking.h
+@@ -195,13 +195,12 @@ static inline void btrfs_tree_unlock_rw(struct extent_buffer *eb, int rw)
+ 
+ struct btrfs_drew_lock {
+ 	atomic_t readers;
+-	struct percpu_counter writers;
++	atomic_t writers;
+ 	wait_queue_head_t pending_writers;
+ 	wait_queue_head_t pending_readers;
+ };
+ 
+-int btrfs_drew_lock_init(struct btrfs_drew_lock *lock);
+-void btrfs_drew_lock_destroy(struct btrfs_drew_lock *lock);
++void btrfs_drew_lock_init(struct btrfs_drew_lock *lock);
+ void btrfs_drew_write_lock(struct btrfs_drew_lock *lock);
+ bool btrfs_drew_try_write_lock(struct btrfs_drew_lock *lock);
+ void btrfs_drew_write_unlock(struct btrfs_drew_lock *lock);
+-- 
+2.41.0.rc2
+
