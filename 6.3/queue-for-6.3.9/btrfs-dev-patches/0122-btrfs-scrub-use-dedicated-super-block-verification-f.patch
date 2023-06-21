@@ -1,0 +1,119 @@
+From 86a7005fe67e9a093480cff309ecc861e6367e99 Mon Sep 17 00:00:00 2001
+From: Qu Wenruo <wqu@suse.com>
+Date: Mon, 20 Mar 2023 10:12:47 +0800
+Subject: [PATCH 122/147] btrfs: scrub: use dedicated super block verification
+ function to scrub one super block
+
+There is really no need to go through the super complex scrub_sectors()
+to just handle super blocks.  Introduce a dedicated function to handle
+super block scrubbing.
+
+This new function will introduce a behavior change, instead of using the
+complex but concurrent scrub_bio system, here we just go submit-and-wait.
+
+There is really not much sense to care the performance of super block
+scrubbing. It only has 3 super blocks at most, and they are all
+scattered around the devices already.
+
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Anand Jain <anand.jain@oracle.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/scrub.c | 60 +++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+index 3faea4bb5..cd4c881aa 100644
+--- a/fs/btrfs/scrub.c
++++ b/fs/btrfs/scrub.c
+@@ -4250,18 +4250,62 @@ int scrub_enumerate_chunks(struct scrub_ctx *sctx,
+ 	return ret;
+ }
+ 
++static int scrub_one_super(struct scrub_ctx *sctx, struct btrfs_device *dev,
++			   struct page *page, u64 physical, u64 generation)
++{
++	struct btrfs_fs_info *fs_info = sctx->fs_info;
++	struct bio_vec bvec;
++	struct bio bio;
++	struct btrfs_super_block *sb = page_address(page);
++	int ret;
++
++	bio_init(&bio, dev->bdev, &bvec, 1, REQ_OP_READ);
++	bio.bi_iter.bi_sector = physical >> SECTOR_SHIFT;
++	__bio_add_page(&bio, page, BTRFS_SUPER_INFO_SIZE, 0);
++	ret = submit_bio_wait(&bio);
++	bio_uninit(&bio);
++
++	if (ret < 0)
++		return ret;
++	ret = btrfs_check_super_csum(fs_info, sb);
++	if (ret != 0) {
++		btrfs_err_rl(fs_info,
++			"super block at physical %llu devid %llu has bad csum",
++			physical, dev->devid);
++		return -EIO;
++	}
++	if (btrfs_super_generation(sb) != generation) {
++		btrfs_err_rl(fs_info,
++"super block at physical %llu devid %llu has bad generation %llu expect %llu",
++			     physical, dev->devid,
++			     btrfs_super_generation(sb), generation);
++		return -EUCLEAN;
++	}
++
++	return btrfs_validate_super(fs_info, sb, -1);
++}
++
+ static noinline_for_stack int scrub_supers(struct scrub_ctx *sctx,
+ 					   struct btrfs_device *scrub_dev)
+ {
+ 	int	i;
+ 	u64	bytenr;
+ 	u64	gen;
+-	int	ret;
++	int ret = 0;
++	struct page *page;
+ 	struct btrfs_fs_info *fs_info = sctx->fs_info;
+ 
+ 	if (BTRFS_FS_ERROR(fs_info))
+ 		return -EROFS;
+ 
++	page = alloc_page(GFP_KERNEL);
++	if (!page) {
++		spin_lock(&sctx->stat_lock);
++		sctx->stat.malloc_errors++;
++		spin_unlock(&sctx->stat_lock);
++		return -ENOMEM;
++	}
++
+ 	/* Seed devices of a new filesystem has their own generation. */
+ 	if (scrub_dev->fs_devices != fs_info->fs_devices)
+ 		gen = scrub_dev->generation;
+@@ -4276,14 +4320,14 @@ static noinline_for_stack int scrub_supers(struct scrub_ctx *sctx,
+ 		if (!btrfs_check_super_location(scrub_dev, bytenr))
+ 			continue;
+ 
+-		ret = scrub_sectors(sctx, bytenr, BTRFS_SUPER_INFO_SIZE, bytenr,
+-				    scrub_dev, BTRFS_EXTENT_FLAG_SUPER, gen, i,
+-				    NULL, bytenr);
+-		if (ret)
+-			return ret;
++		ret = scrub_one_super(sctx, scrub_dev, page, bytenr, gen);
++		if (ret) {
++			spin_lock(&sctx->stat_lock);
++			sctx->stat.super_errors++;
++			spin_unlock(&sctx->stat_lock);
++		}
+ 	}
+-	wait_event(sctx->list_wait, atomic_read(&sctx->bios_in_flight) == 0);
+-
++	__free_page(page);
+ 	return 0;
+ }
+ 
+-- 
+2.41.0
+

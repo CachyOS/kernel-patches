@@ -1,0 +1,151 @@
+From 3c4e50e3c29a37eac580d27e6d2858850d59f04f Mon Sep 17 00:00:00 2001
+From: Boris Burkov <boris@bur.io>
+Date: Tue, 28 Mar 2023 14:19:49 +0900
+Subject: [PATCH 099/147] btrfs: stash ordered extent in dio_data during iomap
+ dio
+
+While it is not feasible for an ordered extent to survive across the
+calls btrfs_direct_write makes into __iomap_dio_rw, it is still helpful
+to stash it on the dio_data in between creating it in iomap_begin and
+finishing it in either end_io or iomap_end.
+
+The specific use I have in mind is that we can check if a particular bio
+is partial in submit_io without unconditionally looking up the ordered
+extent. This is a preparatory patch for a later patch which does just
+that.
+
+Reviewed-by: Naohiro Aota <naohiro.aota@wdc.com>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Tested-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Boris Burkov <boris@bur.io>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/inode.c | 36 +++++++++++++++++++++++-------------
+ 1 file changed, 23 insertions(+), 13 deletions(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 19ae68b7e..695680034 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -79,6 +79,7 @@ struct btrfs_iget_args {
+ struct btrfs_dio_data {
+ 	ssize_t submitted;
+ 	struct extent_changeset *data_reserved;
++	struct btrfs_ordered_extent *ordered;
+ 	bool data_space_reserved;
+ 	bool nocow_done;
+ };
+@@ -6968,6 +6969,7 @@ struct extent_map *btrfs_get_extent(struct btrfs_inode *inode,
+ }
+ 
+ static struct extent_map *btrfs_create_dio_extent(struct btrfs_inode *inode,
++						  struct btrfs_dio_data *dio_data,
+ 						  const u64 start,
+ 						  const u64 len,
+ 						  const u64 orig_start,
+@@ -6978,7 +6980,7 @@ static struct extent_map *btrfs_create_dio_extent(struct btrfs_inode *inode,
+ 						  const int type)
+ {
+ 	struct extent_map *em = NULL;
+-	int ret;
++	struct btrfs_ordered_extent *ordered;
+ 
+ 	if (type != BTRFS_ORDERED_NOCOW) {
+ 		em = create_io_em(inode, start, len, orig_start, block_start,
+@@ -6988,18 +6990,21 @@ static struct extent_map *btrfs_create_dio_extent(struct btrfs_inode *inode,
+ 		if (IS_ERR(em))
+ 			goto out;
+ 	}
+-	ret = btrfs_add_ordered_extent(inode, start, len, len, block_start,
+-				       block_len, 0,
+-				       (1 << type) |
+-				       (1 << BTRFS_ORDERED_DIRECT),
+-				       BTRFS_COMPRESS_NONE);
+-	if (ret) {
++	ordered = btrfs_alloc_ordered_extent(inode, start, len, len,
++					     block_start, block_len, 0,
++					     (1 << type) |
++					     (1 << BTRFS_ORDERED_DIRECT),
++					     BTRFS_COMPRESS_NONE);
++	if (IS_ERR(ordered)) {
+ 		if (em) {
+ 			free_extent_map(em);
+ 			btrfs_drop_extent_map_range(inode, start,
+ 						    start + len - 1, false);
+ 		}
+-		em = ERR_PTR(ret);
++		em = ERR_CAST(ordered);
++	} else {
++		ASSERT(!dio_data->ordered);
++		dio_data->ordered = ordered;
+ 	}
+  out:
+ 
+@@ -7007,6 +7012,7 @@ static struct extent_map *btrfs_create_dio_extent(struct btrfs_inode *inode,
+ }
+ 
+ static struct extent_map *btrfs_new_extent_direct(struct btrfs_inode *inode,
++						  struct btrfs_dio_data *dio_data,
+ 						  u64 start, u64 len)
+ {
+ 	struct btrfs_root *root = inode->root;
+@@ -7022,7 +7028,7 @@ static struct extent_map *btrfs_new_extent_direct(struct btrfs_inode *inode,
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+-	em = btrfs_create_dio_extent(inode, start, ins.offset, start,
++	em = btrfs_create_dio_extent(inode, dio_data, start, ins.offset, start,
+ 				     ins.objectid, ins.offset, ins.offset,
+ 				     ins.offset, BTRFS_ORDERED_REGULAR);
+ 	btrfs_dec_block_group_reservations(fs_info, ins.objectid);
+@@ -7368,7 +7374,7 @@ static int btrfs_get_blocks_direct_write(struct extent_map **map,
+ 		}
+ 		space_reserved = true;
+ 
+-		em2 = btrfs_create_dio_extent(BTRFS_I(inode), start, len,
++		em2 = btrfs_create_dio_extent(BTRFS_I(inode), dio_data, start, len,
+ 					      orig_start, block_start,
+ 					      len, orig_block_len,
+ 					      ram_bytes, type);
+@@ -7414,7 +7420,7 @@ static int btrfs_get_blocks_direct_write(struct extent_map **map,
+ 			goto out;
+ 		space_reserved = true;
+ 
+-		em = btrfs_new_extent_direct(BTRFS_I(inode), start, len);
++		em = btrfs_new_extent_direct(BTRFS_I(inode), dio_data, start, len);
+ 		if (IS_ERR(em)) {
+ 			ret = PTR_ERR(em);
+ 			goto out;
+@@ -7721,6 +7727,10 @@ static int btrfs_dio_iomap_end(struct inode *inode, loff_t pos, loff_t length,
+ 				      pos + length - 1, NULL);
+ 		ret = -ENOTBLK;
+ 	}
++	if (write) {
++		btrfs_put_ordered_extent(dio_data->ordered);
++		dio_data->ordered = NULL;
++	}
+ 
+ 	if (write)
+ 		extent_changeset_free(dio_data->data_reserved);
+@@ -7782,7 +7792,7 @@ static const struct iomap_dio_ops btrfs_dio_ops = {
+ 
+ ssize_t btrfs_dio_read(struct kiocb *iocb, struct iov_iter *iter, size_t done_before)
+ {
+-	struct btrfs_dio_data data;
++	struct btrfs_dio_data data = { 0 };
+ 
+ 	return iomap_dio_rw(iocb, iter, &btrfs_dio_iomap_ops, &btrfs_dio_ops,
+ 			    IOMAP_DIO_PARTIAL, &data, done_before);
+@@ -7791,7 +7801,7 @@ ssize_t btrfs_dio_read(struct kiocb *iocb, struct iov_iter *iter, size_t done_be
+ struct iomap_dio *btrfs_dio_write(struct kiocb *iocb, struct iov_iter *iter,
+ 				  size_t done_before)
+ {
+-	struct btrfs_dio_data data;
++	struct btrfs_dio_data data = { 0 };
+ 
+ 	return __iomap_dio_rw(iocb, iter, &btrfs_dio_iomap_ops, &btrfs_dio_ops,
+ 			    IOMAP_DIO_PARTIAL, &data, done_before);
+-- 
+2.41.0
+
