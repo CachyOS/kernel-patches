@@ -1,23 +1,28 @@
-From 1eee00317d9f6bc1c9e8998dd3a5973a20300d29 Mon Sep 17 00:00:00 2001
+From 60cd41b6dfcb6d77168e2f9122b22069b14f660e Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Wed, 14 Jun 2023 19:42:38 +0200
-Subject: [PATCH 7/8] vma
+Date: Mon, 26 Jun 2023 16:57:20 +0200
+Subject: [PATCH 8/9] vma
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- arch/arm64/mm/fault.c    |  3 ++-
- arch/powerpc/mm/fault.c  |  3 ++-
- arch/s390/mm/fault.c     |  3 ++-
- arch/x86/mm/fault.c      |  3 ++-
- fs/userfaultfd.c         | 42 ++++++++++++++++++-----------------
- include/linux/mm_types.h |  7 +++++-
- include/linux/pagemap.h  | 14 ++++++++----
- mm/filemap.c             | 37 +++++++++++++++++++------------
- mm/madvise.c             |  4 ++--
- mm/memory.c              | 48 ++++++++++++++++++++++------------------
- mm/swap.h                |  1 -
- mm/swap_state.c          | 12 +++++-----
- 12 files changed, 103 insertions(+), 74 deletions(-)
+ arch/arm64/mm/fault.c         |  3 +-
+ arch/powerpc/mm/fault.c       |  3 +-
+ arch/s390/mm/fault.c          |  3 +-
+ arch/x86/mm/fault.c           |  3 +-
+ fs/userfaultfd.c              | 42 +++++++++++++------------
+ include/linux/mm.h            | 23 +++++++-------
+ include/linux/mm_types.h      |  7 ++++-
+ include/linux/pagemap.h       | 14 ++++++---
+ include/linux/vm_event_item.h |  1 -
+ kernel/fork.c                 |  2 ++
+ mm/filemap.c                  | 37 +++++++++++++---------
+ mm/internal.h                 |  1 +
+ mm/madvise.c                  |  4 +--
+ mm/memory.c                   | 58 +++++++++++++++++------------------
+ mm/swap.h                     |  1 -
+ mm/swap_state.c               | 12 +++-----
+ mm/vmstat.c                   |  1 -
+ 17 files changed, 119 insertions(+), 96 deletions(-)
 
 diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
 index 6045a5117ac1..8f59badbffb5 100644
@@ -174,6 +179,62 @@ index 4e800bb7d2ab..11b24367dad7 100644
  
  	if (likely(must_wait && !READ_ONCE(ctx->released))) {
  		wake_up_poll(&ctx->fd_wqh, EPOLLIN);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index cd9b319f03ef..87fb29325353 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -247,7 +247,7 @@ void setup_initial_init_mm(void *start_code, void *end_code,
+ struct vm_area_struct *vm_area_alloc(struct mm_struct *);
+ struct vm_area_struct *vm_area_dup(struct vm_area_struct *);
+ void vm_area_free(struct vm_area_struct *);
+-/* Use only if VMA has no other users */
++/* Use only if VMA has no other users and might still be attached to a tree */
+ void __vm_area_free(struct vm_area_struct *vma);
+ 
+ #ifndef CONFIG_MMU
+@@ -639,23 +639,24 @@ static inline void vma_numab_state_free(struct vm_area_struct *vma) {}
+  */
+ static inline bool vma_start_read(struct vm_area_struct *vma)
+ {
+-	/* Check before locking. A race might cause false locked result. */
+-	if (vma->vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq))
++	int vm_lock_seq = READ_ONCE(vma->vm_lock_seq);
++
++	/*
++	 * Check if VMA is locked before taking vma->vm_lock. A race or
++	 * mm_lock_seq overflow might cause false locked result.
++	 */
++	if (vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq))
+ 		return false;
+ 
+ 	if (unlikely(down_read_trylock(&vma->vm_lock->lock) == 0))
+ 		return false;
+ 
+-	/*
+-	 * Overflow might produce false locked result.
+-	 * False unlocked result is impossible because we modify and check
+-	 * vma->vm_lock_seq under vma->vm_lock protection and mm->mm_lock_seq
+-	 * modification invalidates all existing locks.
+-	 */
+-	if (unlikely(vma->vm_lock_seq == READ_ONCE(vma->vm_mm->mm_lock_seq))) {
++	/* Fail if VMA is detached or was write-locked after we checked it earlier */
++	if (unlikely(vma->detached || vm_lock_seq != READ_ONCE(vma->vm_lock_seq))) {
+ 		up_read(&vma->vm_lock->lock);
+ 		return false;
+ 	}
++
+ 	return true;
+ }
+ 
+@@ -750,7 +751,7 @@ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
+ 	vma->vm_mm = mm;
+ 	vma->vm_ops = &dummy_vm_ops;
+ 	INIT_LIST_HEAD(&vma->anon_vma_chain);
+-	vma_mark_detached(vma, false);
++	vma->detached = true;
+ 	vma_numab_state_init(vma);
+ }
+ 
 diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
 index 306a3d1a0fa6..bd6b95c82f7a 100644
 --- a/include/linux/mm_types.h
@@ -240,6 +301,38 @@ index 08328b5793b5..dae69cf0a7a3 100644
  }
  
  /*
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index 8abfa1240040..e741098954ff 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -154,7 +154,6 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ 		VMA_LOCK_SUCCESS,
+ 		VMA_LOCK_ABORT,
+ 		VMA_LOCK_RETRY,
+-		VMA_LOCK_MISS,
+ #endif
+ 		NR_VM_EVENT_ITEMS
+ };
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 915ad6dae416..9d9740c77229 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -544,6 +544,7 @@ static void vm_area_free_rcu_cb(struct rcu_head *head)
+ 
+ 	/* The vma should not be locked while being destroyed. */
+ 	VM_BUG_ON_VMA(rwsem_is_locked(&vma->vm_lock->lock), vma);
++	WARN_ON_ONCE(!vma->detached);
+ 	__vm_area_free(vma);
+ }
+ #endif
+@@ -553,6 +554,7 @@ void vm_area_free(struct vm_area_struct *vma)
+ #ifdef CONFIG_PER_VMA_LOCK
+ 	call_rcu(&vma->vm_rcu, vm_area_free_rcu_cb);
+ #else
++	WARN_ON_ONCE(!vma->detached);
+ 	__vm_area_free(vma);
+ #endif
+ }
 diff --git a/mm/filemap.c b/mm/filemap.c
 index 83dda76d1fc3..b53cea0c09a5 100644
 --- a/mm/filemap.c
@@ -313,6 +406,18 @@ index 83dda76d1fc3..b53cea0c09a5 100644
  	return true;
  }
  
+diff --git a/mm/internal.h b/mm/internal.h
+index 68410c6d97ac..728189e6c703 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -1068,6 +1068,7 @@ static inline void vma_iter_store(struct vma_iterator *vmi,
+ 	vmi->mas.index = vma->vm_start;
+ 	vmi->mas.last = vma->vm_end - 1;
+ 	mas_store_prealloc(&vmi->mas, vma);
++	vma_mark_detached(vma, false);
+ }
+ 
+ static inline int vma_iter_store_gfp(struct vma_iterator *vmi,
 diff --git a/mm/madvise.c b/mm/madvise.c
 index b5ffbaf616f5..b1e8adf1234e 100644
 --- a/mm/madvise.c
@@ -336,7 +441,7 @@ index b5ffbaf616f5..b1e8adf1234e 100644
  			put_page(page);
  
 diff --git a/mm/memory.c b/mm/memory.c
-index f69fbc251198..b2ea015dcb87 100644
+index f69fbc251198..32ebc5aed096 100644
 --- a/mm/memory.c
 +++ b/mm/memory.c
 @@ -3568,6 +3568,7 @@ static vm_fault_t remove_device_exclusive_entry(struct vm_fault *vmf)
@@ -420,7 +525,16 @@ index f69fbc251198..b2ea015dcb87 100644
  		ret |= VM_FAULT_RETRY;
  		goto out_release;
  	}
-@@ -5291,15 +5306,6 @@ struct vm_area_struct *lock_vma_under_rcu(struct mm_struct *mm,
+@@ -5275,7 +5290,7 @@ struct vm_area_struct *lock_vma_under_rcu(struct mm_struct *mm,
+ 	struct vm_area_struct *vma;
+ 
+ 	rcu_read_lock();
+-retry:
++
+ 	vma = mas_walk(&mas);
+ 	if (!vma)
+ 		goto inval;
+@@ -5291,29 +5306,12 @@ struct vm_area_struct *lock_vma_under_rcu(struct mm_struct *mm,
  	if (!vma_start_read(vma))
  		goto inval;
  
@@ -436,6 +550,20 @@ index f69fbc251198..b2ea015dcb87 100644
  	/* Check since vm_start/vm_end might change before we lock the VMA */
  	if (unlikely(address < vma->vm_start || address >= vma->vm_end)) {
  		vma_end_read(vma);
+ 		goto inval;
+ 	}
+ 
+-	/* Check if the VMA got isolated after we found it */
+-	if (vma->detached) {
+-		vma_end_read(vma);
+-		count_vm_vma_lock_event(VMA_LOCK_MISS);
+-		/* The area was replaced with another one */
+-		goto retry;
+-	}
+-
+ 	rcu_read_unlock();
+ 	return vma;
+ inval:
 diff --git a/mm/swap.h b/mm/swap.h
 index 7c033d793f15..8a3c7a0ace4f 100644
 --- a/mm/swap.h
@@ -505,6 +633,18 @@ index b76a65ac28b3..a3839de71f3f 100644
  }
  
  /**
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index c28046371b45..5d6acdb1b611 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1403,7 +1403,6 @@ const char * const vmstat_text[] = {
+ 	"vma_lock_success",
+ 	"vma_lock_abort",
+ 	"vma_lock_retry",
+-	"vma_lock_miss",
+ #endif
+ #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
+ };
 -- 
 2.41.0
 
