@@ -1,0 +1,84 @@
+From 5c355acee8334d1ace23bab2f118461dcdc8c69a Mon Sep 17 00:00:00 2001
+From: Yu Zhao <yuzhao@google.com>
+Date: Tue, 11 Apr 2023 00:44:36 -0600
+Subject: [PATCH 09/11] kvm/x86: add kvm_arch_test_clear_young()
+
+Implement kvm_arch_test_clear_young() to support the fast path in
+mmu_notifier_ops->test_clear_young().
+
+It focuses on a simple case, i.e., TDP MMU sets the accessed bit in
+KVM PTEs and VMs are not nested, where it can rely on RCU and
+clear_bit() to safely clear the accessed bit without taking
+kvm->mmu_lock. Complex cases fall back to the existing slow path
+where kvm->mmu_lock is then taken.
+
+Signed-off-by: Yu Zhao <yuzhao@google.com>
+---
+ arch/x86/include/asm/kvm_host.h |  7 +++++++
+ arch/x86/kvm/mmu/tdp_mmu.c      | 34 +++++++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 753c67072..d6dfdebe3 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -2223,4 +2223,11 @@ int memslot_rmap_alloc(struct kvm_memory_slot *slot, unsigned long npages);
+  */
+ #define KVM_EXIT_HYPERCALL_MBZ		GENMASK_ULL(31, 1)
+ 
++#define kvm_arch_has_test_clear_young kvm_arch_has_test_clear_young
++static inline bool kvm_arch_has_test_clear_young(void)
++{
++	return IS_ENABLED(CONFIG_X86_64) &&
++	       (!IS_REACHABLE(CONFIG_KVM) || (tdp_mmu_enabled && shadow_accessed_mask));
++}
++
+ #endif /* _ASM_X86_KVM_HOST_H */
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 08340219c..6875a819e 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1232,6 +1232,40 @@ bool kvm_tdp_mmu_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ 	return kvm_tdp_mmu_handle_gfn(kvm, range, test_age_gfn);
+ }
+ 
++bool kvm_arch_test_clear_young(struct kvm *kvm, struct kvm_gfn_range *range)
++{
++	struct kvm_mmu_page *root;
++	int offset = ffs(shadow_accessed_mask) - 1;
++
++	if (kvm_shadow_root_allocated(kvm))
++		return true;
++
++	rcu_read_lock();
++
++	list_for_each_entry_rcu(root, &kvm->arch.tdp_mmu_roots, link) {
++		struct tdp_iter iter;
++
++		if (kvm_mmu_page_as_id(root) != range->slot->as_id)
++			continue;
++
++		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end) {
++			u64 *sptep = rcu_dereference(iter.sptep);
++
++			VM_WARN_ON_ONCE(!page_count(virt_to_page(sptep)));
++
++			if (!(iter.old_spte & shadow_accessed_mask))
++				continue;
++
++			if (kvm_should_clear_young(range, iter.gfn))
++				clear_bit(offset, (unsigned long *)sptep);
++		}
++	}
++
++	rcu_read_unlock();
++
++	return false;
++}
++
+ static bool set_spte_gfn(struct kvm *kvm, struct tdp_iter *iter,
+ 			 struct kvm_gfn_range *range)
+ {
+-- 
+2.41.0
+
