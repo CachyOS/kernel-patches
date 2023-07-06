@@ -1,0 +1,148 @@
+From 7e850fa164b5fad258e7712cb5bd9328fddc4ffb Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 3 May 2023 09:06:14 +0200
+Subject: [PATCH 02/12] btrfs: determine synchronous writers from bio or
+ writeback control
+
+The writeback_control structure already passes down the information about
+a writeback being synchronous from the core VM code, and thus information
+is propagated into the bio REQ_SYNC flag through the wbc_to_write_flags
+helper.
+
+Use that information to decide if checksums calculation is offloaded to
+a workqueue instead of btrfs_inode::sync_writers field that not only
+bloats the inode but also has too wide scope, being inode wide instead
+of limited to the actual writeback request.
+
+The sync writes were set in:
+
+- btrfs_do_write_iter - regular IO, sync status is set
+- start_ordered_ops - ordered write start, writeback with WB_SYNC_ALL
+  mode
+- btrfs_write_marked_extents - write marked extents, writeback with
+  WB_SYNC_ALL mode
+
+Reviewed-by: Chris Mason <clm@fb.com>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: David Sterba <dsterba@suse.com>
+[ update changelog ]
+Signed-off-by: David Sterba <dsterba@suse.com>
+---
+ fs/btrfs/bio.c         | 7 +++----
+ fs/btrfs/btrfs_inode.h | 3 ---
+ fs/btrfs/file.c        | 9 ---------
+ fs/btrfs/inode.c       | 1 -
+ fs/btrfs/transaction.c | 2 --
+ 5 files changed, 3 insertions(+), 19 deletions(-)
+
+diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c
+index 1c59485a9..81ebdbcad 100644
+--- a/fs/btrfs/bio.c
++++ b/fs/btrfs/bio.c
+@@ -579,11 +579,10 @@ static bool should_async_write(struct btrfs_bio *bbio)
+ 		return false;
+ 
+ 	/*
+-	 * If the I/O is not issued by fsync and friends, (->sync_writers != 0),
+-	 * then try to defer the submission to a workqueue to parallelize the
+-	 * checksum calculation.
++	 * Try to defer the submission to a workqueue to parallelize the
++	 * checksum calculation unless the I/O is issued synchronously.
+ 	 */
+-	if (atomic_read(&bbio->inode->sync_writers))
++	if (op_is_sync(bbio->bio.bi_opf))
+ 		return false;
+ 
+ 	/* Zoned devices require I/O to be submitted in order. */
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index ec2ae4406..0849b85b9 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -116,9 +116,6 @@ struct btrfs_inode {
+ 
+ 	unsigned long runtime_flags;
+ 
+-	/* Keep track of who's O_SYNC/fsyncing currently */
+-	atomic_t sync_writers;
+-
+ 	/* full 64 bit generation number, struct vfs_inode doesn't have a big
+ 	 * enough field for this.
+ 	 */
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index f64964739..f53b7b750 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1651,7 +1651,6 @@ ssize_t btrfs_do_write_iter(struct kiocb *iocb, struct iov_iter *from,
+ 	struct file *file = iocb->ki_filp;
+ 	struct btrfs_inode *inode = BTRFS_I(file_inode(file));
+ 	ssize_t num_written, num_sync;
+-	const bool sync = iocb_is_dsync(iocb);
+ 
+ 	/*
+ 	 * If the fs flips readonly due to some impossible error, although we
+@@ -1664,9 +1663,6 @@ ssize_t btrfs_do_write_iter(struct kiocb *iocb, struct iov_iter *from,
+ 	if (encoded && (iocb->ki_flags & IOCB_NOWAIT))
+ 		return -EOPNOTSUPP;
+ 
+-	if (sync)
+-		atomic_inc(&inode->sync_writers);
+-
+ 	if (encoded) {
+ 		num_written = btrfs_encoded_write(iocb, from, encoded);
+ 		num_sync = encoded->len;
+@@ -1686,9 +1682,6 @@ ssize_t btrfs_do_write_iter(struct kiocb *iocb, struct iov_iter *from,
+ 			num_written = num_sync;
+ 	}
+ 
+-	if (sync)
+-		atomic_dec(&inode->sync_writers);
+-
+ 	current->backing_dev_info = NULL;
+ 	return num_written;
+ }
+@@ -1733,9 +1726,7 @@ static int start_ordered_ops(struct inode *inode, loff_t start, loff_t end)
+ 	 * several segments of stripe length (currently 64K).
+ 	 */
+ 	blk_start_plug(&plug);
+-	atomic_inc(&BTRFS_I(inode)->sync_writers);
+ 	ret = btrfs_fdatawrite_range(inode, start, end);
+-	atomic_dec(&BTRFS_I(inode)->sync_writers);
+ 	blk_finish_plug(&plug);
+ 
+ 	return ret;
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 7fcafcc52..e3470c422 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -8468,7 +8468,6 @@ struct inode *btrfs_alloc_inode(struct super_block *sb)
+ 	ei->io_tree.inode = ei;
+ 	extent_io_tree_init(fs_info, &ei->file_extent_tree,
+ 			    IO_TREE_INODE_FILE_EXTENT);
+-	atomic_set(&ei->sync_writers, 0);
+ 	mutex_init(&ei->log_mutex);
+ 	btrfs_ordered_inode_tree_init(&ei->ordered_tree);
+ 	INIT_LIST_HEAD(&ei->delalloc_inodes);
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index 8b6a99b8d..27c616fdf 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -1056,7 +1056,6 @@ int btrfs_write_marked_extents(struct btrfs_fs_info *fs_info,
+ 	u64 start = 0;
+ 	u64 end;
+ 
+-	atomic_inc(&BTRFS_I(fs_info->btree_inode)->sync_writers);
+ 	while (!find_first_extent_bit(dirty_pages, start, &start, &end,
+ 				      mark, &cached_state)) {
+ 		bool wait_writeback = false;
+@@ -1092,7 +1091,6 @@ int btrfs_write_marked_extents(struct btrfs_fs_info *fs_info,
+ 		cond_resched();
+ 		start = end + 1;
+ 	}
+-	atomic_dec(&BTRFS_I(fs_info->btree_inode)->sync_writers);
+ 	return werr;
+ }
+ 
+-- 
+2.41.0.159.g0bfa463d37
+
