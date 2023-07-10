@@ -1,0 +1,410 @@
+From e05c3dd0b92843ad338217f1aa731c6c4ea1bde9 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 10 Jul 2023 17:10:25 +0200
+Subject: [PATCH 5/7] ksm
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ Documentation/admin-guide/mm/ksm.rst          | 25 +++--
+ fs/proc/base.c                                |  1 +
+ include/linux/ksm.h                           | 20 ++++
+ include/linux/mm_types.h                      |  9 +-
+ mm/khugepaged.c                               |  2 +
+ mm/ksm.c                                      | 28 +++++-
+ mm/memory.c                                   |  5 +-
+ .../selftests/mm/ksm_functional_tests.c       | 98 ++++++++++++++++++-
+ 8 files changed, 172 insertions(+), 16 deletions(-)
+
+diff --git a/Documentation/admin-guide/mm/ksm.rst b/Documentation/admin-guide/mm/ksm.rst
+index 7626392fe82c..5c5be7bd84b8 100644
+--- a/Documentation/admin-guide/mm/ksm.rst
++++ b/Documentation/admin-guide/mm/ksm.rst
+@@ -173,6 +173,13 @@ stable_node_chains
+         the number of KSM pages that hit the ``max_page_sharing`` limit
+ stable_node_dups
+         number of duplicated KSM pages
++ksm_zero_pages
++        how many zero pages that are still mapped into processes were mapped by
++        KSM when deduplicating.
++
++When ``use_zero_pages`` is/was enabled, the sum of ``pages_sharing`` +
++``ksm_zero_pages`` represents the actual number of pages saved by KSM.
++if ``use_zero_pages`` has never been enabled, ``ksm_zero_pages`` is 0.
+ 
+ A high ratio of ``pages_sharing`` to ``pages_shared`` indicates good
+ sharing, but a high ratio of ``pages_unshared`` to ``pages_sharing``
+@@ -196,21 +203,25 @@ several times, which are unprofitable memory consumed.
+ 1) How to determine whether KSM save memory or consume memory in system-wide
+    range? Here is a simple approximate calculation for reference::
+ 
+-	general_profit =~ pages_sharing * sizeof(page) - (all_rmap_items) *
++	general_profit =~ ksm_saved_pages * sizeof(page) - (all_rmap_items) *
+ 			  sizeof(rmap_item);
+ 
+-   where all_rmap_items can be easily obtained by summing ``pages_sharing``,
+-   ``pages_shared``, ``pages_unshared`` and ``pages_volatile``.
++   where ksm_saved_pages equals to the sum of ``pages_sharing`` +
++   ``ksm_zero_pages`` of the system, and all_rmap_items can be easily
++   obtained by summing ``pages_sharing``, ``pages_shared``, ``pages_unshared``
++   and ``pages_volatile``.
+ 
+ 2) The KSM profit inner a single process can be similarly obtained by the
+    following approximate calculation::
+ 
+-	process_profit =~ ksm_merging_pages * sizeof(page) -
++	process_profit =~ ksm_saved_pages * sizeof(page) -
+ 			  ksm_rmap_items * sizeof(rmap_item).
+ 
+-   where ksm_merging_pages is shown under the directory ``/proc/<pid>/``,
+-   and ksm_rmap_items is shown in ``/proc/<pid>/ksm_stat``. The process profit
+-   is also shown in ``/proc/<pid>/ksm_stat`` as ksm_process_profit.
++   where ksm_saved_pages equals to the sum of ``ksm_merging_pages`` and
++   ``ksm_zero_pages``, both of which are shown under the directory
++   ``/proc/<pid>/ksm_stat``, and ksm_rmap_items is also shown in
++   ``/proc/<pid>/ksm_stat``. The process profit is also shown in
++   ``/proc/<pid>/ksm_stat`` as ksm_process_profit.
+ 
+ From the perspective of application, a high ratio of ``ksm_rmap_items`` to
+ ``ksm_merging_pages`` means a bad madvise-applied policy, so developers or
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index 05452c3b9872..eb2e498e3b8d 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -3207,6 +3207,7 @@ static int proc_pid_ksm_stat(struct seq_file *m, struct pid_namespace *ns,
+ 	mm = get_task_mm(task);
+ 	if (mm) {
+ 		seq_printf(m, "ksm_rmap_items %lu\n", mm->ksm_rmap_items);
++		seq_printf(m, "ksm_zero_pages %lu\n", mm->ksm_zero_pages);
+ 		seq_printf(m, "ksm_merging_pages %lu\n", mm->ksm_merging_pages);
+ 		seq_printf(m, "ksm_process_profit %ld\n", ksm_process_profit(mm));
+ 		mmput(mm);
+diff --git a/include/linux/ksm.h b/include/linux/ksm.h
+index 899a314bc487..c2dd786a30e1 100644
+--- a/include/linux/ksm.h
++++ b/include/linux/ksm.h
+@@ -26,6 +26,22 @@ int ksm_disable(struct mm_struct *mm);
+ 
+ int __ksm_enter(struct mm_struct *mm);
+ void __ksm_exit(struct mm_struct *mm);
++/*
++ * To identify zeropages that were mapped by KSM, we reuse the dirty bit
++ * in the PTE. If the PTE is dirty, the zeropage was mapped by KSM when
++ * deduplicating memory.
++ */
++#define is_ksm_zero_pte(pte)	(is_zero_pfn(pte_pfn(pte)) && pte_dirty(pte))
++
++extern unsigned long ksm_zero_pages;
++
++static inline void ksm_might_unmap_zero_page(struct mm_struct *mm, pte_t pte)
++{
++	if (is_ksm_zero_pte(pte)) {
++		ksm_zero_pages--;
++		mm->ksm_zero_pages--;
++	}
++}
+ 
+ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
+ {
+@@ -95,6 +111,10 @@ static inline void ksm_exit(struct mm_struct *mm)
+ {
+ }
+ 
++static inline void ksm_might_unmap_zero_page(struct mm_struct *mm, pte_t pte)
++{
++}
++
+ #ifdef CONFIG_MEMORY_FAILURE
+ static inline void collect_procs_ksm(struct page *page,
+ 				     struct list_head *to_kill, int force_early)
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index de10fc797c8e..1cc93fc7d9b5 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -784,7 +784,7 @@ struct mm_struct {
+ #ifdef CONFIG_KSM
+ 		/*
+ 		 * Represent how many pages of this process are involved in KSM
+-		 * merging.
++		 * merging (not including ksm_zero_pages).
+ 		 */
+ 		unsigned long ksm_merging_pages;
+ 		/*
+@@ -792,7 +792,12 @@ struct mm_struct {
+ 		 * including merged and not merged.
+ 		 */
+ 		unsigned long ksm_rmap_items;
+-#endif
++		/*
++		 * Represent how many empty pages are merged with kernel zero
++		 * pages when enabling KSM use_zero_pages.
++		 */
++		unsigned long ksm_zero_pages;
++#endif /* CONFIG_KSM */
+ #ifdef CONFIG_LRU_GEN
+ 		struct {
+ 			/* this mm_struct is on lru_gen_mm_list */
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 78c8d5d8b628..4b8b8673d5d9 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -19,6 +19,7 @@
+ #include <linux/page_table_check.h>
+ #include <linux/swapops.h>
+ #include <linux/shmem_fs.h>
++#include <linux/ksm.h>
+ 
+ #include <asm/tlb.h>
+ #include <asm/pgalloc.h>
+@@ -709,6 +710,7 @@ static void __collapse_huge_page_copy_succeeded(pte_t *pte,
+ 				spin_lock(ptl);
+ 				ptep_clear(vma->vm_mm, address, _pte);
+ 				spin_unlock(ptl);
++				ksm_might_unmap_zero_page(vma->vm_mm, pteval);
+ 			}
+ 		} else {
+ 			src_page = pte_page(pteval);
+diff --git a/mm/ksm.c b/mm/ksm.c
+index ba266359da55..97a9627116fa 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -278,6 +278,9 @@ static unsigned int zero_checksum __read_mostly;
+ /* Whether to merge empty (zeroed) pages with actual zero pages */
+ static bool ksm_use_zero_pages __read_mostly;
+ 
++/* The number of zero pages which is placed by KSM */
++unsigned long ksm_zero_pages;
++
+ #ifdef CONFIG_NUMA
+ /* Zeroed when merging across nodes is not allowed */
+ static unsigned int ksm_merge_across_nodes = 1;
+@@ -448,7 +451,8 @@ static int break_ksm_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long nex
+ 		if (is_migration_entry(entry))
+ 			page = pfn_swap_entry_to_page(entry);
+ 	}
+-	ret = page && PageKsm(page);
++	/* return 1 if the page is an normal ksm page or KSM-placed zero page */
++	ret = (page && PageKsm(page)) || is_ksm_zero_pte(*pte);
+ 	pte_unmap_unlock(pte, ptl);
+ 	return ret;
+ }
+@@ -1222,8 +1226,14 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
+ 		page_add_anon_rmap(kpage, vma, addr, RMAP_NONE);
+ 		newpte = mk_pte(kpage, vma->vm_page_prot);
+ 	} else {
+-		newpte = pte_mkspecial(pfn_pte(page_to_pfn(kpage),
+-					       vma->vm_page_prot));
++		/*
++		 * Use pte_mkdirty to mark the zero page mapped by KSM, and then
++		 * we can easily track all KSM-placed zero pages by checking if
++		 * the dirty bit in zero page's PTE is set.
++		 */
++		newpte = pte_mkdirty(pte_mkspecial(pfn_pte(page_to_pfn(kpage), vma->vm_page_prot)));
++		ksm_zero_pages++;
++		mm->ksm_zero_pages++;
+ 		/*
+ 		 * We're replacing an anonymous page with a zero page, which is
+ 		 * not anonymous. We need to do proper accounting otherwise we
+@@ -3082,7 +3092,7 @@ static void wait_while_offlining(void)
+ #ifdef CONFIG_PROC_FS
+ long ksm_process_profit(struct mm_struct *mm)
+ {
+-	return mm->ksm_merging_pages * PAGE_SIZE -
++	return (long)(mm->ksm_merging_pages + mm->ksm_zero_pages) * PAGE_SIZE -
+ 		mm->ksm_rmap_items * sizeof(struct ksm_rmap_item);
+ }
+ #endif /* CONFIG_PROC_FS */
+@@ -3351,12 +3361,19 @@ static ssize_t pages_volatile_show(struct kobject *kobj,
+ }
+ KSM_ATTR_RO(pages_volatile);
+ 
++static ssize_t ksm_zero_pages_show(struct kobject *kobj,
++				struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%ld\n", ksm_zero_pages);
++}
++KSM_ATTR_RO(ksm_zero_pages);
++
+ static ssize_t general_profit_show(struct kobject *kobj,
+ 				   struct kobj_attribute *attr, char *buf)
+ {
+ 	long general_profit;
+ 
+-	general_profit = ksm_pages_sharing * PAGE_SIZE -
++	general_profit = (ksm_pages_sharing + ksm_zero_pages) * PAGE_SIZE -
+ 				ksm_rmap_items * sizeof(struct ksm_rmap_item);
+ 
+ 	return sysfs_emit(buf, "%ld\n", general_profit);
+@@ -3418,6 +3435,7 @@ static struct attribute *ksm_attrs[] = {
+ 	&pages_sharing_attr.attr,
+ 	&pages_unshared_attr.attr,
+ 	&pages_volatile_attr.attr,
++	&ksm_zero_pages_attr.attr,
+ 	&full_scans_attr.attr,
+ #ifdef CONFIG_NUMA
+ 	&merge_across_nodes_attr.attr,
+diff --git a/mm/memory.c b/mm/memory.c
+index 01f39e8144ef..0dc2f193c4d6 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1433,8 +1433,10 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 			tlb_remove_tlb_entry(tlb, pte, addr);
+ 			zap_install_uffd_wp_if_needed(vma, addr, pte, details,
+ 						      ptent);
+-			if (unlikely(!page))
++			if (unlikely(!page)) {
++				ksm_might_unmap_zero_page(mm, ptent);
+ 				continue;
++			}
+ 
+ 			delay_rmap = 0;
+ 			if (!PageAnon(page)) {
+@@ -3128,6 +3130,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 				inc_mm_counter(mm, MM_ANONPAGES);
+ 			}
+ 		} else {
++			ksm_might_unmap_zero_page(mm, vmf->orig_pte);
+ 			inc_mm_counter(mm, MM_ANONPAGES);
+ 		}
+ 		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+diff --git a/tools/testing/selftests/mm/ksm_functional_tests.c b/tools/testing/selftests/mm/ksm_functional_tests.c
+index 26853badae70..0de9d33cd565 100644
+--- a/tools/testing/selftests/mm/ksm_functional_tests.c
++++ b/tools/testing/selftests/mm/ksm_functional_tests.c
+@@ -29,6 +29,8 @@
+ 
+ static int ksm_fd;
+ static int ksm_full_scans_fd;
++static int proc_self_ksm_stat_fd;
++static int ksm_use_zero_pages_fd;
+ static int pagemap_fd;
+ static size_t pagesize;
+ 
+@@ -59,6 +61,33 @@ static bool range_maps_duplicates(char *addr, unsigned long size)
+ 	return false;
+ }
+ 
++static long get_my_ksm_zero_pages(void)
++{
++	char buf[200];
++	char *substr_ksm_zero;
++	size_t value_pos;
++	ssize_t read_size;
++	unsigned long my_ksm_zero_pages;
++
++	if (!proc_self_ksm_stat_fd)
++		return 0;
++
++	read_size = pread(proc_self_ksm_stat_fd, buf, sizeof(buf) - 1, 0);
++	if (read_size < 0)
++		return -errno;
++
++	buf[read_size] = 0;
++
++	substr_ksm_zero = strstr(buf, "ksm_zero_pages");
++	if (!substr_ksm_zero)
++		return 0;
++
++	value_pos = strcspn(substr_ksm_zero, "0123456789");
++	my_ksm_zero_pages = strtol(substr_ksm_zero + value_pos, NULL, 10);
++
++	return my_ksm_zero_pages;
++}
++
+ static long ksm_get_full_scans(void)
+ {
+ 	char buf[10];
+@@ -159,6 +188,70 @@ static void test_unmerge(void)
+ 	munmap(map, size);
+ }
+ 
++static void test_unmerge_zero_pages(void)
++{
++	const unsigned int size = 2 * MiB;
++	char *map;
++	unsigned int offs;
++	unsigned long pages_expected;
++
++	ksft_print_msg("[RUN] %s\n", __func__);
++
++	if (proc_self_ksm_stat_fd < 0) {
++		ksft_test_result_skip("open(\"/proc/self/ksm_stat\") failed\n");
++		return;
++	}
++	if (ksm_use_zero_pages_fd < 0) {
++		ksft_test_result_skip("open \"/sys/kernel/mm/ksm/use_zero_pages\" failed\n");
++		return;
++	}
++	if (write(ksm_use_zero_pages_fd, "1", 1) != 1) {
++		ksft_test_result_skip("write \"/sys/kernel/mm/ksm/use_zero_pages\" failed\n");
++		return;
++	}
++
++	/* Let KSM deduplicate zero pages. */
++	map = mmap_and_merge_range(0x00, size, false);
++	if (map == MAP_FAILED)
++		return;
++
++	/* Check if ksm_zero_pages is updated correctly after KSM merging */
++	pages_expected = size / pagesize;
++	if (pages_expected != get_my_ksm_zero_pages()) {
++		ksft_test_result_fail("'ksm_zero_pages' updated after merging\n");
++		goto unmap;
++	}
++
++	/* Try to unmerge half of the region */
++	if (madvise(map, size / 2, MADV_UNMERGEABLE)) {
++		ksft_test_result_fail("MADV_UNMERGEABLE failed\n");
++		goto unmap;
++	}
++
++	/* Check if ksm_zero_pages is updated correctly after unmerging */
++	pages_expected /= 2;
++	if (pages_expected != get_my_ksm_zero_pages()) {
++		ksft_test_result_fail("'ksm_zero_pages' updated after unmerging\n");
++		goto unmap;
++	}
++
++	/* Trigger unmerging of the other half by writing to the pages. */
++	for (offs = size / 2; offs < size; offs += pagesize)
++		*((unsigned int *)&map[offs]) = offs;
++
++	/* Now we should have no zeropages remaining. */
++	if (get_my_ksm_zero_pages()) {
++		ksft_test_result_fail("'ksm_zero_pages' updated after write fault\n");
++		goto unmap;
++	}
++
++	/* Check if ksm zero pages are really unmerged */
++	ksft_test_result(!range_maps_duplicates(map, size),
++			"KSM zero pages were unmerged\n");
++unmap:
++	munmap(map, size);
++}
++
+ static void test_unmerge_discarded(void)
+ {
+ 	const unsigned int size = 2 * MiB;
+@@ -358,7 +451,7 @@ static void test_prctl_unmerge(void)
+ 
+ int main(int argc, char **argv)
+ {
+-	unsigned int tests = 5;
++	unsigned int tests = 6;
+ 	int err;
+ 
+ #ifdef __NR_userfaultfd
+@@ -379,8 +472,11 @@ int main(int argc, char **argv)
+ 	pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
+ 	if (pagemap_fd < 0)
+ 		ksft_exit_skip("open(\"/proc/self/pagemap\") failed\n");
++	proc_self_ksm_stat_fd = open("/proc/self/ksm_stat", O_RDONLY);
++	ksm_use_zero_pages_fd = open("/sys/kernel/mm/ksm/use_zero_pages", O_RDWR);
+ 
+ 	test_unmerge();
++	test_unmerge_zero_pages();
+ 	test_unmerge_discarded();
+ #ifdef __NR_userfaultfd
+ 	test_unmerge_uffd_wp();
+-- 
+2.41.0
+
