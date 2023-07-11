@@ -1,0 +1,1462 @@
+From a87c6bebcb1e942bbc824d451e0a93efb954116c Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 11 Jul 2023 19:25:53 +0200
+Subject: [PATCH 6/7] sched
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/kernel/itmt.c         |  23 +-
+ arch/x86/kernel/smpboot.c      |   7 +-
+ include/linux/cgroup-defs.h    |   2 +
+ include/linux/sched.h          |   2 +
+ include/linux/sched/sd_flags.h |   5 +-
+ include/linux/sched/task.h     |  38 ++-
+ kernel/cgroup/cgroup.c         |  46 ++++
+ kernel/fork.c                  |   8 +
+ kernel/sched/core.c            | 116 +++++++++-
+ kernel/sched/deadline.c        |   7 -
+ kernel/sched/debug.c           |   3 +-
+ kernel/sched/fair.c            | 409 ++++++++++++++++++++++++---------
+ kernel/sched/features.h        |   1 +
+ kernel/sched/psi.c             |  21 +-
+ kernel/sched/sched.h           |  32 ++-
+ kernel/sched/topology.c        |  21 +-
+ kernel/softirq.c               |   2 +-
+ 17 files changed, 568 insertions(+), 175 deletions(-)
+
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 670eb08b972a..ee4fe8cdb857 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -165,32 +165,19 @@ int arch_asym_cpu_priority(int cpu)
+ 
+ /**
+  * sched_set_itmt_core_prio() - Set CPU priority based on ITMT
+- * @prio:	Priority of cpu core
+- * @core_cpu:	The cpu number associated with the core
++ * @prio:	Priority of @cpu
++ * @cpu:	The CPU number
+  *
+  * The pstate driver will find out the max boost frequency
+  * and call this function to set a priority proportional
+- * to the max boost frequency. CPU with higher boost
++ * to the max boost frequency. CPUs with higher boost
+  * frequency will receive higher priority.
+  *
+  * No need to rebuild sched domain after updating
+  * the CPU priorities. The sched domains have no
+  * dependency on CPU priorities.
+  */
+-void sched_set_itmt_core_prio(int prio, int core_cpu)
++void sched_set_itmt_core_prio(int prio, int cpu)
+ {
+-	int cpu, i = 1;
+-
+-	for_each_cpu(cpu, topology_sibling_cpumask(core_cpu)) {
+-		int smt_prio;
+-
+-		/*
+-		 * Ensure that the siblings are moved to the end
+-		 * of the priority chain and only used when
+-		 * all other high priority cpus are out of capacity.
+-		 */
+-		smt_prio = prio * smp_num_siblings / (i * i);
+-		per_cpu(sched_core_priority, cpu) = smt_prio;
+-		i++;
+-	}
++	per_cpu(sched_core_priority, cpu) = prio;
+ }
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 483df0427678..a81f2b0dbbad 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -571,7 +571,7 @@ static int x86_core_flags(void)
+ #ifdef CONFIG_SCHED_SMT
+ static int x86_smt_flags(void)
+ {
+-	return cpu_smt_flags() | x86_sched_itmt_flags();
++	return cpu_smt_flags();
+ }
+ #endif
+ #ifdef CONFIG_SCHED_CLUSTER
+@@ -599,10 +599,13 @@ static struct sched_domain_topology_level x86_hybrid_topology[] = {
+ #ifdef CONFIG_SCHED_SMT
+ 	{ cpu_smt_mask, x86_smt_flags, SD_INIT_NAME(SMT) },
+ #endif
++#ifdef CONFIG_SCHED_CLUSTER
++	{ cpu_clustergroup_mask, x86_cluster_flags, SD_INIT_NAME(CLS) },
++#endif
+ #ifdef CONFIG_SCHED_MC
+ 	{ cpu_coregroup_mask, x86_core_flags, SD_INIT_NAME(MC) },
+ #endif
+-	{ cpu_cpu_mask, SD_INIT_NAME(DIE) },
++	{ cpu_cpu_mask, x86_sched_itmt_flags, SD_INIT_NAME(DIE) },
+ 	{ NULL, },
+ };
+ 
+diff --git a/include/linux/cgroup-defs.h b/include/linux/cgroup-defs.h
+index 8a0d5466c7be..ae20dbb885d6 100644
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -661,6 +661,8 @@ struct cgroup_subsys {
+ 	void (*css_rstat_flush)(struct cgroup_subsys_state *css, int cpu);
+ 	int (*css_extra_stat_show)(struct seq_file *seq,
+ 				   struct cgroup_subsys_state *css);
++	int (*css_local_stat_show)(struct seq_file *seq,
++				   struct cgroup_subsys_state *css);
+ 
+ 	int (*can_attach)(struct cgroup_taskset *tset);
+ 	void (*cancel_attach)(struct cgroup_taskset *tset);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index eed5d65b8d1f..8473324705ca 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2437,9 +2437,11 @@ extern void sched_core_free(struct task_struct *tsk);
+ extern void sched_core_fork(struct task_struct *p);
+ extern int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
+ 				unsigned long uaddr);
++extern int sched_core_idle_cpu(int cpu);
+ #else
+ static inline void sched_core_free(struct task_struct *tsk) { }
+ static inline void sched_core_fork(struct task_struct *p) { }
++static inline int sched_core_idle_cpu(int cpu) { return idle_cpu(cpu); }
+ #endif
+ 
+ extern void sched_set_stop_task(int cpu, struct task_struct *stop);
+diff --git a/include/linux/sched/sd_flags.h b/include/linux/sched/sd_flags.h
+index 57bde66d95f7..fad77b5172e2 100644
+--- a/include/linux/sched/sd_flags.h
++++ b/include/linux/sched/sd_flags.h
+@@ -132,12 +132,9 @@ SD_FLAG(SD_SERIALIZE, SDF_SHARED_PARENT | SDF_NEEDS_GROUPS)
+ /*
+  * Place busy tasks earlier in the domain
+  *
+- * SHARED_CHILD: Usually set on the SMT level. Technically could be set further
+- *               up, but currently assumed to be set from the base domain
+- *               upwards (see update_top_cache_domain()).
+  * NEEDS_GROUPS: Load balancing flag.
+  */
+-SD_FLAG(SD_ASYM_PACKING, SDF_SHARED_CHILD | SDF_NEEDS_GROUPS)
++SD_FLAG(SD_ASYM_PACKING, SDF_NEEDS_GROUPS)
+ 
+ /*
+  * Prefer to place tasks in a sibling domain
+diff --git a/include/linux/sched/task.h b/include/linux/sched/task.h
+index e0f5ac90a228..b53909027771 100644
+--- a/include/linux/sched/task.h
++++ b/include/linux/sched/task.h
+@@ -118,11 +118,47 @@ static inline struct task_struct *get_task_struct(struct task_struct *t)
+ }
+ 
+ extern void __put_task_struct(struct task_struct *t);
++extern void __put_task_struct_rcu_cb(struct rcu_head *rhp);
+ 
+ static inline void put_task_struct(struct task_struct *t)
+ {
+-	if (refcount_dec_and_test(&t->usage))
++	if (!refcount_dec_and_test(&t->usage))
++		return;
++
++	/*
++	 * In !RT, it is always safe to call __put_task_struct().
++	 * Under RT, we can only call it in preemptible context.
++	 */
++	if (!IS_ENABLED(CONFIG_PREEMPT_RT) || preemptible()) {
++		static DEFINE_WAIT_OVERRIDE_MAP(put_task_map, LD_WAIT_SLEEP);
++
++		lock_map_acquire_try(&put_task_map);
+ 		__put_task_struct(t);
++		lock_map_release(&put_task_map);
++		return;
++	}
++
++	/*
++	 * under PREEMPT_RT, we can't call put_task_struct
++	 * in atomic context because it will indirectly
++	 * acquire sleeping locks.
++	 *
++	 * call_rcu() will schedule delayed_put_task_struct_rcu()
++	 * to be called in process context.
++	 *
++	 * __put_task_struct() is called when
++	 * refcount_dec_and_test(&t->usage) succeeds.
++	 *
++	 * This means that it can't "conflict" with
++	 * put_task_struct_rcu_user() which abuses ->rcu the same
++	 * way; rcu_users has a reference so task->usage can't be
++	 * zero after rcu_users 1 -> 0 transition.
++	 *
++	 * delayed_free_task() also uses ->rcu, but it is only called
++	 * when it fails to fork a process. Therefore, there is no
++	 * way it can conflict with put_task_struct().
++	 */
++	call_rcu(&t->rcu, __put_task_struct_rcu_cb);
+ }
+ 
+ static inline void put_task_struct_many(struct task_struct *t, int nr)
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 4d42f0cbc11e..b782ae876c84 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -3740,6 +3740,36 @@ static int cpu_stat_show(struct seq_file *seq, void *v)
+ 	return ret;
+ }
+ 
++static int __maybe_unused cgroup_local_stat_show(struct seq_file *seq,
++						 struct cgroup *cgrp, int ssid)
++{
++	struct cgroup_subsys *ss = cgroup_subsys[ssid];
++	struct cgroup_subsys_state *css;
++	int ret;
++
++	if (!ss->css_local_stat_show)
++		return 0;
++
++	css = cgroup_tryget_css(cgrp, ss);
++	if (!css)
++		return 0;
++
++	ret = ss->css_local_stat_show(seq, css);
++	css_put(css);
++	return ret;
++}
++
++static int cpu_local_stat_show(struct seq_file *seq, void *v)
++{
++	struct cgroup __maybe_unused *cgrp = seq_css(seq)->cgroup;
++	int ret = 0;
++
++#ifdef CONFIG_CGROUP_SCHED
++	ret = cgroup_local_stat_show(seq, cgrp, cpu_cgrp_id);
++#endif
++	return ret;
++}
++
+ #ifdef CONFIG_PSI
+ static int cgroup_io_pressure_show(struct seq_file *seq, void *v)
+ {
+@@ -3891,6 +3921,14 @@ static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,
+ 	return psi_trigger_poll(&ctx->psi.trigger, of->file, pt);
+ }
+ 
++static int cgroup_pressure_open(struct kernfs_open_file *of)
++{
++	if (of->file->f_mode & FMODE_WRITE && !capable(CAP_SYS_RESOURCE))
++		return -EPERM;
++
++	return 0;
++}
++
+ static void cgroup_pressure_release(struct kernfs_open_file *of)
+ {
+ 	struct cgroup_file_ctx *ctx = of->priv;
+@@ -5282,6 +5320,10 @@ static struct cftype cgroup_base_files[] = {
+ 		.name = "cpu.stat",
+ 		.seq_show = cpu_stat_show,
+ 	},
++	{
++		.name = "cpu.stat.local",
++		.seq_show = cpu_local_stat_show,
++	},
+ 	{ }	/* terminate */
+ };
+ 
+@@ -5290,6 +5332,7 @@ static struct cftype cgroup_psi_files[] = {
+ 	{
+ 		.name = "io.pressure",
+ 		.file_offset = offsetof(struct cgroup, psi_files[PSI_IO]),
++		.open = cgroup_pressure_open,
+ 		.seq_show = cgroup_io_pressure_show,
+ 		.write = cgroup_io_pressure_write,
+ 		.poll = cgroup_pressure_poll,
+@@ -5298,6 +5341,7 @@ static struct cftype cgroup_psi_files[] = {
+ 	{
+ 		.name = "memory.pressure",
+ 		.file_offset = offsetof(struct cgroup, psi_files[PSI_MEM]),
++		.open = cgroup_pressure_open,
+ 		.seq_show = cgroup_memory_pressure_show,
+ 		.write = cgroup_memory_pressure_write,
+ 		.poll = cgroup_pressure_poll,
+@@ -5306,6 +5350,7 @@ static struct cftype cgroup_psi_files[] = {
+ 	{
+ 		.name = "cpu.pressure",
+ 		.file_offset = offsetof(struct cgroup, psi_files[PSI_CPU]),
++		.open = cgroup_pressure_open,
+ 		.seq_show = cgroup_cpu_pressure_show,
+ 		.write = cgroup_cpu_pressure_write,
+ 		.poll = cgroup_pressure_poll,
+@@ -5315,6 +5360,7 @@ static struct cftype cgroup_psi_files[] = {
+ 	{
+ 		.name = "irq.pressure",
+ 		.file_offset = offsetof(struct cgroup, psi_files[PSI_IRQ]),
++		.open = cgroup_pressure_open,
+ 		.seq_show = cgroup_irq_pressure_show,
+ 		.write = cgroup_irq_pressure_write,
+ 		.poll = cgroup_pressure_poll,
+diff --git a/kernel/fork.c b/kernel/fork.c
+index f405763e06ae..47a1967b6a55 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -993,6 +993,14 @@ void __put_task_struct(struct task_struct *tsk)
+ }
+ EXPORT_SYMBOL_GPL(__put_task_struct);
+ 
++void __put_task_struct_rcu_cb(struct rcu_head *rhp)
++{
++	struct task_struct *task = container_of(rhp, struct task_struct, rcu);
++
++	__put_task_struct(task);
++}
++EXPORT_SYMBOL_GPL(__put_task_struct_rcu_cb);
++
+ void __init __weak arch_task_cache_init(void) { }
+ 
+ /*
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index a68d1276bab0..1b971c69d3a2 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3341,6 +3341,39 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
+ }
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
++static __always_inline
++int __task_state_match(struct task_struct *p, unsigned int state)
++{
++	if (READ_ONCE(p->__state) & state)
++		return 1;
++
++#ifdef CONFIG_PREEMPT_RT
++	if (READ_ONCE(p->saved_state) & state)
++		return -1;
++#endif
++	return 0;
++}
++
++static __always_inline
++int task_state_match(struct task_struct *p, unsigned int state)
++{
++#ifdef CONFIG_PREEMPT_RT
++	int match;
++
++	/*
++	 * Serialize against current_save_and_set_rtlock_wait_state() and
++	 * current_restore_rtlock_saved_state().
++	 */
++	raw_spin_lock_irq(&p->pi_lock);
++	match = __task_state_match(p, state);
++	raw_spin_unlock_irq(&p->pi_lock);
++
++	return match;
++#else
++	return __task_state_match(p, state);
++#endif
++}
++
+ /*
+  * wait_task_inactive - wait for a thread to unschedule.
+  *
+@@ -3359,7 +3392,7 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
+  */
+ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state)
+ {
+-	int running, queued;
++	int running, queued, match;
+ 	struct rq_flags rf;
+ 	unsigned long ncsw;
+ 	struct rq *rq;
+@@ -3385,7 +3418,7 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
+ 		 * is actually now running somewhere else!
+ 		 */
+ 		while (task_on_cpu(rq, p)) {
+-			if (!(READ_ONCE(p->__state) & match_state))
++			if (!task_state_match(p, match_state))
+ 				return 0;
+ 			cpu_relax();
+ 		}
+@@ -3400,8 +3433,15 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
+ 		running = task_on_cpu(rq, p);
+ 		queued = task_on_rq_queued(p);
+ 		ncsw = 0;
+-		if (READ_ONCE(p->__state) & match_state)
++		if ((match = __task_state_match(p, match_state))) {
++			/*
++			 * When matching on p->saved_state, consider this task
++			 * still queued so it will wait.
++			 */
++			if (match < 0)
++				queued = 1;
+ 			ncsw = p->nvcsw | LONG_MIN; /* sets MSB */
++		}
+ 		task_rq_unlock(rq, p, &rf);
+ 
+ 		/*
+@@ -4003,15 +4043,14 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
+ static __always_inline
+ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
+ {
++	int match;
++
+ 	if (IS_ENABLED(CONFIG_DEBUG_PREEMPT)) {
+ 		WARN_ON_ONCE((state & TASK_RTLOCK_WAIT) &&
+ 			     state != TASK_RTLOCK_WAIT);
+ 	}
+ 
+-	if (READ_ONCE(p->__state) & state) {
+-		*success = 1;
+-		return true;
+-	}
++	*success = !!(match = __task_state_match(p, state));
+ 
+ #ifdef CONFIG_PREEMPT_RT
+ 	/*
+@@ -4027,12 +4066,10 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
+ 	 * p::saved_state to TASK_RUNNING so any further tests will
+ 	 * not result in false positives vs. @success
+ 	 */
+-	if (p->saved_state & state) {
++	if (match < 0)
+ 		p->saved_state = TASK_RUNNING;
+-		*success = 1;
+-	}
+ #endif
+-	return false;
++	return match > 0;
+ }
+ 
+ /*
+@@ -7342,6 +7379,19 @@ struct task_struct *idle_task(int cpu)
+ 	return cpu_rq(cpu)->idle;
+ }
+ 
++#ifdef CONFIG_SCHED_CORE
++int sched_core_idle_cpu(int cpu)
++{
++	struct rq *rq = cpu_rq(cpu);
++
++	if (sched_core_enabled(rq) && rq->curr == rq->idle)
++		return 1;
++
++	return idle_cpu(cpu);
++}
++
++#endif
++
+ #ifdef CONFIG_SMP
+ /*
+  * This function computes an effective utilization for the given CPU, to be
+@@ -11103,6 +11153,27 @@ static int cpu_cfs_stat_show(struct seq_file *sf, void *v)
+ 
+ 	return 0;
+ }
++
++static u64 throttled_time_self(struct task_group *tg)
++{
++	int i;
++	u64 total = 0;
++
++	for_each_possible_cpu(i) {
++		total += READ_ONCE(tg->cfs_rq[i]->throttled_clock_self_time);
++	}
++
++	return total;
++}
++
++static int cpu_cfs_local_stat_show(struct seq_file *sf, void *v)
++{
++	struct task_group *tg = css_tg(seq_css(sf));
++
++	seq_printf(sf, "throttled_time %llu\n", throttled_time_self(tg));
++
++	return 0;
++}
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ 
+@@ -11179,6 +11250,10 @@ static struct cftype cpu_legacy_files[] = {
+ 		.name = "stat",
+ 		.seq_show = cpu_cfs_stat_show,
+ 	},
++	{
++		.name = "stat.local",
++		.seq_show = cpu_cfs_local_stat_show,
++	},
+ #endif
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 	{
+@@ -11235,6 +11310,24 @@ static int cpu_extra_stat_show(struct seq_file *sf,
+ 	return 0;
+ }
+ 
++static int cpu_local_stat_show(struct seq_file *sf,
++			       struct cgroup_subsys_state *css)
++{
++#ifdef CONFIG_CFS_BANDWIDTH
++	{
++		struct task_group *tg = css_tg(css);
++		u64 throttled_self_usec;
++
++		throttled_self_usec = throttled_time_self(tg);
++		do_div(throttled_self_usec, NSEC_PER_USEC);
++
++		seq_printf(sf, "throttled_usec %llu\n",
++			   throttled_self_usec);
++	}
++#endif
++	return 0;
++}
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ static u64 cpu_weight_read_u64(struct cgroup_subsys_state *css,
+ 			       struct cftype *cft)
+@@ -11413,6 +11506,7 @@ struct cgroup_subsys cpu_cgrp_subsys = {
+ 	.css_released	= cpu_cgroup_css_released,
+ 	.css_free	= cpu_cgroup_css_free,
+ 	.css_extra_stat_show = cpu_extra_stat_show,
++	.css_local_stat_show = cpu_local_stat_show,
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 	.can_attach	= cpu_cgroup_can_attach,
+ #endif
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 5a9a4b81c972..f827067ad03b 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -489,13 +489,6 @@ static inline int is_leftmost(struct task_struct *p, struct dl_rq *dl_rq)
+ 
+ static void init_dl_rq_bw_ratio(struct dl_rq *dl_rq);
+ 
+-void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime)
+-{
+-	raw_spin_lock_init(&dl_b->dl_runtime_lock);
+-	dl_b->dl_period = period;
+-	dl_b->dl_runtime = runtime;
+-}
+-
+ void init_dl_bw(struct dl_bw *dl_b)
+ {
+ 	raw_spin_lock_init(&dl_b->lock);
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 0b2340a79b65..aeeba46a096b 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -427,6 +427,7 @@ static void register_sd(struct sched_domain *sd, struct dentry *parent)
+ #undef SDM
+ 
+ 	debugfs_create_file("flags", 0444, parent, &sd->flags, &sd_flags_fops);
++	debugfs_create_file("groups_flags", 0444, parent, &sd->groups->flags, &sd_flags_fops);
+ }
+ 
+ void update_sched_domain_debugfs(void)
+@@ -777,7 +778,7 @@ static void print_cpu(struct seq_file *m, int cpu)
+ #define P(x)								\
+ do {									\
+ 	if (sizeof(rq->x) == 4)						\
+-		SEQ_printf(m, "  .%-30s: %ld\n", #x, (long)(rq->x));	\
++		SEQ_printf(m, "  .%-30s: %d\n", #x, (int)(rq->x));	\
+ 	else								\
+ 		SEQ_printf(m, "  .%-30s: %Ld\n", #x, (long long)(rq->x));\
+ } while (0)
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 9671df93d1f5..64cbea29b007 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1082,6 +1082,23 @@ update_stats_curr_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
+  * Scheduling class queueing methods:
+  */
+ 
++static inline bool is_core_idle(int cpu)
++{
++#ifdef CONFIG_SCHED_SMT
++	int sibling;
++
++	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
++		if (cpu == sibling)
++			continue;
++
++		if (!idle_cpu(sibling))
++			return false;
++	}
++#endif
++
++	return true;
++}
++
+ #ifdef CONFIG_NUMA
+ #define NUMA_IMBALANCE_MIN 2
+ 
+@@ -1718,23 +1735,6 @@ struct numa_stats {
+ 	int idle_cpu;
+ };
+ 
+-static inline bool is_core_idle(int cpu)
+-{
+-#ifdef CONFIG_SCHED_SMT
+-	int sibling;
+-
+-	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
+-		if (cpu == sibling)
+-			continue;
+-
+-		if (!idle_cpu(sibling))
+-			return false;
+-	}
+-#endif
+-
+-	return true;
+-}
+-
+ struct task_numa_env {
+ 	struct task_struct *p;
+ 
+@@ -4805,6 +4805,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
+ }
+ 
+ static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
++static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq);
+ 
+ static inline bool cfs_bandwidth_used(void);
+ 
+@@ -4891,8 +4892,18 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 
+ 	if (cfs_rq->nr_running == 1) {
+ 		check_enqueue_throttle(cfs_rq);
+-		if (!throttled_hierarchy(cfs_rq))
++		if (!throttled_hierarchy(cfs_rq)) {
+ 			list_add_leaf_cfs_rq(cfs_rq);
++		} else {
++#ifdef CONFIG_CFS_BANDWIDTH
++			struct rq *rq = rq_of(cfs_rq);
++
++			if (cfs_rq_throttled(cfs_rq) && !cfs_rq->throttled_clock)
++				cfs_rq->throttled_clock = rq_clock(rq);
++			if (!cfs_rq->throttled_clock_self)
++				cfs_rq->throttled_clock_self = rq_clock(rq);
++#endif
++		}
+ 	}
+ }
+ 
+@@ -5395,6 +5406,17 @@ static int tg_unthrottle_up(struct task_group *tg, void *data)
+ 		/* Add cfs_rq with load or one or more already running entities to the list */
+ 		if (!cfs_rq_is_decayed(cfs_rq))
+ 			list_add_leaf_cfs_rq(cfs_rq);
++
++		if (cfs_rq->throttled_clock_self) {
++			u64 delta = rq_clock(rq) - cfs_rq->throttled_clock_self;
++
++			cfs_rq->throttled_clock_self = 0;
++
++			if (SCHED_WARN_ON((s64)delta < 0))
++				delta = 0;
++
++			cfs_rq->throttled_clock_self_time += delta;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -5409,6 +5431,10 @@ static int tg_throttle_down(struct task_group *tg, void *data)
+ 	if (!cfs_rq->throttle_count) {
+ 		cfs_rq->throttled_clock_pelt = rq_clock_pelt(rq);
+ 		list_del_leaf_cfs_rq(cfs_rq);
++
++		SCHED_WARN_ON(cfs_rq->throttled_clock_self);
++		if (cfs_rq->nr_running)
++			cfs_rq->throttled_clock_self = rq_clock(rq);
+ 	}
+ 	cfs_rq->throttle_count++;
+ 
+@@ -5498,7 +5524,9 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
+ 	 * throttled-list.  rq->lock protects completion.
+ 	 */
+ 	cfs_rq->throttled = 1;
+-	cfs_rq->throttled_clock = rq_clock(rq);
++	SCHED_WARN_ON(cfs_rq->throttled_clock);
++	if (cfs_rq->nr_running)
++		cfs_rq->throttled_clock = rq_clock(rq);
+ 	return true;
+ }
+ 
+@@ -5516,7 +5544,10 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ 	update_rq_clock(rq);
+ 
+ 	raw_spin_lock(&cfs_b->lock);
+-	cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
++	if (cfs_rq->throttled_clock) {
++		cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
++		cfs_rq->throttled_clock = 0;
++	}
+ 	list_del_rcu(&cfs_rq->throttled_list);
+ 	raw_spin_unlock(&cfs_b->lock);
+ 
+@@ -7045,6 +7076,37 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 	return idle_cpu;
+ }
+ 
++/*
++ * For the multiple-LLC per node case, make sure to try the other LLC's if the
++ * local LLC comes up empty.
++ */
++static int
++select_idle_node(struct task_struct *p, struct sched_domain *sd, int target)
++{
++	struct sched_domain *parent = sd->parent;
++	struct sched_group *sg;
++
++	/* Make sure to not cross nodes. */
++	if (!parent || parent->flags & SD_NUMA)
++		return -1;
++
++	sg = parent->groups;
++	do {
++		int cpu = cpumask_first(sched_group_span(sg));
++
++		if (!cpus_share_cache(cpu, target)) {
++			int i = select_idle_cpu(p, per_cpu(sd_llc, cpu),
++						test_idle_cores(cpu), cpu);
++			if ((unsigned)i < nr_cpumask_bits)
++				return i;
++		}
++
++		sg = sg->next;
++	} while (sg != parent->groups);
++
++	return -1;
++}
++
+ /*
+  * Scan the asym_capacity domain for idle CPUs; pick the first idle one on which
+  * the task fits. If no CPU is big enough, but there are idle ones, try to
+@@ -7217,6 +7279,12 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+ 
++	if (sched_feat(SIS_NODE)) {
++		i = select_idle_node(p, sd, target);
++		if ((unsigned)i < nr_cpumask_bits)
++			return i;
++	}
++
+ 	return target;
+ }
+ 
+@@ -8358,6 +8426,11 @@ enum group_type {
+ 	 * more powerful CPU.
+ 	 */
+ 	group_misfit_task,
++	/*
++	 * Balance SMT group that's fully busy. Can benefit from migration
++	 * a task on SMT with busy sibling to another CPU on idle core.
++	 */
++	group_smt_balance,
+ 	/*
+ 	 * SD_ASYM_PACKING only: One local CPU with higher capacity is available,
+ 	 * and the task should be migrated to it instead of running on the
+@@ -9066,6 +9139,7 @@ struct sg_lb_stats {
+ 	unsigned int group_weight;
+ 	enum group_type group_type;
+ 	unsigned int group_asym_packing; /* Tasks should be moved to preferred CPU */
++	unsigned int group_smt_balance;  /* Task on busy SMT be moved */
+ 	unsigned long group_misfit_task_load; /* A CPU has a task too big for its capacity */
+ #ifdef CONFIG_NUMA_BALANCING
+ 	unsigned int nr_numa_running;
+@@ -9339,6 +9413,9 @@ group_type group_classify(unsigned int imbalance_pct,
+ 	if (sgs->group_asym_packing)
+ 		return group_asym_packing;
+ 
++	if (sgs->group_smt_balance)
++		return group_smt_balance;
++
+ 	if (sgs->group_misfit_task_load)
+ 		return group_misfit_task;
+ 
+@@ -9349,98 +9426,128 @@ group_type group_classify(unsigned int imbalance_pct,
+ }
+ 
+ /**
+- * asym_smt_can_pull_tasks - Check whether the load balancing CPU can pull tasks
+- * @dst_cpu:	Destination CPU of the load balancing
++ * sched_use_asym_prio - Check whether asym_packing priority must be used
++ * @sd:		The scheduling domain of the load balancing
++ * @cpu:	A CPU
++ *
++ * Always use CPU priority when balancing load between SMT siblings. When
++ * balancing load between cores, it is not sufficient that @cpu is idle. Only
++ * use CPU priority if the whole core is idle.
++ *
++ * Returns: True if the priority of @cpu must be followed. False otherwise.
++ */
++static bool sched_use_asym_prio(struct sched_domain *sd, int cpu)
++{
++	if (!sched_smt_active())
++		return true;
++
++	return sd->flags & SD_SHARE_CPUCAPACITY || is_core_idle(cpu);
++}
++
++/**
++ * sched_asym - Check if the destination CPU can do asym_packing load balance
++ * @env:	The load balancing environment
+  * @sds:	Load-balancing data with statistics of the local group
+  * @sgs:	Load-balancing statistics of the candidate busiest group
+- * @sg:		The candidate busiest group
+- *
+- * Check the state of the SMT siblings of both @sds::local and @sg and decide
+- * if @dst_cpu can pull tasks.
++ * @group:	The candidate busiest group
+  *
+- * If @dst_cpu does not have SMT siblings, it can pull tasks if two or more of
+- * the SMT siblings of @sg are busy. If only one CPU in @sg is busy, pull tasks
+- * only if @dst_cpu has higher priority.
++ * @env::dst_cpu can do asym_packing if it has higher priority than the
++ * preferred CPU of @group.
+  *
+- * If both @dst_cpu and @sg have SMT siblings, and @sg has exactly one more
+- * busy CPU than @sds::local, let @dst_cpu pull tasks if it has higher priority.
+- * Bigger imbalances in the number of busy CPUs will be dealt with in
+- * update_sd_pick_busiest().
++ * SMT is a special case. If we are balancing load between cores, @env::dst_cpu
++ * can do asym_packing balance only if all its SMT siblings are idle. Also, it
++ * can only do it if @group is an SMT group and has exactly on busy CPU. Larger
++ * imbalances in the number of CPUS are dealt with in find_busiest_group().
+  *
+- * If @sg does not have SMT siblings, only pull tasks if all of the SMT siblings
+- * of @dst_cpu are idle and @sg has lower priority.
++ * If we are balancing load within an SMT core, or at DIE domain level, always
++ * proceed.
+  *
+- * Return: true if @dst_cpu can pull tasks, false otherwise.
++ * Return: true if @env::dst_cpu can do with asym_packing load balance. False
++ * otherwise.
+  */
+-static bool asym_smt_can_pull_tasks(int dst_cpu, struct sd_lb_stats *sds,
+-				    struct sg_lb_stats *sgs,
+-				    struct sched_group *sg)
++static inline bool
++sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs,
++	   struct sched_group *group)
+ {
+-#ifdef CONFIG_SCHED_SMT
+-	bool local_is_smt, sg_is_smt;
+-	int sg_busy_cpus;
+-
+-	local_is_smt = sds->local->flags & SD_SHARE_CPUCAPACITY;
+-	sg_is_smt = sg->flags & SD_SHARE_CPUCAPACITY;
+-
+-	sg_busy_cpus = sgs->group_weight - sgs->idle_cpus;
+-
+-	if (!local_is_smt) {
+-		/*
+-		 * If we are here, @dst_cpu is idle and does not have SMT
+-		 * siblings. Pull tasks if candidate group has two or more
+-		 * busy CPUs.
+-		 */
+-		if (sg_busy_cpus >= 2) /* implies sg_is_smt */
+-			return true;
++	/* Ensure that the whole local core is idle, if applicable. */
++	if (!sched_use_asym_prio(env->sd, env->dst_cpu))
++		return false;
+ 
+-		/*
+-		 * @dst_cpu does not have SMT siblings. @sg may have SMT
+-		 * siblings and only one is busy. In such case, @dst_cpu
+-		 * can help if it has higher priority and is idle (i.e.,
+-		 * it has no running tasks).
+-		 */
+-		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
++	/*
++	 * CPU priorities does not make sense for SMT cores with more than one
++	 * busy sibling.
++	 */
++	if (group->flags & SD_SHARE_CPUCAPACITY) {
++		if (sgs->group_weight - sgs->idle_cpus != 1)
++			return false;
+ 	}
+ 
+-	/* @dst_cpu has SMT siblings. */
++	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
++}
+ 
+-	if (sg_is_smt) {
+-		int local_busy_cpus = sds->local->group_weight -
+-				      sds->local_stat.idle_cpus;
+-		int busy_cpus_delta = sg_busy_cpus - local_busy_cpus;
++/* One group has more than one SMT CPU while the other group does not */
++static inline bool smt_vs_nonsmt_groups(struct sched_group *sg1,
++				    struct sched_group *sg2)
++{
++	if (!sg1 || !sg2)
++		return false;
+ 
+-		if (busy_cpus_delta == 1)
+-			return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
++	return (sg1->flags & SD_SHARE_CPUCAPACITY) !=
++		(sg2->flags & SD_SHARE_CPUCAPACITY);
++}
+ 
++static inline bool smt_balance(struct lb_env *env, struct sg_lb_stats *sgs,
++			       struct sched_group *group)
++{
++	if (env->idle == CPU_NOT_IDLE)
+ 		return false;
+-	}
+ 
+ 	/*
+-	 * @sg does not have SMT siblings. Ensure that @sds::local does not end
+-	 * up with more than one busy SMT sibling and only pull tasks if there
+-	 * are not busy CPUs (i.e., no CPU has running tasks).
++	 * For SMT source group, it is better to move a task
++	 * to a CPU that doesn't have multiple tasks sharing its CPU capacity.
++	 * Note that if a group has a single SMT, SD_SHARE_CPUCAPACITY
++	 * will not be on.
+ 	 */
+-	if (!sds->local_stat.sum_nr_running)
+-		return sched_asym_prefer(dst_cpu, sg->asym_prefer_cpu);
++	if (group->flags & SD_SHARE_CPUCAPACITY &&
++	    sgs->sum_h_nr_running > 1)
++		return true;
+ 
+ 	return false;
+-#else
+-	/* Always return false so that callers deal with non-SMT cases. */
+-	return false;
+-#endif
+ }
+ 
+-static inline bool
+-sched_asym(struct lb_env *env, struct sd_lb_stats *sds,  struct sg_lb_stats *sgs,
+-	   struct sched_group *group)
++static inline long sibling_imbalance(struct lb_env *env,
++				    struct sd_lb_stats *sds,
++				    struct sg_lb_stats *busiest,
++				    struct sg_lb_stats *local)
+ {
+-	/* Only do SMT checks if either local or candidate have SMT siblings */
+-	if ((sds->local->flags & SD_SHARE_CPUCAPACITY) ||
+-	    (group->flags & SD_SHARE_CPUCAPACITY))
+-		return asym_smt_can_pull_tasks(env->dst_cpu, sds, sgs, group);
++	int ncores_busiest, ncores_local;
++	long imbalance;
+ 
+-	return sched_asym_prefer(env->dst_cpu, group->asym_prefer_cpu);
++	if (env->idle == CPU_NOT_IDLE || !busiest->sum_nr_running)
++		return 0;
++
++	ncores_busiest = sds->busiest->cores;
++	ncores_local = sds->local->cores;
++
++	if (ncores_busiest == ncores_local) {
++		imbalance = busiest->sum_nr_running;
++		lsub_positive(&imbalance, local->sum_nr_running);
++		return imbalance;
++	}
++
++	/* Balance such that nr_running/ncores ratio are same on both groups */
++	imbalance = ncores_local * busiest->sum_nr_running;
++	lsub_positive(&imbalance, ncores_busiest * local->sum_nr_running);
++	/* Normalize imbalance and do rounding on normalization */
++	imbalance = 2 * imbalance + ncores_local + ncores_busiest;
++	imbalance /= ncores_local + ncores_busiest;
++
++	/* Take advantage of resource in an empty sched group */
++	if (imbalance == 0 && local->sum_nr_running == 0 &&
++	    busiest->sum_nr_running > 1)
++		imbalance = 2;
++
++	return imbalance;
+ }
+ 
+ static inline bool
+@@ -9535,6 +9642,10 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 		sgs->group_asym_packing = 1;
+ 	}
+ 
++	/* Check for loaded SMT group to be balanced to dst CPU */
++	if (!local_group && smt_balance(env, sgs, group))
++		sgs->group_smt_balance = 1;
++
+ 	sgs->group_type = group_classify(env->sd->imbalance_pct, group, sgs);
+ 
+ 	/* Computing avg_load makes sense only when group is overloaded */
+@@ -9619,6 +9730,7 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+ 			return false;
+ 		break;
+ 
++	case group_smt_balance:
+ 	case group_fully_busy:
+ 		/*
+ 		 * Select the fully busy group with highest avg_load. In
+@@ -9628,13 +9740,37 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+ 		 * contention when accessing shared HW resources.
+ 		 *
+ 		 * XXX for now avg_load is not computed and always 0 so we
+-		 * select the 1st one.
++		 * select the 1st one, except if @sg is composed of SMT
++		 * siblings.
+ 		 */
+-		if (sgs->avg_load <= busiest->avg_load)
++
++		if (sgs->avg_load < busiest->avg_load)
+ 			return false;
++
++		if (sgs->avg_load == busiest->avg_load) {
++			/*
++			 * SMT sched groups need more help than non-SMT groups.
++			 * If @sg happens to also be SMT, either choice is good.
++			 */
++			if (sds->busiest->flags & SD_SHARE_CPUCAPACITY)
++				return false;
++		}
++
+ 		break;
+ 
+ 	case group_has_spare:
++		/*
++		 * Do not pick sg with SMT CPUs over sg with pure CPUs,
++		 * as we do not want to pull task off SMT core with one task
++		 * and make the core idle.
++		 */
++		if (smt_vs_nonsmt_groups(sds->busiest, sg)) {
++			if (sg->flags & SD_SHARE_CPUCAPACITY && sgs->sum_h_nr_running <= 1)
++				return false;
++			else
++				return true;
++		}
++
+ 		/*
+ 		 * Select not overloaded group with lowest number of idle cpus
+ 		 * and highest number of running tasks. We could also compare
+@@ -9831,6 +9967,7 @@ static bool update_pick_idlest(struct sched_group *idlest,
+ 
+ 	case group_imbalanced:
+ 	case group_asym_packing:
++	case group_smt_balance:
+ 		/* Those types are not used in the slow wakeup path */
+ 		return false;
+ 
+@@ -9962,6 +10099,7 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 
+ 	case group_imbalanced:
+ 	case group_asym_packing:
++	case group_smt_balance:
+ 		/* Those type are not used in the slow wakeup path */
+ 		return NULL;
+ 
+@@ -10106,7 +10244,6 @@ static void update_idle_cpu_scan(struct lb_env *env,
+ 
+ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sds)
+ {
+-	struct sched_domain *child = env->sd->child;
+ 	struct sched_group *sg = env->sd->groups;
+ 	struct sg_lb_stats *local = &sds->local_stat;
+ 	struct sg_lb_stats tmp_sgs;
+@@ -10147,8 +10284,13 @@ static inline void update_sd_lb_stats(struct lb_env *env, struct sd_lb_stats *sd
+ 		sg = sg->next;
+ 	} while (sg != env->sd->groups);
+ 
+-	/* Tag domain that child domain prefers tasks go to siblings first */
+-	sds->prefer_sibling = child && child->flags & SD_PREFER_SIBLING;
++	/*
++	 * Indicate that the child domain of the busiest group prefers tasks
++	 * go to a child's sibling domains first. NB the flags of a sched group
++	 * are those of the child domain.
++	 */
++	if (sds->busiest)
++		sds->prefer_sibling = !!(sds->busiest->flags & SD_PREFER_SIBLING);
+ 
+ 
+ 	if (env->sd->flags & SD_NUMA)
+@@ -10212,6 +10354,13 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
+ 		return;
+ 	}
+ 
++	if (busiest->group_type == group_smt_balance) {
++		/* Reduce number of tasks sharing CPU capacity */
++		env->migration_type = migrate_task;
++		env->imbalance = 1;
++		return;
++	}
++
+ 	if (busiest->group_type == group_imbalanced) {
+ 		/*
+ 		 * In the group_imb case we cannot rely on group-wide averages
+@@ -10259,14 +10408,12 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
+ 		}
+ 
+ 		if (busiest->group_weight == 1 || sds->prefer_sibling) {
+-			unsigned int nr_diff = busiest->sum_nr_running;
+ 			/*
+ 			 * When prefer sibling, evenly spread running tasks on
+ 			 * groups.
+ 			 */
+ 			env->migration_type = migrate_task;
+-			lsub_positive(&nr_diff, local->sum_nr_running);
+-			env->imbalance = nr_diff;
++			env->imbalance = sibling_imbalance(env, sds, busiest, local);
+ 		} else {
+ 
+ 			/*
+@@ -10458,22 +10605,32 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
+ 			goto out_balanced;
+ 	}
+ 
+-	/* Try to move all excess tasks to child's sibling domain */
++	/*
++	 * Try to move all excess tasks to a sibling domain of the busiest
++	 * group's child domain.
++	 */
+ 	if (sds.prefer_sibling && local->group_type == group_has_spare &&
+-	    busiest->sum_nr_running > local->sum_nr_running + 1)
++	    sibling_imbalance(env, &sds, busiest, local) > 1)
+ 		goto force_balance;
+ 
+ 	if (busiest->group_type != group_overloaded) {
+-		if (env->idle == CPU_NOT_IDLE)
++		if (env->idle == CPU_NOT_IDLE) {
+ 			/*
+ 			 * If the busiest group is not overloaded (and as a
+ 			 * result the local one too) but this CPU is already
+ 			 * busy, let another idle CPU try to pull task.
+ 			 */
+ 			goto out_balanced;
++		}
++
++		if (busiest->group_type == group_smt_balance &&
++		    smt_vs_nonsmt_groups(sds.local, sds.busiest)) {
++			/* Let non SMT CPU pull from SMT CPU sharing with sibling */
++			goto force_balance;
++		}
+ 
+ 		if (busiest->group_weight > 1 &&
+-		    local->idle_cpus <= (busiest->idle_cpus + 1))
++		    local->idle_cpus <= (busiest->idle_cpus + 1)) {
+ 			/*
+ 			 * If the busiest group is not overloaded
+ 			 * and there is no imbalance between this and busiest
+@@ -10484,12 +10641,14 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
+ 			 * there is more than 1 CPU per group.
+ 			 */
+ 			goto out_balanced;
++		}
+ 
+-		if (busiest->sum_h_nr_running == 1)
++		if (busiest->sum_h_nr_running == 1) {
+ 			/*
+ 			 * busiest doesn't have any tasks waiting to run
+ 			 */
+ 			goto out_balanced;
++		}
+ 	}
+ 
+ force_balance:
+@@ -10560,8 +10719,15 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 		    nr_running == 1)
+ 			continue;
+ 
+-		/* Make sure we only pull tasks from a CPU of lower priority */
++		/*
++		 * Make sure we only pull tasks from a CPU of lower priority
++		 * when balancing between SMT siblings.
++		 *
++		 * If balancing between cores, let lower priority CPUs help
++		 * SMT cores with more than one busy sibling.
++		 */
+ 		if ((env->sd->flags & SD_ASYM_PACKING) &&
++		    sched_use_asym_prio(env->sd, i) &&
+ 		    sched_asym_prefer(i, env->dst_cpu) &&
+ 		    nr_running == 1)
+ 			continue;
+@@ -10650,12 +10816,19 @@ static inline bool
+ asym_active_balance(struct lb_env *env)
+ {
+ 	/*
+-	 * ASYM_PACKING needs to force migrate tasks from busy but
+-	 * lower priority CPUs in order to pack all tasks in the
+-	 * highest priority CPUs.
++	 * ASYM_PACKING needs to force migrate tasks from busy but lower
++	 * priority CPUs in order to pack all tasks in the highest priority
++	 * CPUs. When done between cores, do it only if the whole core if the
++	 * whole core is idle.
++	 *
++	 * If @env::src_cpu is an SMT core with busy siblings, let
++	 * the lower priority @env::dst_cpu help it. Do not follow
++	 * CPU priority.
+ 	 */
+ 	return env->idle != CPU_NOT_IDLE && (env->sd->flags & SD_ASYM_PACKING) &&
+-	       sched_asym_prefer(env->dst_cpu, env->src_cpu);
++	       sched_use_asym_prio(env->sd, env->dst_cpu) &&
++	       (sched_asym_prefer(env->dst_cpu, env->src_cpu) ||
++		!sched_use_asym_prio(env->sd, env->src_cpu));
+ }
+ 
+ static inline bool
+@@ -10709,7 +10882,7 @@ static int active_load_balance_cpu_stop(void *data);
+ static int should_we_balance(struct lb_env *env)
+ {
+ 	struct sched_group *sg = env->sd->groups;
+-	int cpu;
++	int cpu, idle_smt = -1;
+ 
+ 	/*
+ 	 * Ensure the balancing environment is consistent; can happen
+@@ -10736,10 +10909,24 @@ static int should_we_balance(struct lb_env *env)
+ 		if (!idle_cpu(cpu))
+ 			continue;
+ 
++		/*
++		 * Don't balance to idle SMT in busy core right away when
++		 * balancing cores, but remember the first idle SMT CPU for
++		 * later consideration.  Find CPU on an idle core first.
++		 */
++		if (!(env->sd->flags & SD_SHARE_CPUCAPACITY) && !is_core_idle(cpu)) {
++			if (idle_smt == -1)
++				idle_smt = cpu;
++			continue;
++		}
++
+ 		/* Are we the first idle CPU? */
+ 		return cpu == env->dst_cpu;
+ 	}
+ 
++	if (idle_smt == env->dst_cpu)
++		return true;
++
+ 	/* Are we the first CPU of this group ? */
+ 	return group_balance_cpu(sg) == env->dst_cpu;
+ }
+@@ -10762,7 +10949,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 		.sd		= sd,
+ 		.dst_cpu	= this_cpu,
+ 		.dst_rq		= this_rq,
+-		.dst_grpmask    = sched_group_span(sd->groups),
++		.dst_grpmask    = group_balance_mask(sd->groups),
+ 		.idle		= idle,
+ 		.loop_break	= SCHED_NR_MIGRATE_BREAK,
+ 		.cpus		= cpus,
+@@ -11389,9 +11576,13 @@ static void nohz_balancer_kick(struct rq *rq)
+ 		 * When ASYM_PACKING; see if there's a more preferred CPU
+ 		 * currently idle; in which case, kick the ILB to move tasks
+ 		 * around.
++		 *
++		 * When balancing betwen cores, all the SMT siblings of the
++		 * preferred CPU must be idle.
+ 		 */
+ 		for_each_cpu_and(i, sched_domain_span(sd), nohz.idle_cpus_mask) {
+-			if (sched_asym_prefer(i, cpu)) {
++			if (sched_use_asym_prio(sd, i) &&
++			    sched_asym_prefer(i, cpu)) {
+ 				flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
+ 				goto unlock;
+ 			}
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index ee7f23c76bd3..9e390eb82e38 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -62,6 +62,7 @@ SCHED_FEAT(TTWU_QUEUE, true)
+  */
+ SCHED_FEAT(SIS_PROP, false)
+ SCHED_FEAT(SIS_UTIL, true)
++SCHED_FEAT(SIS_NODE, true)
+ 
+ /*
+  * Issue a WARN when we do multiple update_rq_clock() calls
+diff --git a/kernel/sched/psi.c b/kernel/sched/psi.c
+index e072f6b31bf3..2ccb0b2ebd78 100644
+--- a/kernel/sched/psi.c
++++ b/kernel/sched/psi.c
+@@ -140,7 +140,7 @@
+ static int psi_bug __read_mostly;
+ 
+ DEFINE_STATIC_KEY_FALSE(psi_disabled);
+-DEFINE_STATIC_KEY_TRUE(psi_cgroups_enabled);
++static DEFINE_STATIC_KEY_TRUE(psi_cgroups_enabled);
+ 
+ #ifdef CONFIG_PSI_DEFAULT_DISABLED
+ static bool psi_enable;
+@@ -160,7 +160,6 @@ __setup("psi=", setup_psi);
+ #define EXP_300s	2034		/* 1/exp(2s/300s) */
+ 
+ /* PSI trigger definitions */
+-#define WINDOW_MIN_US 500000	/* Min window size is 500ms */
+ #define WINDOW_MAX_US 10000000	/* Max window size is 10s */
+ #define UPDATES_PER_WINDOW 10	/* 10 updates per window */
+ 
+@@ -1305,8 +1304,7 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group,
+ 	if (state >= PSI_NONIDLE)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	if (window_us < WINDOW_MIN_US ||
+-		window_us > WINDOW_MAX_US)
++	if (window_us == 0 || window_us > WINDOW_MAX_US)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	/*
+@@ -1409,11 +1407,16 @@ void psi_trigger_destroy(struct psi_trigger *t)
+ 			group->rtpoll_nr_triggers[t->state]--;
+ 			if (!group->rtpoll_nr_triggers[t->state])
+ 				group->rtpoll_states &= ~(1 << t->state);
+-			/* reset min update period for the remaining triggers */
+-			list_for_each_entry(tmp, &group->rtpoll_triggers, node)
+-				period = min(period, div_u64(tmp->win.size,
+-						UPDATES_PER_WINDOW));
+-			group->rtpoll_min_period = period;
++			/*
++			 * Reset min update period for the remaining triggers
++			 * iff the destroying trigger had the min window size.
++			 */
++			if (group->rtpoll_min_period == div_u64(t->win.size, UPDATES_PER_WINDOW)) {
++				list_for_each_entry(tmp, &group->rtpoll_triggers, node)
++					period = min(period, div_u64(tmp->win.size,
++							UPDATES_PER_WINDOW));
++				group->rtpoll_min_period = period;
++			}
+ 			/* Destroy rtpoll_task when the last trigger is destroyed */
+ 			if (group->rtpoll_states == 0) {
+ 				group->rtpoll_until = 0;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index ec7b3e0a2b20..0605fb53816d 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -286,12 +286,6 @@ struct rt_bandwidth {
+ 
+ void __dl_clear_params(struct task_struct *p);
+ 
+-struct dl_bandwidth {
+-	raw_spinlock_t		dl_runtime_lock;
+-	u64			dl_runtime;
+-	u64			dl_period;
+-};
+-
+ static inline int dl_bandwidth_enabled(void)
+ {
+ 	return sysctl_sched_rt_runtime >= 0;
+@@ -642,6 +636,8 @@ struct cfs_rq {
+ 	u64			throttled_clock;
+ 	u64			throttled_clock_pelt;
+ 	u64			throttled_clock_pelt_time;
++	u64			throttled_clock_self;
++	u64			throttled_clock_self_time;
+ 	int			throttled;
+ 	int			throttle_count;
+ 	struct list_head	throttled_list;
+@@ -1772,6 +1768,13 @@ queue_balance_callback(struct rq *rq,
+ 	for (__sd = rcu_dereference_check_sched_domain(cpu_rq(cpu)->sd); \
+ 			__sd; __sd = __sd->parent)
+ 
++/* A mask of all the SD flags that have the SDF_SHARED_CHILD metaflag */
++#define SD_FLAG(name, mflags) (name * !!((mflags) & SDF_SHARED_CHILD)) |
++static const unsigned int SD_SHARED_CHILD_MASK =
++#include <linux/sched/sd_flags.h>
++0;
++#undef SD_FLAG
++
+ /**
+  * highest_flag_domain - Return highest sched_domain containing flag.
+  * @cpu:	The CPU whose highest level of sched domain is to
+@@ -1779,16 +1782,25 @@ queue_balance_callback(struct rq *rq,
+  * @flag:	The flag to check for the highest sched_domain
+  *		for the given CPU.
+  *
+- * Returns the highest sched_domain of a CPU which contains the given flag.
++ * Returns the highest sched_domain of a CPU which contains @flag. If @flag has
++ * the SDF_SHARED_CHILD metaflag, all the children domains also have @flag.
+  */
+ static inline struct sched_domain *highest_flag_domain(int cpu, int flag)
+ {
+ 	struct sched_domain *sd, *hsd = NULL;
+ 
+ 	for_each_domain(cpu, sd) {
+-		if (!(sd->flags & flag))
++		if (sd->flags & flag) {
++			hsd = sd;
++			continue;
++		}
++
++		/*
++		 * Stop the search if @flag is known to be shared at lower
++		 * levels. It will not be found further up.
++		 */
++		if (flag & SD_SHARED_CHILD_MASK)
+ 			break;
+-		hsd = sd;
+ 	}
+ 
+ 	return hsd;
+@@ -1844,6 +1856,7 @@ struct sched_group {
+ 	atomic_t		ref;
+ 
+ 	unsigned int		group_weight;
++	unsigned int		cores;
+ 	struct sched_group_capacity *sgc;
+ 	int			asym_prefer_cpu;	/* CPU of highest priority in group */
+ 	int			flags;
+@@ -2378,7 +2391,6 @@ extern struct rt_bandwidth def_rt_bandwidth;
+ extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
+ extern bool sched_rt_bandwidth_account(struct rt_rq *rt_rq);
+ 
+-extern void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime);
+ extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
+ extern void init_dl_inactive_task_timer(struct sched_dl_entity *dl_se);
+ 
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 6682535e37c8..8c7c0b64e615 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -719,8 +719,13 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
+ 
+ 		if (sd_parent_degenerate(tmp, parent)) {
+ 			tmp->parent = parent->parent;
+-			if (parent->parent)
++
++			if (parent->parent) {
+ 				parent->parent->child = tmp;
++				if (tmp->flags & SD_SHARE_CPUCAPACITY)
++					parent->parent->groups->flags |= SD_SHARE_CPUCAPACITY;
++			}
++
+ 			/*
+ 			 * Transfer SD_PREFER_SIBLING down in case of a
+ 			 * degenerate parent; the spans match for this
+@@ -1270,14 +1275,26 @@ build_sched_groups(struct sched_domain *sd, int cpu)
+ static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
+ {
+ 	struct sched_group *sg = sd->groups;
++	struct cpumask *mask = sched_domains_tmpmask2;
+ 
+ 	WARN_ON(!sg);
+ 
+ 	do {
+-		int cpu, max_cpu = -1;
++		int cpu, cores = 0, max_cpu = -1;
+ 
+ 		sg->group_weight = cpumask_weight(sched_group_span(sg));
+ 
++		cpumask_copy(mask, sched_group_span(sg));
++		for_each_cpu(cpu, mask) {
++			cores++;
++#ifdef CONFIG_SCHED_SMT
++			cpumask_andnot(mask, mask, cpu_smt_mask(cpu));
++#else
++			__cpumask_clear_cpu(cpu, mask);
++#endif
++		}
++		sg->cores = cores;
++
+ 		if (!(sd->flags & SD_ASYM_PACKING))
+ 			goto next;
+ 
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index 1b725510dd0f..a5758661875c 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -630,7 +630,7 @@ static inline void tick_irq_exit(void)
+ 	int cpu = smp_processor_id();
+ 
+ 	/* Make sure that timer wheel updates are propagated */
+-	if ((idle_cpu(cpu) && !need_resched()) || tick_nohz_full_cpu(cpu)) {
++	if ((sched_core_idle_cpu(cpu) && !need_resched()) || tick_nohz_full_cpu(cpu)) {
+ 		if (!in_hardirq())
+ 			tick_nohz_irq_exit();
+ 	}
+-- 
+2.41.0
+
