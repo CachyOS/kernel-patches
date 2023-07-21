@@ -1,7 +1,168 @@
-From a7fa4feba520dadd1f0e7eb2baea57e9ec640485 Mon Sep 17 00:00:00 2001
+From 6c51f5471f0c3626f799ae3276b2fa68ee091d5f Mon Sep 17 00:00:00 2001
+From: Vasiliy Stelmachenok <ventureo@yandex.ru>
+Date: Fri, 21 Jul 2023 10:39:22 +0300
+Subject: [PATCH 1/7] Revert "posix-timers: Prevent RT livelock in
+ itimer_delete()"
+
+This reverts commit c1968bb8a28625cc95d2ad3ca872ab98c9c36d59.
+---
+ kernel/time/posix-timers.c | 43 +++++++-------------------------------
+ 1 file changed, 8 insertions(+), 35 deletions(-)
+
+diff --git a/kernel/time/posix-timers.c b/kernel/time/posix-timers.c
+index ed3c4a954398..808a247205a9 100644
+--- a/kernel/time/posix-timers.c
++++ b/kernel/time/posix-timers.c
+@@ -1037,52 +1037,27 @@ SYSCALL_DEFINE1(timer_delete, timer_t, timer_id)
+ }
+ 
+ /*
+- * Delete a timer if it is armed, remove it from the hash and schedule it
+- * for RCU freeing.
++ * return timer owned by the process, used by exit_itimers
+  */
+ static void itimer_delete(struct k_itimer *timer)
+ {
+-	unsigned long flags;
+-
+-	/*
+-	 * irqsave is required to make timer_wait_running() work.
+-	 */
+-	spin_lock_irqsave(&timer->it_lock, flags);
+-
+ retry_delete:
+-	/*
+-	 * Even if the timer is not longer accessible from other tasks
+-	 * it still might be armed and queued in the underlying timer
+-	 * mechanism. Worse, that timer mechanism might run the expiry
+-	 * function concurrently.
+-	 */
+-	if (timer_delete_hook(timer) == TIMER_RETRY) {
+-		/*
+-		 * Timer is expired concurrently, prevent livelocks
+-		 * and pointless spinning on RT.
+-		 *
+-		 * timer_wait_running() drops timer::it_lock, which opens
+-		 * the possibility for another task to delete the timer.
+-		 *
+-		 * That's not possible here because this is invoked from
+-		 * do_exit() only for the last thread of the thread group.
+-		 * So no other task can access and delete that timer.
+-		 */
+-		if (WARN_ON_ONCE(timer_wait_running(timer, &flags) != timer))
+-			return;
++	spin_lock_irq(&timer->it_lock);
+ 
++	if (timer_delete_hook(timer) == TIMER_RETRY) {
++		spin_unlock_irq(&timer->it_lock);
+ 		goto retry_delete;
+ 	}
+ 	list_del(&timer->list);
+ 
+-	spin_unlock_irqrestore(&timer->it_lock, flags);
++	spin_unlock_irq(&timer->it_lock);
+ 	release_posix_timer(timer, IT_ID_SET);
+ }
+ 
+ /*
+- * Invoked from do_exit() when the last thread of a thread group exits.
+- * At that point no other task can access the timers of the dying
+- * task anymore.
++ * This is called by do_exit or de_thread, only when nobody else can
++ * modify the signal->posix_timers list. Yet we need sighand->siglock
++ * to prevent the race with /proc/pid/timers.
+  */
+ void exit_itimers(struct task_struct *tsk)
+ {
+@@ -1092,12 +1067,10 @@ void exit_itimers(struct task_struct *tsk)
+ 	if (list_empty(&tsk->signal->posix_timers))
+ 		return;
+ 
+-	/* Protect against concurrent read via /proc/$PID/timers */
+ 	spin_lock_irq(&tsk->sighand->siglock);
+ 	list_replace_init(&tsk->signal->posix_timers, &timers);
+ 	spin_unlock_irq(&tsk->sighand->siglock);
+ 
+-	/* The timers are not longer accessible via tsk::signal */
+ 	while (!list_empty(&timers)) {
+ 		tmr = list_first_entry(&timers, struct k_itimer, list);
+ 		itimer_delete(tmr);
+-- 
+2.41.0
+
+
+From 40c3e42b4fa4b6f4259065185eca3ec8678cf836 Mon Sep 17 00:00:00 2001
+From: Vasiliy Stelmachenok <ventureo@yandex.ru>
+Date: Tue, 18 Jul 2023 21:52:13 +0300
+Subject: [PATCH 2/7] Revert "sched/core: introduce sched_core_idle_cpu()"
+
+---
+ include/linux/sched.h |  2 --
+ kernel/sched/core.c   | 13 -------------
+ kernel/softirq.c      |  2 +-
+ 3 files changed, 1 insertion(+), 16 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 8473324705ca..eed5d65b8d1f 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2437,11 +2437,9 @@ extern void sched_core_free(struct task_struct *tsk);
+ extern void sched_core_fork(struct task_struct *p);
+ extern int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
+ 				unsigned long uaddr);
+-extern int sched_core_idle_cpu(int cpu);
+ #else
+ static inline void sched_core_free(struct task_struct *tsk) { }
+ static inline void sched_core_fork(struct task_struct *p) { }
+-static inline int sched_core_idle_cpu(int cpu) { return idle_cpu(cpu); }
+ #endif
+ 
+ extern void sched_set_stop_task(int cpu, struct task_struct *stop);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 1b971c69d3a2..4085bfa3b556 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7379,19 +7379,6 @@ struct task_struct *idle_task(int cpu)
+ 	return cpu_rq(cpu)->idle;
+ }
+ 
+-#ifdef CONFIG_SCHED_CORE
+-int sched_core_idle_cpu(int cpu)
+-{
+-	struct rq *rq = cpu_rq(cpu);
+-
+-	if (sched_core_enabled(rq) && rq->curr == rq->idle)
+-		return 1;
+-
+-	return idle_cpu(cpu);
+-}
+-
+-#endif
+-
+ #ifdef CONFIG_SMP
+ /*
+  * This function computes an effective utilization for the given CPU, to be
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index a5758661875c..1b725510dd0f 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -630,7 +630,7 @@ static inline void tick_irq_exit(void)
+ 	int cpu = smp_processor_id();
+ 
+ 	/* Make sure that timer wheel updates are propagated */
+-	if ((sched_core_idle_cpu(cpu) && !need_resched()) || tick_nohz_full_cpu(cpu)) {
++	if ((idle_cpu(cpu) && !need_resched()) || tick_nohz_full_cpu(cpu)) {
+ 		if (!in_hardirq())
+ 			tick_nohz_irq_exit();
+ 	}
+-- 
+2.41.0
+
+
+From 3f66b5a5650197ae70ab23e2a56454671bd6859a Mon Sep 17 00:00:00 2001
 From: Vasiliy Stelmachenok <ventureo@yandex.ru>
 Date: Wed, 28 Jun 2023 21:04:39 +0300
-Subject: [PATCH 1/4] Revert "sched: Consider task_struct::saved_state in
+Subject: [PATCH 3/7] Revert "sched: Consider task_struct::saved_state in
  wait_task_inactive()"
 
 ---
@@ -9,7 +170,7 @@ Subject: [PATCH 1/4] Revert "sched: Consider task_struct::saved_state in
  1 file changed, 11 insertions(+), 48 deletions(-)
 
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 1b971c69d3a2..c9caed5c344f 100644
+index 4085bfa3b556..02e1a1a78bd0 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -3341,39 +3341,6 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
@@ -121,78 +282,83 @@ index 1b971c69d3a2..c9caed5c344f 100644
  }
  
  /*
+-- 
+2.41.0
 
 
-From b82c3dd5b4cb8517764540d97d01b20a342a26f5 Mon Sep 17 00:00:00 2001
+From e553a96d14026576b71762e76db21c6a0d842483 Mon Sep 17 00:00:00 2001
 From: Vasiliy Stelmachenok <ventureo@yandex.ru>
-Date: Tue, 18 Jul 2023 22:22:06 +0300
-Subject: [PATCH 2/4] Revert "sched/core: introduce sched_core_idle_cpu()"
+Date: Fri, 21 Jul 2023 12:58:11 +0300
+Subject: [PATCH 4/7] Revert "serial: 8250: lock port for UART_IER access in
+ omap8250_irq()"
 
+This reverts commit fc52289156d78e427052b22386c46070110535c2.
 ---
- include/linux/sched.h |  2 --
- kernel/sched/core.c   | 13 -------------
- kernel/softirq.c      |  2 +-
- 3 files changed, 1 insertion(+), 16 deletions(-)
+ drivers/tty/serial/8250/8250_omap.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
 
-diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 8473324705ca..eed5d65b8d1f 100644
---- a/include/linux/sched.h
-+++ b/include/linux/sched.h
-@@ -2437,11 +2437,9 @@ extern void sched_core_free(struct task_struct *tsk);
- extern void sched_core_fork(struct task_struct *p);
- extern int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
- 				unsigned long uaddr);
--extern int sched_core_idle_cpu(int cpu);
- #else
- static inline void sched_core_free(struct task_struct *tsk) { }
- static inline void sched_core_fork(struct task_struct *p) { }
--static inline int sched_core_idle_cpu(int cpu) { return idle_cpu(cpu); }
- #endif
+diff --git a/drivers/tty/serial/8250/8250_omap.c b/drivers/tty/serial/8250/8250_omap.c
+index b758e9b613c7..c07068c5866f 100644
+--- a/drivers/tty/serial/8250/8250_omap.c
++++ b/drivers/tty/serial/8250/8250_omap.c
+@@ -649,18 +649,17 @@ static irqreturn_t omap8250_irq(int irq, void *dev_id)
+ 	if ((lsr & UART_LSR_OE) && up->overrun_backoff_time_ms > 0) {
+ 		unsigned long delay;
  
- extern void sched_set_stop_task(int cpu, struct task_struct *stop);
-diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index c9caed5c344f..02e1a1a78bd0 100644
---- a/kernel/sched/core.c
-+++ b/kernel/sched/core.c
-@@ -7342,19 +7342,6 @@ struct task_struct *idle_task(int cpu)
- 	return cpu_rq(cpu)->idle;
- }
+-		/* Synchronize UART_IER access against the console. */
+-		spin_lock(&port->lock);
+ 		up->ier = port->serial_in(port, UART_IER);
+ 		if (up->ier & (UART_IER_RLSI | UART_IER_RDI)) {
++			spin_lock(&port->lock);
+ 			port->ops->stop_rx(port);
++			spin_unlock(&port->lock);
+ 		} else {
+ 			/* Keep restarting the timer until
+ 			 * the input overrun subsides.
+ 			 */
+ 			cancel_delayed_work(&up->overrun_backoff);
+ 		}
+-		spin_unlock(&port->lock);
  
--#ifdef CONFIG_SCHED_CORE
--int sched_core_idle_cpu(int cpu)
--{
--	struct rq *rq = cpu_rq(cpu);
--
--	if (sched_core_enabled(rq) && rq->curr == rq->idle)
--		return 1;
--
--	return idle_cpu(cpu);
--}
--
--#endif
--
- #ifdef CONFIG_SMP
- /*
-  * This function computes an effective utilization for the given CPU, to be
-diff --git a/kernel/softirq.c b/kernel/softirq.c
-index a5758661875c..1b725510dd0f 100644
---- a/kernel/softirq.c
-+++ b/kernel/softirq.c
-@@ -630,7 +630,7 @@ static inline void tick_irq_exit(void)
- 	int cpu = smp_processor_id();
- 
- 	/* Make sure that timer wheel updates are propagated */
--	if ((sched_core_idle_cpu(cpu) && !need_resched()) || tick_nohz_full_cpu(cpu)) {
-+	if ((idle_cpu(cpu) && !need_resched()) || tick_nohz_full_cpu(cpu)) {
- 		if (!in_hardirq())
- 			tick_nohz_irq_exit();
- 	}
+ 		delay = msecs_to_jiffies(up->overrun_backoff_time_ms);
+ 		schedule_delayed_work(&up->overrun_backoff, delay);
+-- 
+2.41.0
 
 
-From 49f6615e2f85d4c230948e6e65a551c77829a0b5 Mon Sep 17 00:00:00 2001
+From 4d1110be1947faa11dc73acc0c5092194bd9763f Mon Sep 17 00:00:00 2001
 From: Vasiliy Stelmachenok <ventureo@yandex.ru>
-Date: Tue, 18 Jul 2023 22:28:38 +0300
-Subject: [PATCH 3/4] Add realtime patchset
+Date: Fri, 21 Jul 2023 12:58:30 +0300
+Subject: [PATCH 5/7] Revert "serial: 8250: lock port for stop_rx() in
+ omap8250_irq()"
+
+This reverts commit 27cd11322f9dfdd2d168052bb27e0e93a7c8bd1b.
+---
+ drivers/tty/serial/8250/8250_omap.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/tty/serial/8250/8250_omap.c b/drivers/tty/serial/8250/8250_omap.c
+index c07068c5866f..43864e30c0e3 100644
+--- a/drivers/tty/serial/8250/8250_omap.c
++++ b/drivers/tty/serial/8250/8250_omap.c
+@@ -651,9 +651,7 @@ static irqreturn_t omap8250_irq(int irq, void *dev_id)
+ 
+ 		up->ier = port->serial_in(port, UART_IER);
+ 		if (up->ier & (UART_IER_RLSI | UART_IER_RDI)) {
+-			spin_lock(&port->lock);
+ 			port->ops->stop_rx(port);
+-			spin_unlock(&port->lock);
+ 		} else {
+ 			/* Keep restarting the timer until
+ 			 * the input overrun subsides.
+-- 
+2.41.0
+
+
+From 05b3b6bdf4984c06c4d3c7a23a263842f5e08b98 Mon Sep 17 00:00:00 2001
+From: Vasiliy Stelmachenok <ventureo@yandex.ru>
+Date: Fri, 21 Jul 2023 13:03:32 +0300
+Subject: [PATCH 6/7] Add realtime patchset
 
 ---
  arch/arm/Kconfig                              |    5 +-
@@ -242,7 +408,6 @@ Subject: [PATCH 3/4] Add realtime patchset
  drivers/tty/serial/8250/Kconfig               |    1 +
  drivers/tty/serial/amba-pl011.c               |   17 +-
  drivers/tty/serial/omap-serial.c              |   12 +-
- drivers/tty/serial/serial_core.c              |   10 +-
  drivers/tty/tty_io.c                          |    9 +-
  fs/proc/consoles.c                            |   14 +-
  include/linux/console.h                       |  178 ++
@@ -257,7 +422,6 @@ Subject: [PATCH 3/4] Add realtime patchset
  include/linux/serial_8250.h                   |   11 +-
  include/linux/thread_info.h                   |   64 +-
  include/linux/trace_events.h                  |   10 +-
- include/trace/events/timer.h                  |    6 +-
  kernel/Kconfig.preempt                        |    6 +
  kernel/bpf/syscall.c                          |   29 +-
  kernel/debug/kdb/kdb_io.c                     |    2 +
@@ -292,7 +456,7 @@ Subject: [PATCH 3/4] Add realtime patchset
  mm/page_alloc.c                               |   15 +-
  net/core/dev.c                                |   39 +-
  net/core/skbuff.c                             |    7 +-
- 97 files changed, 4432 insertions(+), 619 deletions(-)
+ 95 files changed, 4419 insertions(+), 616 deletions(-)
  create mode 100644 kernel/printk/printk_nobkl.c
 
 diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
@@ -766,7 +930,7 @@ index 0996094b0d22..308666f63a47 100644
    DEFINE(TSK_TI_TTBR0,		offsetof(struct task_struct, thread_info.ttbr0));
  #endif
 diff --git a/arch/arm64/kernel/signal.c b/arch/arm64/kernel/signal.c
-index 2cfc810d0a5b..8fbb364b05a6 100644
+index 10b407672c42..f8a9455ced92 100644
 --- a/arch/arm64/kernel/signal.c
 +++ b/arch/arm64/kernel/signal.c
 @@ -1280,7 +1280,7 @@ static void do_signal(struct pt_regs *regs)
@@ -879,7 +1043,7 @@ index bf5dde1a4114..1ca7cc28b0bf 100644
  /* Bits in local_flags */
  /* Don't move TLF_NAPPING without adjusting the code in entry_32.S */
 diff --git a/arch/powerpc/kernel/interrupt.c b/arch/powerpc/kernel/interrupt.c
-index e34c72285b4e..80bbf5e013f3 100644
+index f3fc5fe919d9..dbd34a981da8 100644
 --- a/arch/powerpc/kernel/interrupt.c
 +++ b/arch/powerpc/kernel/interrupt.c
 @@ -186,7 +186,7 @@ interrupt_exit_user_prepare_main(unsigned long ret, struct pt_regs *regs)
@@ -891,7 +1055,7 @@ index e34c72285b4e..80bbf5e013f3 100644
  			schedule();
  		} else {
  			/*
-@@ -398,11 +398,15 @@ notrace unsigned long interrupt_exit_kernel_prepare(struct pt_regs *regs)
+@@ -397,11 +397,15 @@ notrace unsigned long interrupt_exit_kernel_prepare(struct pt_regs *regs)
  		/* Returning to a kernel context with local irqs enabled. */
  		WARN_ON_ONCE(!(regs->msr & MSR_EE));
  again:
@@ -1264,7 +1428,7 @@ index e4f4d2e3fdfe..533d5a21a4a8 100644
  	select INTERVAL_TREE
  	# we need shmfs for the swappable backing store, and in particular
 diff --git a/drivers/gpu/drm/i915/display/intel_crtc.c b/drivers/gpu/drm/i915/display/intel_crtc.c
-index ed45a6934854..72d90edd9518 100644
+index 349bc7f5f9a0..1b87a3c90687 100644
 --- a/drivers/gpu/drm/i915/display/intel_crtc.c
 +++ b/drivers/gpu/drm/i915/display/intel_crtc.c
 @@ -523,7 +523,8 @@ void intel_pipe_update_start(struct intel_crtc_state *new_crtc_state)
@@ -2032,7 +2196,7 @@ index fb1d5ec0940e..bf7ab55c8923 100644
  
  static void mtk8250_set_flow_ctrl(struct uart_8250_port *up, int mode)
 diff --git a/drivers/tty/serial/8250/8250_omap.c b/drivers/tty/serial/8250/8250_omap.c
-index 734f092ef839..bfa50a26349d 100644
+index 43864e30c0e3..28d46f184cd5 100644
 --- a/drivers/tty/serial/8250/8250_omap.c
 +++ b/drivers/tty/serial/8250/8250_omap.c
 @@ -334,8 +334,7 @@ static void omap8250_restore_regs(struct uart_8250_port *up)
@@ -2152,7 +2316,7 @@ index 734f092ef839..bfa50a26349d 100644
  	}
  }
  
-@@ -1717,12 +1727,16 @@ static int omap8250_runtime_resume(struct device *dev)
+@@ -1729,12 +1739,16 @@ static int omap8250_runtime_resume(struct device *dev)
  
  	up = serial8250_get_port(priv->line);
  
@@ -2911,36 +3075,6 @@ index 82d35dbbfa6c..511cf17d8795 100644
  }
  
  static int __init
-diff --git a/drivers/tty/serial/serial_core.c b/drivers/tty/serial/serial_core.c
-index 54e82f476a2c..ea4a70055ad9 100644
---- a/drivers/tty/serial/serial_core.c
-+++ b/drivers/tty/serial/serial_core.c
-@@ -2333,8 +2333,11 @@ int uart_suspend_port(struct uart_driver *drv, struct uart_port *uport)
- 	 * able to Re-start_rx later.
- 	 */
- 	if (!console_suspend_enabled && uart_console(uport)) {
--		if (uport->ops->start_rx)
-+		if (uport->ops->start_rx) {
-+			spin_lock_irq(&uport->lock);
- 			uport->ops->stop_rx(uport);
-+			spin_unlock_irq(&uport->lock);
-+		}
- 		goto unlock;
- 	}
- 
-@@ -2427,8 +2430,11 @@ int uart_resume_port(struct uart_driver *drv, struct uart_port *uport)
- 		if (console_suspend_enabled)
- 			uart_change_pm(state, UART_PM_STATE_ON);
- 		uport->ops->set_termios(uport, &termios, NULL);
--		if (!console_suspend_enabled && uport->ops->start_rx)
-+		if (!console_suspend_enabled && uport->ops->start_rx) {
-+			spin_lock_irq(&uport->lock);
- 			uport->ops->start_rx(uport);
-+			spin_unlock_irq(&uport->lock);
-+		}
- 		if (console_suspend_enabled)
- 			console_start(uport->cons);
- 	}
 diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
 index c84be40fb8df..0dc7277b09db 100644
 --- a/drivers/tty/tty_io.c
@@ -3288,7 +3422,7 @@ index a92bce40b04b..bf82980f569d 100644
  
  static inline struct task_struct *this_cpu_ksoftirqd(void)
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index c2f0c6002a84..1b8ab47ec778 100644
+index 68adc8af29ef..610bc31cce07 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -3240,7 +3240,11 @@ struct softnet_data {
@@ -3758,23 +3892,6 @@ index 7c4a0b72334e..a8d989676567 100644
  	TRACE_FLAG_NMI			= 0x40,
  	TRACE_FLAG_BH_OFF		= 0x80,
  };
-diff --git a/include/trace/events/timer.h b/include/trace/events/timer.h
-index 3e8619c72f77..b4bc2828fa09 100644
---- a/include/trace/events/timer.h
-+++ b/include/trace/events/timer.h
-@@ -158,7 +158,11 @@ DEFINE_EVENT(timer_class, timer_cancel,
- 		{ HRTIMER_MODE_ABS_SOFT,	"ABS|SOFT"	},	\
- 		{ HRTIMER_MODE_REL_SOFT,	"REL|SOFT"	},	\
- 		{ HRTIMER_MODE_ABS_PINNED_SOFT,	"ABS|PINNED|SOFT" },	\
--		{ HRTIMER_MODE_REL_PINNED_SOFT,	"REL|PINNED|SOFT" })
-+		{ HRTIMER_MODE_REL_PINNED_SOFT,	"REL|PINNED|SOFT" },	\
-+		{ HRTIMER_MODE_ABS_HARD,	"ABS|HARD" },		\
-+		{ HRTIMER_MODE_REL_HARD,	"REL|HARD" },		\
-+		{ HRTIMER_MODE_ABS_PINNED_HARD, "ABS|PINNED|HARD" },	\
-+		{ HRTIMER_MODE_REL_PINNED_HARD,	"REL|PINNED|HARD" })
- 
- /**
-  * hrtimer_init - called when the hrtimer is initialized
 diff --git a/kernel/Kconfig.preempt b/kernel/Kconfig.preempt
 index c2f1fd95a821..260c08efeb48 100644
 --- a/kernel/Kconfig.preempt
@@ -7685,7 +7802,7 @@ index 02e1a1a78bd0..0969e5f85bcc 100644
  	 * The idle tasks have their own, simple scheduling class:
  	 */
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 64cbea29b007..81349d8b0772 100644
+index a6205f9e6cb5..bcb4e26953f2 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -5034,7 +5034,7 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
@@ -7724,7 +7841,7 @@ index 64cbea29b007..81349d8b0772 100644
  }
  
  static __always_inline
-@@ -6252,7 +6252,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
+@@ -6270,7 +6270,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
  
  		if (delta < 0) {
  			if (task_current(rq, p))
@@ -7733,7 +7850,7 @@ index 64cbea29b007..81349d8b0772 100644
  			return;
  		}
  		hrtick_start(rq, delta);
-@@ -8018,7 +8018,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
+@@ -8036,7 +8036,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
  	return;
  
  preempt:
@@ -7742,7 +7859,7 @@ index 64cbea29b007..81349d8b0772 100644
  	/*
  	 * Only set the backward buddy when the current task is still
  	 * on the rq. This can happen when a wakeup gets interleaved
-@@ -12318,7 +12318,7 @@ static void task_fork_fair(struct task_struct *p)
+@@ -12336,7 +12336,7 @@ static void task_fork_fair(struct task_struct *p)
  		 * 'current' within the tree based on its new key value.
  		 */
  		swap(curr->vruntime, se->vruntime);
@@ -7751,7 +7868,7 @@ index 64cbea29b007..81349d8b0772 100644
  	}
  
  	se->vruntime -= cfs_rq->min_vruntime;
-@@ -12345,7 +12345,7 @@ prio_changed_fair(struct rq *rq, struct task_struct *p, int oldprio)
+@@ -12363,7 +12363,7 @@ prio_changed_fair(struct rq *rq, struct task_struct *p, int oldprio)
  	 */
  	if (task_current(rq, p)) {
  		if (p->prio > oldprio)
@@ -7775,10 +7892,10 @@ index 9e390eb82e38..c88dcb3017a7 100644
  
  /*
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 0605fb53816d..a8faef45f15f 100644
+index a6e814eb84cd..e9865247970b 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -2387,6 +2387,15 @@ extern void reweight_task(struct task_struct *p, int prio);
+@@ -2409,6 +2409,15 @@ extern void reweight_task(struct task_struct *p, int prio);
  extern void resched_curr(struct rq *rq);
  extern void resched_cpu(int cpu);
  
@@ -8147,7 +8264,7 @@ index 808a247205a9..c0a32aab8f27 100644
  		tmr = list_first_entry(&timers, struct k_itimer, list);
  		itimer_delete(tmr);
 diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
-index 42c0be3080bd..0d29eaa8c616 100644
+index 4df14db4da49..b417fe6e43f6 100644
 --- a/kernel/time/tick-sched.c
 +++ b/kernel/time/tick-sched.c
 @@ -795,7 +795,7 @@ static void tick_nohz_restart(struct tick_sched *ts, ktime_t now)
@@ -8447,12 +8564,14 @@ index cea28d30abb5..e4e802b3fbf0 100644
 +#endif
 +	}
  }
+-- 
+2.41.0
 
 
-From dcb431d3239cc880c9e818c3b96e761cff6bd636 Mon Sep 17 00:00:00 2001
+From 296a713521673964e90b33d4a988ccb07581d80e Mon Sep 17 00:00:00 2001
 From: Vasiliy Stelmachenok <ventureo@yandex.ru>
-Date: Tue, 18 Jul 2023 22:29:11 +0300
-Subject: [PATCH 4/4] Don't make realtime patchset dependent on CONFIG_EXPERT
+Date: Wed, 28 Jun 2023 21:09:25 +0300
+Subject: [PATCH 7/7] Don't make realtime patchset dependent on CONFIG_EXPERT
 
 It's just a headache to have a bunch of garbage in your config for the
 sake of enabling one option. It makes it much easier to keep our config
