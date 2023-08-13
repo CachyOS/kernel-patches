@@ -1,0 +1,291 @@
+From 191a7a1eb599a18cbe84239c4eeab83a023ed003 Mon Sep 17 00:00:00 2001
+From: Meng Li <li.meng@amd.com>
+Date: Tue, 8 Aug 2023 16:09:57 +0800
+Subject: [PATCH 07/11] cpufreq: amd-pstate: Enable AMD Pstate Preferred Core
+ Supporting.
+
+AMD Pstate driver utilizes the functions and data structures
+provided by the ITMT architecture to enable the scheduler to
+favor scheduling on cores which can be get a higher frequency
+with lower voltage. We call it AMD Pstate Preferrred Core.
+
+Here sched_set_itmt_core_prio() is called to set priorities and
+sched_set_itmt_support() is called to enable ITMT feature.
+AMD Pstate driver uses the highest performance value to indicate
+the priority of CPU. The higher value has a higher priority.
+
+The initial core rankings are set up by AMD Pstate when the
+system boots.
+
+Add device attribute for preferred core states.
+
+Add one new early parameter `enable` to allow user to
+enable the preferred core if the processor and power
+firmware can support preferred core feature.
+
+Signed-off-by: Meng Li <li.meng@amd.com>
+Signed-off-by: Perry Yuan <Perry.Yuan@amd.com>
+---
+ drivers/cpufreq/amd-pstate.c | 149 +++++++++++++++++++++++++++++++----
+ 1 file changed, 133 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 9a1e194d5..e919b3f4a 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -37,6 +37,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/static_call.h>
+ #include <linux/amd-pstate.h>
++#include <linux/topology.h>
+ 
+ #include <acpi/processor.h>
+ #include <acpi/cppc_acpi.h>
+@@ -49,6 +50,8 @@
+ 
+ #define AMD_PSTATE_TRANSITION_LATENCY	20000
+ #define AMD_PSTATE_TRANSITION_DELAY	1000
++#define AMD_PSTATE_PREFCORE_THRESHOLD	166
++#define AMD_PSTATE_MAX_CPPC_PERF	255
+ 
+ /*
+  * TODO: We need more time to fine tune processors with shared memory solution
+@@ -65,6 +68,14 @@ static struct cpufreq_driver amd_pstate_epp_driver;
+ static int cppc_state = AMD_PSTATE_UNDEFINED;
+ static bool cppc_enabled;
+ 
++/*
++ * CPPC Preferred Core feature is supported by power firmware
++ */
++static bool prefcore_enabled = false;
++
++/* Disable AMD Pstate Preferred Core loading */
++static bool no_prefcore __read_mostly = true;
++
+ /*
+  * AMD Energy Preference Performance (EPP)
+  * The EPP is used in the CCLK DPM controller to drive
+@@ -290,23 +301,21 @@ static inline int amd_pstate_enable(bool enable)
+ static int pstate_init_perf(struct amd_cpudata *cpudata)
+ {
+ 	u64 cap1;
+-	u32 highest_perf;
+ 
+ 	int ret = rdmsrl_safe_on_cpu(cpudata->cpu, MSR_AMD_CPPC_CAP1,
+ 				     &cap1);
+ 	if (ret)
+ 		return ret;
+ 
+-	/*
+-	 * TODO: Introduce AMD specific power feature.
+-	 *
+-	 * CPPC entry doesn't indicate the highest performance in some ASICs.
++	/* For platforms that do not support the preferred core feature, the
++	 * highest_pef may be configured with 166 or 255, to avoid max frequency
++	 * calculated wrongly. we take the AMD_CPPC_HIGHEST_PERF(cap1) value as
++	 * the default max perf.
+ 	 */
+-	highest_perf = amd_get_highest_perf();
+-	if (highest_perf > AMD_CPPC_HIGHEST_PERF(cap1))
+-		highest_perf = AMD_CPPC_HIGHEST_PERF(cap1);
+-
+-	WRITE_ONCE(cpudata->highest_perf, highest_perf);
++	if (!prefcore_enabled)
++		WRITE_ONCE(cpudata->highest_perf, AMD_CPPC_HIGHEST_PERF(cap1));
++	else
++		WRITE_ONCE(cpudata->highest_perf, AMD_PSTATE_PREFCORE_THRESHOLD);
+ 
+ 	WRITE_ONCE(cpudata->nominal_perf, AMD_CPPC_NOMINAL_PERF(cap1));
+ 	WRITE_ONCE(cpudata->lowest_nonlinear_perf, AMD_CPPC_LOWNONLIN_PERF(cap1));
+@@ -318,17 +327,15 @@ static int pstate_init_perf(struct amd_cpudata *cpudata)
+ static int cppc_init_perf(struct amd_cpudata *cpudata)
+ {
+ 	struct cppc_perf_caps cppc_perf;
+-	u32 highest_perf;
+ 
+ 	int ret = cppc_get_perf_caps(cpudata->cpu, &cppc_perf);
+ 	if (ret)
+ 		return ret;
+ 
+-	highest_perf = amd_get_highest_perf();
+-	if (highest_perf > cppc_perf.highest_perf)
+-		highest_perf = cppc_perf.highest_perf;
+-
+-	WRITE_ONCE(cpudata->highest_perf, highest_perf);
++	if (!prefcore_enabled)
++		WRITE_ONCE(cpudata->highest_perf, cppc_perf.highest_perf);
++	else
++		WRITE_ONCE(cpudata->highest_perf, AMD_PSTATE_PREFCORE_THRESHOLD);
+ 
+ 	WRITE_ONCE(cpudata->nominal_perf, cppc_perf.nominal_perf);
+ 	WRITE_ONCE(cpudata->lowest_nonlinear_perf,
+@@ -676,6 +683,90 @@ static void amd_perf_ctl_reset(unsigned int cpu)
+ 	wrmsrl_on_cpu(cpu, MSR_AMD_PERF_CTL, 0);
+ }
+ 
++/*
++ * Set AMD Pstate Preferred Core enable can't be done directly from cpufreq callbacks
++ * due to locking, so queue the work for later.
++ */
++static void amd_pstste_sched_prefcore_workfn(struct work_struct *work)
++{
++	sched_set_itmt_support();
++}
++static DECLARE_WORK(sched_prefcore_work, amd_pstste_sched_prefcore_workfn);
++
++/**
++ * Get the highest performance register value.
++ * @cpu: CPU from which to get highest performance.
++ * @highest_perf: Return address.
++ *
++ * Return: 0 for success, -EIO otherwise.
++ */
++static int amd_pstate_get_highest_perf(int cpu, u64 *highest_perf)
++{
++       int ret;
++
++       if (boot_cpu_has(X86_FEATURE_CPPC)) {
++               u64 cap1;
++
++               ret = rdmsrl_safe_on_cpu(cpu, MSR_AMD_CPPC_CAP1, &cap1);
++               if (ret)
++                       return ret;
++               WRITE_ONCE(*highest_perf, AMD_CPPC_HIGHEST_PERF(cap1));
++       } else {
++               ret = cppc_get_highest_perf(cpu, highest_perf);
++       }
++
++       return (ret);
++}
++
++static void amd_pstate_init_prefcore(void)
++{
++	int cpu, ret;
++	u64 highest_perf;
++
++	if (no_prefcore)
++		return;
++
++	for_each_possible_cpu(cpu) {
++		ret = amd_pstate_get_highest_perf(cpu, &highest_perf);
++		if (ret)
++			break;
++
++		sched_set_itmt_core_prio(highest_perf, cpu);
++	}
++
++	/*
++	 * This code can be run during CPU online under the
++	 * CPU hotplug locks, so sched_set_amd_prefcore_support()
++	 * cannot be called from here.  Queue up a work item
++	 * to invoke it.
++	 */
++	schedule_work(&sched_prefcore_work);
++}
++
++/*
++ * Check if AMD Pstate Preferred core feature is supported and enabled
++ * 1) no_prefcore is used to enable or disable AMD Pstate Preferred Core
++ * loading when user would like to enable or disable it. Without that,
++ * AMD Pstate Preferred Core will be disabled by default if the processor
++ * and power firmware can support preferred core feature.
++ * 2) prefcore_enabled is used to indicate whether CPPC preferred core is enabled.
++ */
++static void check_prefcore_supported(int cpu)
++{
++	u64 highest_perf;
++	int ret;
++
++	if (no_prefcore)
++		return;
++
++	ret = amd_pstate_get_highest_perf(cpu, &highest_perf);
++	if (ret)
++		return;
++
++	if(highest_perf < AMD_PSTATE_MAX_CPPC_PERF)
++		prefcore_enabled = true;
++}
++
+ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+ {
+ 	int min_freq, max_freq, nominal_freq, lowest_nonlinear_freq, ret;
+@@ -697,6 +788,9 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+ 
+ 	cpudata->cpu = policy->cpu;
+ 
++	/* check if CPPC preferred core feature is enabled*/
++	check_prefcore_supported(policy->cpu);
++
+ 	ret = amd_pstate_init_perf(cpudata);
+ 	if (ret)
+ 		goto free_cpudata1;
+@@ -1037,6 +1131,12 @@ static ssize_t status_store(struct device *a, struct device_attribute *b,
+ 	return ret < 0 ? ret : count;
+ }
+ 
++static ssize_t prefcore_state_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n", prefcore_enabled ? "enabled" : "disabled");
++}
++
+ cpufreq_freq_attr_ro(amd_pstate_max_freq);
+ cpufreq_freq_attr_ro(amd_pstate_lowest_nonlinear_freq);
+ 
+@@ -1044,6 +1144,7 @@ cpufreq_freq_attr_ro(amd_pstate_highest_perf);
+ cpufreq_freq_attr_rw(energy_performance_preference);
+ cpufreq_freq_attr_ro(energy_performance_available_preferences);
+ static DEVICE_ATTR_RW(status);
++static DEVICE_ATTR_RO(prefcore_state);
+ 
+ static struct freq_attr *amd_pstate_attr[] = {
+ 	&amd_pstate_max_freq,
+@@ -1063,6 +1164,7 @@ static struct freq_attr *amd_pstate_epp_attr[] = {
+ 
+ static struct attribute *pstate_global_attributes[] = {
+ 	&dev_attr_status.attr,
++	&dev_attr_prefcore_state.attr,
+ 	NULL
+ };
+ 
+@@ -1114,6 +1216,9 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 	cpudata->cpu = policy->cpu;
+ 	cpudata->epp_policy = 0;
+ 
++	/* check if CPPC preferred core feature is supported*/
++	check_prefcore_supported(policy->cpu);
++
+ 	ret = amd_pstate_init_perf(cpudata);
+ 	if (ret)
+ 		goto free_cpudata1;
+@@ -1506,6 +1611,8 @@ static int __init amd_pstate_init(void)
+ 		}
+ 	}
+ 
++	amd_pstate_init_prefcore();
++
+ 	return ret;
+ 
+ global_attr_free:
+@@ -1527,7 +1634,17 @@ static int __init amd_pstate_param(char *str)
+ 
+ 	return amd_pstate_set_driver(mode_idx);
+ }
++
++static int __init amd_prefcore_param(char *str)
++{
++	if (!strcmp(str, "enable"))
++		no_prefcore = false;
++
++	return 0;
++}
++
+ early_param("amd_pstate", amd_pstate_param);
++early_param("amd_prefcore", amd_prefcore_param);
+ 
+ MODULE_AUTHOR("Huang Rui <ray.huang@amd.com>");
+ MODULE_DESCRIPTION("AMD Processor P-state Frequency Driver");
+-- 
+2.42.0.rc0.25.ga82fb66fed
+
