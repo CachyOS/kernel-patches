@@ -1,9 +1,8 @@
-From 883cdf22d4cd25d1f940ef7593af6ffda71506e4 Mon Sep 17 00:00:00 2001
-From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Wed, 13 Sep 2023 20:11:52 +0200
-Subject: [PATCH] rt
+From 0183746089388b522d1c8f85496d540d8620faad Mon Sep 17 00:00:00 2001
+From: Vasiliy Stelmachenok <ventureo@yandex.ru>
+Date: Tue, 29 Aug 2023 15:29:03 +0300
+Subject: [PATCH] Add realtime patchset
 
-Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
 ---
  arch/x86/Kconfig                              |    2 +
  arch/x86/include/asm/preempt.h                |   33 +-
@@ -53,11 +52,9 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  kernel/debug/kdb/kdb_io.c                     |    2 +
  kernel/entry/common.c                         |    4 +-
  kernel/fork.c                                 |    8 +
- kernel/futex/futex.h                          |   23 +
- kernel/futex/pi.c                             |   13 +-
- kernel/futex/requeue.c                        |    4 +-
+ kernel/futex/pi.c                             |   11 +
  kernel/ksysfs.c                               |   12 +
- kernel/locking/rtmutex.c                      |   44 +-
+ kernel/locking/rtmutex.c                      |   37 +-
  kernel/locking/rwbase_rt.c                    |    8 +
  kernel/locking/rwsem.c                        |    8 +-
  kernel/locking/spinlock_rt.c                  |    6 +
@@ -87,7 +84,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  net/core/dev.c                                |   39 +-
  net/core/skbuff.c                             |    7 +-
  sound/soc/mediatek/mt8186/mt8186-afe-clk.c    |    2 -
- 82 files changed, 4142 insertions(+), 408 deletions(-)
+ 80 files changed, 4112 insertions(+), 402 deletions(-)
  create mode 100644 kernel/printk/printk_nobkl.c
 
 diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
@@ -2920,42 +2917,8 @@ index 95ca80492a37..36fb0b711541 100644
  void __init __weak arch_task_cache_init(void) { }
  
  /*
-diff --git a/kernel/futex/futex.h b/kernel/futex/futex.h
-index b5379c0e6d6d..58fbc34a5981 100644
---- a/kernel/futex/futex.h
-+++ b/kernel/futex/futex.h
-@@ -254,6 +254,29 @@ double_unlock_hb(struct futex_hash_bucket *hb1, struct futex_hash_bucket *hb2)
- 		spin_unlock(&hb2->lock);
- }
- 
-+static inline void futex_trylock_hblock(spinlock_t *lock)
-+{
-+	do {
-+		ktime_t chill_time;;
-+
-+		/*
-+		 * Current is not longer pi_blocked_on if it owns the lock. It
-+		 * can still have pi_blocked_on set if the lock acquiring was
-+		 * interrupted by signal or timeout. The trylock operation does
-+		 * not clobber pi_blocked_on so it is the only option.
-+		 * Should the try-lock operation fail then it needs leave the CPU
-+		 * to avoid a busy loop in case it is the task with the highest
-+		 * priority.
-+		 */
-+		if (spin_trylock(lock))
-+			return;
-+
-+		chill_time = ktime_set(0, NSEC_PER_MSEC);
-+		set_current_state(TASK_UNINTERRUPTIBLE);
-+		schedule_hrtimeout(&chill_time, HRTIMER_MODE_REL_HARD);
-+	} while (1);
-+}
-+
- /* syscalls */
- 
- extern int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags, u32
 diff --git a/kernel/futex/pi.c b/kernel/futex/pi.c
-index ce2889f12375..1440fdcdbfd8 100644
+index ce2889f12375..f8e65b27d9d6 100644
 --- a/kernel/futex/pi.c
 +++ b/kernel/futex/pi.c
 @@ -1,6 +1,7 @@
@@ -2979,41 +2942,17 @@ index ce2889f12375..1440fdcdbfd8 100644
  	rt_mutex_init_waiter(&rt_waiter);
  
  	/*
-@@ -1039,7 +1046,10 @@ int futex_lock_pi(u32 __user *uaddr, unsigned int flags, ktime_t *time, int tryl
- 	ret = rt_mutex_wait_proxy_lock(&q.pi_state->pi_mutex, to, &rt_waiter);
- 
- cleanup:
--	spin_lock(q.lock_ptr);
-+	rt_mutex_post_schedule();
-+
-+	futex_trylock_hblock(q.lock_ptr);
-+
- 	/*
- 	 * If we failed to acquire the lock (deadlock/signal/timeout), we must
- 	 * first acquire the hb->lock before removing the lock from the
-@@ -1051,7 +1061,6 @@ int futex_lock_pi(u32 __user *uaddr, unsigned int flags, ktime_t *time, int tryl
- 	 */
+@@ -1052,6 +1059,10 @@ int futex_lock_pi(u32 __user *uaddr, unsigned int flags, ktime_t *time, int tryl
  	if (ret && !rt_mutex_cleanup_proxy_lock(&q.pi_state->pi_mutex, &rt_waiter))
  		ret = 0;
--
+ 
++	/*
++	 * Waiter is unqueued.
++	 */
++	rt_mutex_post_schedule();
  no_block:
  	/*
  	 * Fixup the pi_state owner and possibly acquire the lock if we
-diff --git a/kernel/futex/requeue.c b/kernel/futex/requeue.c
-index cba8b1a6a4cc..26888cfa7444 100644
---- a/kernel/futex/requeue.c
-+++ b/kernel/futex/requeue.c
-@@ -850,8 +850,8 @@ int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
- 		pi_mutex = &q.pi_state->pi_mutex;
- 		ret = rt_mutex_wait_proxy_lock(pi_mutex, to, &rt_waiter);
- 
--		/* Current is not longer pi_blocked_on */
--		spin_lock(q.lock_ptr);
-+		futex_trylock_hblock(q.lock_ptr);
-+
- 		if (ret && !rt_mutex_cleanup_proxy_lock(pi_mutex, &rt_waiter))
- 			ret = 0;
- 
 diff --git a/kernel/ksysfs.c b/kernel/ksysfs.c
 index aad7a3bfd846..fe654a9791a7 100644
 --- a/kernel/ksysfs.c
@@ -3045,7 +2984,7 @@ index aad7a3bfd846..fe654a9791a7 100644
  	NULL
  };
 diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
-index 21db0df0eb00..e56585ef489c 100644
+index 21db0df0eb00..4a10e8c16fd2 100644
 --- a/kernel/locking/rtmutex.c
 +++ b/kernel/locking/rtmutex.c
 @@ -218,6 +218,11 @@ static __always_inline bool rt_mutex_cmpxchg_acquire(struct rt_mutex_base *lock,
@@ -3081,23 +3020,7 @@ index 21db0df0eb00..e56585ef489c 100644
  static __always_inline bool rt_mutex_cmpxchg_release(struct rt_mutex_base *lock,
  						     struct task_struct *old,
  						     struct task_struct *new)
-@@ -1147,10 +1166,13 @@ try_to_take_rt_mutex(struct rt_mutex_base *lock, struct task_struct *task,
- 	 * Clear @task->pi_blocked_on. Requires protection by
- 	 * @task->pi_lock. Redundant operation for the @waiter == NULL
- 	 * case, but conditionals are more expensive than a redundant
--	 * store.
-+	 * store. But then there is FUTEX and if rt_mutex_wait_proxy_lock()
-+	 * did not acquire the lock it try-locks another lock before it clears
-+	 * @task->pi_blocked_on so we mustn't clear it here premature.
- 	 */
- 	raw_spin_lock(&task->pi_lock);
--	task->pi_blocked_on = NULL;
-+	if (waiter)
-+		task->pi_blocked_on = NULL;
- 	/*
- 	 * Finish the lock acquisition. @task is the new owner. If
- 	 * other waiters exist we have to insert the highest priority
-@@ -1613,7 +1635,7 @@ static int __sched rt_mutex_slowlock_block(struct rt_mutex_base *lock,
+@@ -1613,7 +1632,7 @@ static int __sched rt_mutex_slowlock_block(struct rt_mutex_base *lock,
  		raw_spin_unlock_irq(&lock->wait_lock);
  
  		if (!owner || !rtmutex_spin_on_owner(lock, waiter, owner))
@@ -3106,7 +3029,7 @@ index 21db0df0eb00..e56585ef489c 100644
  
  		raw_spin_lock_irq(&lock->wait_lock);
  		set_current_state(state);
-@@ -1642,7 +1664,7 @@ static void __sched rt_mutex_handle_deadlock(int res, int detect_deadlock,
+@@ -1642,7 +1661,7 @@ static void __sched rt_mutex_handle_deadlock(int res, int detect_deadlock,
  	WARN(1, "rtmutex deadlock detected\n");
  	while (1) {
  		set_current_state(TASK_INTERRUPTIBLE);
@@ -3115,7 +3038,7 @@ index 21db0df0eb00..e56585ef489c 100644
  	}
  }
  
-@@ -1737,6 +1759,15 @@ static int __sched rt_mutex_slowlock(struct rt_mutex_base *lock,
+@@ -1737,6 +1756,15 @@ static int __sched rt_mutex_slowlock(struct rt_mutex_base *lock,
  	unsigned long flags;
  	int ret;
  
@@ -3131,7 +3054,7 @@ index 21db0df0eb00..e56585ef489c 100644
  	/*
  	 * Technically we could use raw_spin_[un]lock_irq() here, but this can
  	 * be called in early boot if the cmpxchg() fast path is disabled
-@@ -1748,6 +1779,7 @@ static int __sched rt_mutex_slowlock(struct rt_mutex_base *lock,
+@@ -1748,6 +1776,7 @@ static int __sched rt_mutex_slowlock(struct rt_mutex_base *lock,
  	raw_spin_lock_irqsave(&lock->wait_lock, flags);
  	ret = __rt_mutex_slowlock_locked(lock, ww_ctx, state);
  	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
@@ -3139,7 +3062,7 @@ index 21db0df0eb00..e56585ef489c 100644
  
  	return ret;
  }
-@@ -1755,7 +1787,9 @@ static int __sched rt_mutex_slowlock(struct rt_mutex_base *lock,
+@@ -1755,7 +1784,9 @@ static int __sched rt_mutex_slowlock(struct rt_mutex_base *lock,
  static __always_inline int __rt_mutex_lock(struct rt_mutex_base *lock,
  					   unsigned int state)
  {
@@ -3151,7 +3074,7 @@ index 21db0df0eb00..e56585ef489c 100644
  
  	return rt_mutex_slowlock(lock, NULL, state);
 diff --git a/kernel/locking/rwbase_rt.c b/kernel/locking/rwbase_rt.c
-index 25ec0239477c..34a59569db6b 100644
+index 25ec0239477c..b5e881250fec 100644
 --- a/kernel/locking/rwbase_rt.c
 +++ b/kernel/locking/rwbase_rt.c
 @@ -71,6 +71,7 @@ static int __sched __rwbase_read_lock(struct rwbase_rt *rwb,
@@ -3182,7 +3105,7 @@ index 25ec0239477c..34a59569db6b 100644
  	/* Force readers into slow path */
  	atomic_sub(READER_BIAS, &rwb->readers);
  
-+	rwbase_pre_schedule();
++	rt_mutex_pre_schedule();
 +
  	raw_spin_lock_irqsave(&rtm->wait_lock, flags);
  	if (__rwbase_write_trylock(rwb))
@@ -3191,7 +3114,7 @@ index 25ec0239477c..34a59569db6b 100644
  		if (rwbase_signal_pending_state(state, current)) {
  			rwbase_restore_current_state();
  			__rwbase_write_unlock(rwb, 0, flags);
-+			rwbase_post_schedule();
++			rt_mutex_post_schedule();
  			trace_contention_end(rwb, -EINTR);
  			return -EINTR;
  		}
@@ -3199,7 +3122,7 @@ index 25ec0239477c..34a59569db6b 100644
  
  out_unlock:
  	raw_spin_unlock_irqrestore(&rtm->wait_lock, flags);
-+	rwbase_post_schedule();
++	rt_mutex_post_schedule();
  	return 0;
  }
  
