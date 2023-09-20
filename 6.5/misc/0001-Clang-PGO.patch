@@ -1,0 +1,1344 @@
+From 693e1e9cc0813e5201b6fc57c2a0b353318318e4 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Wed, 20 Sep 2023 17:15:30 +0200
+Subject: [PATCH] Clang-PGO
+
+Workflow:
+1. Compile the kernel with CONFIG_CLANG_PGO enabled (without LTO!!)
+2. Install the kernel
+3. Boot into the kernel
+4. `echo 1 | sudo tee /proc/pgo/reset`
+5. Run a workload
+6. `sudo cp -a /proc/pgo/vmlinux.profraw .`
+7.` sudo chown $USER:$USER vmlinux.profraw`
+8. `llvm-profdata merge --output=vmlinux.profdata vmlinux.profraw`
+9. `export KCFLAGS=-fprofile-use=$PATHTOPROFDATA`
+10. Compile the Kernel, LTO can be enabled now, include the PGO patch but disable the PGO entry
+11. Install the final kernel :)
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ Documentation/dev-tools/pgo.rst       | 127 ++++++++
+ Makefile                              |   3 +
+ arch/Kconfig                          |   1 +
+ arch/x86/Kconfig                      |   1 +
+ arch/x86/boot/Makefile                |   1 +
+ arch/x86/boot/compressed/Makefile     |   1 +
+ arch/x86/crypto/Makefile              |   3 +
+ arch/x86/entry/vdso/Makefile          |   1 +
+ arch/x86/kernel/Makefile              |   3 +
+ arch/x86/kernel/vmlinux.lds.S         |   2 +
+ arch/x86/platform/efi/Makefile        |   1 +
+ arch/x86/purgatory/Makefile           |   1 +
+ arch/x86/realmode/rm/Makefile         |   1 +
+ arch/x86/um/vdso/Makefile             |   1 +
+ drivers/firmware/efi/libstub/Makefile |   1 +
+ include/asm-generic/vmlinux.lds.h     |  32 ++
+ kernel/Makefile                       |   1 +
+ kernel/pgo/Kconfig                    |  37 +++
+ kernel/pgo/Makefile                   |   5 +
+ kernel/pgo/fs.c                       | 420 ++++++++++++++++++++++++++
+ kernel/pgo/instrument.c               | 188 ++++++++++++
+ kernel/pgo/pgo.h                      | 221 ++++++++++++++
+ scripts/Makefile.lib                  |  10 +
+ 23 files changed, 1062 insertions(+)
+ create mode 100644 Documentation/dev-tools/pgo.rst
+ create mode 100644 kernel/pgo/Kconfig
+ create mode 100644 kernel/pgo/Makefile
+ create mode 100644 kernel/pgo/fs.c
+ create mode 100644 kernel/pgo/instrument.c
+ create mode 100644 kernel/pgo/pgo.h
+
+diff --git a/Documentation/dev-tools/pgo.rst b/Documentation/dev-tools/pgo.rst
+new file mode 100644
+index 000000000000..76175c523f4f
+--- /dev/null
++++ b/Documentation/dev-tools/pgo.rst
+@@ -0,0 +1,127 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++===============================
++Using PGO with the Linux kernel
++===============================
++
++Clang's profiling kernel support (PGO_) enables profiling of the Linux kernel
++when building with Clang. The profiling data is exported via the ``pgo``
++procfs directory.
++
++.. _PGO: https://clang.llvm.org/docs/UsersManual.html#profile-guided-optimization
++
++
++Preparation
++===========
++
++Configure the kernel with:
++
++.. code-block:: make
++
++   CONFIG_PROC_FS=y
++   CONFIG_PGO_CLANG=y
++
++Note that kernels compiled with profiling flags will be significantly larger
++and run slower.
++
++Profiling data will only become accessible once procfs has been mounted:
++
++.. code-block:: sh
++
++   mount -t proc proc /proc
++
++
++Customization
++=============
++
++You can enable or disable profiling for individual file and directories by
++adding a line similar to the following to the respective kernel Makefile:
++
++- For a single file (e.g. main.o)
++
++  .. code-block:: make
++
++     PGO_PROFILE_main.o := y
++
++- For all files in one directory
++
++  .. code-block:: make
++
++     PGO_PROFILE := y
++
++To exclude files from being profiled use
++
++  .. code-block:: make
++
++     PGO_PROFILE_main.o := n
++
++and
++
++  .. code-block:: make
++
++     PGO_PROFILE := n
++
++Only files which are linked to the main kernel image or are compiled as kernel
++modules are supported by this mechanism.
++
++
++Files
++=====
++
++The PGO kernel support creates the following files in procfs:
++
++``/proc/pgo``
++	Parent directory for all PGO-related files.
++
++``/proc/pgo/reset``
++	Global reset file: resets all coverage data to zero when written to.
++
++``/proc/pgo/vmlinux.profraw``
++	The raw PGO data that must be processed with ``llvm_profdata``.
++
++
++Workflow
++========
++
++The PGO kernel can be run on the host or test machines. The data though should
++be analyzed with Clang's tools from the same Clang version as the kernel was
++compiled. Clang's tolerant of version skew, but it's easier to use the same
++Clang version.
++
++The profiling data is useful for optimizing the kernel, analyzing coverage,
++etc. Clang offers tools to perform these tasks.
++
++Here is an example workflow for profiling an instrumented kernel with PGO and
++using the result to optimize the kernel:
++
++1) Install the kernel on the TEST machine.
++
++2) Reset the data counters right before running the load tests
++
++   .. code-block:: sh
++
++      $ echo 1 > /proc/pgo/reset
++
++3) Run the load tests.
++
++4) Collect the raw profile data
++
++   .. code-block:: sh
++
++      $ cp -a /proc/pgo/vmlinux.profraw /tmp/vmlinux.profraw
++
++5) (Optional) Download the raw profile data to the HOST machine.
++
++6) Process the raw profile data
++
++   .. code-block:: sh
++
++      $ llvm-profdata merge --output=vmlinux.profdata vmlinux.profraw
++
++   Note that multiple raw profile data files can be merged during this step.
++
++7) Rebuild the kernel using the processed profile data (PGO disabled)
++
++   .. code-block:: sh
++
++      $ make LLVM=1 KCFLAGS=-fprofile-use=vmlinux.profdata ...
+diff --git a/Makefile b/Makefile
+index beddccac3283..57022711b5d5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -762,6 +762,9 @@ endif # KBUILD_EXTMOD
+ # Defaults to vmlinux, but the arch makefile usually adds further targets
+ all: vmlinux
+ 
++CFLAGS_PGO_CLANG := -fprofile-generate
++export CFLAGS_PGO_CLANG
++
+ CFLAGS_GCOV	:= -fprofile-arcs -ftest-coverage
+ ifdef CONFIG_CC_IS_GCC
+ CFLAGS_GCOV	+= -fno-tree-loop-im
+diff --git a/arch/Kconfig b/arch/Kconfig
+index aff2746c8af2..626492e26c2e 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -1480,6 +1480,7 @@ config ARCH_HAS_NONLEAF_PMD_YOUNG
+ 	  may use this capability to reduce their search space.
+ 
+ source "kernel/gcov/Kconfig"
++source "kernel/pgo/Kconfig"
+ 
+ source "scripts/gcc-plugins/Kconfig"
+ 
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index e36261b4ea14..20af78dcbd4c 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -116,6 +116,7 @@ config X86
+ 	select ARCH_USES_CFI_TRAPS		if X86_64 && CFI_CLANG
+ 	select ARCH_SUPPORTS_LTO_CLANG
+ 	select ARCH_SUPPORTS_LTO_CLANG_THIN
++	select ARCH_SUPPORTS_PGO_CLANG		if X86_64
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_MEMTEST
+ 	select ARCH_USE_QUEUED_RWLOCKS
+diff --git a/arch/x86/boot/Makefile b/arch/x86/boot/Makefile
+index f33e45ed1437..82a8dd067a3b 100644
+--- a/arch/x86/boot/Makefile
++++ b/arch/x86/boot/Makefile
+@@ -70,6 +70,7 @@ KBUILD_AFLAGS	:= $(KBUILD_CFLAGS) -D__ASSEMBLY__
+ KBUILD_CFLAGS	+= $(call cc-option,-fmacro-prefix-map=$(srctree)/=)
+ KBUILD_CFLAGS	+= -fno-asynchronous-unwind-tables
+ GCOV_PROFILE := n
++PGO_PROFILE := n
+ UBSAN_SANITIZE := n
+ 
+ $(obj)/bzImage: asflags-y  := $(SVGA_MODE)
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+index 40d2ff503079..2c5811970fd9 100644
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -60,6 +60,7 @@ CFLAGS_sev.o += -I$(objtree)/arch/x86/lib/
+ 
+ KBUILD_AFLAGS  := $(KBUILD_CFLAGS) -D__ASSEMBLY__
+ GCOV_PROFILE := n
++PGO_PROFILE := n
+ UBSAN_SANITIZE :=n
+ 
+ KBUILD_LDFLAGS := -m elf_$(UTS_MACHINE)
+diff --git a/arch/x86/crypto/Makefile b/arch/x86/crypto/Makefile
+index 9aa46093c91b..dbbbcdd872d1 100644
+--- a/arch/x86/crypto/Makefile
++++ b/arch/x86/crypto/Makefile
+@@ -89,6 +89,9 @@ nhpoly1305-sse2-y := nh-sse2-x86_64.o nhpoly1305-sse2-glue.o
+ obj-$(CONFIG_CRYPTO_NHPOLY1305_AVX2) += nhpoly1305-avx2.o
+ nhpoly1305-avx2-y := nh-avx2-x86_64.o nhpoly1305-avx2-glue.o
+ 
++# Disable PGO for curve25519-x86_64. With PGO enabled, clang runs out of
++# registers for some of the functions.
++PGO_PROFILE_curve25519-x86_64.o := n
+ obj-$(CONFIG_CRYPTO_CURVE25519_X86) += curve25519-x86_64.o
+ 
+ obj-$(CONFIG_CRYPTO_SM3_AVX_X86_64) += sm3-avx-x86_64.o
+diff --git a/arch/x86/entry/vdso/Makefile b/arch/x86/entry/vdso/Makefile
+index 6a1821bd7d5e..b1fdce771b1a 100644
+--- a/arch/x86/entry/vdso/Makefile
++++ b/arch/x86/entry/vdso/Makefile
+@@ -186,6 +186,7 @@ quiet_cmd_vdso = VDSO    $@
+ VDSO_LDFLAGS = -shared --hash-style=both --build-id=sha1 \
+ 	$(call ld-option, --eh-frame-hdr) -Bsymbolic -z noexecstack
+ GCOV_PROFILE := n
++PGO_PROFILE := n
+ 
+ quiet_cmd_vdso_and_check = VDSO    $@
+       cmd_vdso_and_check = $(cmd_vdso); $(cmd_vdso_check)
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 4070a01c11b7..4b52991f06c7 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -27,6 +27,9 @@ KASAN_SANITIZE_stacktrace.o				:= n
+ KASAN_SANITIZE_paravirt.o				:= n
+ KASAN_SANITIZE_sev.o					:= n
+ 
++# Cannot write to profiling regions before the page tables are set up.
++PGO_PROFILE_head$(BITS).o				:= n
++
+ # With some compiler versions the generated code results in boot hangs, caused
+ # by several compilation units. To be safe, disable all instrumentation.
+ KCSAN_SANITIZE := n
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index f15fb71f280e..a1681c942be8 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -195,6 +195,8 @@ SECTIONS
+ 
+ 	BUG_TABLE
+ 
++	PGO_CLANG_DATA
++
+ 	ORC_UNWIND_TABLE
+ 
+ 	. = ALIGN(PAGE_SIZE);
+diff --git a/arch/x86/platform/efi/Makefile b/arch/x86/platform/efi/Makefile
+index 543df9a1379d..1420ab1fa3a6 100644
+--- a/arch/x86/platform/efi/Makefile
++++ b/arch/x86/platform/efi/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ KASAN_SANITIZE := n
+ GCOV_PROFILE := n
++PGO_PROFILE := n
+ 
+ obj-$(CONFIG_EFI) 		+= memmap.o quirks.o efi.o efi_$(BITS).o \
+ 				   efi_stub_$(BITS).o
+diff --git a/arch/x86/purgatory/Makefile b/arch/x86/purgatory/Makefile
+index c2a29be35c01..0fb6b8bd6b7b 100644
+--- a/arch/x86/purgatory/Makefile
++++ b/arch/x86/purgatory/Makefile
+@@ -28,6 +28,7 @@ targets += purgatory.ro purgatory.chk
+ 
+ # Sanitizer, etc. runtimes are unavailable and cannot be linked here.
+ GCOV_PROFILE	:= n
++PGO_PROFILE	:= n
+ KASAN_SANITIZE	:= n
+ UBSAN_SANITIZE	:= n
+ KCSAN_SANITIZE	:= n
+diff --git a/arch/x86/realmode/rm/Makefile b/arch/x86/realmode/rm/Makefile
+index f614009d3e4e..5efd78cad9da 100644
+--- a/arch/x86/realmode/rm/Makefile
++++ b/arch/x86/realmode/rm/Makefile
+@@ -77,4 +77,5 @@ KBUILD_CFLAGS	:= $(REALMODE_CFLAGS) -D_SETUP -D_WAKEUP \
+ KBUILD_AFLAGS	:= $(KBUILD_CFLAGS) -D__ASSEMBLY__
+ KBUILD_CFLAGS	+= -fno-asynchronous-unwind-tables
+ GCOV_PROFILE := n
++PGO_PROFILE := n
+ UBSAN_SANITIZE := n
+diff --git a/arch/x86/um/vdso/Makefile b/arch/x86/um/vdso/Makefile
+index 6825e146a62f..96a0761698ab 100644
+--- a/arch/x86/um/vdso/Makefile
++++ b/arch/x86/um/vdso/Makefile
+@@ -67,6 +67,7 @@ quiet_cmd_vdso = VDSO    $@
+ 
+ VDSO_LDFLAGS = -fPIC -shared -Wl,--hash-style=sysv -z noexecstack
+ GCOV_PROFILE := n
++PGO_PROFILE := n
+ 
+ #
+ # Install the unstripped copy of vdso*.so listed in $(vdso-install-y).
+diff --git a/drivers/firmware/efi/libstub/Makefile b/drivers/firmware/efi/libstub/Makefile
+index 16d64a34d1e1..7d06589d26b1 100644
+--- a/drivers/firmware/efi/libstub/Makefile
++++ b/drivers/firmware/efi/libstub/Makefile
+@@ -57,6 +57,7 @@ KBUILD_CFLAGS := $(filter-out $(CC_FLAGS_CFI), $(KBUILD_CFLAGS))
+ KBUILD_CFLAGS := $(filter-out $(CC_FLAGS_LTO), $(KBUILD_CFLAGS))
+ 
+ GCOV_PROFILE			:= n
++PGO_PROFILE			:= n
+ # Sanitizer runtimes are unavailable and cannot be linked here.
+ KASAN_SANITIZE			:= n
+ KCSAN_SANITIZE			:= n
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 9c59409104f6..1e382b327a7b 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -347,6 +347,37 @@
+ #define THERMAL_TABLE(name)
+ #endif
+ 
++#ifdef CONFIG_PGO_CLANG
++#define PGO_CLANG_DATA							\
++	__llvm_prf_data : AT(ADDR(__llvm_prf_data) - LOAD_OFFSET) {	\
++		__llvm_prf_data_start = .;				\
++		*(__llvm_prf_data)					\
++		__llvm_prf_data_end = .;				\
++	}								\
++	__llvm_prf_cnts : AT(ADDR(__llvm_prf_cnts) - LOAD_OFFSET) {	\
++		__llvm_prf_cnts_start = .;				\
++		*(__llvm_prf_cnts)					\
++		__llvm_prf_cnts_end = .;				\
++	}								\
++	__llvm_prf_names : AT(ADDR(__llvm_prf_names) - LOAD_OFFSET) {	\
++		__llvm_prf_names_start = .;				\
++		*(__llvm_prf_names)					\
++		__llvm_prf_names_end = .;				\
++	}								\
++	__llvm_prf_vals : AT(ADDR(__llvm_prf_vals) - LOAD_OFFSET) {	\
++		__llvm_prf_vals_start = .;				\
++		*(__llvm_prf_vals)					\
++		__llvm_prf_vals_end = .;				\
++	}								\
++	__llvm_prf_vnds : AT(ADDR(__llvm_prf_vnds) - LOAD_OFFSET) {	\
++		__llvm_prf_vnds_start = .;				\
++		*(__llvm_prf_vnds)					\
++		__llvm_prf_vnds_end = .;				\
++	}
++#else
++#define PGO_CLANG_DATA
++#endif
++
+ #define KERNEL_DTB()							\
+ 	STRUCT_ALIGN();							\
+ 	__dtb_start = .;						\
+@@ -1131,6 +1162,7 @@
+ 		CONSTRUCTORS						\
+ 	}								\
+ 	BUG_TABLE							\
++	PGO_CLANG_DATA
+ 
+ #define INIT_TEXT_SECTION(inittext_align)				\
+ 	. = ALIGN(inittext_align);					\
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 3947122d618b..1fe46db40806 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -114,6 +114,7 @@ obj-$(CONFIG_SHADOW_CALL_STACK) += scs.o
+ obj-$(CONFIG_HAVE_STATIC_CALL) += static_call.o
+ obj-$(CONFIG_HAVE_STATIC_CALL_INLINE) += static_call_inline.o
+ obj-$(CONFIG_CFI_CLANG) += cfi.o
++obj-$(CONFIG_PGO_CLANG) += pgo/
+ 
+ obj-$(CONFIG_PERF_EVENTS) += events/
+ 
+diff --git a/kernel/pgo/Kconfig b/kernel/pgo/Kconfig
+new file mode 100644
+index 000000000000..18d301a6d1a1
+--- /dev/null
++++ b/kernel/pgo/Kconfig
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: GPL-2.0-only
++menu "Profile Guided Optimization (PGO) (EXPERIMENTAL)"
++
++config ARCH_SUPPORTS_PGO_CLANG
++	bool
++
++config PGO_CLANG
++	bool "Enable clang's PGO-based kernel profiling"
++	depends on PROC_FS
++	depends on ARCH_SUPPORTS_PGO_CLANG
++	depends on CC_IS_CLANG
++	depends on !ARCH_WANTS_NO_INSTR || CC_HAS_NO_PROFILE_FN_ATTR
++	help
++	  This option enables clang's PGO (Profile Guided Optimization) based
++	  code profiling to better optimize the kernel.
++
++	  If unsure, say N.
++
++	  Run a representative workload for your application on a kernel
++	  compiled with this option and download the raw profile file from
++	  /proc/pgo/vmlinux.profraw. This file needs to be
++	  processed with llvm-profdata. It may be merged with other collected
++	  raw profiles.
++
++	  Copy the processed profile file into vmlinux.profdata, and enable
++	  KCFLAGS=-fprofile-use=vmlinux.profdata to produce an optimized
++	  kernel.
++
++	  Note that a kernel compiled with profiling flags will be
++	  significantly larger and run slower. Also be sure to exclude files
++	  from profiling which are not linked to the kernel image to prevent
++	  linker errors.
++
++	  Note that the procfs filesystem has to be mounted to access
++	  profiling data.
++
++endmenu
+diff --git a/kernel/pgo/Makefile b/kernel/pgo/Makefile
+new file mode 100644
+index 000000000000..41e27cefd9a4
+--- /dev/null
++++ b/kernel/pgo/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0
++GCOV_PROFILE	:= n
++PGO_PROFILE	:= n
++
++obj-y	+= fs.o instrument.o
+diff --git a/kernel/pgo/fs.c b/kernel/pgo/fs.c
+new file mode 100644
+index 000000000000..cd9187b138a9
+--- /dev/null
++++ b/kernel/pgo/fs.c
+@@ -0,0 +1,420 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2019 Google, Inc.
++ *
++ * Author:
++ *	Sami Tolvanen <samitolvanen@google.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#define pr_fmt(fmt)	"pgo: " fmt
++
++#include <linux/kernel.h>
++#include <linux/proc_fs.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/mm.h>
++#include "pgo.h"
++
++static struct proc_dir_entry *directory;
++
++struct prf_private_data {
++	void *buffer;
++	size_t size;
++};
++
++/*
++ * Raw profile data format:
++ *
++ *	- llvm_prf_header
++ *	- __llvm_prf_data
++ *	- __llvm_prf_cnts
++ *	- __llvm_prf_names
++ *	- zero padding to 8 bytes
++ *	- for each llvm_prf_data in __llvm_prf_data:
++ *		- llvm_prf_value_data
++ *			- llvm_prf_value_record + site count array
++ *				- llvm_prf_value_node_data
++ *				...
++ *			...
++ *		...
++ */
++
++static void prf_fill_header(void **buffer)
++{
++	struct llvm_prf_header *header = *(struct llvm_prf_header **)buffer;
++
++#ifdef CONFIG_64BIT
++	header->magic = LLVM_INSTR_PROF_RAW_MAGIC_64;
++#else
++	header->magic = LLVM_INSTR_PROF_RAW_MAGIC_32;
++#endif
++	header->version = LLVM_VARIANT_MASK_IR_PROF | LLVM_INSTR_PROF_RAW_VERSION;
++#if __clang_major__ >= 13
++	header->binary_ids_size = 0;
++#endif
++	header->data_size = prf_data_count();
++	header->padding_bytes_before_counters = 0;
++	header->counters_size = prf_cnts_count();
++	header->padding_bytes_after_counters = 0;
++	header->names_size = prf_names_count();
++#if __clang_major__ >= 14
++	header->counters_delta = (u64)__llvm_prf_cnts_start - (u64)__llvm_prf_data_start;
++#else
++	header->counters_delta = (u64)__llvm_prf_cnts_start;
++#endif
++	header->names_delta = (u64)__llvm_prf_names_start;
++	header->value_kind_last = LLVM_INSTR_PROF_IPVK_LAST;
++
++	*buffer += sizeof(*header);
++}
++
++/*
++ * Copy the source into the buffer, incrementing the pointer into buffer in the
++ * process.
++ */
++static void prf_copy_to_buffer(void **buffer, void *src, unsigned long size)
++{
++	memcpy(*buffer, src, size);
++	*buffer += size;
++}
++
++static u32 __prf_get_value_size(struct llvm_prf_data *p, u32 *value_kinds)
++{
++	struct llvm_prf_value_node **nodes =
++		(struct llvm_prf_value_node **)p->values;
++	u32 kinds = 0;
++	u32 size = 0;
++	unsigned int kind;
++	unsigned int n;
++	unsigned int s = 0;
++
++	for (kind = 0; kind < ARRAY_SIZE(p->num_value_sites); kind++) {
++		unsigned int sites = p->num_value_sites[kind];
++
++		if (!sites)
++			continue;
++
++		/* Record + site count array */
++		size += prf_get_value_record_size(sites);
++		kinds++;
++
++		if (!nodes)
++			continue;
++
++		for (n = 0; n < sites; n++) {
++			u32 count = 0;
++			struct llvm_prf_value_node *site = nodes[s + n];
++
++			while (site && ++count <= U8_MAX)
++				site = site->next;
++
++			size += count *
++				sizeof(struct llvm_prf_value_node_data);
++		}
++
++		s += sites;
++	}
++
++	if (size)
++		size += sizeof(struct llvm_prf_value_data);
++
++	if (value_kinds)
++		*value_kinds = kinds;
++
++	return size;
++}
++
++static u32 prf_get_value_size(void)
++{
++	u32 size = 0;
++	struct llvm_prf_data *p;
++
++	for (p = __llvm_prf_data_start; p < __llvm_prf_data_end; p++)
++		size += __prf_get_value_size(p, NULL);
++
++	return size;
++}
++
++/* Serialize the profiling's value. */
++static void prf_serialize_value(struct llvm_prf_data *p, void **buffer)
++{
++	struct llvm_prf_value_data header;
++	struct llvm_prf_value_node **nodes =
++		(struct llvm_prf_value_node **)p->values;
++	unsigned int kind;
++	unsigned int n;
++	unsigned int s = 0;
++
++	header.total_size = __prf_get_value_size(p, &header.num_value_kinds);
++
++	if (!header.num_value_kinds)
++		/* Nothing to write. */
++		return;
++
++	prf_copy_to_buffer(buffer, &header, sizeof(header));
++
++	for (kind = 0; kind < ARRAY_SIZE(p->num_value_sites); kind++) {
++		struct llvm_prf_value_record *record;
++		u8 *counts;
++		unsigned int sites = p->num_value_sites[kind];
++
++		if (!sites)
++			continue;
++
++		/* Profiling value record. */
++		record = *(struct llvm_prf_value_record **)buffer;
++		*buffer += prf_get_value_record_header_size();
++
++		record->kind = kind;
++		record->num_value_sites = sites;
++
++		/* Site count array. */
++		counts = *(u8 **)buffer;
++		*buffer += prf_get_value_record_site_count_size(sites);
++
++		/*
++		 * If we don't have nodes, we can skip updating the site count
++		 * array, because the buffer is zero filled.
++		 */
++		if (!nodes)
++			continue;
++
++		for (n = 0; n < sites; n++) {
++			u32 count = 0;
++			struct llvm_prf_value_node *site = nodes[s + n];
++
++			while (site && ++count <= U8_MAX) {
++				prf_copy_to_buffer(buffer, site,
++						   sizeof(struct llvm_prf_value_node_data));
++				site = site->next;
++			}
++
++			counts[n] = (u8)count;
++		}
++
++		s += sites;
++	}
++}
++
++static void prf_serialize_values(void **buffer)
++{
++	struct llvm_prf_data *p;
++
++	for (p = __llvm_prf_data_start; p < __llvm_prf_data_end; p++)
++		prf_serialize_value(p, buffer);
++}
++
++static inline unsigned long prf_get_padding(unsigned long size)
++{
++	return 7 & (sizeof(u64) - size % sizeof(u64));
++}
++
++/* Note: caller *must* hold pgo_lock */
++static unsigned long prf_buffer_size(void)
++{
++	return sizeof(struct llvm_prf_header) +
++			prf_data_size()	+
++			prf_cnts_size() +
++			prf_names_size() +
++			prf_get_padding(prf_names_size()) +
++			prf_get_value_size();
++}
++
++/*
++ * Serialize the profiling data into a format LLVM's tools can understand.
++ * Returns actual buffer size in p->size.
++ * Note: p->buffer must point into vzalloc()'d
++ * area of at least prf_buffer_size() in size.
++ * Note: caller *must* hold pgo_lock.
++ */
++static int prf_serialize(struct prf_private_data *p, size_t buf_size)
++{
++	void *buffer;
++
++	/* get buffer size, again. */
++	p->size = prf_buffer_size();
++
++	/* check for unlikely overflow. */
++	if (p->size > buf_size)
++		return -EAGAIN;
++
++	buffer = p->buffer;
++
++	prf_fill_header(&buffer);
++	prf_copy_to_buffer(&buffer, __llvm_prf_data_start,  prf_data_size());
++	prf_copy_to_buffer(&buffer, __llvm_prf_cnts_start,  prf_cnts_size());
++	prf_copy_to_buffer(&buffer, __llvm_prf_names_start, prf_names_size());
++	buffer += prf_get_padding(prf_names_size());
++
++	prf_serialize_values(&buffer);
++
++	return 0;
++}
++
++/* open() implementation for PGO. Creates a copy of the profiling data set. */
++static int prf_open(struct inode *inode, struct file *file)
++{
++	struct prf_private_data *data;
++	unsigned long flags;
++	size_t buf_size;
++	int err = -EINVAL;
++
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	/* Get initial buffer size. */
++	flags = prf_lock();
++	data->size = prf_buffer_size();
++	prf_unlock(flags);
++
++	do {
++		vfree(data->buffer);
++
++		/* Allocate, round up to page size. */
++		buf_size = PAGE_ALIGN(data->size);
++		data->buffer = vzalloc(buf_size);
++
++		if (!data->buffer) {
++			err = -ENOMEM;
++			break;
++		}
++
++		/*
++		 * Try serialize and get actual
++		 * data length in data->size.
++		 */
++		flags = prf_lock();
++		err = prf_serialize(data, buf_size);
++		prf_unlock(flags);
++		/* In unlikely case, try again. */
++	} while (err == -EAGAIN);
++
++	if (err < 0) {
++		if (data)
++			vfree(data->buffer);
++		kfree(data);
++	} else {
++		file->private_data = data;
++	}
++
++	return err;
++}
++
++/* read() implementation for PGO. */
++static ssize_t prf_read(struct file *file, char __user *buf, size_t count,
++			loff_t *ppos)
++{
++	struct prf_private_data *data = file->private_data;
++
++	if (WARN_ON_ONCE(!data))
++		return -ENOMEM;
++
++	return simple_read_from_buffer(buf, count, ppos, data->buffer,
++				       data->size);
++}
++
++/* release() implementation for PGO. Release resources allocated by open(). */
++static int prf_release(struct inode *inode, struct file *file)
++{
++	struct prf_private_data *data = file->private_data;
++
++	if (data) {
++		vfree(data->buffer);
++		kfree(data);
++	}
++
++	return 0;
++}
++
++static const struct proc_ops prf_pops = {
++	.proc_open		= prf_open,
++	.proc_read		= prf_read,
++	.proc_lseek		= default_llseek,
++	.proc_release	= prf_release
++};
++
++
++/* write() implementation for resetting PGO's profile data. */
++static ssize_t reset_write(struct file *file, const char __user *addr,
++			   size_t len, loff_t *pos)
++{
++	struct llvm_prf_data *data;
++
++	memset(__llvm_prf_cnts_start, 0, prf_cnts_size());
++
++	for (data = __llvm_prf_data_start; data < __llvm_prf_data_end; data++) {
++		struct llvm_prf_value_node **vnodes;
++		u64 current_vsite_count;
++		u32 i;
++
++		if (!data->values)
++			continue;
++
++		current_vsite_count = 0;
++		vnodes = (struct llvm_prf_value_node **)data->values;
++
++		for (i = LLVM_INSTR_PROF_IPVK_FIRST; i <= LLVM_INSTR_PROF_IPVK_LAST; i++)
++			current_vsite_count += data->num_value_sites[i];
++
++		for (i = 0; i < current_vsite_count; i++) {
++			struct llvm_prf_value_node *current_vnode = vnodes[i];
++
++			while (current_vnode) {
++				current_vnode->count = 0;
++				current_vnode = current_vnode->next;
++			}
++		}
++	}
++
++	return len;
++}
++
++static const struct proc_ops prf_reset_pops = {
++	.proc_write		= reset_write,
++	.proc_lseek		= noop_llseek,
++};
++
++
++/* Create procfs entries. */
++static int __init pgo_init(void)
++{
++	directory = proc_mkdir("pgo", NULL);
++	if (!directory)
++		goto err_remove;
++
++	if (!proc_create("vmlinux.profraw", 0600, directory,
++				 &prf_pops))
++		goto err_remove;
++
++	if (!proc_create("reset", 0200, directory,
++				 &prf_reset_pops))
++		goto err_remove;
++
++	return 0;
++
++err_remove:
++	pr_err("initialization failed\n");
++	return -EIO;
++}
++
++/* Remove procfs entries. */
++static void __exit pgo_exit(void)
++{
++	proc_remove(directory);
++}
++
++module_init(pgo_init);
++module_exit(pgo_exit);
+diff --git a/kernel/pgo/instrument.c b/kernel/pgo/instrument.c
+new file mode 100644
+index 000000000000..8b54fb6be336
+--- /dev/null
++++ b/kernel/pgo/instrument.c
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2019 Google, Inc.
++ *
++ * Author:
++ *	Sami Tolvanen <samitolvanen@google.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#define pr_fmt(fmt)	"pgo: " fmt
++
++#include <asm/sections.h>
++#include <linux/bitops.h>
++#include <linux/kernel.h>
++#include <linux/export.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include "pgo.h"
++
++/*
++ * This lock guards both profile count updating and serialization of the
++ * profiling data. Keeping both of these activities separate via locking
++ * ensures that we don't try to serialize data that's only partially updated.
++ */
++static DEFINE_SPINLOCK(pgo_lock);
++static int current_node;
++
++unsigned long prf_lock(void)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&pgo_lock, flags);
++
++	return flags;
++}
++
++void prf_unlock(unsigned long flags)
++{
++	spin_unlock_irqrestore(&pgo_lock, flags);
++}
++
++/*
++ * Return a newly allocated profiling value node which contains the tracked
++ * value by the value profiler.
++ * Note: caller *must* hold pgo_lock.
++ */
++static struct llvm_prf_value_node *allocate_node(struct llvm_prf_data *p,
++						 u32 index, u64 value)
++{
++	const int max_vnds = prf_vnds_count();
++
++	/*
++	 * Check that p is within vmlinux __llvm_prf_data section.
++	 * If not, don't allocate since we can't handle modules yet.
++	 */
++	if (!memory_contains(__llvm_prf_data_start,
++		__llvm_prf_data_end, p, sizeof(*p)))
++		return NULL;
++
++	if (WARN_ON_ONCE(current_node >= max_vnds))
++		return NULL; /* Out of nodes */
++
++	/* reserve vnode for vmlinux */
++	return &__llvm_prf_vnds_start[current_node++];
++}
++
++/*
++ * Counts the number of times a target value is seen.
++ *
++ * Records the target value for the index if not seen before. Otherwise,
++ * increments the counter associated w/ the target value.
++ */
++void __llvm_profile_instrument_target(u64 target_value, void *data, u32 index)
++{
++	struct llvm_prf_data *p = (struct llvm_prf_data *)data;
++	struct llvm_prf_value_node **counters;
++	struct llvm_prf_value_node *curr;
++	struct llvm_prf_value_node *min = NULL;
++	struct llvm_prf_value_node *prev = NULL;
++	u64 min_count = U64_MAX;
++	u8 values = 0;
++	unsigned long flags;
++
++	if (!p || !p->values)
++		return;
++
++	counters = (struct llvm_prf_value_node **)p->values;
++	curr = counters[index];
++
++	while (curr) {
++		if (target_value == curr->value) {
++			curr->count++;
++			return;
++		}
++
++		if (curr->count < min_count) {
++			min_count = curr->count;
++			min = curr;
++		}
++
++		prev = curr;
++		curr = curr->next;
++		values++;
++	}
++
++	if (values >= LLVM_INSTR_PROF_MAX_NUM_VAL_PER_SITE) {
++		if (!min->count || !(--min->count)) {
++			curr = min;
++			curr->value = target_value;
++			curr->count++;
++		}
++		return;
++	}
++
++	/* Lock when updating the value node structure. */
++	flags = prf_lock();
++
++	curr = allocate_node(p, index, target_value);
++	if (!curr)
++		goto out;
++
++	curr->value = target_value;
++	curr->count++;
++
++	if (!counters[index])
++		counters[index] = curr;
++	else if (prev && !prev->next)
++		prev->next = curr;
++
++out:
++	prf_unlock(flags);
++}
++EXPORT_SYMBOL(__llvm_profile_instrument_target);
++
++/* Counts the number of times a range of targets values are seen. */
++void __llvm_profile_instrument_range(u64 target_value, void *data,
++				     u32 index, s64 precise_start,
++				     s64 precise_last, s64 large_value)
++{
++	if (large_value != S64_MIN && (s64)target_value >= large_value)
++		target_value = large_value;
++	else if ((s64)target_value < precise_start ||
++		 (s64)target_value > precise_last)
++		target_value = precise_last + 1;
++
++	__llvm_profile_instrument_target(target_value, data, index);
++}
++EXPORT_SYMBOL(__llvm_profile_instrument_range);
++
++static u64 inst_prof_get_range_rep_value(u64 value)
++{
++	if (value <= 8)
++		/* The first ranges are individually tracked, use it as is. */
++		return value;
++	else if (value >= 513)
++		/* The last range is mapped to its lowest value. */
++		return 513;
++	else if (hweight64(value) == 1)
++		/* If it's a power of two, use it as is. */
++		return value;
++
++	/* Otherwise, take to the previous power of two + 1. */
++	return ((u64)1 << (64 - __builtin_clzll(value) - 1)) + 1;
++}
++
++/*
++ * The target values are partitioned into multiple ranges. The range spec is
++ * defined in compiler-rt/include/profile/InstrProfData.inc.
++ */
++void __llvm_profile_instrument_memop(u64 target_value, void *data,
++				     u32 counter_index)
++{
++	u64 rep_value;
++
++	/* Map the target value to the representative value of its range. */
++	rep_value = inst_prof_get_range_rep_value(target_value);
++	__llvm_profile_instrument_target(rep_value, data, counter_index);
++}
++EXPORT_SYMBOL(__llvm_profile_instrument_memop);
+diff --git a/kernel/pgo/pgo.h b/kernel/pgo/pgo.h
+new file mode 100644
+index 000000000000..ef558bf9e9f3
+--- /dev/null
++++ b/kernel/pgo/pgo.h
+@@ -0,0 +1,221 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2019 Google, Inc.
++ *
++ * Author:
++ *	Sami Tolvanen <samitolvanen@google.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _PGO_H
++#define _PGO_H
++
++/*
++ * Note: These internal LLVM definitions must match the compiler version.
++ * See llvm/include/llvm/ProfileData/InstrProfData.inc in LLVM's source code.
++ */
++
++#define LLVM_INSTR_PROF_RAW_MAGIC_64	\
++		((u64)255 << 56 |	\
++		 (u64)'l' << 48 |	\
++		 (u64)'p' << 40 |	\
++		 (u64)'r' << 32 |	\
++		 (u64)'o' << 24 |	\
++		 (u64)'f' << 16 |	\
++		 (u64)'r' << 8  |	\
++		 (u64)129)
++#define LLVM_INSTR_PROF_RAW_MAGIC_32	\
++		((u64)255 << 56 |	\
++		 (u64)'l' << 48 |	\
++		 (u64)'p' << 40 |	\
++		 (u64)'r' << 32 |	\
++		 (u64)'o' << 24 |	\
++		 (u64)'f' << 16 |	\
++		 (u64)'R' << 8  |	\
++		 (u64)129)
++
++#if __clang_major__ >= 14
++#define LLVM_INSTR_PROF_RAW_VERSION		8
++#elif __clang_major__ == 13
++#define LLVM_INSTR_PROF_RAW_VERSION		7
++#else
++#define LLVM_INSTR_PROF_RAW_VERSION		5
++#endif
++
++#define LLVM_INSTR_PROF_DATA_ALIGNMENT		8
++#define LLVM_INSTR_PROF_IPVK_FIRST		0
++#define LLVM_INSTR_PROF_IPVK_LAST		1
++#define LLVM_INSTR_PROF_MAX_NUM_VAL_PER_SITE	255
++
++#define LLVM_VARIANT_MASK_IR_PROF	(0x1ULL << 56)
++#define LLVM_VARIANT_MASK_CSIR_PROF	(0x1ULL << 57)
++
++/**
++ * struct llvm_prf_header - represents the raw profile header data structure.
++ * @magic: the magic token for the file format.
++ * @version: the version of the file format.
++ * @data_size: the number of entries in the profile data section.
++ * @padding_bytes_before_counters: the number of padding bytes before the
++ *   counters.
++ * @counters_size: the size in bytes of the LLVM profile section containing the
++ *   counters.
++ * @padding_bytes_after_counters: the number of padding bytes after the
++ *   counters.
++ * @names_size: the size in bytes of the LLVM profile section containing the
++ *   counters' names.
++ * @counters_delta: the beginning of the LLMV profile counters section.
++ * @names_delta: the beginning of the LLMV profile names section.
++ * @value_kind_last: the last profile value kind.
++ */
++struct llvm_prf_header {
++	u64 magic;
++	u64 version;
++#if __clang_major__ >= 13
++	u64 binary_ids_size;
++#endif
++	u64 data_size;
++	u64 padding_bytes_before_counters;
++	u64 counters_size;
++	u64 padding_bytes_after_counters;
++	u64 names_size;
++	u64 counters_delta;
++	u64 names_delta;
++	u64 value_kind_last;
++};
++
++/**
++ * struct llvm_prf_data - represents the per-function control structure.
++ * @name_ref: the reference to the function's name.
++ * @func_hash: the hash value of the function.
++ * @counter_ptr: a pointer to the profile counter.
++ * @function_ptr: a pointer to the function.
++ * @values: the profiling values associated with this function.
++ * @num_counters: the number of counters in the function.
++ * @num_value_sites: the number of value profile sites.
++ */
++struct llvm_prf_data {
++	const u64 name_ref;
++	const u64 func_hash;
++	const void *counter_ptr;
++	const void *function_ptr;
++	void *values;
++	const u32 num_counters;
++	const u16 num_value_sites[LLVM_INSTR_PROF_IPVK_LAST + 1];
++} __aligned(LLVM_INSTR_PROF_DATA_ALIGNMENT);
++
++/**
++ * struct llvm_prf_value_node_data - represents the data part of the struct
++ *   llvm_prf_value_node data structure.
++ * @value: the value counters.
++ * @count: the counters' count.
++ */
++struct llvm_prf_value_node_data {
++	u64 value;
++	u64 count;
++};
++
++/**
++ * struct llvm_prf_value_node - represents an internal data structure used by
++ *   the value profiler.
++ * @value: the value counters.
++ * @count: the counters' count.
++ * @next: the next value node.
++ */
++struct llvm_prf_value_node {
++	u64 value;
++	u64 count;
++	struct llvm_prf_value_node *next;
++};
++
++/**
++ * struct llvm_prf_value_data - represents the value profiling data in indexed
++ *   format.
++ * @total_size: the total size in bytes including this field.
++ * @num_value_kinds: the number of value profile kinds that has value profile
++ *   data.
++ */
++struct llvm_prf_value_data {
++	u32 total_size;
++	u32 num_value_kinds;
++};
++
++/**
++ * struct llvm_prf_value_record - represents the on-disk layout of the value
++ *   profile data of a particular kind for one function.
++ * @kind: the kind of the value profile record.
++ * @num_value_sites: the number of value profile sites.
++ * @site_count_array: the first element of the array that stores the number
++ *   of profiled values for each value site.
++ */
++struct llvm_prf_value_record {
++	u32 kind;
++	u32 num_value_sites;
++	u8 site_count_array[];
++};
++
++#define prf_get_value_record_header_size()		\
++	offsetof(struct llvm_prf_value_record, site_count_array)
++#define prf_get_value_record_site_count_size(sites)	\
++	roundup((sites), 8)
++#define prf_get_value_record_size(sites)		\
++	(prf_get_value_record_header_size() +		\
++	 prf_get_value_record_site_count_size((sites)))
++
++/* Data sections */
++extern struct llvm_prf_data __llvm_prf_data_start[];
++extern struct llvm_prf_data __llvm_prf_data_end[];
++
++extern u64 __llvm_prf_cnts_start[];
++extern u64 __llvm_prf_cnts_end[];
++
++extern char __llvm_prf_names_start[];
++extern char __llvm_prf_names_end[];
++
++extern struct llvm_prf_value_node __llvm_prf_vnds_start[];
++extern struct llvm_prf_value_node __llvm_prf_vnds_end[];
++
++/* Locking for vnodes */
++extern unsigned long prf_lock(void);
++extern void prf_unlock(unsigned long flags);
++
++/* Declarations for LLVM instrumentation. */
++void __llvm_profile_instrument_target(u64 target_value, void *data, u32 index);
++void __llvm_profile_instrument_range(u64 target_value, void *data,
++				     u32 index, s64 precise_start,
++				     s64 precise_last, s64 large_value);
++void __llvm_profile_instrument_memop(u64 target_value, void *data,
++				     u32 counter_index);
++
++#define __DEFINE_PRF_SIZE(s) \
++	static inline unsigned long prf_ ## s ## _size(void)		\
++	{								\
++		unsigned long start =					\
++			(unsigned long)__llvm_prf_ ## s ## _start;	\
++		unsigned long end =					\
++			(unsigned long)__llvm_prf_ ## s ## _end;	\
++		return roundup(end - start,				\
++				sizeof(__llvm_prf_ ## s ## _start[0]));	\
++	}								\
++	static inline unsigned long prf_ ## s ## _count(void)		\
++	{								\
++		return prf_ ## s ## _size() /				\
++			sizeof(__llvm_prf_ ## s ## _start[0]);		\
++	}
++
++__DEFINE_PRF_SIZE(data);
++__DEFINE_PRF_SIZE(cnts);
++__DEFINE_PRF_SIZE(names);
++__DEFINE_PRF_SIZE(vnds);
++
++#undef __DEFINE_PRF_SIZE
++
++#endif /* _PGO_H */
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index 68d0134bdbf9..6b5f073af683 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -152,6 +152,16 @@ _c_flags += $(if $(patsubst n%,, \
+ 		$(CFLAGS_GCOV))
+ endif
+ 
++#
++# Enable clang's PGO profiling flags for a file or directory depending on
++# variables PGO_PROFILE_obj.o and PGO_PROFILE.
++#
++ifeq ($(CONFIG_PGO_CLANG),y)
++_c_flags += $(if $(patsubst n%,, \
++		$(PGO_PROFILE_$(basetarget).o)$(PGO_PROFILE)y), \
++		$(CFLAGS_PGO_CLANG))
++endif
++
+ #
+ # Enable address sanitizer flags for kernel except some files or directories
+ # we don't want to check (depends on variables KASAN_SANITIZE_obj.o, KASAN_SANITIZE)
+-- 
+2.42.0
+
