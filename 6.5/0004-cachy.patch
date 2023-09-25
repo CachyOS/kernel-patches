@@ -1,6 +1,6 @@
-From 66d7ea59c0156a2323559f2c4a40d5f8dc58b40c Mon Sep 17 00:00:00 2001
+From 824c9adf2297e355eb9d6067869825bb179f248e Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 23 Sep 2023 13:07:34 +0200
+Date: Mon, 25 Sep 2023 18:09:53 +0200
 Subject: [PATCH 4/7] cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -47,17 +47,19 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  init/Kconfig                                  |   26 +
  kernel/Kconfig.hz                             |   24 +
  kernel/fork.c                                 |   14 +
- kernel/sched/fair.c                           |   70 +-
- kernel/sched/features.h                       |    1 +
- kernel/sched/sched.h                          |    1 +
+ kernel/sched/fair.c                           |   20 +-
  kernel/sysctl.c                               |   12 +
  kernel/user_namespace.c                       |    7 +
+ lib/scatterlist.c                             |   23 +-
  mm/Kconfig                                    |    2 +-
+ mm/internal.h                                 |    1 +
+ mm/list_lru.c                                 |    4 +
  mm/page-writeback.c                           |    8 +
+ mm/page_alloc.c                               |   42 +-
  mm/swap.c                                     |    5 +
  mm/vmpressure.c                               |    4 +
- mm/vmscan.c                                   |    8 +
- 52 files changed, 8416 insertions(+), 55 deletions(-)
+ mm/vmscan.c                                   |   28 +-
+ 54 files changed, 8419 insertions(+), 90 deletions(-)
  create mode 100644 drivers/i2c/busses/i2c-nct6775.c
  create mode 100644 drivers/pci/controller/intel-nvme-remap.c
  create mode 100644 drivers/platform/x86/legion-laptop.c
@@ -9092,7 +9094,7 @@ index f81149739eb9f..36fb0b711541d 100644
  	if (err)
  		goto bad_unshare_out;
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 1d9c2482c5a35..52a97aacdac60 100644
+index 1d9c2482c5a35..ff33866916263 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -69,9 +69,13 @@
@@ -9151,111 +9153,6 @@ index 1d9c2482c5a35..52a97aacdac60 100644
  
  #ifdef CONFIG_NUMA_BALANCING
  /* Restrict the NUMA promotion throughput (MB/s) for each target node. */
-@@ -3664,7 +3682,8 @@ static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
-  */
- static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
- {
--	long delta = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
-+	long delta;
-+	u64 now;
- 
- 	/*
- 	 * No need to update load_avg for root_task_group as it is not used.
-@@ -3672,9 +3691,19 @@ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
- 	if (cfs_rq->tg == &root_task_group)
- 		return;
- 
-+	/*
-+	 * For migration heavy workloads, access to tg->load_avg can be
-+	 * unbound. Limit the update rate to at most once per ms.
-+	 */
-+	now = sched_clock_cpu(cpu_of(rq_of(cfs_rq)));
-+	if (now - cfs_rq->last_update_tg_load_avg < NSEC_PER_MSEC)
-+		return;
-+
-+	delta = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
- 	if (abs(delta) > cfs_rq->tg_load_avg_contrib / 64) {
- 		atomic_long_add(delta, &cfs_rq->tg->load_avg);
- 		cfs_rq->tg_load_avg_contrib = cfs_rq->avg.load_avg;
-+		cfs_rq->last_update_tg_load_avg = now;
- 	}
- }
- 
-@@ -7045,6 +7074,37 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
- 	return idle_cpu;
- }
- 
-+/*
-+ * For the multiple-LLC per node case, make sure to try the other LLC's if the
-+ * local LLC comes up empty.
-+ */
-+static int
-+select_idle_node(struct task_struct *p, struct sched_domain *sd, int target)
-+{
-+	struct sched_domain *parent = sd->parent;
-+	struct sched_group *sg;
-+
-+	/* Make sure to not cross nodes. */
-+	if (!parent || parent->flags & SD_NUMA)
-+		return -1;
-+
-+	sg = parent->groups;
-+	do {
-+		int cpu = cpumask_first(sched_group_span(sg));
-+
-+		if (!cpus_share_cache(cpu, target)) {
-+			int i = select_idle_cpu(p, per_cpu(sd_llc, cpu),
-+						test_idle_cores(cpu), cpu);
-+			if ((unsigned)i < nr_cpumask_bits)
-+				return i;
-+		}
-+
-+		sg = sg->next;
-+	} while (sg != parent->groups);
-+
-+	return -1;
-+}
-+
- /*
-  * Scan the asym_capacity domain for idle CPUs; pick the first idle one on which
-  * the task fits. If no CPU is big enough, but there are idle ones, try to
-@@ -7217,6 +7277,12 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
- 	if ((unsigned)i < nr_cpumask_bits)
- 		return i;
- 
-+	if (sched_feat(SIS_NODE)) {
-+		i = select_idle_node(p, sd, target);
-+		if ((unsigned)i < nr_cpumask_bits)
-+			return i;
-+	}
-+
- 	return target;
- }
- 
-diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index ee7f23c76bd33..9e390eb82e384 100644
---- a/kernel/sched/features.h
-+++ b/kernel/sched/features.h
-@@ -62,6 +62,7 @@ SCHED_FEAT(TTWU_QUEUE, true)
-  */
- SCHED_FEAT(SIS_PROP, false)
- SCHED_FEAT(SIS_UTIL, true)
-+SCHED_FEAT(SIS_NODE, true)
- 
- /*
-  * Issue a WARN when we do multiple update_rq_clock() calls
-diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index e93e006a942b9..8cb74bed9e555 100644
---- a/kernel/sched/sched.h
-+++ b/kernel/sched/sched.h
-@@ -591,6 +591,7 @@ struct cfs_rq {
- 	} removed;
- 
- #ifdef CONFIG_FAIR_GROUP_SCHED
-+	u64			last_update_tg_load_avg;
- 	unsigned long		tg_load_avg_contrib;
- 	long			propagate;
- 	long			prop_runnable_sum;
 diff --git a/kernel/sysctl.c b/kernel/sysctl.c
 index 354a2d294f526..4dc780aa3bcc8 100644
 --- a/kernel/sysctl.c
@@ -9304,6 +9201,44 @@ index 1d8e47bed3f11..fec01d016a351 100644
  static struct kmem_cache *user_ns_cachep __read_mostly;
  static DEFINE_MUTEX(userns_state_mutex);
  
+diff --git a/lib/scatterlist.c b/lib/scatterlist.c
+index c65566b4dc662..d3c8aaa68c5d3 100644
+--- a/lib/scatterlist.c
++++ b/lib/scatterlist.c
+@@ -150,31 +150,12 @@ EXPORT_SYMBOL(sg_init_one);
+  */
+ static struct scatterlist *sg_kmalloc(unsigned int nents, gfp_t gfp_mask)
+ {
+-	if (nents == SG_MAX_SINGLE_ALLOC) {
+-		/*
+-		 * Kmemleak doesn't track page allocations as they are not
+-		 * commonly used (in a raw form) for kernel data structures.
+-		 * As we chain together a list of pages and then a normal
+-		 * kmalloc (tracked by kmemleak), in order to for that last
+-		 * allocation not to become decoupled (and thus a
+-		 * false-positive) we need to inform kmemleak of all the
+-		 * intermediate allocations.
+-		 */
+-		void *ptr = (void *) __get_free_page(gfp_mask);
+-		kmemleak_alloc(ptr, PAGE_SIZE, 1, gfp_mask);
+-		return ptr;
+-	} else
+-		return kmalloc_array(nents, sizeof(struct scatterlist),
+-				     gfp_mask);
++	return kmalloc_array(nents, sizeof(struct scatterlist), gfp_mask);
+ }
+ 
+ static void sg_kfree(struct scatterlist *sg, unsigned int nents)
+ {
+-	if (nents == SG_MAX_SINGLE_ALLOC) {
+-		kmemleak_free(sg);
+-		free_page((unsigned long) sg);
+-	} else
+-		kfree(sg);
++	kfree(sg);
+ }
+ 
+ /**
 diff --git a/mm/Kconfig b/mm/Kconfig
 index 09130434e30d3..f772ba88df878 100644
 --- a/mm/Kconfig
@@ -9317,6 +9252,40 @@ index 09130434e30d3..f772ba88df878 100644
  	default 1
  
  #
+diff --git a/mm/internal.h b/mm/internal.h
+index 8ed127c1c808c..2f3040ec707d7 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -421,6 +421,7 @@ extern void prep_compound_page(struct page *page, unsigned int order);
+ extern void post_alloc_hook(struct page *page, unsigned int order,
+ 					gfp_t gfp_flags);
+ extern int user_min_free_kbytes;
++extern atomic_long_t kswapd_waiters;
+ 
+ extern void free_unref_page(struct page *page, unsigned int order);
+ extern void free_unref_page_list(struct list_head *list);
+diff --git a/mm/list_lru.c b/mm/list_lru.c
+index a05e5bef3b400..0ead8e6651df0 100644
+--- a/mm/list_lru.c
++++ b/mm/list_lru.c
+@@ -178,6 +178,7 @@ EXPORT_SYMBOL_GPL(list_lru_isolate_move);
+ unsigned long list_lru_count_one(struct list_lru *lru,
+ 				 int nid, struct mem_cgroup *memcg)
+ {
++#if defined(CONFIG_MEMCG) && !defined(CONFIG_SLOB)
+ 	struct list_lru_one *l;
+ 	long count;
+ 
+@@ -190,6 +191,9 @@ unsigned long list_lru_count_one(struct list_lru *lru,
+ 		count = 0;
+ 
+ 	return count;
++#else
++	return READ_ONCE(lru->node[nid].lru.nr_items);
++#endif
+ }
+ EXPORT_SYMBOL_GPL(list_lru_count_one);
+ 
 diff --git a/mm/page-writeback.c b/mm/page-writeback.c
 index d3f42009bb702..39b9fd0606304 100644
 --- a/mm/page-writeback.c
@@ -9344,6 +9313,116 @@ index d3f42009bb702..39b9fd0606304 100644
 +#endif
  
  EXPORT_SYMBOL_GPL(dirty_writeback_interval);
+ 
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 7d3460c7a480b..bd2a12f4e04de 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -204,6 +204,8 @@ EXPORT_SYMBOL(node_states);
+ 
+ gfp_t gfp_allowed_mask __read_mostly = GFP_BOOT_MASK;
+ 
++atomic_long_t kswapd_waiters = ATOMIC_LONG_INIT(0);
++
+ /*
+  * A cached value of the page's pageblock's migratetype, used when the page is
+  * put on a pcplist. Used to avoid the pageblock migratetype lookup when
+@@ -297,7 +299,7 @@ static compound_page_dtor * const compound_page_dtors[NR_COMPOUND_DTORS] = {
+ 
+ int min_free_kbytes = 1024;
+ int user_min_free_kbytes = -1;
+-static int watermark_boost_factor __read_mostly = 15000;
++static int watermark_boost_factor __read_mostly;
+ static int watermark_scale_factor = 10;
+ 
+ /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
+@@ -2152,16 +2154,17 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
+ }
+ 
+ /*
+- * Obtain a specified number of elements from the buddy allocator, all under
+- * a single hold of the lock, for efficiency.  Add them to the supplied list.
+- * Returns the number of new pages which were placed at *list.
++ * Obtain a specified number of elements from the buddy allocator, and relax the
++ * zone lock when needed. Add them to the supplied list. Returns the number of
++ * new pages which were placed at *list.
+  */
+ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 			unsigned long count, struct list_head *list,
+ 			int migratetype, unsigned int alloc_flags)
+ {
++	const bool can_resched = !preempt_count() && !irqs_disabled();
+ 	unsigned long flags;
+-	int i;
++	int i, last_mod = 0;
+ 
+ 	spin_lock_irqsave(&zone->lock, flags);
+ 	for (i = 0; i < count; ++i) {
+@@ -2170,6 +2173,18 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 		if (unlikely(page == NULL))
+ 			break;
+ 
++		/* Reschedule and ease the contention on the lock if needed */
++		if (i + 1 < count && ((can_resched && need_resched()) ||
++				      spin_needbreak(&zone->lock))) {
++			__mod_zone_page_state(zone, NR_FREE_PAGES,
++					      -((i + 1 - last_mod) << order));
++			last_mod = i + 1;
++			spin_unlock_irqrestore(&zone->lock, flags);
++			if (can_resched)
++				cond_resched();
++			spin_lock_irqsave(&zone->lock, flags);
++		}
++
+ 		/*
+ 		 * Split buddy pages returned by expand() are received here in
+ 		 * physical page order. The page is added to the tail of
+@@ -2186,7 +2201,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 					      -(1 << order));
+ 	}
+ 
+-	__mod_zone_page_state(zone, NR_FREE_PAGES, -(i << order));
++	__mod_zone_page_state(zone, NR_FREE_PAGES, -((i - last_mod) << order));
+ 	spin_unlock_irqrestore(&zone->lock, flags);
+ 
+ 	return i;
+@@ -3962,6 +3977,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	unsigned int cpuset_mems_cookie;
+ 	unsigned int zonelist_iter_cookie;
+ 	int reserve_flags;
++	bool woke_kswapd = false;
+ 
+ restart:
+ 	compaction_retries = 0;
+@@ -4001,8 +4017,13 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 			goto nopage;
+ 	}
+ 
+-	if (alloc_flags & ALLOC_KSWAPD)
++	if (alloc_flags & ALLOC_KSWAPD) {
++		if (!woke_kswapd) {
++			atomic_long_inc(&kswapd_waiters);
++			woke_kswapd = true;
++		}
+ 		wake_all_kswapds(order, gfp_mask, ac);
++	}
+ 
+ 	/*
+ 	 * The adjusted alloc_flags might result in immediate success, so try
+@@ -4217,9 +4238,12 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 		goto retry;
+ 	}
+ fail:
+-	warn_alloc(gfp_mask, ac->nodemask,
+-			"page allocation failure: order:%u", order);
+ got_pg:
++	if (woke_kswapd)
++		atomic_long_dec(&kswapd_waiters);
++	if (!page)
++		warn_alloc(gfp_mask, ac->nodemask,
++				"page allocation failure: order:%u", order);
+ 	return page;
+ }
  
 diff --git a/mm/swap.c b/mm/swap.c
 index cd8f0150ba3aa..42c405a4f114c 100644
@@ -9383,7 +9462,7 @@ index 22c6689d93027..bf65bd9abdf34 100644
  
  /*
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index da152407bc2b1..790b19d476cf6 100644
+index da152407bc2b1..a958dc4e00245 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -186,7 +186,11 @@ struct scan_control {
@@ -9410,6 +9489,70 @@ index da152407bc2b1..790b19d476cf6 100644
  
  static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  {
+@@ -6908,7 +6916,7 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
+ 	return 0;
+ }
+ 
+-static bool allow_direct_reclaim(pg_data_t *pgdat)
++static bool allow_direct_reclaim(pg_data_t *pgdat, bool using_kswapd)
+ {
+ 	struct zone *zone;
+ 	unsigned long pfmemalloc_reserve = 0;
+@@ -6937,6 +6945,10 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
+ 
+ 	wmark_ok = free_pages > pfmemalloc_reserve / 2;
+ 
++	/* The throttled direct reclaimer is now a kswapd waiter */
++	if (unlikely(!using_kswapd && !wmark_ok))
++		atomic_long_inc(&kswapd_waiters);
++
+ 	/* kswapd must be awake if processes are being throttled */
+ 	if (!wmark_ok && waitqueue_active(&pgdat->kswapd_wait)) {
+ 		if (READ_ONCE(pgdat->kswapd_highest_zoneidx) > ZONE_NORMAL)
+@@ -7002,7 +7014,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
+ 
+ 		/* Throttle based on the first usable node */
+ 		pgdat = zone->zone_pgdat;
+-		if (allow_direct_reclaim(pgdat))
++		if (allow_direct_reclaim(pgdat, gfp_mask & __GFP_KSWAPD_RECLAIM))
+ 			goto out;
+ 		break;
+ 	}
+@@ -7024,11 +7036,14 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
+ 	 */
+ 	if (!(gfp_mask & __GFP_FS))
+ 		wait_event_interruptible_timeout(pgdat->pfmemalloc_wait,
+-			allow_direct_reclaim(pgdat), HZ);
++			allow_direct_reclaim(pgdat, true), HZ);
+ 	else
+ 		/* Throttle until kswapd wakes the process */
+ 		wait_event_killable(zone->zone_pgdat->pfmemalloc_wait,
+-			allow_direct_reclaim(pgdat));
++			allow_direct_reclaim(pgdat, true));
++
++	if (unlikely(!(gfp_mask & __GFP_KSWAPD_RECLAIM)))
++		atomic_long_dec(&kswapd_waiters);
+ 
+ 	if (fatal_signal_pending(current))
+ 		return true;
+@@ -7526,14 +7541,15 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
+ 		 * able to safely make forward progress. Wake them
+ 		 */
+ 		if (waitqueue_active(&pgdat->pfmemalloc_wait) &&
+-				allow_direct_reclaim(pgdat))
++				allow_direct_reclaim(pgdat, true))
+ 			wake_up_all(&pgdat->pfmemalloc_wait);
+ 
+ 		/* Check if kswapd should be suspending */
+ 		__fs_reclaim_release(_THIS_IP_);
+ 		ret = try_to_freeze();
+ 		__fs_reclaim_acquire(_THIS_IP_);
+-		if (ret || kthread_should_stop())
++		if (ret || kthread_should_stop() ||
++		    !atomic_long_read(&kswapd_waiters))
+ 			break;
+ 
+ 		/*
 -- 
 2.42.0
 
