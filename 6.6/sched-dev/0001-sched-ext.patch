@@ -1,6 +1,6 @@
-From a606cf325ad605022e3c5357bac2cef120a73121 Mon Sep 17 00:00:00 2001
+From 1d5eefab83823197c1de81da58ba61bef161635b Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Mon, 4 Dec 2023 17:37:48 +0100
+Date: Thu, 7 Dec 2023 20:43:19 +0100
 Subject: [PATCH] sched-ext
 
 Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
@@ -60,7 +60,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  .../sched_ext/scx_layered/src/bpf/util.bpf.c  |   68 +
  .../sched_ext/scx_layered/src/layered_sys.rs  |   10 +
  tools/sched_ext/scx_layered/src/main.rs       | 1641 ++++++
- tools/sched_ext/scx_nest.bpf.c                |  677 +++
+ tools/sched_ext/scx_nest.bpf.c                |  681 +++
  tools/sched_ext/scx_nest.c                    |  227 +
  tools/sched_ext/scx_nest.h                    |   18 +
  tools/sched_ext/scx_nest_stats_table.h        |   19 +
@@ -83,7 +83,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  tools/sched_ext/scx_userland.c                |  366 ++
  tools/sched_ext/scx_userland.h                |   19 +
  tools/sched_ext/user_exit_info.h              |   50 +
- 78 files changed, 18172 insertions(+), 105 deletions(-)
+ 78 files changed, 18176 insertions(+), 105 deletions(-)
  create mode 100644 Documentation/scheduler/sched-ext.rst
  create mode 100644 include/linux/sched/ext.h
  create mode 100644 kernel/sched/ext.c
@@ -13777,10 +13777,10 @@ index 000000000..7eb2edf53
 +}
 diff --git a/tools/sched_ext/scx_nest.bpf.c b/tools/sched_ext/scx_nest.bpf.c
 new file mode 100644
-index 000000000..d60636e8d
+index 000000000..3ab6d52d0
 --- /dev/null
 +++ b/tools/sched_ext/scx_nest.bpf.c
-@@ -0,0 +1,677 @@
+@@ -0,0 +1,681 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * As described in [0], a Nest scheduler which encourages task placement on
@@ -13833,7 +13833,7 @@ index 000000000..d60636e8d
 +const volatile u64 slice_ns = SCX_SLICE_DFL;
 +const volatile bool find_fully_idle = false;
 +const volatile u64 sampling_cadence_ns = 1 * NSEC_PER_SEC;
-+const volatile u64 r_depth = 6;
++const volatile u64 r_depth = 5;
 +
 +// Used for stats tracking. May be stale at any given time.
 +u64 stats_primary_mask, stats_reserved_mask, stats_other_mask, stats_idle_mask;
@@ -13894,8 +13894,8 @@ index 000000000..d60636e8d
 +	/* Whether the current core has been scheduled for compaction. */
 +	bool scheduled_compaction;
 +
-+	/* Number of tasks active on the core. */
-+	u32 num_active;
++	/* Number of times a primary core has been scheduled for compaction. */
++	u32 num_schedulings;
 +};
 +
 +struct {
@@ -14156,7 +14156,6 @@ index 000000000..d60636e8d
 +	struct task_ctx *tctx;
 +	u64 vtime = p->scx.dsq_vtime;
 +	s32 cpu = bpf_get_smp_processor_id();
-+	struct pcpu_ctx *pcpu_ctx;
 +
 +	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 +	if (!tctx) {
@@ -14170,11 +14169,6 @@ index 000000000..d60636e8d
 +			update_attached(tctx, tctx->prev_cpu, cpu);
 +
 +		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice_ns, enq_flags);
-+		pcpu_ctx = bpf_map_lookup_elem(&pcpu_ctxs, &cpu);
-+		if (!pcpu_ctx)
-+			scx_bpf_error("Failed to lookup pcpu ctx");
-+		else
-+			pcpu_ctx->num_active++;
 +		return;
 +	}
 +
@@ -14203,30 +14197,41 @@ index 000000000..d60636e8d
 +		return;
 +	}
 +
-+	pcpu_ctx = bpf_map_lookup_elem(&pcpu_ctxs, &key);
-+	if (!pcpu_ctx) {
-+		scx_bpf_error("Failed to lookup pcpu ctx");
-+		return;
-+	}
-+	in_primary = bpf_cpumask_test_cpu(cpu, cast_mask(primary));
 +	if (!scx_bpf_consume(FALLBACK_DSQ_ID)) {
++		in_primary = bpf_cpumask_test_cpu(cpu, cast_mask(primary));
++
 +		if (prev && (prev->scx.flags & SCX_TASK_QUEUED) && in_primary) {
-+			pcpu_ctx->num_active++;
 +			scx_bpf_dispatch(prev, SCX_DSQ_LOCAL, slice_ns, 0);
 +			return;
 +		}
 +
 +		stat_inc(NEST_STAT(NOT_CONSUMED));
 +		if (in_primary) {
++			pcpu_ctx = bpf_map_lookup_elem(&pcpu_ctxs, &key);
++			if (!pcpu_ctx) {
++				scx_bpf_error("Failed to lookup pcpu ctx");
++				return;
++			}
++
 +			/*
-+			 * Always immediately demote a primary core if we
-+			 * couldn't consume, and the previous task is dying.
++			 * Immediately demote a primary core if:
++			 * - It's been scheduled for compaction at least
++			 *   r_depth times without actually being compacted.
++			 * - The previous task on it is dying
++			 *
++			 * Note that we elect to not compact the "first" CPU in
++			 * the mask so as to encourage at least one core to
++			 * remain in the nest. It would be better to check for
++			 * whether there is only one core remaining in the
++			 * nest, but BPF doesn't yet have a kfunc for querying
++			 * cpumask weight.
 +			 */
-+			if (bpf_cpumask_first(cast_mask(primary)) != cpu &&
-+			    (pcpu_ctx->num_active < r_depth || (prev && prev->__state == TASK_DEAD))) {
++			if ((prev && prev->__state == TASK_DEAD) ||
++			    (cpu != bpf_cpumask_first(cast_mask(primary)) && pcpu_ctx->num_schedulings >= r_depth)) {
 +				stat_inc(NEST_STAT(COMPACTED));
 +				bpf_cpumask_clear_cpu(cpu, primary);
 +				try_make_core_reserved(cpu, reserve, false);
++				pcpu_ctx->num_schedulings = 0;
 +			} else  {
 +				pcpu_ctx->scheduled_compaction = true;
 +				/*
@@ -14236,15 +14241,13 @@ index 000000000..d60636e8d
 +				 */
 +				bpf_timer_start(&pcpu_ctx->timer, p_remove_ns,
 +						0 /*BPF_F_TIMER_CPU_PIN*/);
++				pcpu_ctx->num_schedulings++;
 +				stat_inc(NEST_STAT(SCHEDULED_COMPACTION));
 +			}
-+			pcpu_ctx->num_active = 0;
 +		}
 +		return;
 +	}
 +	stat_inc(NEST_STAT(CONSUMED));
-+	if (in_primary)
-+		pcpu_ctx->num_active++;
 +}
 +
 +void BPF_STRUCT_OPS(nest_running, struct task_struct *p)
@@ -14329,6 +14332,7 @@ index 000000000..d60636e8d
 +	bpf_cpumask_clear_cpu(cpu, primary);
 +	try_make_core_reserved(cpu, reserve, false);
 +	bpf_rcu_read_unlock();
++	pcpu_ctx->num_schedulings = 0;
 +	pcpu_ctx->scheduled_compaction = false;
 +	return 0;
 +}
@@ -14421,7 +14425,7 @@ index 000000000..d60636e8d
 +			scx_bpf_error("Failed to initialize pcpu timer");
 +			return -EINVAL;
 +		}
-+		ctx->num_active  = 0;
++		ctx->num_schedulings  = 0;
 +		bpf_timer_set_callback(&ctx->timer, compact_primary_core);
 +	}
 +
@@ -14460,7 +14464,7 @@ index 000000000..d60636e8d
 +};
 diff --git a/tools/sched_ext/scx_nest.c b/tools/sched_ext/scx_nest.c
 new file mode 100644
-index 000000000..5d59e4824
+index 000000000..90f5a8bd2
 --- /dev/null
 +++ b/tools/sched_ext/scx_nest.c
 @@ -0,0 +1,227 @@
@@ -14493,7 +14497,7 @@ index 000000000..5d59e4824
 +"  -m R_MAX      Maximum number of cores in the reserve nest (default 5)\n"
 +"  -i ITERS      Number of successive placement failures tolerated before trying to aggressively expand primary nest (default 2), or 0 to disable\n"
 +"  -s SLICE_US   Override slice duration in us (default 20000us / 20ms)\n"
-+"  -D R_DECAY    Override the depth of work before which a core will be decayed\n"
++"  -D R_SCHED    Override the number of times that a core may be scheduled for compaction before having compaction happen immediately (default 5), or -1 to disable\n"
 +"  -I            First try to find a fully idle core, and then any idle core, when searching nests. Default behavior is to ignore hypertwins and check for any idle core.\n"
 +"  -h            Display this help and exit\n";
 +
