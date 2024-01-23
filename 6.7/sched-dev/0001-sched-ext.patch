@@ -1,6 +1,6 @@
-From db00bf5b0ef35ff37f141f3b4bdce7e99af55c30 Mon Sep 17 00:00:00 2001
+From 0ebe233635138980e036aca60fc8752c11798ab1 Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Tue, 23 Jan 2024 19:51:51 +0100
+Date: Tue, 23 Jan 2024 20:49:34 +0100
 Subject: [PATCH] sched-ext
 
 Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
@@ -10,9 +10,12 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  MAINTAINERS                                   |    3 +
  Makefile                                      |    8 +-
  drivers/tty/sysrq.c                           |    1 +
+ fs/kernfs/dir.c                               |   31 +-
+ fs/kernfs/kernfs-internal.h                   |    2 +
  include/asm-generic/vmlinux.lds.h             |    1 +
  include/linux/cgroup-defs.h                   |    8 +
  include/linux/cgroup.h                        |    5 +-
+ include/linux/kernfs.h                        |    7 +-
  include/linux/sched.h                         |    5 +
  include/linux/sched/ext.h                     |  751 +++
  include/linux/sched/task.h                    |    3 +-
@@ -129,7 +132,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  .../selftests/scx/select_cpu_vtime.bpf.c      |   94 +
  .../testing/selftests/scx/select_cpu_vtime.c  |   59 +
  tools/testing/selftests/scx/test_example.c    |   49 +
- 124 files changed, 20746 insertions(+), 547 deletions(-)
+ 127 files changed, 20773 insertions(+), 560 deletions(-)
  create mode 100644 Documentation/scheduler/sched-ext.rst
  create mode 100644 include/linux/sched/ext.h
  create mode 100644 kernel/sched/ext.c
@@ -587,6 +590,94 @@ index 6b4a28bcf..6ec15c131 100644
  	NULL,				/* S */
  	NULL,				/* T */
  	NULL,				/* U */
+diff --git a/fs/kernfs/dir.c b/fs/kernfs/dir.c
+index 8b2bd65d7..b03bb91af 100644
+--- a/fs/kernfs/dir.c
++++ b/fs/kernfs/dir.c
+@@ -529,6 +529,20 @@ void kernfs_get(struct kernfs_node *kn)
+ }
+ EXPORT_SYMBOL_GPL(kernfs_get);
+ 
++static void kernfs_free_rcu(struct rcu_head *rcu)
++{
++	struct kernfs_node *kn = container_of(rcu, struct kernfs_node, rcu);
++
++	kfree_const(kn->name);
++
++	if (kn->iattr) {
++		simple_xattrs_free(&kn->iattr->xattrs, NULL);
++		kmem_cache_free(kernfs_iattrs_cache, kn->iattr);
++	}
++
++	kmem_cache_free(kernfs_node_cache, kn);
++}
++
+ /**
+  * kernfs_put - put a reference count on a kernfs_node
+  * @kn: the target kernfs_node
+@@ -557,16 +571,11 @@ void kernfs_put(struct kernfs_node *kn)
+ 	if (kernfs_type(kn) == KERNFS_LINK)
+ 		kernfs_put(kn->symlink.target_kn);
+ 
+-	kfree_const(kn->name);
+-
+-	if (kn->iattr) {
+-		simple_xattrs_free(&kn->iattr->xattrs, NULL);
+-		kmem_cache_free(kernfs_iattrs_cache, kn->iattr);
+-	}
+ 	spin_lock(&kernfs_idr_lock);
+ 	idr_remove(&root->ino_idr, (u32)kernfs_ino(kn));
+ 	spin_unlock(&kernfs_idr_lock);
+-	kmem_cache_free(kernfs_node_cache, kn);
++
++	call_rcu(&kn->rcu, kernfs_free_rcu);
+ 
+ 	kn = parent;
+ 	if (kn) {
+@@ -575,7 +584,7 @@ void kernfs_put(struct kernfs_node *kn)
+ 	} else {
+ 		/* just released the root kn, free @root too */
+ 		idr_destroy(&root->ino_idr);
+-		kfree(root);
++		kfree_rcu(root, rcu);
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(kernfs_put);
+@@ -703,7 +712,7 @@ struct kernfs_node *kernfs_find_and_get_node_by_id(struct kernfs_root *root,
+ 	ino_t ino = kernfs_id_ino(id);
+ 	u32 gen = kernfs_id_gen(id);
+ 
+-	spin_lock(&kernfs_idr_lock);
++	rcu_read_lock();
+ 
+ 	kn = idr_find(&root->ino_idr, (u32)ino);
+ 	if (!kn)
+@@ -727,10 +736,10 @@ struct kernfs_node *kernfs_find_and_get_node_by_id(struct kernfs_root *root,
+ 	if (unlikely(!__kernfs_active(kn) || !atomic_inc_not_zero(&kn->count)))
+ 		goto err_unlock;
+ 
+-	spin_unlock(&kernfs_idr_lock);
++	rcu_read_unlock();
+ 	return kn;
+ err_unlock:
+-	spin_unlock(&kernfs_idr_lock);
++	rcu_read_unlock();
+ 	return NULL;
+ }
+ 
+diff --git a/fs/kernfs/kernfs-internal.h b/fs/kernfs/kernfs-internal.h
+index 237f2764b..b42ee6547 100644
+--- a/fs/kernfs/kernfs-internal.h
++++ b/fs/kernfs/kernfs-internal.h
+@@ -49,6 +49,8 @@ struct kernfs_root {
+ 	struct rw_semaphore	kernfs_rwsem;
+ 	struct rw_semaphore	kernfs_iattr_rwsem;
+ 	struct rw_semaphore	kernfs_supers_rwsem;
++
++	struct rcu_head		rcu;
+ };
+ 
+ /* +1 to avoid triggering overflow warning when negating it */
 diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
 index bae0fe4d4..b4c51e798 100644
 --- a/include/asm-generic/vmlinux.lds.h
@@ -662,6 +753,32 @@ index 0ef0af660..53040f746 100644
  void cgroup_file_notify(struct cgroup_file *cfile);
  void cgroup_file_show(struct cgroup_file *cfile, bool show);
  
+diff --git a/include/linux/kernfs.h b/include/linux/kernfs.h
+index 99aaa050c..05dcbae7e 100644
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@ -206,6 +206,9 @@ struct kernfs_node {
+ 
+ 	const void		*ns;	/* namespace tag */
+ 	unsigned int		hash;	/* ns + name hash */
++	unsigned short		flags;
++	umode_t			mode;
++
+ 	union {
+ 		struct kernfs_elem_dir		dir;
+ 		struct kernfs_elem_symlink	symlink;
+@@ -220,9 +223,9 @@ struct kernfs_node {
+ 	 */
+ 	u64			id;
+ 
+-	unsigned short		flags;
+-	umode_t			mode;
+ 	struct kernfs_iattrs	*iattr;
++
++	struct rcu_head		rcu;
+ };
+ 
+ /*
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index 292c31697..e5530c97f 100644
 --- a/include/linux/sched.h
