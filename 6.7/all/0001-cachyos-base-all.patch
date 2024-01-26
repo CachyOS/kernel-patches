@@ -1,6 +1,6 @@
-From c63a3782f62d98335685f8c79bdb4a956a4e7d8b Mon Sep 17 00:00:00 2001
+From 9df435b88b3b6733e9783b1c269ccaeb559a2cf5 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 20 Jan 2024 13:52:31 +0100
+Date: Fri, 26 Jan 2024 11:06:04 +0100
 Subject: [PATCH 1/7] amd-pref-core
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -17,7 +17,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  9 files changed, 275 insertions(+), 12 deletions(-)
 
 diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
-index 65731b060e3f..cbfa63a87e4a 100644
+index b72e2049c487..95164b35f973 100644
 --- a/Documentation/admin-guide/kernel-parameters.txt
 +++ b/Documentation/admin-guide/kernel-parameters.txt
 @@ -363,6 +363,11 @@
@@ -585,7 +585,7 @@ index 1c5ca92a0555..5d62beea2712 100644
 -- 
 2.43.0
 
-From 78029e447836e7c23be18bd0e29b545d71849beb Mon Sep 17 00:00:00 2001
+From b93a261febe97b6013eff5aa17b9c1747011a79d Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Fri, 22 Dec 2023 17:53:09 +0100
 Subject: [PATCH 2/7] bbr3
@@ -3939,21 +3939,513 @@ index 1f9f6c1c196b..b6cb292779a6 100644
 -- 
 2.43.0
 
-From 06b82ba274185e92b0d55d73ea93c4c356402930 Mon Sep 17 00:00:00 2001
+From e7522c0018c1b9f11aa12d00975c3a1cc2049ff7 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 20 Jan 2024 13:52:52 +0100
-Subject: [PATCH 3/7] cachy
+Date: Fri, 26 Jan 2024 11:07:04 +0100
+Subject: [PATCH 3/7] block
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ block/bfq-iosched.c | 120 ++++++++++++++++++++++++++++++++++++--------
+ block/bfq-iosched.h |  16 +++++-
+ block/mq-deadline.c | 114 +++++++++++++++++++++++++++++++++--------
+ 3 files changed, 205 insertions(+), 45 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 3cce6de464a7..9bd57baa4b0b 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -467,6 +467,21 @@ static struct bfq_io_cq *bfq_bic_lookup(struct request_queue *q)
+ 	return icq;
+ }
+ 
++static struct bfq_io_cq *bfq_bic_try_lookup(struct request_queue *q)
++{
++	if (!current->io_context)
++		return NULL;
++	if (spin_trylock_irq(&q->queue_lock)) {
++		struct bfq_io_cq *icq;
++
++		icq = icq_to_bic(ioc_lookup_icq(q));
++		spin_unlock_irq(&q->queue_lock);
++		return icq;
++	}
++
++	return NULL;
++}
++
+ /*
+  * Scheduler run of queue, if there are requests pending and no one in the
+  * driver that will restart queueing.
+@@ -2454,10 +2469,21 @@ static bool bfq_bio_merge(struct request_queue *q, struct bio *bio,
+ 	 * returned by bfq_bic_lookup does not go away before
+ 	 * bfqd->lock is taken.
+ 	 */
+-	struct bfq_io_cq *bic = bfq_bic_lookup(q);
++	struct bfq_io_cq *bic = bfq_bic_try_lookup(q);
+ 	bool ret;
+ 
+-	spin_lock_irq(&bfqd->lock);
++	/*
++	 * bio merging is called for every bio queued, and it's very easy
++	 * to run into contention because of that. If we fail getting
++	 * the dd lock, just skip this merge attempt. For related IO, the
++	 * plug will be the successful merging point. If we get here, we
++	 * already failed doing the obvious merge. Chances of actually
++	 * getting a merge off this path is a lot slimmer, so skipping an
++	 * occassional lookup that will most likely not succeed anyway should
++	 * not be a problem.
++	 */
++	if (!spin_trylock_irq(&bfqd->lock))
++		return false;
+ 
+ 	if (bic) {
+ 		/*
+@@ -5148,6 +5174,10 @@ static bool bfq_has_work(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct bfq_data *bfqd = hctx->queue->elevator->elevator_data;
+ 
++	if (!list_empty_careful(&bfqd->at_head) ||
++	    !list_empty_careful(&bfqd->at_tail))
++		return true;
++
+ 	/*
+ 	 * Avoiding lock: a race on bfqd->queued should cause at
+ 	 * most a call to dispatch for nothing
+@@ -5297,15 +5327,61 @@ static inline void bfq_update_dispatch_stats(struct request_queue *q,
+ 					     bool idle_timer_disabled) {}
+ #endif /* CONFIG_BFQ_CGROUP_DEBUG */
+ 
++static void bfq_insert_request(struct request_queue *q, struct request *rq,
++			       blk_insert_t flags, struct list_head *free);
++
++static void __bfq_do_insert(struct request_queue *q, blk_insert_t flags,
++			    struct list_head *list, struct list_head *free)
++{
++	while (!list_empty(list)) {
++		struct request *rq;
++
++		rq = list_first_entry(list, struct request, queuelist);
++		list_del_init(&rq->queuelist);
++		bfq_insert_request(q, rq, flags, free);
++	}
++}
++
++static void bfq_do_insert(struct request_queue *q, struct list_head *free)
++{
++	struct bfq_data *bfqd = q->elevator->elevator_data;
++	LIST_HEAD(at_head);
++	LIST_HEAD(at_tail);
++
++	spin_lock(&bfqd->insert_lock);
++	list_splice_init(&bfqd->at_head, &at_head);
++	list_splice_init(&bfqd->at_tail, &at_tail);
++	spin_unlock(&bfqd->insert_lock);
++
++	__bfq_do_insert(q, BLK_MQ_INSERT_AT_HEAD, &at_head, free);
++	__bfq_do_insert(q, 0, &at_tail, free);
++}
++
+ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ {
+-	struct bfq_data *bfqd = hctx->queue->elevator->elevator_data;
++	struct request_queue *q = hctx->queue;
++	struct bfq_data *bfqd = q->elevator->elevator_data;
+ 	struct request *rq;
+ 	struct bfq_queue *in_serv_queue;
+ 	bool waiting_rq, idle_timer_disabled = false;
++	LIST_HEAD(free);
++
++	/*
++	 * If someone else is already dispatching, skip this one. This will
++	 * defer the next dispatch event to when something completes, and could
++	 * potentially lower the queue depth for contended cases.
++	 *
++	 * See the logic in blk_mq_do_dispatch_sched(), which loops and
++	 * retries if nothing is dispatched.
++	 */
++	if (test_bit(BFQ_DISPATCHING, &bfqd->run_state) ||
++	    test_and_set_bit_lock(BFQ_DISPATCHING, &bfqd->run_state))
++		return NULL;
+ 
+ 	spin_lock_irq(&bfqd->lock);
+ 
++	bfq_do_insert(hctx->queue, &free);
++
+ 	in_serv_queue = bfqd->in_service_queue;
+ 	waiting_rq = in_serv_queue && bfq_bfqq_wait_request(in_serv_queue);
+ 
+@@ -5315,7 +5391,9 @@ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 			waiting_rq && !bfq_bfqq_wait_request(in_serv_queue);
+ 	}
+ 
++	clear_bit_unlock(BFQ_DISPATCHING, &bfqd->run_state);
+ 	spin_unlock_irq(&bfqd->lock);
++	blk_mq_free_requests(&free);
+ 	bfq_update_dispatch_stats(hctx->queue, rq,
+ 			idle_timer_disabled ? in_serv_queue : NULL,
+ 				idle_timer_disabled);
+@@ -6236,27 +6314,21 @@ static inline void bfq_update_insert_stats(struct request_queue *q,
+ 
+ static struct bfq_queue *bfq_init_rq(struct request *rq);
+ 
+-static void bfq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+-			       blk_insert_t flags)
++static void bfq_insert_request(struct request_queue *q, struct request *rq,
++			       blk_insert_t flags, struct list_head *free)
+ {
+-	struct request_queue *q = hctx->queue;
+ 	struct bfq_data *bfqd = q->elevator->elevator_data;
+ 	struct bfq_queue *bfqq;
+ 	bool idle_timer_disabled = false;
+ 	blk_opf_t cmd_flags;
+-	LIST_HEAD(free);
+ 
+ #ifdef CONFIG_BFQ_GROUP_IOSCHED
+ 	if (!cgroup_subsys_on_dfl(io_cgrp_subsys) && rq->bio)
+ 		bfqg_stats_update_legacy_io(q, rq);
+ #endif
+-	spin_lock_irq(&bfqd->lock);
+ 	bfqq = bfq_init_rq(rq);
+-	if (blk_mq_sched_try_insert_merge(q, rq, &free)) {
+-		spin_unlock_irq(&bfqd->lock);
+-		blk_mq_free_requests(&free);
++	if (blk_mq_sched_try_insert_merge(q, rq, free))
+ 		return;
+-	}
+ 
+ 	trace_block_rq_insert(rq);
+ 
+@@ -6286,8 +6358,6 @@ static void bfq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+ 	 * merge).
+ 	 */
+ 	cmd_flags = rq->cmd_flags;
+-	spin_unlock_irq(&bfqd->lock);
+-
+ 	bfq_update_insert_stats(q, bfqq, idle_timer_disabled,
+ 				cmd_flags);
+ }
+@@ -6296,13 +6366,15 @@ static void bfq_insert_requests(struct blk_mq_hw_ctx *hctx,
+ 				struct list_head *list,
+ 				blk_insert_t flags)
+ {
+-	while (!list_empty(list)) {
+-		struct request *rq;
++	struct request_queue *q = hctx->queue;
++	struct bfq_data *bfqd = q->elevator->elevator_data;
+ 
+-		rq = list_first_entry(list, struct request, queuelist);
+-		list_del_init(&rq->queuelist);
+-		bfq_insert_request(hctx, rq, flags);
+-	}
++	spin_lock_irq(&bfqd->insert_lock);
++	if (flags & BLK_MQ_INSERT_AT_HEAD)
++		list_splice_init(list, &bfqd->at_head);
++	else
++		list_splice_init(list, &bfqd->at_tail);
++	spin_unlock_irq(&bfqd->insert_lock);
+ }
+ 
+ static void bfq_update_hw_tag(struct bfq_data *bfqd)
+@@ -7211,6 +7283,12 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	q->elevator = eq;
+ 	spin_unlock_irq(&q->queue_lock);
+ 
++	spin_lock_init(&bfqd->lock);
++	spin_lock_init(&bfqd->insert_lock);
++
++	INIT_LIST_HEAD(&bfqd->at_head);
++	INIT_LIST_HEAD(&bfqd->at_tail);
++
+ 	/*
+ 	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
+ 	 * Grab a permanent reference to it, so that the normal code flow
+@@ -7329,8 +7407,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	/* see comments on the definition of next field inside bfq_data */
+ 	bfqd->actuator_load_threshold = 4;
+ 
+-	spin_lock_init(&bfqd->lock);
+-
+ 	/*
+ 	 * The invocation of the next bfq_create_group_hierarchy
+ 	 * function is the head of a chain of function calls
+diff --git a/block/bfq-iosched.h b/block/bfq-iosched.h
+index 467e8cfc41a2..f44f5d4ec2f4 100644
+--- a/block/bfq-iosched.h
++++ b/block/bfq-iosched.h
+@@ -504,12 +504,26 @@ struct bfq_io_cq {
+ 	unsigned int requests;	/* Number of requests this process has in flight */
+ };
+ 
++enum {
++	BFQ_DISPATCHING	= 0,
++};
++
+ /**
+  * struct bfq_data - per-device data structure.
+  *
+  * All the fields are protected by @lock.
+  */
+ struct bfq_data {
++	struct {
++		spinlock_t lock;
++		spinlock_t insert_lock;
++	} ____cacheline_aligned_in_smp;
++
++	unsigned long run_state;
++
++	struct list_head at_head;
++	struct list_head at_tail;
++
+ 	/* device request queue */
+ 	struct request_queue *queue;
+ 	/* dispatch queue */
+@@ -795,8 +809,6 @@ struct bfq_data {
+ 	/* fallback dummy bfqq for extreme OOM conditions */
+ 	struct bfq_queue oom_bfqq;
+ 
+-	spinlock_t lock;
+-
+ 	/*
+ 	 * bic associated with the task issuing current bio for
+ 	 * merging. This and the next field are used as a support to
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index f958e79277b8..1b0de4fc3958 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -79,10 +79,24 @@ struct dd_per_prio {
+ 	struct io_stats_per_prio stats;
+ };
+ 
++enum {
++	DD_DISPATCHING	= 0,
++};
++
+ struct deadline_data {
+ 	/*
+ 	 * run time data
+ 	 */
++	struct {
++		spinlock_t lock;
++		spinlock_t insert_lock;
++		spinlock_t zone_lock;
++	} ____cacheline_aligned_in_smp;
++
++	unsigned long run_state;
++
++	struct list_head at_head;
++	struct list_head at_tail;
+ 
+ 	struct dd_per_prio per_prio[DD_PRIO_COUNT];
+ 
+@@ -100,9 +114,6 @@ struct deadline_data {
+ 	int front_merges;
+ 	u32 async_depth;
+ 	int prio_aging_expire;
+-
+-	spinlock_t lock;
+-	spinlock_t zone_lock;
+ };
+ 
+ /* Maps an I/O priority class to a deadline scheduler priority. */
+@@ -113,6 +124,9 @@ static const enum dd_prio ioprio_class_to_prio[] = {
+ 	[IOPRIO_CLASS_IDLE]	= DD_IDLE_PRIO,
+ };
+ 
++static void dd_insert_request(struct request_queue *q, struct request *rq,
++			      blk_insert_t flags, struct list_head *free);
++
+ static inline struct rb_root *
+ deadline_rb_root(struct dd_per_prio *per_prio, struct request *rq)
+ {
+@@ -585,6 +599,33 @@ static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
+ 	return NULL;
+ }
+ 
++static void __dd_do_insert(struct request_queue *q, blk_insert_t flags,
++			   struct list_head *list, struct list_head *free)
++{
++	while (!list_empty(list)) {
++		struct request *rq;
++
++		rq = list_first_entry(list, struct request, queuelist);
++		list_del_init(&rq->queuelist);
++		dd_insert_request(q, rq, flags, free);
++	}
++}
++
++static void dd_do_insert(struct request_queue *q, struct list_head *free)
++{
++	struct deadline_data *dd = q->elevator->elevator_data;
++	LIST_HEAD(at_head);
++	LIST_HEAD(at_tail);
++
++	spin_lock(&dd->insert_lock);
++	list_splice_init(&dd->at_head, &at_head);
++	list_splice_init(&dd->at_tail, &at_tail);
++	spin_unlock(&dd->insert_lock);
++
++	__dd_do_insert(q, BLK_MQ_INSERT_AT_HEAD, &at_head, free);
++	__dd_do_insert(q, 0, &at_tail, free);
++}
++
+ /*
+  * Called from blk_mq_run_hw_queue() -> __blk_mq_sched_dispatch_requests().
+  *
+@@ -595,12 +636,27 @@ static struct request *dd_dispatch_prio_aged_requests(struct deadline_data *dd,
+  */
+ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ {
+-	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
++	struct request_queue *q = hctx->queue;
++	struct deadline_data *dd = q->elevator->elevator_data;
+ 	const unsigned long now = jiffies;
+ 	struct request *rq;
+ 	enum dd_prio prio;
++	LIST_HEAD(free);
++
++	/*
++	 * If someone else is already dispatching, skip this one. This will
++	 * defer the next dispatch event to when something completes, and could
++	 * potentially lower the queue depth for contended cases.
++	 *
++	 * See the logic in blk_mq_do_dispatch_sched(), which loops and
++	 * retries if nothing is dispatched.
++	 */
++	if (test_bit(DD_DISPATCHING, &dd->run_state) ||
++	    test_and_set_bit_lock(DD_DISPATCHING, &dd->run_state))
++		return NULL;
+ 
+ 	spin_lock(&dd->lock);
++	dd_do_insert(q, &free);
+ 	rq = dd_dispatch_prio_aged_requests(dd, now);
+ 	if (rq)
+ 		goto unlock;
+@@ -616,8 +672,10 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 	}
+ 
+ unlock:
++	clear_bit_unlock(DD_DISPATCHING, &dd->run_state);
+ 	spin_unlock(&dd->lock);
+ 
++	blk_mq_free_requests(&free);
+ 	return rq;
+ }
+ 
+@@ -706,6 +764,13 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
+ 
+ 	eq->elevator_data = dd;
+ 
++	spin_lock_init(&dd->lock);
++	spin_lock_init(&dd->insert_lock);
++	spin_lock_init(&dd->zone_lock);
++
++	INIT_LIST_HEAD(&dd->at_head);
++	INIT_LIST_HEAD(&dd->at_tail);
++
+ 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+ 		struct dd_per_prio *per_prio = &dd->per_prio[prio];
+ 
+@@ -722,8 +787,6 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
+ 	dd->last_dir = DD_WRITE;
+ 	dd->fifo_batch = fifo_batch;
+ 	dd->prio_aging_expire = prio_aging_expire;
+-	spin_lock_init(&dd->lock);
+-	spin_lock_init(&dd->zone_lock);
+ 
+ 	/* We dispatch from request queue wide instead of hw queue */
+ 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
+@@ -779,7 +842,19 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
+ 	struct request *free = NULL;
+ 	bool ret;
+ 
+-	spin_lock(&dd->lock);
++	/*
++	 * bio merging is called for every bio queued, and it's very easy
++	 * to run into contention because of that. If we fail getting
++	 * the dd lock, just skip this merge attempt. For related IO, the
++	 * plug will be the successful merging point. If we get here, we
++	 * already failed doing the obvious merge. Chances of actually
++	 * getting a merge off this path is a lot slimmer, so skipping an
++	 * occassional lookup that will most likely not succeed anyway should
++	 * not be a problem.
++	 */
++	if (!spin_trylock(&dd->lock))
++		return false;
++
+ 	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
+ 	spin_unlock(&dd->lock);
+ 
+@@ -792,10 +867,9 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
+ /*
+  * add rq to rbtree and fifo
+  */
+-static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
++static void dd_insert_request(struct request_queue *q, struct request *rq,
+ 			      blk_insert_t flags, struct list_head *free)
+ {
+-	struct request_queue *q = hctx->queue;
+ 	struct deadline_data *dd = q->elevator->elevator_data;
+ 	const enum dd_data_dir data_dir = rq_data_dir(rq);
+ 	u16 ioprio = req_get_ioprio(rq);
+@@ -867,19 +941,13 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
+ {
+ 	struct request_queue *q = hctx->queue;
+ 	struct deadline_data *dd = q->elevator->elevator_data;
+-	LIST_HEAD(free);
+ 
+-	spin_lock(&dd->lock);
+-	while (!list_empty(list)) {
+-		struct request *rq;
+-
+-		rq = list_first_entry(list, struct request, queuelist);
+-		list_del_init(&rq->queuelist);
+-		dd_insert_request(hctx, rq, flags, &free);
+-	}
+-	spin_unlock(&dd->lock);
+-
+-	blk_mq_free_requests(&free);
++	spin_lock(&dd->insert_lock);
++	if (flags & BLK_MQ_INSERT_AT_HEAD)
++		list_splice_init(list, &dd->at_head);
++	else
++		list_splice_init(list, &dd->at_tail);
++	spin_unlock(&dd->insert_lock);
+ }
+ 
+ /* Callback from inside blk_mq_rq_ctx_init(). */
+@@ -958,6 +1026,10 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
+ 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
+ 	enum dd_prio prio;
+ 
++	if (!list_empty_careful(&dd->at_head) ||
++	    !list_empty_careful(&dd->at_tail))
++		return true;
++
+ 	for (prio = 0; prio <= DD_PRIO_MAX; prio++)
+ 		if (dd_has_work_for_prio(&dd->per_prio[prio]))
+ 			return true;
+-- 
+2.43.0
+
+From 88f6faa5c8ecdb50d18ee6bad1bdf920348eac4a Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Fri, 26 Jan 2024 11:07:16 +0100
+Subject: [PATCH 4/7] cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  .../admin-guide/kernel-parameters.txt         |    9 +
- Makefile                                      |    3 +
+ Makefile                                      |  162 +-
+ arch/arm/Makefile                             |   56 +-
  arch/x86/Kconfig.cpu                          |  427 +-
- arch/x86/Makefile                             |   46 +-
+ arch/x86/Makefile                             |   19 +-
+ arch/x86/Makefile_32.cpu                      |   41 -
  arch/x86/include/asm/pci.h                    |    6 +
  arch/x86/include/asm/vermagic.h               |   74 +
  arch/x86/pci/common.c                         |    7 +-
  block/bfq-iosched.c                           |    6 +
+ block/elevator.c                              |   10 +
  drivers/Makefile                              |   15 +-
  drivers/ata/ahci.c                            |   23 +-
  drivers/cpufreq/Kconfig.x86                   |    2 -
@@ -3961,6 +4453,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  drivers/i2c/busses/Makefile                   |    1 +
  drivers/i2c/busses/i2c-nct6775.c              |  648 ++
  drivers/i2c/busses/i2c-piix4.c                |    4 +-
+ drivers/input/evdev.c                         |   19 +-
  drivers/md/dm-crypt.c                         |    5 +
  drivers/pci/controller/Makefile               |    6 +
  drivers/pci/controller/intel-nvme-remap.c     |  462 ++
@@ -3976,21 +4469,25 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  kernel/Kconfig.hz                             |   24 +
  kernel/fork.c                                 |   14 +
  kernel/sched/fair.c                           |   13 +
+ kernel/sched/sched.h                          |    2 +-
  kernel/sysctl.c                               |   12 +
  kernel/user_namespace.c                       |    7 +
  mm/Kconfig                                    |    2 +-
+ mm/compaction.c                               |    4 +
+ mm/huge_memory.c                              |    4 +
  mm/page-writeback.c                           |    8 +
+ mm/page_alloc.c                               |   27 +-
  mm/swap.c                                     |    5 +
  mm/vmpressure.c                               |    4 +
  mm/vmscan.c                                   |    8 +
- 37 files changed, 8346 insertions(+), 48 deletions(-)
+ 45 files changed, 8517 insertions(+), 172 deletions(-)
  create mode 100644 drivers/i2c/busses/i2c-nct6775.c
  create mode 100644 drivers/pci/controller/intel-nvme-remap.c
  create mode 100644 drivers/platform/x86/legion-laptop.c
  create mode 100644 drivers/platform/x86/steamdeck.c
 
 diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
-index cbfa63a87e4a..5f86793358d9 100644
+index 95164b35f973..8396c4fa9bd4 100644
 --- a/Documentation/admin-guide/kernel-parameters.txt
 +++ b/Documentation/admin-guide/kernel-parameters.txt
 @@ -4362,6 +4362,15 @@
@@ -4010,10 +4507,165 @@ index cbfa63a87e4a..5f86793358d9 100644
  				Safety option to keep boot IRQs enabled. This
  				should never be necessary.
 diff --git a/Makefile b/Makefile
-index 186da2386a06..adde78f0cb56 100644
+index 0564d3d09395..a71b0a117fe9 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -807,6 +807,9 @@ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
+@@ -804,9 +804,164 @@ endif # need-config
+ 
+ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
+ 
++# This selects which ARM instruction set is used.
++arch-$(CONFIG_CPU_32v7M)	:=-march=armv7-m
++arch-$(CONFIG_CPU_32v7)		:=-march=armv7-a
++arch-$(CONFIG_CPU_32v6)		:=-march=armv6
++# Only override the compiler option if ARMv6. The ARMv6K extensions are
++# always available in ARMv7
++ifeq ($(CONFIG_CPU_32v6),y)
++arch-$(CONFIG_CPU_32v6K)	:=-march=armv6k
++endif
++arch-$(CONFIG_CPU_32v5)		:=-march=armv5te
++arch-$(CONFIG_CPU_32v4T)	:=-march=armv4t
++arch-$(CONFIG_CPU_32v4)		:=-march=armv4
++arch-$(CONFIG_CPU_32v3)		:=-march=armv3m
++
++# Note that GCC does not numerically define an architecture version
++# macro, but instead defines a whole series of macros which makes
++# testing for a specific architecture or later rather impossible.
++cpp-$(CONFIG_CPU_32v7M)		:=-D__LINUX_ARM_ARCH__=7
++cpp-$(CONFIG_CPU_32v7)		:=-D__LINUX_ARM_ARCH__=7
++cpp-$(CONFIG_CPU_32v6)		:=-D__LINUX_ARM_ARCH__=6
++# Only override the compiler option if ARMv6. The ARMv6K extensions are
++# always available in ARMv7
++ifeq ($(CONFIG_CPU_32v6),y)
++cpp-$(CONFIG_CPU_32v6K)		:=-D__LINUX_ARM_ARCH__=6
++endif
++cpp-$(CONFIG_CPU_32v5)		:=-D__LINUX_ARM_ARCH__=5
++cpp-$(CONFIG_CPU_32v4T)		:=-D__LINUX_ARM_ARCH__=4
++cpp-$(CONFIG_CPU_32v4)		:=-D__LINUX_ARM_ARCH__=4
++cpp-$(CONFIG_CPU_32v3)		:=-D__LINUX_ARM_ARCH__=3
++
++# This selects how we optimise for the processor.
++tune-$(CONFIG_CPU_ARM7TDMI)	:=-mtune=arm7tdmi
++tune-$(CONFIG_CPU_ARM720T)	:=-mtune=arm7tdmi
++tune-$(CONFIG_CPU_ARM740T)	:=-mtune=arm7tdmi
++tune-$(CONFIG_CPU_ARM9TDMI)	:=-mtune=arm9tdmi
++tune-$(CONFIG_CPU_ARM940T)	:=-mtune=arm9tdmi
++tune-$(CONFIG_CPU_ARM946E)	:=-mtune=arm9e
++tune-$(CONFIG_CPU_ARM920T)	:=-mtune=arm9tdmi
++tune-$(CONFIG_CPU_ARM922T)	:=-mtune=arm9tdmi
++tune-$(CONFIG_CPU_ARM925T)	:=-mtune=arm9tdmi
++tune-$(CONFIG_CPU_ARM926T)	:=-mtune=arm9tdmi
++tune-$(CONFIG_CPU_FA526)	:=-mtune=arm9tdmi
++tune-$(CONFIG_CPU_SA110)	:=-mtune=strongarm110
++tune-$(CONFIG_CPU_SA1100)	:=-mtune=strongarm1100
++tune-$(CONFIG_CPU_XSCALE)	:=-mtune=xscale
++tune-$(CONFIG_CPU_XSC3)		:=-mtune=xscale
++tune-$(CONFIG_CPU_FEROCEON)	:=-mtune=xscale
++tune-$(CONFIG_CPU_V6)		:=-mtune=arm1136j-s
++tune-$(CONFIG_CPU_V6K)		:=-mtune=arm1136j-s
++
++KBUILD_CPPFLAGS	+=$(cpp-y)
++KBUILD_CFLAGS	+=$(arch-y) $(tune-y)
++KBUILD_AFLAGS	+=$(arch-y) $(tune-y)
++
++# This selects which x86 instruction set is used.
++cflags-$(CONFIG_M486SX)		+= -march=i486
++cflags-$(CONFIG_M486)		+= -march=i486
++cflags-$(CONFIG_M586)		+= -march=i586
++cflags-$(CONFIG_M586TSC)	+= -march=i586
++cflags-$(CONFIG_M586MMX)	+= -march=pentium-mmx
++cflags-$(CONFIG_M686)		+= -march=i686
++cflags-$(CONFIG_MPENTIUMII)	+= -march=i686 $(call tune,pentium2)
++cflags-$(CONFIG_MPENTIUMIII)	+= -march=i686 $(call tune,pentium3)
++cflags-$(CONFIG_MPENTIUMM)	+= -march=i686 $(call tune,pentium3)
++cflags-$(CONFIG_MPENTIUM4)	+= -march=i686 $(call tune,pentium4)
++cflags-$(CONFIG_MK6)		+= -march=k6
++# Please note, that patches that add -march=athlon-xp and friends are pointless.
++# They make zero difference whatsosever to performance at this time.
++cflags-$(CONFIG_MK7)		+= -march=athlon
++cflags-$(CONFIG_MK8)		+= $(call cc-option,-march=k8,-march=athlon)
++cflags-$(CONFIG_MCRUSOE)	+= -march=i686 $(align)
++cflags-$(CONFIG_MEFFICEON)	+= -march=i686 $(call tune,pentium3) $(align)
++cflags-$(CONFIG_MWINCHIPC6)	+= $(call cc-option,-march=winchip-c6,-march=i586)
++cflags-$(CONFIG_MWINCHIP3D)	+= $(call cc-option,-march=winchip2,-march=i586)
++cflags-$(CONFIG_MCYRIXIII)	+= $(call cc-option,-march=c3,-march=i486) $(align)
++cflags-$(CONFIG_MVIAC3_2)	+= $(call cc-option,-march=c3-2,-march=i686)
++cflags-$(CONFIG_MVIAC7)		+= -march=i686
++cflags-$(CONFIG_MCORE2)		+= -march=i686 $(call tune,core2)
++cflags-$(CONFIG_MATOM)		+= $(call cc-option,-march=atom,$(call cc-option,-march=core2,-march=i686)) \
++$(call cc-option,-mtune=atom,$(call cc-option,-mtune=generic))
++
++# AMD Elan support
++cflags-$(CONFIG_MELAN)		+= -march=i486
++
++# Geode GX1 support
++cflags-$(CONFIG_MGEODEGX1)	+= -march=pentium-mmx
++cflags-$(CONFIG_MGEODE_LX)	+= $(call cc-option,-march=geode,-march=pentium-mmx)
++# add at the end to overwrite eventual tuning options from earlier
++# cpu entries
++cflags-$(CONFIG_X86_GENERIC) 	+= $(call tune,generic,$(call tune,i686))
++
++# Bug fix for binutils: this option is required in order to keep
++# binutils from generating NOPL instructions against our will.
++ifneq ($(CONFIG_X86_P6_NOP),y)
++cflags-y			+= $(call cc-option,-Wa$(comma)-mtune=generic32,)
++endif
++
++# x86_64 instruction set
++cflags64-$(CONFIG_MK8)		+= -march=k8
++cflags64-$(CONFIG_MPSC)		+= -march=nocona
++cflags64-$(CONFIG_MK8SSE3)	+= -march=k8-sse3
++cflags64-$(CONFIG_MK10) 		+= -march=amdfam10
++cflags64-$(CONFIG_MBARCELONA) 	+= -march=barcelona
++cflags64-$(CONFIG_MBOBCAT) 	+= -march=btver1
++cflags64-$(CONFIG_MJAGUAR) 	+= -march=btver2
++cflags64-$(CONFIG_MBULLDOZER) 	+= -march=bdver1
++cflags64-$(CONFIG_MPILEDRIVER)	+= -march=bdver2 -mno-tbm
++cflags64-$(CONFIG_MSTEAMROLLER) 	+= -march=bdver3 -mno-tbm
++cflags64-$(CONFIG_MEXCAVATOR) 	+= -march=bdver4 -mno-tbm
++cflags64-$(CONFIG_MZEN) 		+= -march=znver1
++cflags64-$(CONFIG_MZEN2) 	+= -march=znver2
++cflags64-$(CONFIG_MZEN3) 	+= -march=znver3
++cflags64-$(CONFIG_MZEN4) 	+= -march=znver4
++cflags64-$(CONFIG_MNATIVE_INTEL) += -march=native
++cflags64-$(CONFIG_MNATIVE_AMD) 	+= -march=native
++cflags64-$(CONFIG_MATOM) 	+= -march=bonnell
++cflags64-$(CONFIG_MCORE2) 	+= -march=core2
++cflags64-$(CONFIG_MNEHALEM) 	+= -march=nehalem
++cflags64-$(CONFIG_MWESTMERE) 	+= -march=westmere
++cflags64-$(CONFIG_MSILVERMONT) 	+= -march=silvermont
++cflags64-$(CONFIG_MGOLDMONT) 	+= -march=goldmont
++cflags64-$(CONFIG_MGOLDMONTPLUS) += -march=goldmont-plus
++cflags64-$(CONFIG_MSANDYBRIDGE) 	+= -march=sandybridge
++cflags64-$(CONFIG_MIVYBRIDGE) 	+= -march=ivybridge
++cflags64-$(CONFIG_MHASWELL) 	+= -march=haswell
++cflags64-$(CONFIG_MBROADWELL) 	+= -march=broadwell
++cflags64-$(CONFIG_MSKYLAKE) 	+= -march=skylake
++cflags64-$(CONFIG_MSKYLAKEX) 	+= -march=skylake-avx512
++cflags64-$(CONFIG_MCANNONLAKE) 	+= -march=cannonlake
++cflags64-$(CONFIG_MICELAKE) 	+= -march=icelake-client
++cflags64-$(CONFIG_MCASCADELAKE) 	+= -march=cascadelake
++cflags64-$(CONFIG_MCOOPERLAKE) 	+= -march=cooperlake
++cflags64-$(CONFIG_MTIGERLAKE) 	+= -march=tigerlake
++cflags64-$(CONFIG_MSAPPHIRERAPIDS) += -march=sapphirerapids
++cflags64-$(CONFIG_MROCKETLAKE) 	+= -march=rocketlake
++cflags64-$(CONFIG_MALDERLAKE) 	+= -march=alderlake
++cflags64-$(CONFIG_MRAPTORLAKE) 	+= -march=raptorlake
++cflags64-$(CONFIG_MMETEORLAKE) 	+= -march=meteorlake
++cflags64-$(CONFIG_MEMERALDRAPIDS)	+= -march=emeraldrapids
++cflags64-$(CONFIG_GENERIC_CPU2) 	+= -march=x86-64-v2
++cflags64-$(CONFIG_GENERIC_CPU3) 	+= -march=x86-64-v3
++cflags64-$(CONFIG_GENERIC_CPU4) 	+= -march=x86-64-v4
++cflags64-$(CONFIG_GENERIC_CPU)	+= -mtune=generic
++KBUILD_CFLAGS += $(cflags64-y)
++
++rustflags64-$(CONFIG_MK8)		+= -Ctarget-cpu=k8
++rustflags64-$(CONFIG_MPSC)	+= -Ctarget-cpu=nocona
++rustflags64-$(CONFIG_MCORE2)	+= -Ctarget-cpu=core2
++rustflags64-$(CONFIG_MATOM)	+= -Ctarget-cpu=atom
++rustflags64-$(CONFIG_GENERIC_CPU)	+= -Ztune-cpu=generic
++KBUILD_RUSTFLAGS += $(rustflags64-y)
++
  ifdef CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE
  KBUILD_CFLAGS += -O2
  KBUILD_RUSTFLAGS += -Copt-level=2
@@ -4023,6 +4675,101 @@ index 186da2386a06..adde78f0cb56 100644
  else ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
  KBUILD_CFLAGS += -Os
  KBUILD_RUSTFLAGS += -Copt-level=s
+@@ -982,15 +1137,18 @@ NOSTDINC_FLAGS += -nostdinc
+ # perform bounds checking.
+ KBUILD_CFLAGS += $(call cc-option, -fstrict-flex-arrays=3)
+ 
++# disable GCC vectorization on trees
++KBUILD_CFLAGS	+= $(call cc-option, -fno-tree-vectorize)
++
+ # disable invalid "can't wrap" optimizations for signed / pointers
+ KBUILD_CFLAGS	+= -fno-strict-overflow
+ 
+ # Make sure -fstack-check isn't enabled (like gentoo apparently did)
+ KBUILD_CFLAGS  += -fno-stack-check
+ 
+-# conserve stack if available
++# conserve stack, ivopts and modulo-sched if available
+ ifdef CONFIG_CC_IS_GCC
+-KBUILD_CFLAGS   += -fconserve-stack
++KBUILD_CFLAGS   += -fconserve-stack -fivopts -fmodulo-sched
+ endif
+ 
+ # change __FILE__ to the relative path from the srctree
+diff --git a/arch/arm/Makefile b/arch/arm/Makefile
+index 5ba42f69f8ce..5d0f225c5459 100644
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -59,56 +59,6 @@ endif
+ #
+ KBUILD_CFLAGS	+= $(call cc-option,-fno-ipa-sra)
+ 
+-# This selects which instruction set is used.
+-arch-$(CONFIG_CPU_32v7M)	:=-march=armv7-m
+-arch-$(CONFIG_CPU_32v7)		:=-march=armv7-a
+-arch-$(CONFIG_CPU_32v6)		:=-march=armv6
+-# Only override the compiler option if ARMv6. The ARMv6K extensions are
+-# always available in ARMv7
+-ifeq ($(CONFIG_CPU_32v6),y)
+-arch-$(CONFIG_CPU_32v6K)	:=-march=armv6k
+-endif
+-arch-$(CONFIG_CPU_32v5)		:=-march=armv5te
+-arch-$(CONFIG_CPU_32v4T)	:=-march=armv4t
+-arch-$(CONFIG_CPU_32v4)		:=-march=armv4
+-arch-$(CONFIG_CPU_32v3)		:=-march=armv3m
+-
+-# Note that GCC does not numerically define an architecture version
+-# macro, but instead defines a whole series of macros which makes
+-# testing for a specific architecture or later rather impossible.
+-cpp-$(CONFIG_CPU_32v7M)		:=-D__LINUX_ARM_ARCH__=7
+-cpp-$(CONFIG_CPU_32v7)		:=-D__LINUX_ARM_ARCH__=7
+-cpp-$(CONFIG_CPU_32v6)		:=-D__LINUX_ARM_ARCH__=6
+-# Only override the compiler option if ARMv6. The ARMv6K extensions are
+-# always available in ARMv7
+-ifeq ($(CONFIG_CPU_32v6),y)
+-cpp-$(CONFIG_CPU_32v6K)		:=-D__LINUX_ARM_ARCH__=6
+-endif
+-cpp-$(CONFIG_CPU_32v5)		:=-D__LINUX_ARM_ARCH__=5
+-cpp-$(CONFIG_CPU_32v4T)		:=-D__LINUX_ARM_ARCH__=4
+-cpp-$(CONFIG_CPU_32v4)		:=-D__LINUX_ARM_ARCH__=4
+-cpp-$(CONFIG_CPU_32v3)		:=-D__LINUX_ARM_ARCH__=3
+-
+-# This selects how we optimise for the processor.
+-tune-$(CONFIG_CPU_ARM7TDMI)	:=-mtune=arm7tdmi
+-tune-$(CONFIG_CPU_ARM720T)	:=-mtune=arm7tdmi
+-tune-$(CONFIG_CPU_ARM740T)	:=-mtune=arm7tdmi
+-tune-$(CONFIG_CPU_ARM9TDMI)	:=-mtune=arm9tdmi
+-tune-$(CONFIG_CPU_ARM940T)	:=-mtune=arm9tdmi
+-tune-$(CONFIG_CPU_ARM946E)	:=-mtune=arm9e
+-tune-$(CONFIG_CPU_ARM920T)	:=-mtune=arm9tdmi
+-tune-$(CONFIG_CPU_ARM922T)	:=-mtune=arm9tdmi
+-tune-$(CONFIG_CPU_ARM925T)	:=-mtune=arm9tdmi
+-tune-$(CONFIG_CPU_ARM926T)	:=-mtune=arm9tdmi
+-tune-$(CONFIG_CPU_FA526)	:=-mtune=arm9tdmi
+-tune-$(CONFIG_CPU_SA110)	:=-mtune=strongarm110
+-tune-$(CONFIG_CPU_SA1100)	:=-mtune=strongarm1100
+-tune-$(CONFIG_CPU_XSCALE)	:=-mtune=xscale
+-tune-$(CONFIG_CPU_XSC3)		:=-mtune=xscale
+-tune-$(CONFIG_CPU_FEROCEON)	:=-mtune=xscale
+-tune-$(CONFIG_CPU_V6)		:=-mtune=arm1136j-s
+-tune-$(CONFIG_CPU_V6K)		:=-mtune=arm1136j-s
+-
+ ifeq ($(CONFIG_AEABI),y)
+ CFLAGS_ABI	:=-mabi=aapcs-linux -mfpu=vfp
+ else
+@@ -140,9 +90,9 @@ AFLAGS_ISA	:=$(CFLAGS_ISA)
+ endif
+ 
+ # Need -Uarm for gcc < 3.x
+-KBUILD_CPPFLAGS	+=$(cpp-y)
+-KBUILD_CFLAGS	+=$(CFLAGS_ABI) $(CFLAGS_ISA) $(arch-y) $(tune-y) $(call cc-option,-mshort-load-bytes,$(call cc-option,-malignment-traps,)) -msoft-float -Uarm
+-KBUILD_AFLAGS	+=$(CFLAGS_ABI) $(AFLAGS_ISA) -Wa,$(arch-y) $(tune-y) -include asm/unified.h -msoft-float
++
++KBUILD_CFLAGS	+=$(CFLAGS_ABI) $(CFLAGS_ISA) $(call cc-option,-mshort-load-bytes,$(call cc-option,-malignment-traps,)) -msoft-float -Uarm
++KBUILD_AFLAGS	+=$(CFLAGS_ABI) $(AFLAGS_ISA) -Wa,-include asm/unified.h -msoft-float
+ 
+ CHECKFLAGS	+= -D__arm__
+ 
 diff --git a/arch/x86/Kconfig.cpu b/arch/x86/Kconfig.cpu
 index 00468adf180f..46cc91cb622f 100644
 --- a/arch/x86/Kconfig.cpu
@@ -4557,69 +5304,91 @@ index 00468adf180f..46cc91cb622f 100644
  config IA32_FEAT_CTL
  	def_bool y
 diff --git a/arch/x86/Makefile b/arch/x86/Makefile
-index 1a068de12a56..2b59976e114b 100644
+index 1a068de12a56..440d668cceee 100644
 --- a/arch/x86/Makefile
 +++ b/arch/x86/Makefile
-@@ -67,7 +67,7 @@ export BITS
+@@ -67,8 +67,8 @@ export BITS
  #
  #    https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53383
  #
 -KBUILD_CFLAGS += -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx
-+KBUILD_CFLAGS += -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-avx2 -mno-avx512f -fno-tree-vectorize
- KBUILD_RUSTFLAGS += -Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2
+-KBUILD_RUSTFLAGS += -Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2
++KBUILD_CFLAGS += -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-avx2 -mno-avx512f
++KBUILD_RUSTFLAGS += -Ctarget-feature=-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,-avx512f
  
  ifeq ($(CONFIG_X86_KERNEL_IBT),y)
-@@ -152,8 +152,48 @@ else
-         # FIXME - should be integrated in Makefile.cpu (Makefile_32.cpu)
-         cflags-$(CONFIG_MK8)		+= -march=k8
-         cflags-$(CONFIG_MPSC)		+= -march=nocona
+ #
+@@ -149,21 +149,6 @@ else
+ 	# Use -mskip-rax-setup if supported.
+ 	KBUILD_CFLAGS += $(call cc-option,-mskip-rax-setup)
+ 
+-        # FIXME - should be integrated in Makefile.cpu (Makefile_32.cpu)
+-        cflags-$(CONFIG_MK8)		+= -march=k8
+-        cflags-$(CONFIG_MPSC)		+= -march=nocona
 -        cflags-$(CONFIG_MCORE2)		+= -march=core2
 -        cflags-$(CONFIG_MATOM)		+= -march=atom
-+        cflags-$(CONFIG_MK8SSE3)	+= -march=k8-sse3
-+        cflags-$(CONFIG_MK10) 		+= -march=amdfam10
-+        cflags-$(CONFIG_MBARCELONA) 	+= -march=barcelona
-+        cflags-$(CONFIG_MBOBCAT) 	+= -march=btver1
-+        cflags-$(CONFIG_MJAGUAR) 	+= -march=btver2
-+        cflags-$(CONFIG_MBULLDOZER) 	+= -march=bdver1
-+        cflags-$(CONFIG_MPILEDRIVER)	+= -march=bdver2 -mno-tbm
-+        cflags-$(CONFIG_MSTEAMROLLER) 	+= -march=bdver3 -mno-tbm
-+        cflags-$(CONFIG_MEXCAVATOR) 	+= -march=bdver4 -mno-tbm
-+        cflags-$(CONFIG_MZEN) 		+= -march=znver1
-+        cflags-$(CONFIG_MZEN2) 	+= -march=znver2
-+        cflags-$(CONFIG_MZEN3) 	+= -march=znver3
-+        cflags-$(CONFIG_MZEN4) 	+= -march=znver4
-+        cflags-$(CONFIG_MNATIVE_INTEL) += -march=native
-+        cflags-$(CONFIG_MNATIVE_AMD) 	+= -march=native
-+        cflags-$(CONFIG_MATOM) 	+= -march=bonnell
-+        cflags-$(CONFIG_MCORE2) 	+= -march=core2
-+        cflags-$(CONFIG_MNEHALEM) 	+= -march=nehalem
-+        cflags-$(CONFIG_MWESTMERE) 	+= -march=westmere
-+        cflags-$(CONFIG_MSILVERMONT) 	+= -march=silvermont
-+        cflags-$(CONFIG_MGOLDMONT) 	+= -march=goldmont
-+        cflags-$(CONFIG_MGOLDMONTPLUS) += -march=goldmont-plus
-+        cflags-$(CONFIG_MSANDYBRIDGE) 	+= -march=sandybridge
-+        cflags-$(CONFIG_MIVYBRIDGE) 	+= -march=ivybridge
-+        cflags-$(CONFIG_MHASWELL) 	+= -march=haswell
-+        cflags-$(CONFIG_MBROADWELL) 	+= -march=broadwell
-+        cflags-$(CONFIG_MSKYLAKE) 	+= -march=skylake
-+        cflags-$(CONFIG_MSKYLAKEX) 	+= -march=skylake-avx512
-+        cflags-$(CONFIG_MCANNONLAKE) 	+= -march=cannonlake
-+        cflags-$(CONFIG_MICELAKE) 	+= -march=icelake-client
-+        cflags-$(CONFIG_MCASCADELAKE) 	+= -march=cascadelake
-+        cflags-$(CONFIG_MCOOPERLAKE) 	+= -march=cooperlake
-+        cflags-$(CONFIG_MTIGERLAKE) 	+= -march=tigerlake
-+        cflags-$(CONFIG_MSAPPHIRERAPIDS) += -march=sapphirerapids
-+        cflags-$(CONFIG_MROCKETLAKE) 	+= -march=rocketlake
-+        cflags-$(CONFIG_MALDERLAKE) 	+= -march=alderlake
-+        cflags-$(CONFIG_MRAPTORLAKE) 	+= -march=raptorlake
-+        cflags-$(CONFIG_MMETEORLAKE) 	+= -march=meteorlake
-+        cflags-$(CONFIG_MEMERALDRAPIDS)	+= -march=emeraldrapids
-+        cflags-$(CONFIG_GENERIC_CPU2) 	+= -march=x86-64-v2
-+        cflags-$(CONFIG_GENERIC_CPU3) 	+= -march=x86-64-v3
-+        cflags-$(CONFIG_GENERIC_CPU4) 	+= -march=x86-64-v4
-         cflags-$(CONFIG_GENERIC_CPU)	+= -mtune=generic
-         KBUILD_CFLAGS += $(cflags-y)
+-        cflags-$(CONFIG_GENERIC_CPU)	+= -mtune=generic
+-        KBUILD_CFLAGS += $(cflags-y)
+-
+-        rustflags-$(CONFIG_MK8)		+= -Ctarget-cpu=k8
+-        rustflags-$(CONFIG_MPSC)	+= -Ctarget-cpu=nocona
+-        rustflags-$(CONFIG_MCORE2)	+= -Ctarget-cpu=core2
+-        rustflags-$(CONFIG_MATOM)	+= -Ctarget-cpu=atom
+-        rustflags-$(CONFIG_GENERIC_CPU)	+= -Ztune-cpu=generic
+-        KBUILD_RUSTFLAGS += $(rustflags-y)
+-
+         KBUILD_CFLAGS += -mno-red-zone
+         KBUILD_CFLAGS += -mcmodel=kernel
+         KBUILD_RUSTFLAGS += -Cno-redzone=y
+diff --git a/arch/x86/Makefile_32.cpu b/arch/x86/Makefile_32.cpu
+index 94834c4b5e5e..81923b4afdf8 100644
+--- a/arch/x86/Makefile_32.cpu
++++ b/arch/x86/Makefile_32.cpu
+@@ -10,44 +10,3 @@ else
+ align		:= -falign-functions=0 -falign-jumps=0 -falign-loops=0
+ endif
  
+-cflags-$(CONFIG_M486SX)		+= -march=i486
+-cflags-$(CONFIG_M486)		+= -march=i486
+-cflags-$(CONFIG_M586)		+= -march=i586
+-cflags-$(CONFIG_M586TSC)	+= -march=i586
+-cflags-$(CONFIG_M586MMX)	+= -march=pentium-mmx
+-cflags-$(CONFIG_M686)		+= -march=i686
+-cflags-$(CONFIG_MPENTIUMII)	+= -march=i686 $(call tune,pentium2)
+-cflags-$(CONFIG_MPENTIUMIII)	+= -march=i686 $(call tune,pentium3)
+-cflags-$(CONFIG_MPENTIUMM)	+= -march=i686 $(call tune,pentium3)
+-cflags-$(CONFIG_MPENTIUM4)	+= -march=i686 $(call tune,pentium4)
+-cflags-$(CONFIG_MK6)		+= -march=k6
+-# Please note, that patches that add -march=athlon-xp and friends are pointless.
+-# They make zero difference whatsosever to performance at this time.
+-cflags-$(CONFIG_MK7)		+= -march=athlon
+-cflags-$(CONFIG_MK8)		+= $(call cc-option,-march=k8,-march=athlon)
+-cflags-$(CONFIG_MCRUSOE)	+= -march=i686 $(align)
+-cflags-$(CONFIG_MEFFICEON)	+= -march=i686 $(call tune,pentium3) $(align)
+-cflags-$(CONFIG_MWINCHIPC6)	+= $(call cc-option,-march=winchip-c6,-march=i586)
+-cflags-$(CONFIG_MWINCHIP3D)	+= $(call cc-option,-march=winchip2,-march=i586)
+-cflags-$(CONFIG_MCYRIXIII)	+= $(call cc-option,-march=c3,-march=i486) $(align)
+-cflags-$(CONFIG_MVIAC3_2)	+= $(call cc-option,-march=c3-2,-march=i686)
+-cflags-$(CONFIG_MVIAC7)		+= -march=i686
+-cflags-$(CONFIG_MCORE2)		+= -march=i686 $(call tune,core2)
+-cflags-$(CONFIG_MATOM)		+= $(call cc-option,-march=atom,$(call cc-option,-march=core2,-march=i686)) \
+-	$(call cc-option,-mtune=atom,$(call cc-option,-mtune=generic))
+-
+-# AMD Elan support
+-cflags-$(CONFIG_MELAN)		+= -march=i486
+-
+-# Geode GX1 support
+-cflags-$(CONFIG_MGEODEGX1)	+= -march=pentium-mmx
+-cflags-$(CONFIG_MGEODE_LX)	+= $(call cc-option,-march=geode,-march=pentium-mmx)
+-# add at the end to overwrite eventual tuning options from earlier
+-# cpu entries
+-cflags-$(CONFIG_X86_GENERIC) 	+= $(call tune,generic,$(call tune,i686))
+-
+-# Bug fix for binutils: this option is required in order to keep
+-# binutils from generating NOPL instructions against our will.
+-ifneq ($(CONFIG_X86_P6_NOP),y)
+-cflags-y			+= $(call cc-option,-Wa$(comma)-mtune=generic32,)
+-endif
 diff --git a/arch/x86/include/asm/pci.h b/arch/x86/include/asm/pci.h
 index b40c462b4af3..c4e66e60d559 100644
 --- a/arch/x86/include/asm/pci.h
@@ -4759,10 +5528,10 @@ index ddb798603201..7c20387d8202 100644
  }
 -#endif
 diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
-index 3cce6de464a7..2bd54d089198 100644
+index 9bd57baa4b0b..62821ff40acd 100644
 --- a/block/bfq-iosched.c
 +++ b/block/bfq-iosched.c
-@@ -7627,6 +7627,7 @@ MODULE_ALIAS("bfq-iosched");
+@@ -7703,6 +7703,7 @@ MODULE_ALIAS("bfq-iosched");
  static int __init bfq_init(void)
  {
  	int ret;
@@ -4770,7 +5539,7 @@ index 3cce6de464a7..2bd54d089198 100644
  
  #ifdef CONFIG_BFQ_GROUP_IOSCHED
  	ret = blkcg_policy_register(&blkcg_policy_bfq);
-@@ -7658,6 +7659,11 @@ static int __init bfq_init(void)
+@@ -7734,6 +7735,11 @@ static int __init bfq_init(void)
  	if (ret)
  		goto slab_kill;
  
@@ -4782,6 +5551,30 @@ index 3cce6de464a7..2bd54d089198 100644
  	return 0;
  
  slab_kill:
+diff --git a/block/elevator.c b/block/elevator.c
+index 5ff093cb3cf8..1c93fe91b006 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -574,9 +574,19 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
+ 
+ 	if (q->nr_hw_queues != 1 &&
+ 	    !blk_mq_is_shared_tags(q->tag_set->flags))
++#if defined(CONFIG_CACHY) && defined(CONFIG_MQ_IOSCHED_KYBER)
++		return elevator_find_get(q, "kyber");
++#elif defined(CONFIG_CACHY)
++		return elevator_find_get(q, "mq-deadline");
++#else
+ 		return NULL;
++#endif
+ 
++#if defined(CONFIG_CACHY) && defined(CONFIG_IOSCHED_BFQ)
++	return elevator_find_get(q, "bfq");
++#else
+ 	return elevator_find_get(q, "mq-deadline");
++#endif
+ }
+ 
+ /*
 diff --git a/drivers/Makefile b/drivers/Makefile
 index d828329c268d..ea3d3c303a43 100644
 --- a/drivers/Makefile
@@ -5597,6 +6390,70 @@ index 809fbd014cd6..d54b35b147ee 100644
  
  	/* If the SMBus is still busy, we give up */
  	if (timeout == MAX_TIMEOUT) {
+diff --git a/drivers/input/evdev.c b/drivers/input/evdev.c
+index 51e0c4954600..35c3ad741870 100644
+--- a/drivers/input/evdev.c
++++ b/drivers/input/evdev.c
+@@ -46,6 +46,7 @@ struct evdev_client {
+ 	struct fasync_struct *fasync;
+ 	struct evdev *evdev;
+ 	struct list_head node;
++	struct rcu_head rcu;
+ 	enum input_clock_type clk_type;
+ 	bool revoked;
+ 	unsigned long *evmasks[EV_CNT];
+@@ -377,13 +378,22 @@ static void evdev_attach_client(struct evdev *evdev,
+ 	spin_unlock(&evdev->client_lock);
+ }
+ 
++static void evdev_reclaim_client(struct rcu_head *rp)
++{
++	struct evdev_client *client = container_of(rp, struct evdev_client, rcu);
++	unsigned int i;
++	for (i = 0; i < EV_CNT; ++i)
++		bitmap_free(client->evmasks[i]);
++	kvfree(client);
++}
++
+ static void evdev_detach_client(struct evdev *evdev,
+ 				struct evdev_client *client)
+ {
+ 	spin_lock(&evdev->client_lock);
+ 	list_del_rcu(&client->node);
+ 	spin_unlock(&evdev->client_lock);
+-	synchronize_rcu();
++	call_rcu(&client->rcu, evdev_reclaim_client);
+ }
+ 
+ static int evdev_open_device(struct evdev *evdev)
+@@ -436,7 +446,6 @@ static int evdev_release(struct inode *inode, struct file *file)
+ {
+ 	struct evdev_client *client = file->private_data;
+ 	struct evdev *evdev = client->evdev;
+-	unsigned int i;
+ 
+ 	mutex_lock(&evdev->mutex);
+ 
+@@ -448,11 +457,6 @@ static int evdev_release(struct inode *inode, struct file *file)
+ 
+ 	evdev_detach_client(evdev, client);
+ 
+-	for (i = 0; i < EV_CNT; ++i)
+-		bitmap_free(client->evmasks[i]);
+-
+-	kvfree(client);
+-
+ 	evdev_close_device(evdev);
+ 
+ 	return 0;
+@@ -495,7 +499,6 @@ static int evdev_open(struct inode *inode, struct file *file)
+ 
+  err_free_client:
+ 	evdev_detach_client(evdev, client);
+-	kvfree(client);
+ 	return error;
+ }
+ 
 diff --git a/drivers/md/dm-crypt.c b/drivers/md/dm-crypt.c
 index 2ae8560b6a14..a6083da0b73a 100644
 --- a/drivers/md/dm-crypt.c
@@ -12850,7 +13707,7 @@ index 10917c3e1f03..458360cf9bfb 100644
  	if (err)
  		goto bad_unshare_out;
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index d7a3c63a2171..6c58fda40043 100644
+index 4182fb118ce9..dfa4630fea3d 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -73,10 +73,19 @@ unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
@@ -12886,6 +13743,19 @@ index d7a3c63a2171..6c58fda40043 100644
  
  #ifdef CONFIG_NUMA_BALANCING
  /* Restrict the NUMA promotion throughput (MB/s) for each target node. */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 2e5a95486a42..dabb52655144 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2499,7 +2499,7 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+ 
+ extern void wakeup_preempt(struct rq *rq, struct task_struct *p, int flags);
+ 
+-#ifdef CONFIG_PREEMPT_RT
++#if defined(CONFIG_PREEMPT_RT) || defined(CONFIG_CACHY)
+ #define SCHED_NR_MIGRATE_BREAK 8
+ #else
+ #define SCHED_NR_MIGRATE_BREAK 32
 diff --git a/kernel/sysctl.c b/kernel/sysctl.c
 index 157f7ce2942d..c92d8a4b23fb 100644
 --- a/kernel/sysctl.c
@@ -12947,6 +13817,38 @@ index 57cd378c73d6..7dad3be1972a 100644
  	default 1
  
  #
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 01ba298739dd..1a9208d5432b 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -1808,7 +1808,11 @@ static int sysctl_compact_unevictable_allowed __read_mostly = CONFIG_COMPACT_UNE
+  * aggressively the kernel should compact memory in the
+  * background. It takes values in the range [0, 100].
+  */
++#ifdef CONFIG_CACHY
++static unsigned int __read_mostly sysctl_compaction_proactiveness;
++#else
+ static unsigned int __read_mostly sysctl_compaction_proactiveness = 20;
++#endif
+ static int sysctl_extfrag_threshold = 500;
+ static int __read_mostly sysctl_compact_memory;
+ 
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 86ee29b5c39c..6bf88a632509 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -61,7 +61,11 @@ unsigned long transparent_hugepage_flags __read_mostly =
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE_MADVISE
+ 	(1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG)|
+ #endif
++#ifdef CONFIG_CACHY
++	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_OR_MADV_FLAG)|
++#else
+ 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG)|
++#endif
+ 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG)|
+ 	(1<<TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG);
+ 
 diff --git a/mm/page-writeback.c b/mm/page-writeback.c
 index 05e5c425b3ff..b9e83e14050c 100644
 --- a/mm/page-writeback.c
@@ -12975,6 +13877,72 @@ index 05e5c425b3ff..b9e83e14050c 100644
  
  EXPORT_SYMBOL_GPL(dirty_writeback_interval);
  
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 733732e7e0ba..0ba67045d37c 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -287,7 +287,11 @@ const char * const migratetype_names[MIGRATE_TYPES] = {
+ 
+ int min_free_kbytes = 1024;
+ int user_min_free_kbytes = -1;
++#ifdef CONFIG_CACHY
++static int watermark_boost_factor __read_mostly;
++#else
+ static int watermark_boost_factor __read_mostly = 15000;
++#endif
+ static int watermark_scale_factor = 10;
+ 
+ /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
+@@ -2117,16 +2121,17 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
+ }
+ 
+ /*
+- * Obtain a specified number of elements from the buddy allocator, all under
+- * a single hold of the lock, for efficiency.  Add them to the supplied list.
+- * Returns the number of new pages which were placed at *list.
++ * Obtain a specified number of elements from the buddy allocator, and relax the
++ * zone lock when needed. Add them to the supplied list. Returns the number of
++ * new pages which were placed at *list.
+  */
+ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 			unsigned long count, struct list_head *list,
+ 			int migratetype, unsigned int alloc_flags)
+ {
++	const bool can_resched = !preempt_count() && !irqs_disabled();
+ 	unsigned long flags;
+-	int i;
++	int i, last_mod = 0;
+ 
+ 	spin_lock_irqsave(&zone->lock, flags);
+ 	for (i = 0; i < count; ++i) {
+@@ -2135,6 +2140,18 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 		if (unlikely(page == NULL))
+ 			break;
+ 
++		/* Reschedule and ease the contention on the lock if needed */
++		if (i + 1 < count && ((can_resched && need_resched()) ||
++				      spin_needbreak(&zone->lock))) {
++			__mod_zone_page_state(zone, NR_FREE_PAGES,
++					      -((i + 1 - last_mod) << order));
++			last_mod = i + 1;
++			spin_unlock_irqrestore(&zone->lock, flags);
++			if (can_resched)
++				cond_resched();
++			spin_lock_irqsave(&zone->lock, flags);
++		}
++
+ 		/*
+ 		 * Split buddy pages returned by expand() are received here in
+ 		 * physical page order. The page is added to the tail of
+@@ -2151,7 +2168,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 					      -(1 << order));
+ 	}
+ 
+-	__mod_zone_page_state(zone, NR_FREE_PAGES, -(i << order));
++	__mod_zone_page_state(zone, NR_FREE_PAGES, -((i - last_mod) << order));
+ 	spin_unlock_irqrestore(&zone->lock, flags);
+ 
+ 	return i;
 diff --git a/mm/swap.c b/mm/swap.c
 index cd8f0150ba3a..42c405a4f114 100644
 --- a/mm/swap.c
@@ -13043,10 +14011,10 @@ index bba207f41b14..b2ddacafa857 100644
 -- 
 2.43.0
 
-From bb8c68f17c375ce8ade03071dfadc822cc9ef880 Mon Sep 17 00:00:00 2001
+From 33495b8357186d27d7c08c274eaa05fb7c473635 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 20 Jan 2024 13:53:08 +0100
-Subject: [PATCH 4/7] fixes
+Date: Fri, 26 Jan 2024 11:07:29 +0100
+Subject: [PATCH 5/7] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -13066,13 +14034,9 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  drivers/net/wireless/ath/ath11k/debugfs.c     |   25 +-
  drivers/net/wireless/ath/ath11k/debugfs.h     |   12 +-
  drivers/net/wireless/ath/ath11k/mac.c         |   12 +-
- include/linux/nodemask.h                      |  120 +-
  include/linux/pageblock-flags.h               |    2 +-
  kernel/padata.c                               |    4 +-
- kernel/smp.c                                  |    2 +-
- mm/page_alloc.c                               |    2 +-
- mm/readahead.c                                |   10 +-
- 22 files changed, 1618 insertions(+), 99 deletions(-)
+ 18 files changed, 1519 insertions(+), 64 deletions(-)
  create mode 100644 Documentation/ABI/testing/sysfs-class-led-trigger-blkdev
  create mode 100644 Documentation/leds/ledtrig-blkdev.rst
  create mode 100644 drivers/leds/trigger/ledtrig-blkdev.c
@@ -14862,338 +15826,6 @@ index 7f7b39817773..6acf11fafb22 100644
  	.sta_add_debugfs		= ath11k_debugfs_sta_op_add,
  #endif
  
-diff --git a/include/linux/nodemask.h b/include/linux/nodemask.h
-index 8d07116caaf1..72a8d967d5fa 100644
---- a/include/linux/nodemask.h
-+++ b/include/linux/nodemask.h
-@@ -99,6 +99,47 @@
- typedef struct { DECLARE_BITMAP(bits, MAX_NUMNODES); } nodemask_t;
- extern nodemask_t _unused_nodemask_arg_;
- 
-+#if MAX_NUMNODES > 1
-+extern unsigned int nr_node_ids;
-+#else
-+#define nr_node_ids		1U
-+#endif
-+
-+/*
-+ * We have several different "preferred sizes" for the nodemask operations,
-+ * depending on operation.
-+ *
-+ * For example, the bitmap scanning and operating operations have optimized
-+ * routines that work for the single-word case, but only when the size is
-+ * constant. So if MAX_NUMNODES fits in one single word, we are better off
-+ * using that small constant, in order to trigger the optimized bit finding.
-+ * That is 'small_nodemask_size'.
-+ *
-+ * The clearing and copying operations will similarly perform better with a
-+ * constant size, but we limit that size arbitrarily to four words. We call
-+ * this 'large_nodemask_size'.
-+ *
-+ * Finally, some operations just want the exact limit, either because they set
-+ * bits or just don't have any faster fixed-sized versions. We call this just
-+ * 'nr_node_ids'.
-+ *
-+ * Note that these optional constants are always guaranteed to be at least as
-+ * big as 'nr_node_ids' itself is, and all our nodemask allocations are at
-+ * least that size. The optimization comes from being able to potentially use
-+ * a compile-time constant instead of a run-time generated exact number of
-+ * nodes.
-+ */
-+#if MAX_NUMNODES <= BITS_PER_LONG
-+  #define small_nodemask_bits ((unsigned int)MAX_NUMNODES)
-+  #define large_nodemask_bits ((unsigned int)MAX_NUMNODES)
-+#elif MAX_NUMNODES <= 4*BITS_PER_LONG
-+  #define small_nodemask_bits nr_node_ids
-+  #define large_nodemask_bits ((unsigned int)MAX_NUMNODES)
-+#else
-+  #define small_nodemask_bits nr_node_ids
-+  #define large_nodemask_bits nr_node_ids
-+#endif
-+
- /**
-  * nodemask_pr_args - printf args to output a nodemask
-  * @maskp: nodemask to be printed
-@@ -109,7 +150,7 @@ extern nodemask_t _unused_nodemask_arg_;
- 				__nodemask_pr_bits(maskp)
- static inline unsigned int __nodemask_pr_numnodes(const nodemask_t *m)
- {
--	return m ? MAX_NUMNODES : 0;
-+	return m ? nr_node_ids : 0;
- }
- static inline const unsigned long *__nodemask_pr_bits(const nodemask_t *m)
- {
-@@ -137,13 +178,13 @@ static inline void __node_clear(int node, volatile nodemask_t *dstp)
- 	clear_bit(node, dstp->bits);
- }
- 
--#define nodes_setall(dst) __nodes_setall(&(dst), MAX_NUMNODES)
-+#define nodes_setall(dst) __nodes_setall(&(dst), large_nodemask_bits)
- static inline void __nodes_setall(nodemask_t *dstp, unsigned int nbits)
- {
- 	bitmap_fill(dstp->bits, nbits);
- }
- 
--#define nodes_clear(dst) __nodes_clear(&(dst), MAX_NUMNODES)
-+#define nodes_clear(dst) __nodes_clear(&(dst), large_nodemask_bits)
- static inline void __nodes_clear(nodemask_t *dstp, unsigned int nbits)
- {
- 	bitmap_zero(dstp->bits, nbits);
-@@ -160,7 +201,7 @@ static inline bool __node_test_and_set(int node, nodemask_t *addr)
- }
- 
- #define nodes_and(dst, src1, src2) \
--			__nodes_and(&(dst), &(src1), &(src2), MAX_NUMNODES)
-+			__nodes_and(&(dst), &(src1), &(src2), small_nodemask_bits)
- static inline void __nodes_and(nodemask_t *dstp, const nodemask_t *src1p,
- 					const nodemask_t *src2p, unsigned int nbits)
- {
-@@ -168,7 +209,7 @@ static inline void __nodes_and(nodemask_t *dstp, const nodemask_t *src1p,
- }
- 
- #define nodes_or(dst, src1, src2) \
--			__nodes_or(&(dst), &(src1), &(src2), MAX_NUMNODES)
-+			__nodes_or(&(dst), &(src1), &(src2), small_nodemask_bits)
- static inline void __nodes_or(nodemask_t *dstp, const nodemask_t *src1p,
- 					const nodemask_t *src2p, unsigned int nbits)
- {
-@@ -176,7 +217,7 @@ static inline void __nodes_or(nodemask_t *dstp, const nodemask_t *src1p,
- }
- 
- #define nodes_xor(dst, src1, src2) \
--			__nodes_xor(&(dst), &(src1), &(src2), MAX_NUMNODES)
-+			__nodes_xor(&(dst), &(src1), &(src2), small_nodemask_bits)
- static inline void __nodes_xor(nodemask_t *dstp, const nodemask_t *src1p,
- 					const nodemask_t *src2p, unsigned int nbits)
- {
-@@ -184,7 +225,7 @@ static inline void __nodes_xor(nodemask_t *dstp, const nodemask_t *src1p,
- }
- 
- #define nodes_andnot(dst, src1, src2) \
--			__nodes_andnot(&(dst), &(src1), &(src2), MAX_NUMNODES)
-+			__nodes_andnot(&(dst), &(src1), &(src2), small_nodemask_bits)
- static inline void __nodes_andnot(nodemask_t *dstp, const nodemask_t *src1p,
- 					const nodemask_t *src2p, unsigned int nbits)
- {
-@@ -192,7 +233,7 @@ static inline void __nodes_andnot(nodemask_t *dstp, const nodemask_t *src1p,
- }
- 
- #define nodes_complement(dst, src) \
--			__nodes_complement(&(dst), &(src), MAX_NUMNODES)
-+			__nodes_complement(&(dst), &(src), small_nodemask_bits)
- static inline void __nodes_complement(nodemask_t *dstp,
- 					const nodemask_t *srcp, unsigned int nbits)
- {
-@@ -200,7 +241,7 @@ static inline void __nodes_complement(nodemask_t *dstp,
- }
- 
- #define nodes_equal(src1, src2) \
--			__nodes_equal(&(src1), &(src2), MAX_NUMNODES)
-+			__nodes_equal(&(src1), &(src2), small_nodemask_bits)
- static inline bool __nodes_equal(const nodemask_t *src1p,
- 					const nodemask_t *src2p, unsigned int nbits)
- {
-@@ -208,7 +249,7 @@ static inline bool __nodes_equal(const nodemask_t *src1p,
- }
- 
- #define nodes_intersects(src1, src2) \
--			__nodes_intersects(&(src1), &(src2), MAX_NUMNODES)
-+			__nodes_intersects(&(src1), &(src2), small_nodemask_bits)
- static inline bool __nodes_intersects(const nodemask_t *src1p,
- 					const nodemask_t *src2p, unsigned int nbits)
- {
-@@ -216,33 +257,33 @@ static inline bool __nodes_intersects(const nodemask_t *src1p,
- }
- 
- #define nodes_subset(src1, src2) \
--			__nodes_subset(&(src1), &(src2), MAX_NUMNODES)
-+			__nodes_subset(&(src1), &(src2), small_nodemask_bits)
- static inline bool __nodes_subset(const nodemask_t *src1p,
- 					const nodemask_t *src2p, unsigned int nbits)
- {
- 	return bitmap_subset(src1p->bits, src2p->bits, nbits);
- }
- 
--#define nodes_empty(src) __nodes_empty(&(src), MAX_NUMNODES)
-+#define nodes_empty(src) __nodes_empty(&(src), small_nodemask_bits)
- static inline bool __nodes_empty(const nodemask_t *srcp, unsigned int nbits)
- {
- 	return bitmap_empty(srcp->bits, nbits);
- }
- 
--#define nodes_full(nodemask) __nodes_full(&(nodemask), MAX_NUMNODES)
-+#define nodes_full(nodemask) __nodes_full(&(nodemask), small_nodemask_bits)
- static inline bool __nodes_full(const nodemask_t *srcp, unsigned int nbits)
- {
- 	return bitmap_full(srcp->bits, nbits);
- }
- 
--#define nodes_weight(nodemask) __nodes_weight(&(nodemask), MAX_NUMNODES)
-+#define nodes_weight(nodemask) __nodes_weight(&(nodemask), small_nodemask_bits)
- static inline int __nodes_weight(const nodemask_t *srcp, unsigned int nbits)
- {
- 	return bitmap_weight(srcp->bits, nbits);
- }
- 
- #define nodes_shift_right(dst, src, n) \
--			__nodes_shift_right(&(dst), &(src), (n), MAX_NUMNODES)
-+			__nodes_shift_right(&(dst), &(src), (n), small_nodemask_bits)
- static inline void __nodes_shift_right(nodemask_t *dstp,
- 					const nodemask_t *srcp, int n, int nbits)
- {
-@@ -250,26 +291,38 @@ static inline void __nodes_shift_right(nodemask_t *dstp,
- }
- 
- #define nodes_shift_left(dst, src, n) \
--			__nodes_shift_left(&(dst), &(src), (n), MAX_NUMNODES)
-+			__nodes_shift_left(&(dst), &(src), (n), small_nodemask_bits)
- static inline void __nodes_shift_left(nodemask_t *dstp,
- 					const nodemask_t *srcp, int n, int nbits)
- {
- 	bitmap_shift_left(dstp->bits, srcp->bits, n, nbits);
- }
- 
--/* FIXME: better would be to fix all architectures to never return
--          > MAX_NUMNODES, then the silly min_ts could be dropped. */
-+/*
-+ * FIXME: audit tree to move end-of-nodemask to >= nr_node_ids;
-+ *        for now, map it to >= MAX_NUMNODES.
-+ */
- 
- #define first_node(src) __first_node(&(src))
- static inline unsigned int __first_node(const nodemask_t *srcp)
- {
--	return min_t(unsigned int, MAX_NUMNODES, find_first_bit(srcp->bits, MAX_NUMNODES));
-+	unsigned int bit = find_first_bit(srcp->bits, small_nodemask_bits);
-+
-+	if (bit >= nr_node_ids)
-+		bit = MAX_NUMNODES;
-+
-+	return bit;
- }
- 
- #define next_node(n, src) __next_node((n), &(src))
- static inline unsigned int __next_node(int n, const nodemask_t *srcp)
- {
--	return min_t(unsigned int, MAX_NUMNODES, find_next_bit(srcp->bits, MAX_NUMNODES, n+1));
-+	unsigned int bit = find_next_bit(srcp->bits, small_nodemask_bits, n+1);
-+
-+	if (bit >= nr_node_ids)
-+		bit = MAX_NUMNODES;
-+
-+	return bit;
- }
- 
- /*
-@@ -283,6 +336,7 @@ static inline unsigned int __next_node_in(int node, const nodemask_t *srcp)
- 
- 	if (ret == MAX_NUMNODES)
- 		ret = __first_node(srcp);
-+
- 	return ret;
- }
- 
-@@ -306,8 +360,12 @@ static inline void init_nodemask_of_node(nodemask_t *mask, int node)
- #define first_unset_node(mask) __first_unset_node(&(mask))
- static inline unsigned int __first_unset_node(const nodemask_t *maskp)
- {
--	return min_t(unsigned int, MAX_NUMNODES,
--			find_first_zero_bit(maskp->bits, MAX_NUMNODES));
-+	unsigned int bit = find_first_zero_bit(maskp->bits, small_nodemask_bits);
-+
-+	if (bit >= nr_node_ids)
-+		bit = MAX_NUMNODES;
-+
-+	return bit;
- }
- 
- #define NODE_MASK_LAST_WORD BITMAP_LAST_WORD_MASK(MAX_NUMNODES)
-@@ -337,21 +395,21 @@ static inline unsigned int __first_unset_node(const nodemask_t *maskp)
- #define nodes_addr(src) ((src).bits)
- 
- #define nodemask_parse_user(ubuf, ulen, dst) \
--		__nodemask_parse_user((ubuf), (ulen), &(dst), MAX_NUMNODES)
-+		__nodemask_parse_user((ubuf), (ulen), &(dst), nr_node_ids)
- static inline int __nodemask_parse_user(const char __user *buf, int len,
- 					nodemask_t *dstp, int nbits)
- {
- 	return bitmap_parse_user(buf, len, dstp->bits, nbits);
- }
- 
--#define nodelist_parse(buf, dst) __nodelist_parse((buf), &(dst), MAX_NUMNODES)
-+#define nodelist_parse(buf, dst) __nodelist_parse((buf), &(dst), nr_node_ids)
- static inline int __nodelist_parse(const char *buf, nodemask_t *dstp, int nbits)
- {
- 	return bitmap_parselist(buf, dstp->bits, nbits);
- }
- 
- #define node_remap(oldbit, old, new) \
--		__node_remap((oldbit), &(old), &(new), MAX_NUMNODES)
-+		__node_remap((oldbit), &(old), &(new), nr_node_ids)
- static inline int __node_remap(int oldbit,
- 		const nodemask_t *oldp, const nodemask_t *newp, int nbits)
- {
-@@ -359,7 +417,7 @@ static inline int __node_remap(int oldbit,
- }
- 
- #define nodes_remap(dst, src, old, new) \
--		__nodes_remap(&(dst), &(src), &(old), &(new), MAX_NUMNODES)
-+		__nodes_remap(&(dst), &(src), &(old), &(new), nr_node_ids)
- static inline void __nodes_remap(nodemask_t *dstp, const nodemask_t *srcp,
- 		const nodemask_t *oldp, const nodemask_t *newp, int nbits)
- {
-@@ -367,7 +425,7 @@ static inline void __nodes_remap(nodemask_t *dstp, const nodemask_t *srcp,
- }
- 
- #define nodes_onto(dst, orig, relmap) \
--		__nodes_onto(&(dst), &(orig), &(relmap), MAX_NUMNODES)
-+		__nodes_onto(&(dst), &(orig), &(relmap), nr_node_ids)
- static inline void __nodes_onto(nodemask_t *dstp, const nodemask_t *origp,
- 		const nodemask_t *relmapp, int nbits)
- {
-@@ -375,7 +433,7 @@ static inline void __nodes_onto(nodemask_t *dstp, const nodemask_t *origp,
- }
- 
- #define nodes_fold(dst, orig, sz) \
--		__nodes_fold(&(dst), &(orig), sz, MAX_NUMNODES)
-+		__nodes_fold(&(dst), &(orig), sz, nr_node_ids)
- static inline void __nodes_fold(nodemask_t *dstp, const nodemask_t *origp,
- 		int sz, int nbits)
- {
-@@ -385,7 +443,7 @@ static inline void __nodes_fold(nodemask_t *dstp, const nodemask_t *origp,
- #if MAX_NUMNODES > 1
- #define for_each_node_mask(node, mask)				    \
- 	for ((node) = first_node(mask);				    \
--	     (node) < MAX_NUMNODES;				    \
-+	     (node) < nr_node_ids;				    \
- 	     (node) = next_node((node), (mask)))
- #else /* MAX_NUMNODES == 1 */
- #define for_each_node_mask(node, mask)                                  \
-@@ -452,7 +510,6 @@ static inline unsigned int next_memory_node(int nid)
- 	return next_node(nid, node_states[N_MEMORY]);
- }
- 
--extern unsigned int nr_node_ids;
- extern unsigned int nr_online_nodes;
- 
- static inline void node_set_online(int nid)
-@@ -494,7 +551,6 @@ static inline int num_node_state(enum node_states state)
- #define first_memory_node	0
- #define next_online_node(nid)	(MAX_NUMNODES)
- #define next_memory_node(nid)	(MAX_NUMNODES)
--#define nr_node_ids		1U
- #define nr_online_nodes		1U
- 
- #define node_set_online(node)	   node_set_state((node), N_ONLINE)
-@@ -516,7 +572,7 @@ static inline int node_random(const nodemask_t *maskp)
- 		bit = first_node(*maskp);
- 		break;
- 	default:
--		bit = find_nth_bit(maskp->bits, MAX_NUMNODES, get_random_u32_below(w));
-+		bit = find_nth_bit(maskp->bits, nr_node_ids, get_random_u32_below(w));
- 		break;
- 	}
- 	return bit;
 diff --git a/include/linux/pageblock-flags.h b/include/linux/pageblock-flags.h
 index e83c4c095041..21b8dfa5d828 100644
 --- a/include/linux/pageblock-flags.h
@@ -15229,62 +15861,13 @@ index 179fb1518070..b6bb0c45d7b8 100644
  {
  	struct padata_work *pw = container_of(w, struct padata_work, pw_work);
  	struct padata_mt_job_state *ps = pw->pw_data;
-diff --git a/kernel/smp.c b/kernel/smp.c
-index f085ebcdf9e7..80ba1a8535c9 100644
---- a/kernel/smp.c
-+++ b/kernel/smp.c
-@@ -957,7 +957,7 @@ early_param("maxcpus", maxcpus);
- 
- #if (NR_CPUS > 1) && !defined(CONFIG_FORCE_NR_CPUS)
- /* Setup number of possible processor ids */
--unsigned int nr_cpu_ids __read_mostly = NR_CPUS;
-+unsigned int nr_cpu_ids __ro_after_init = NR_CPUS;
- EXPORT_SYMBOL(nr_cpu_ids);
- #endif
- 
-diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 733732e7e0ba..f9c402bec7a7 100644
---- a/mm/page_alloc.c
-+++ b/mm/page_alloc.c
-@@ -295,7 +295,7 @@ int movable_zone;
- EXPORT_SYMBOL(movable_zone);
- 
- #if MAX_NUMNODES > 1
--unsigned int nr_node_ids __read_mostly = MAX_NUMNODES;
-+unsigned int nr_node_ids __ro_after_init = MAX_NUMNODES;
- unsigned int nr_online_nodes __read_mostly = 1;
- EXPORT_SYMBOL(nr_node_ids);
- EXPORT_SYMBOL(nr_online_nodes);
-diff --git a/mm/readahead.c b/mm/readahead.c
-index 6925e6959fd3..1c1d26ad0ba5 100644
---- a/mm/readahead.c
-+++ b/mm/readahead.c
-@@ -600,9 +600,17 @@ static void ondemand_readahead(struct readahead_control *ractl,
- 				max_pages);
- 		rcu_read_unlock();
- 
--		if (!start || start - index > max_pages)
-+		if (!start || start - index - 1 > max_pages)
- 			return;
- 
-+		/*
-+		 * If no gaps in the range, page_cache_next_miss() returns
-+		 * index beyond range. Adjust it back to make sure
-+		 * ractl->_index is updated correctly later.
-+		 */
-+		if ((start - index - 1) == max_pages)
-+			start--;
-+
- 		ra->start = start;
- 		ra->size = start - index;	/* old async_size */
- 		ra->size += req_size;
 -- 
 2.43.0
 
-From 1011a75235fb7faa0e4df87867e6e4994197118f Mon Sep 17 00:00:00 2001
+From f6747891bd7401f5f8ace7d8e8fb24507a960cd0 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 20 Jan 2024 13:54:18 +0100
-Subject: [PATCH 5/7] ksm
+Date: Fri, 26 Jan 2024 11:07:57 +0100
+Subject: [PATCH 6/7] ksm
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -15721,386 +16304,9 @@ index 9a846439b36a..30962445ad3a 100644
 -- 
 2.43.0
 
-From 6731d7f5503bdbb0b381ba1093e1bd5d0d51130d Mon Sep 17 00:00:00 2001
+From 6cf3b805445f7ee074306037e414174f7fa68244 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 20 Jan 2024 13:54:34 +0100
-Subject: [PATCH 6/7] sched
-
-Signed-off-by: Peter Jung <admin@ptr1337.dev>
----
- include/linux/sched.h |   2 +-
- kernel/sched/debug.c  |  11 ++-
- kernel/sched/fair.c   | 180 ++++++++++++++++++------------------------
- kernel/sched/sched.h  |   1 +
- 4 files changed, 87 insertions(+), 107 deletions(-)
-
-diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 292c31697248..cd56d4018527 100644
---- a/include/linux/sched.h
-+++ b/include/linux/sched.h
-@@ -553,7 +553,7 @@ struct sched_entity {
- 	struct load_weight		load;
- 	struct rb_node			run_node;
- 	u64				deadline;
--	u64				min_deadline;
-+	u64				min_vruntime;
- 
- 	struct list_head		group_node;
- 	unsigned int			on_rq;
-diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
-index 4580a450700e..168eecc209b4 100644
---- a/kernel/sched/debug.c
-+++ b/kernel/sched/debug.c
-@@ -628,8 +628,8 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
- 
- void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
- {
--	s64 left_vruntime = -1, min_vruntime, right_vruntime = -1, spread;
--	struct sched_entity *last, *first;
-+	s64 left_vruntime = -1, min_vruntime, right_vruntime = -1, left_deadline = -1, spread;
-+	struct sched_entity *last, *first, *root;
- 	struct rq *rq = cpu_rq(cpu);
- 	unsigned long flags;
- 
-@@ -644,15 +644,20 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
- 			SPLIT_NS(cfs_rq->exec_clock));
- 
- 	raw_spin_rq_lock_irqsave(rq, flags);
-+	root = __pick_root_entity(cfs_rq);
-+	if (root)
-+		left_vruntime = root->min_vruntime;
- 	first = __pick_first_entity(cfs_rq);
- 	if (first)
--		left_vruntime = first->vruntime;
-+		left_deadline = first->deadline;
- 	last = __pick_last_entity(cfs_rq);
- 	if (last)
- 		right_vruntime = last->vruntime;
- 	min_vruntime = cfs_rq->min_vruntime;
- 	raw_spin_rq_unlock_irqrestore(rq, flags);
- 
-+	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_deadline",
-+			SPLIT_NS(left_deadline));
- 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_vruntime",
- 			SPLIT_NS(left_vruntime));
- 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "min_vruntime",
-diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 6c58fda40043..b847c887d7c5 100644
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -564,7 +564,11 @@ static inline u64 min_vruntime(u64 min_vruntime, u64 vruntime)
- static inline bool entity_before(const struct sched_entity *a,
- 				 const struct sched_entity *b)
- {
--	return (s64)(a->vruntime - b->vruntime) < 0;
-+	/*
-+	 * Tiebreak on vruntime seems unnecessary since it can
-+	 * hardly happen.
-+	 */
-+	return (s64)(a->deadline - b->deadline) < 0;
- }
- 
- static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
-@@ -733,7 +737,7 @@ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
-  * Note: using 'avg_vruntime() > se->vruntime' is inacurate due
-  *       to the loss in precision caused by the division.
-  */
--int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
-+static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
- {
- 	struct sched_entity *curr = cfs_rq->curr;
- 	s64 avg = cfs_rq->avg_vruntime;
-@@ -746,7 +750,12 @@ int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
- 		load += weight;
- 	}
- 
--	return avg >= entity_key(cfs_rq, se) * load;
-+	return avg >= (s64)(vruntime - cfs_rq->min_vruntime) * load;
-+}
-+
-+int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
-+{
-+	return vruntime_eligible(cfs_rq, se->vruntime);
- }
- 
- static u64 __update_min_vruntime(struct cfs_rq *cfs_rq, u64 vruntime)
-@@ -765,9 +774,8 @@ static u64 __update_min_vruntime(struct cfs_rq *cfs_rq, u64 vruntime)
- 
- static void update_min_vruntime(struct cfs_rq *cfs_rq)
- {
--	struct sched_entity *se = __pick_first_entity(cfs_rq);
-+	struct sched_entity *se = __pick_root_entity(cfs_rq);
- 	struct sched_entity *curr = cfs_rq->curr;
--
- 	u64 vruntime = cfs_rq->min_vruntime;
- 
- 	if (curr) {
-@@ -779,9 +787,9 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
- 
- 	if (se) {
- 		if (!curr)
--			vruntime = se->vruntime;
-+			vruntime = se->min_vruntime;
- 		else
--			vruntime = min_vruntime(vruntime, se->vruntime);
-+			vruntime = min_vruntime(vruntime, se->min_vruntime);
- 	}
- 
- 	/* ensure we never gain time by being placed backwards. */
-@@ -794,34 +802,34 @@ static inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
- 	return entity_before(__node_2_se(a), __node_2_se(b));
- }
- 
--#define deadline_gt(field, lse, rse) ({ (s64)((lse)->field - (rse)->field) > 0; })
-+#define vruntime_gt(field, lse, rse) ({ (s64)((lse)->field - (rse)->field) > 0; })
- 
--static inline void __update_min_deadline(struct sched_entity *se, struct rb_node *node)
-+static inline void __min_vruntime_update(struct sched_entity *se, struct rb_node *node)
- {
- 	if (node) {
- 		struct sched_entity *rse = __node_2_se(node);
--		if (deadline_gt(min_deadline, se, rse))
--			se->min_deadline = rse->min_deadline;
-+		if (vruntime_gt(min_vruntime, se, rse))
-+			se->min_vruntime = rse->min_vruntime;
- 	}
- }
- 
- /*
-- * se->min_deadline = min(se->deadline, left->min_deadline, right->min_deadline)
-+ * se->min_vruntime = min(se->vruntime, {left,right}->min_vruntime)
-  */
--static inline bool min_deadline_update(struct sched_entity *se, bool exit)
-+static inline bool min_vruntime_update(struct sched_entity *se, bool exit)
- {
--	u64 old_min_deadline = se->min_deadline;
-+	u64 old_min_vruntime = se->min_vruntime;
- 	struct rb_node *node = &se->run_node;
- 
--	se->min_deadline = se->deadline;
--	__update_min_deadline(se, node->rb_right);
--	__update_min_deadline(se, node->rb_left);
-+	se->min_vruntime = se->vruntime;
-+	__min_vruntime_update(se, node->rb_right);
-+	__min_vruntime_update(se, node->rb_left);
- 
--	return se->min_deadline == old_min_deadline;
-+	return se->min_vruntime == old_min_vruntime;
- }
- 
--RB_DECLARE_CALLBACKS(static, min_deadline_cb, struct sched_entity,
--		     run_node, min_deadline, min_deadline_update);
-+RB_DECLARE_CALLBACKS(static, min_vruntime_cb, struct sched_entity,
-+		     run_node, min_vruntime, min_vruntime_update);
- 
- /*
-  * Enqueue an entity into the rb-tree:
-@@ -829,18 +837,28 @@ RB_DECLARE_CALLBACKS(static, min_deadline_cb, struct sched_entity,
- static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
- {
- 	avg_vruntime_add(cfs_rq, se);
--	se->min_deadline = se->deadline;
-+	se->min_vruntime = se->vruntime;
- 	rb_add_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
--				__entity_less, &min_deadline_cb);
-+				__entity_less, &min_vruntime_cb);
- }
- 
- static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
- {
- 	rb_erase_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
--				  &min_deadline_cb);
-+				  &min_vruntime_cb);
- 	avg_vruntime_sub(cfs_rq, se);
- }
- 
-+struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq)
-+{
-+	struct rb_node *root = cfs_rq->tasks_timeline.rb_root.rb_node;
-+
-+	if (!root)
-+		return NULL;
-+
-+	return __node_2_se(root);
-+}
-+
- struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
- {
- 	struct rb_node *left = rb_first_cached(&cfs_rq->tasks_timeline);
-@@ -863,23 +881,29 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
-  *     with the earliest virtual deadline.
-  *
-  * We can do this in O(log n) time due to an augmented RB-tree. The
-- * tree keeps the entries sorted on service, but also functions as a
-- * heap based on the deadline by keeping:
-+ * tree keeps the entries sorted on deadline, but also functions as a
-+ * heap based on the vruntime by keeping:
-  *
-- *  se->min_deadline = min(se->deadline, se->{left,right}->min_deadline)
-+ *  se->min_vruntime = min(se->vruntime, se->{left,right}->min_vruntime)
-  *
-- * Which allows an EDF like search on (sub)trees.
-+ * Which allows tree pruning through eligibility.
-  */
--static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq)
-+static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
- {
- 	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
-+	struct sched_entity *se = __pick_first_entity(cfs_rq);
- 	struct sched_entity *curr = cfs_rq->curr;
- 	struct sched_entity *best = NULL;
--	struct sched_entity *best_left = NULL;
-+
-+	/*
-+	 * We can safely skip eligibility check if there is only one entity
-+	 * in this cfs_rq, saving some cycles.
-+	 */
-+	if (cfs_rq->nr_running == 1)
-+		return curr && curr->on_rq ? curr : se;
- 
- 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
- 		curr = NULL;
--	best = curr;
- 
- 	/*
- 	 * Once selected, run a task until it either becomes non-eligible or
-@@ -888,95 +912,45 @@ static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq)
- 	if (sched_feat(RUN_TO_PARITY) && curr && curr->vlag == curr->deadline)
- 		return curr;
- 
-+	/* Pick the leftmost entity if it's eligible */
-+	if (se && entity_eligible(cfs_rq, se)) {
-+		best = se;
-+		goto found;
-+	}
-+
-+	/* Heap search for the EEVD entity */
- 	while (node) {
--		struct sched_entity *se = __node_2_se(node);
-+		struct rb_node *left = node->rb_left;
- 
- 		/*
--		 * If this entity is not eligible, try the left subtree.
-+		 * Eligible entities in left subtree are always better
-+		 * choices, since they have earlier deadlines.
- 		 */
--		if (!entity_eligible(cfs_rq, se)) {
--			node = node->rb_left;
-+		if (left && vruntime_eligible(cfs_rq,
-+					__node_2_se(left)->min_vruntime)) {
-+			node = left;
- 			continue;
- 		}
- 
--		/*
--		 * Now we heap search eligible trees for the best (min_)deadline
--		 */
--		if (!best || deadline_gt(deadline, best, se))
--			best = se;
-+		se = __node_2_se(node);
- 
- 		/*
--		 * Every se in a left branch is eligible, keep track of the
--		 * branch with the best min_deadline
-+		 * The left subtree either is empty or has no eligible
-+		 * entity, so check the current node since it is the one
-+		 * with earliest deadline that might be eligible.
- 		 */
--		if (node->rb_left) {
--			struct sched_entity *left = __node_2_se(node->rb_left);
--
--			if (!best_left || deadline_gt(min_deadline, best_left, left))
--				best_left = left;
--
--			/*
--			 * min_deadline is in the left branch. rb_left and all
--			 * descendants are eligible, so immediately switch to the second
--			 * loop.
--			 */
--			if (left->min_deadline == se->min_deadline)
--				break;
--		}
--
--		/* min_deadline is at this node, no need to look right */
--		if (se->deadline == se->min_deadline)
-+		if (entity_eligible(cfs_rq, se)) {
-+			best = se;
- 			break;
--
--		/* else min_deadline is in the right branch. */
--		node = node->rb_right;
--	}
--
--	/*
--	 * We ran into an eligible node which is itself the best.
--	 * (Or nr_running == 0 and both are NULL)
--	 */
--	if (!best_left || (s64)(best_left->min_deadline - best->deadline) > 0)
--		return best;
--
--	/*
--	 * Now best_left and all of its children are eligible, and we are just
--	 * looking for deadline == min_deadline
--	 */
--	node = &best_left->run_node;
--	while (node) {
--		struct sched_entity *se = __node_2_se(node);
--
--		/* min_deadline is the current node */
--		if (se->deadline == se->min_deadline)
--			return se;
--
--		/* min_deadline is in the left branch */
--		if (node->rb_left &&
--		    __node_2_se(node->rb_left)->min_deadline == se->min_deadline) {
--			node = node->rb_left;
--			continue;
- 		}
- 
--		/* else min_deadline is in the right branch */
- 		node = node->rb_right;
- 	}
--	return NULL;
--}
--
--static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
--{
--	struct sched_entity *se = __pick_eevdf(cfs_rq);
--
--	if (!se) {
--		struct sched_entity *left = __pick_first_entity(cfs_rq);
--		if (left) {
--			pr_err("EEVDF scheduling fail, picking leftmost\n");
--			return left;
--		}
--	}
-+found:
-+	if (!best || (curr && entity_before(curr, best)))
-+		best = curr;
- 
--	return se;
-+	return best;
- }
- 
- #ifdef CONFIG_SCHED_DEBUG
-diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 2e5a95486a42..539c7e763f15 100644
---- a/kernel/sched/sched.h
-+++ b/kernel/sched/sched.h
-@@ -2822,6 +2822,7 @@ DEFINE_LOCK_GUARD_2(double_rq_lock, struct rq,
- 		    double_rq_lock(_T->lock, _T->lock2),
- 		    double_rq_unlock(_T->lock, _T->lock2))
- 
-+extern struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq);
- extern struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq);
- extern struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq);
- 
--- 
-2.43.0
-
-From a2dc5185ce93ec2a6be4ecf17efef3baf3752f6d Mon Sep 17 00:00:00 2001
-From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 20 Jan 2024 13:54:43 +0100
+Date: Fri, 26 Jan 2024 11:08:07 +0100
 Subject: [PATCH 7/7] zstd
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
