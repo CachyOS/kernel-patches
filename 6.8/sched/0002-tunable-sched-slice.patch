@@ -1,0 +1,408 @@
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH RFC] sched/eevdf: Use tunable knob sysctl_sched_base_slice
+ as explicit time quanta
+From: Ze Gao <zegao2021@gmail.com>
+Date: Thu, 11 Jan 2024 06:57:46 -0500
+Message-Id: <20240111115745.62813-2-zegao@tencent.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+AFAIS, We've overlooked what role of the concept of time quanta plays
+in EEVDF. According to Theorem 1 in [1], we have
+
+	-r_max < log_k(t) < max(r_max, q)
+
+cleary we don't want either r_max (the maximum user request) or q (time
+quanta) to be too much big.
+
+To trade for throughput, in [2] it chooses to do tick preemtion at
+per request boundary (i.e., once a cetain request is fulfilled), which
+means we literally have no concept of time quanta defined anymore.
+Obviously this is no problem if we make
+
+	q = r_i = sysctl_sched_base_slice
+
+just as exactly what we have for now, which actually creates a implict
+quanta for us and works well.
+
+However, with custom slice being possible, the lag bound is subject
+only to the distribution of users requested slices given the fact no
+time quantum is available now and we would pay the cost of losing
+many scheduling opportunities to maintain fairness and responsiveness
+due to [2]. What's worse, we may suffer unexpected unfairness and
+lantecy.
+
+For example, take two cpu bound processes with the same weight and bind
+them to the same cpu, and let process A request for 100ms whereas B
+request for 0.1ms each time (with HZ=1000, sysctl_sched_base_slice=3ms,
+nr_cpu=42).  And we can clearly see that playing with custom slice can
+actually incur unfair cpu bandwidth allocation (10706 whose request
+length is 0.1ms gets more cpu time as well as better latency compared to
+10705. Note you might see the other way around in different machines but
+the allocation inaccuracy retains, and even top can show you the
+noticeble difference in terms of cpu util by per second reporting), which
+is obviously not what we want because that would mess up the nice system
+and fairness would not hold.
+
+			stress-ng-cpu:10705	stress-ng-cpu:10706
+---------------------------------------------------------------------
+Slices(ms)		100			0.1
+Runtime(ms)		4934.206		5025.048
+Switches		58			67
+Average delay(ms)	87.074			73.863
+Maximum delay(ms)	101.998			101.010
+
+In contrast, using sysctl_sched_base_slice as the size of a 'quantum'
+in this patch gives us a better control of the allocation accuracy and
+the avg latency:
+
+			stress-ng-cpu:10584	stress-ng-cpu:10583
+---------------------------------------------------------------------
+Slices(ms)		100			0.1
+Runtime(ms)		4980.309		4981.356
+Switches		1253			1254
+Average delay(ms)	3.990			3.990
+Maximum delay(ms)	5.001			4.014
+
+Furthmore, with sysctl_sched_base_slice = 10ms, we might benefit from
+less switches at the cost of worse delay:
+
+			stress-ng-cpu:11208	stress-ng-cpu:11207
+---------------------------------------------------------------------
+Slices(ms)		100			0.1
+Runtime(ms)		4983.722		4977.035
+Switches		456			456
+Average delay(ms)	10.963			10.939
+Maximum delay(ms)	19.002			21.001
+
+By being able to tune sysctl_sched_base_slice knob, we can achieve
+the goal to strike a good balance between throughput and latency by
+adjusting the frequency of context switches, and the conclusions are
+much close to what's covered in [1] with the explicit definition of
+a time quantum. And it aslo gives more freedom to choose the eligible
+request length range(either through nice value or raw value)
+without worrying about overscheduling or underscheduling too much.
+
+Note this change should introduce no obvious regression because all
+processes have the same request length as sysctl_sched_base_slice as
+in the status quo. And the result of benchmarks proves this as well.
+
+schbench -m2 -F128 -n10	-r90	w/patch	tip/6.7-rc7
+Wakeup  (usec): 99.0th:		3028	95
+Request (usec): 99.0th:		14992	21984
+RPS    (count): 50.0th:		5864	5848
+
+hackbench -s 512 -l 200 -f 25 -P	w/patch	 tip/6.7-rc7
+-g 10 					0.212	0.223
+-g 20					0.415	0.432
+-g 30				 	0.625	0.639
+-g 40					0.852	0.858
+
+[1]: https://dl.acm.org/doi/10.5555/890606
+[2]: https://lore.kernel.org/all/20230420150537.GC4253@hirez.programming.kicks-ass.net/T/#u
+
+Signed-off-by: Ze Gao <zegao@tencent.com>
+---
+
+Hi peter,
+
+I've been attempting to figure out how eevdf works and how the
+idle of latency-nice would fit in it in future.
+
+After reading [1], code and all the disscusions you guys make, I
+find out the current implemention deliberately does not embrace
+the concept of 'time quanta' mentioned in the paper in [2] and I
+see some likely risks ( or not ?) if we are going to bring in
+custom slices ( raw value or latency nice) support by not having
+one.
+
+Getting my hand dirty gives me some experimental results and it
+shows that user specified slices can actually hurt fairness.
+
+So I decide to engage in and propose this patch to explicitly use
+the tunable knob sysctl_sched_base_slice as time quanta. The
+benchmarks shows no regression as expected though.
+
+Still this is just an immature idea and there should be things I
+am blind of or overlook. IOW I'm unsure if it is a real
+problem indeed. Hope to get some sage insights from you.
+
+Regards,
+                Ze
+ kernel/sched/fair.c | 47 +++++++++++++++++++++++++++++++++------------
+ 1 file changed, 35 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index d7a3c63a2171..1746b224595b 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -694,12 +694,13 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
+  */
+ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	s64 lag, limit;
++	s64 lag, limit, quanta;
+ 
+ 	SCHED_WARN_ON(!se->on_rq);
+ 	lag = avg_vruntime(cfs_rq) - se->vruntime;
+ 
+-	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
++	quanta = max_t(u64, TICK_NSEC, sysctl_sched_base_slice);
++	limit = calc_delta_fair(max_t(u64, 2*se->slice, quanta), se);
+ 	se->vlag = clamp(lag, -limit, limit);
+ }
+ 
+@@ -1003,25 +1004,47 @@ static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
+  */
+ static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	if ((s64)(se->vruntime - se->deadline) < 0)
+-		return;
++	u64 delta_exec;
+ 
+ 	/*
+-	 * For EEVDF the virtual time slope is determined by w_i (iow.
+-	 * nice) while the request time r_i is determined by
+-	 * sysctl_sched_base_slice.
++	 * To allow wakeup preemption to happen in time, we check to
++	 * push deadlines forward by each call.
+ 	 */
+-	se->slice = sysctl_sched_base_slice;
++	if ((s64)(se->vruntime - se->deadline) >= 0) {
++		/*
++		 * For EEVDF the virtual time slope is determined by w_i (iow.
++		 * nice) while the request time r_i is determined by
++		 * sysctl_sched_base_slice.
++		 */
++		se->slice = sysctl_sched_base_slice;
++		/*
++		 * EEVDF: vd_i = ve_i + r_i / w_i
++		 */
++		se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
++	}
++	/*
++	 * Make sysctl_sched_base_slice as the size of a 'quantum' in EEVDF
++	 * so as to avoid overscheduling or underscheduling with arbitrary
++	 * request lengths users specify.
++	 *
++	 * IOW, we now change to make scheduling decisions at per
++	 * max(TICK, sysctl_sched_base_slice) boundary.
++	 */
++	delta_exec = se->sum_exec_runtime - se->prev_sum_exec_runtime;
++	if (delta_exec < sysctl_sched_base_slice)
++		return;
+ 
+ 	/*
+-	 * EEVDF: vd_i = ve_i + r_i / w_i
++	 * We can come here with TIF_NEED_RESCHED already set from wakeup path.
++	 * Check to see if we can save a call to pick_eevdf if it's set already.
+ 	 */
+-	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
++	if (entity_is_task(se) && test_tsk_need_resched(task_of(se)))
++		return;
+ 
+ 	/*
+-	 * The task has consumed its request, reschedule.
++	 * The task has consumed a quantum, check and reschedule.
+ 	 */
+-	if (cfs_rq->nr_running > 1) {
++	if (cfs_rq->nr_running > 1 && pick_eevdf(cfs_rq) != se) {
+ 		resched_curr(rq_of(cfs_rq));
+ 		clear_buddies(cfs_rq, se);
+ 	}
+-- 
+2.41.0
+
+ include/linux/sched.h   |  3 +++
+ kernel/sched/core.c     | 33 ++++++++++++++++++++++++++-------
+ kernel/sched/debug.c    |  3 ++-
+ kernel/sched/fair.c     | 26 ++++++++++++++++++++++++--
+ kernel/sched/features.h |  1 +
+ 5 files changed, 56 insertions(+), 10 deletions(-)
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 292c31697..b821c20a4 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -558,6 +558,9 @@ struct sched_entity {
+ 	struct list_head		group_node;
+ 	unsigned int			on_rq;
+ 
++	unsigned int			custom_slice : 1;
++					/* 31 bits hole */
++
+ 	u64				exec_start;
+ 	u64				sum_exec_runtime;
+ 	u64				prev_sum_exec_runtime;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index a708d225c..ba9edcb47 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4497,7 +4497,6 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	p->se.nr_migrations		= 0;
+ 	p->se.vruntime			= 0;
+ 	p->se.vlag			= 0;
+-	p->se.slice			= sysctl_sched_base_slice;
+ 	INIT_LIST_HEAD(&p->se.group_node);
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+@@ -4751,6 +4750,8 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 
+ 		p->prio = p->normal_prio = p->static_prio;
+ 		set_load_weight(p, false);
++		p->se.custom_slice = 0;
++		p->se.slice = sysctl_sched_base_slice;
+ 
+ 		/*
+ 		 * We don't need the reset flag anymore after the fork. It has
+@@ -7564,10 +7565,20 @@ static void __setscheduler_params(struct task_struct *p,
+ 
+ 	p->policy = policy;
+ 
+-	if (dl_policy(policy))
++	if (dl_policy(policy)) {
+ 		__setparam_dl(p, attr);
+-	else if (fair_policy(policy))
++	} else if (fair_policy(policy)) {
+ 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
++		if (attr->sched_runtime) {
++			p->se.custom_slice = 1;
++			p->se.slice = clamp_t(u64, attr->sched_runtime,
++					      NSEC_PER_MSEC/10,   /* HZ=1000 * 10 */
++					      NSEC_PER_MSEC*100); /* HZ=100  / 10 */
++		} else {
++			p->se.custom_slice = 0;
++			p->se.slice = sysctl_sched_base_slice;
++		}
++	}
+ 
+ 	/*
+ 	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
+@@ -7749,7 +7760,9 @@ static int __sched_setscheduler(struct task_struct *p,
+ 	 * but store a possible modification of reset_on_fork.
+ 	 */
+ 	if (unlikely(policy == p->policy)) {
+-		if (fair_policy(policy) && attr->sched_nice != task_nice(p))
++		if (fair_policy(policy) &&
++		    (attr->sched_nice != task_nice(p) ||
++		     (attr->sched_runtime && attr->sched_runtime != p->se.slice)))
+ 			goto change;
+ 		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
+ 			goto change;
+@@ -7895,6 +7908,9 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
+ 		.sched_nice	= PRIO_TO_NICE(p->static_prio),
+ 	};
+ 
++	if (p->se.custom_slice)
++		attr.sched_runtime = p->se.slice;
++
+ 	/* Fixup the legacy SCHED_RESET_ON_FORK hack. */
+ 	if ((policy != SETPARAM_POLICY) && (policy & SCHED_RESET_ON_FORK)) {
+ 		attr.sched_flags |= SCHED_FLAG_RESET_ON_FORK;
+@@ -8061,12 +8077,14 @@ static int sched_copy_attr(struct sched_attr __user *uattr, struct sched_attr *a
+ 
+ static void get_params(struct task_struct *p, struct sched_attr *attr)
+ {
+-	if (task_has_dl_policy(p))
++	if (task_has_dl_policy(p)) {
+ 		__getparam_dl(p, attr);
+-	else if (task_has_rt_policy(p))
++	} else if (task_has_rt_policy(p)) {
+ 		attr->sched_priority = p->rt_priority;
+-	else
++	} else {
+ 		attr->sched_nice = task_nice(p);
++		attr->sched_runtime = p->se.slice;
++	}
+ }
+ 
+ /**
+@@ -10021,6 +10039,7 @@ void __init sched_init(void)
+ 	}
+ 
+ 	set_load_weight(&init_task, false);
++	init_task.se.slice = sysctl_sched_base_slice,
+ 
+ 	/*
+ 	 * The boot idle thread does lazy MMU switching as well:
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 4580a4507..a5c58cb25 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -579,11 +579,12 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
+ 	else
+ 		SEQ_printf(m, " %c", task_state_to_char(p));
+ 
+-	SEQ_printf(m, "%15s %5d %9Ld.%06ld %c %9Ld.%06ld %9Ld.%06ld %9Ld.%06ld %9Ld %5d ",
++	SEQ_printf(m, "%15s %5d %9Ld.%06ld %c %9Ld.%06ld %c %9Ld.%06ld %9Ld.%06ld %9Ld %5d ",
+ 		p->comm, task_pid_nr(p),
+ 		SPLIT_NS(p->se.vruntime),
+ 		entity_eligible(cfs_rq_of(&p->se), &p->se) ? 'E' : 'N',
+ 		SPLIT_NS(p->se.deadline),
++		p->se.custom_slice ? 'S' : ' ',
+ 		SPLIT_NS(p->se.slice),
+ 		SPLIT_NS(p->se.sum_exec_runtime),
+ 		(long long)(p->nvcsw + p->nivcsw),
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 1746b2245..c248990de 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1006,6 +1006,26 @@ static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+ 	u64 delta_exec;
+ 
++
++	if (sched_feat(SCHED_QUANTA))
++		goto check_quanta;
++
++	if ((s64)(se->vruntime - se->deadline) < 0)
++		return;
++
++	if (!se->custom_slice)
++		se->slice = sysctl_sched_base_slice;
++
++	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
++
++	if (cfs_rq->nr_running > 1) {
++		resched_curr(rq_of(cfs_rq));
++		clear_buddies(cfs_rq, se);
++	}
++
++	return;
++
++check_quanta:
+ 	/*
+ 	 * To allow wakeup preemption to happen in time, we check to
+ 	 * push deadlines forward by each call.
+@@ -1016,7 +1036,8 @@ static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 		 * nice) while the request time r_i is determined by
+ 		 * sysctl_sched_base_slice.
+ 		 */
+-		se->slice = sysctl_sched_base_slice;
++		if (!se->custom_slice)
++			se->slice = sysctl_sched_base_slice;
+ 		/*
+ 		 * EEVDF: vd_i = ve_i + r_i / w_i
+ 		 */
+@@ -5139,7 +5160,8 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	u64 vslice, vruntime = avg_vruntime(cfs_rq);
+ 	s64 lag = 0;
+ 
+-	se->slice = sysctl_sched_base_slice;
++	if (!se->custom_slice)
++		se->slice = sysctl_sched_base_slice;
+ 	vslice = calc_delta_fair(se->slice, se);
+ 
+ 	/*
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index a3ddf84de..d7ab4972c 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -25,6 +25,7 @@ SCHED_FEAT(CACHE_HOT_BUDDY, true)
+  * Allow wakeup-time preemption of the current task:
+  */
+ SCHED_FEAT(WAKEUP_PREEMPTION, true)
++SCHED_FEAT(SCHED_QUANTA, true)
+ 
+ SCHED_FEAT(HRTICK, false)
+ SCHED_FEAT(HRTICK_DL, false)
