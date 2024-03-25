@@ -1,0 +1,110 @@
+From f3899cbaf28a211937028d40d06a866eea75ad4a Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sat, 20 Jan 2024 14:54:37 -0700
+Subject: [PATCH 6/8] block/bfq: serialize request dispatching
+
+If we're entering request dispatch but someone else is already
+dispatching, then just skip this dispatch. We know IO is inflight and
+this will trigger another dispatch event for any completion. This will
+potentially cause slightly lower queue depth for contended cases, but
+those are slowed down anyway and this should not cause an issue.
+
+By itself, this patch doesn't help a whole lot, as the dispatch
+lock contention reduction is just eating up by the same dd->lock now
+seeing increased insertion contention. But it's required work to be
+able to reduce the lock contention in general.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/bfq-iosched.c | 17 +++++++++++++++--
+ block/bfq-iosched.h | 12 ++++++++++--
+ 2 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index 9fa427d5f..590882b64 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -5304,6 +5304,18 @@ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 	struct bfq_queue *in_serv_queue;
+ 	bool waiting_rq, idle_timer_disabled = false;
+ 
++	/*
++	 * If someone else is already dispatching, skip this one. This will
++	 * defer the next dispatch event to when something completes, and could
++	 * potentially lower the queue depth for contended cases.
++	 *
++	 * See the logic in blk_mq_do_dispatch_sched(), which loops and
++	 * retries if nothing is dispatched.
++	 */
++	if (test_bit(BFQ_DISPATCHING, &bfqd->run_state) ||
++	    test_and_set_bit_lock(BFQ_DISPATCHING, &bfqd->run_state))
++		return NULL;
++
+ 	spin_lock_irq(&bfqd->lock);
+ 
+ 	in_serv_queue = bfqd->in_service_queue;
+@@ -5315,6 +5327,7 @@ static struct request *bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ 			waiting_rq && !bfq_bfqq_wait_request(in_serv_queue);
+ 	}
+ 
++	clear_bit_unlock(BFQ_DISPATCHING, &bfqd->run_state);
+ 	spin_unlock_irq(&bfqd->lock);
+ 	bfq_update_dispatch_stats(hctx->queue, rq,
+ 			idle_timer_disabled ? in_serv_queue : NULL,
+@@ -7210,6 +7223,8 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	q->elevator = eq;
+ 	spin_unlock_irq(&q->queue_lock);
+ 
++	spin_lock_init(&bfqd->lock);
++
+ 	/*
+ 	 * Our fallback bfqq if bfq_find_alloc_queue() runs into OOM issues.
+ 	 * Grab a permanent reference to it, so that the normal code flow
+@@ -7328,8 +7343,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
+ 	/* see comments on the definition of next field inside bfq_data */
+ 	bfqd->actuator_load_threshold = 4;
+ 
+-	spin_lock_init(&bfqd->lock);
+-
+ 	/*
+ 	 * The invocation of the next bfq_create_group_hierarchy
+ 	 * function is the head of a chain of function calls
+diff --git a/block/bfq-iosched.h b/block/bfq-iosched.h
+index 467e8cfc4..56ff69f22 100644
+--- a/block/bfq-iosched.h
++++ b/block/bfq-iosched.h
+@@ -504,12 +504,22 @@ struct bfq_io_cq {
+ 	unsigned int requests;	/* Number of requests this process has in flight */
+ };
+ 
++enum {
++	BFQ_DISPATCHING	= 0,
++};
++
+ /**
+  * struct bfq_data - per-device data structure.
+  *
+  * All the fields are protected by @lock.
+  */
+ struct bfq_data {
++	struct {
++		spinlock_t lock;
++	} ____cacheline_aligned_in_smp;
++
++	unsigned long run_state;
++
+ 	/* device request queue */
+ 	struct request_queue *queue;
+ 	/* dispatch queue */
+@@ -795,8 +805,6 @@ struct bfq_data {
+ 	/* fallback dummy bfqq for extreme OOM conditions */
+ 	struct bfq_queue oom_bfqq;
+ 
+-	spinlock_t lock;
+-
+ 	/*
+ 	 * bic associated with the task issuing current bio for
+ 	 * merging. This and the next field are used as a support to
+-- 
+2.43.0.232.ge79552d197
+
