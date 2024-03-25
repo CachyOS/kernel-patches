@@ -1,0 +1,154 @@
+From 3678cfd1cdf17c2d8807f852dec036c9bc6c2486 Mon Sep 17 00:00:00 2001
+From: Perry Yuan <Perry.Yuan@amd.com>
+Date: Mon, 18 Mar 2024 18:11:10 +0800
+Subject: [PATCH 11/16] cpufreq: amd-pstate: implement cpb_boost sysfs entry
+ for boost control
+
+With this new sysfs entry `cpb_boost`created, user can change CPU boost
+state dynamically under `active`, `guided` and `passive` modes.
+And the highest perf and frequency will also be updated as the boost
+state changing.
+
+0): check current boost state
+cat /sys/devices/system/cpu/amd_pstate/cpb_boost
+
+1): disable CPU boost
+sudo bash -c "echo 0 > /sys/devices/system/cpu/amd_pstate/cpb_boost"
+
+2): enable CPU boost
+sudo bash -c "echo 1 > /sys/devices/system/cpu/amd_pstate/cpb_boost"
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=217931
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=217618
+Signed-off-by: Perry Yuan <Perry.Yuan@amd.com>
+---
+ drivers/cpufreq/amd-pstate.c | 99 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 99 insertions(+)
+
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 81787f83c..4cd281804 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -1291,6 +1291,103 @@ static ssize_t prefcore_show(struct device *dev,
+ 	return sysfs_emit(buf, "%s\n", str_enabled_disabled(amd_pstate_prefcore));
+ }
+ 
++static int amd_cpu_boost_update(struct amd_cpudata *cpudata, u32 on)
++{
++	struct cpufreq_policy *policy = cpufreq_cpu_acquire(cpudata->cpu);
++	struct cppc_perf_ctrls perf_ctrls;
++	u32 highest_perf, nominal_perf, nominal_freq, max_freq;
++	int ret;
++
++	if (!policy)
++		return -ENODATA;
++
++	highest_perf = READ_ONCE(cpudata->highest_perf);
++	nominal_perf = READ_ONCE(cpudata->nominal_perf);
++	nominal_freq = READ_ONCE(cpudata->nominal_freq);
++	max_freq = READ_ONCE(cpudata->max_freq);
++
++	if (boot_cpu_has(X86_FEATURE_CPPC)) {
++		u64 value = READ_ONCE(cpudata->cppc_req_cached);
++
++		value &= ~GENMASK_ULL(7, 0);
++		value |= on ? highest_perf : nominal_perf;
++		WRITE_ONCE(cpudata->cppc_req_cached, value);
++
++		wrmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, value);
++
++	} else {
++		perf_ctrls.max_perf = on ? highest_perf : nominal_perf;
++		ret = cppc_set_epp_perf(cpudata->cpu, &perf_ctrls, 1);
++		if (ret) {
++			pr_debug("failed to set energy perf value (%d)\n", ret);
++			return ret;
++		}
++	}
++
++	if (on)
++		policy->cpuinfo.max_freq = max_freq;
++	else
++		policy->cpuinfo.max_freq = nominal_freq;
++
++	policy->max = policy->cpuinfo.max_freq;
++
++	if (cppc_state == AMD_PSTATE_PASSIVE) {
++		ret = freq_qos_update_request(&cpudata->req[1],
++				      policy->cpuinfo.max_freq);
++	}
++
++	cpufreq_cpu_release(policy);
++
++	return ret;
++}
++
++static ssize_t cpb_boost_show(struct device *dev,
++			   struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", amd_pstate_global_params.cpb_boost);
++}
++
++static ssize_t cpb_boost_store(struct device *dev, struct device_attribute *b,
++			    const char *buf, size_t count)
++{
++	bool new_state;
++	ssize_t ret;
++	int cpu;
++
++	mutex_lock(&amd_pstate_driver_lock);
++	if (!amd_pstate_global_params.cpb_supported) {
++		pr_err("Boost mode is not supported by this processor or SBIOS\n");
++		return -EINVAL;
++	}
++
++	ret = kstrtobool(buf, &new_state);
++	if (ret)
++		return -EINVAL;
++
++	amd_pstate_global_params.cpb_boost = !!new_state;
++
++	for_each_present_cpu(cpu) {
++
++		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
++		struct amd_cpudata *cpudata = policy->driver_data;
++
++		if (!cpudata) {
++			pr_err("cpudata is NULL\n");
++			ret = -ENODATA;
++			cpufreq_cpu_put(policy);
++			goto err_exit;
++		}
++
++		amd_cpu_boost_update(cpudata, amd_pstate_global_params.cpb_boost);
++		refresh_frequency_limits(policy);
++		cpufreq_cpu_put(policy);
++	}
++
++err_exit:
++	mutex_unlock(&amd_pstate_driver_lock);
++	return ret < 0 ? ret : count;
++}
++
+ cpufreq_freq_attr_ro(amd_pstate_max_freq);
+ cpufreq_freq_attr_ro(amd_pstate_lowest_nonlinear_freq);
+ 
+@@ -1301,6 +1398,7 @@ cpufreq_freq_attr_rw(energy_performance_preference);
+ cpufreq_freq_attr_ro(energy_performance_available_preferences);
+ static DEVICE_ATTR_RW(status);
+ static DEVICE_ATTR_RO(prefcore);
++static DEVICE_ATTR_RW(cpb_boost);
+ 
+ static struct freq_attr *amd_pstate_attr[] = {
+ 	&amd_pstate_max_freq,
+@@ -1325,6 +1423,7 @@ static struct freq_attr *amd_pstate_epp_attr[] = {
+ static struct attribute *pstate_global_attributes[] = {
+ 	&dev_attr_status.attr,
+ 	&dev_attr_prefcore.attr,
++	&dev_attr_cpb_boost.attr,
+ 	NULL
+ };
+ 
+-- 
+2.43.0.232.ge79552d197
+
