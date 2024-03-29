@@ -1,6 +1,6 @@
-From 66b352a32bc48b8edd9c9be1129d393d9b5a0f18 Mon Sep 17 00:00:00 2001
+From e6d939f7bdf14b08d35fdc61cd96da90c6213e0a Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Thu, 28 Mar 2024 19:05:00 +0100
+Date: Fri, 29 Mar 2024 08:25:57 +0100
 Subject: [PATCH] sched-ext
 
 Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
@@ -39,14 +39,14 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  tools/sched_ext/Makefile                      |  246 +
  tools/sched_ext/README.md                     |  270 +
  .../sched_ext/include/bpf-compat/gnu/stubs.h  |   11 +
- tools/sched_ext/include/scx/common.bpf.h      |  247 +
+ tools/sched_ext/include/scx/common.bpf.h      |  250 +
  tools/sched_ext/include/scx/common.h          |   71 +
  tools/sched_ext/include/scx/compat.bpf.h      |   88 +
  tools/sched_ext/include/scx/compat.h          |  143 +
  tools/sched_ext/include/scx/user_exit_info.h  |   80 +
  tools/sched_ext/scx_central.bpf.c             |  361 ++
  tools/sched_ext/scx_central.c                 |  122 +
- tools/sched_ext/scx_flatcg.bpf.c              |  949 +++
+ tools/sched_ext/scx_flatcg.bpf.c              |  939 +++
  tools/sched_ext/scx_flatcg.c                  |  219 +
  tools/sched_ext/scx_flatcg.h                  |   51 +
  tools/sched_ext/scx_qmap.bpf.c                |  398 ++
@@ -90,7 +90,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  .../sched_ext/select_cpu_vtime.bpf.c          |   92 +
  .../selftests/sched_ext/select_cpu_vtime.c    |   59 +
  .../selftests/sched_ext/test_example.c        |   49 +
- 85 files changed, 13236 insertions(+), 105 deletions(-)
+ 85 files changed, 13229 insertions(+), 105 deletions(-)
  create mode 100644 Documentation/scheduler/sched-ext.rst
  create mode 100644 include/linux/sched/ext.h
  create mode 100644 kernel/sched/ext.c
@@ -9047,10 +9047,10 @@ index 000000000..ad7d139ce
 + */
 diff --git a/tools/sched_ext/include/scx/common.bpf.h b/tools/sched_ext/include/scx/common.bpf.h
 new file mode 100644
-index 000000000..6b675160c
+index 000000000..de31ace67
 --- /dev/null
 +++ b/tools/sched_ext/include/scx/common.bpf.h
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,250 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Copyright (c) 2022 Meta Platforms, Inc. and affiliates.
@@ -9251,6 +9251,9 @@ index 000000000..6b675160c
 +#define bpf_rbtree_add(head, node, less) bpf_rbtree_add_impl(head, node, less, NULL, 0)
 +
 +struct bpf_rb_node *bpf_rbtree_first(struct bpf_rb_root *root) __ksym;
++
++extern void *bpf_refcount_acquire_impl(void *kptr, void *meta) __ksym;
++#define bpf_refcount_acquire(kptr) bpf_refcount_acquire_impl(kptr, NULL)
 +
 +/* task */
 +struct task_struct *bpf_task_from_pid(s32 pid) __ksym;
@@ -10201,10 +10204,10 @@ index 000000000..bc209ad6a
 +}
 diff --git a/tools/sched_ext/scx_flatcg.bpf.c b/tools/sched_ext/scx_flatcg.bpf.c
 new file mode 100644
-index 000000000..9946b8949
+index 000000000..a9c2fa41a
 --- /dev/null
 +++ b/tools/sched_ext/scx_flatcg.bpf.c
-@@ -0,0 +1,949 @@
+@@ -0,0 +1,939 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * A demo sched_ext flattened cgroup hierarchy scheduler. It implements
@@ -10306,6 +10309,7 @@ index 000000000..9946b8949
 +	struct bpf_rb_node	rb_node;
 +	__u64			cvtime;
 +	__u64			cgid;
++	struct bpf_refcount	refcount;
 +};
 +
 +private(CGV_TREE) struct bpf_spin_lock cgv_tree_lock;
@@ -10495,14 +10499,17 @@ index 000000000..9946b8949
 +	}
 +
 +	stash = bpf_map_lookup_elem(&cgv_node_stash, &cgid);
-+	if (!stash) {
++	if (!stash || !stash->node) {
 +		scx_bpf_error("cgv_node lookup failed for cgid %llu", cgid);
 +		return;
 +	}
 +
-+	/* NULL if the node is already on the rbtree */
-+	cgv_node = bpf_kptr_xchg(&stash->node, NULL);
++	cgv_node = bpf_refcount_acquire(stash->node);
 +	if (!cgv_node) {
++		/*
++		 * Node never leaves cgv_node_stash, this should only happen if
++		 * fcg_cgroup_exit deletes the stashed node
++		 */
 +		stat_inc(FCG_STAT_ENQ_RACE);
 +		return;
 +	}
@@ -10815,7 +10822,6 @@ index 000000000..9946b8949
 +static bool try_pick_next_cgroup(u64 *cgidp)
 +{
 +	struct bpf_rb_node *rb_node;
-+	struct cgv_node_stash *stash;
 +	struct cgv_node *cgv_node;
 +	struct fcg_cgrp_ctx *cgc;
 +	struct cgroup *cgrp;
@@ -10899,12 +10905,6 @@ index 000000000..9946b8949
 +	return true;
 +
 +out_stash:
-+	stash = bpf_map_lookup_elem(&cgv_node_stash, &cgid);
-+	if (!stash) {
-+		stat_inc(FCG_STAT_PNC_GONE);
-+		goto out_free;
-+	}
-+
 +	/*
 +	 * Paired with cmpxchg in cgrp_enqueued(). If they see the following
 +	 * transition, they'll enqueue the cgroup. If they are earlier, we'll
@@ -10917,15 +10917,8 @@ index 000000000..9946b8949
 +		bpf_rbtree_add(&cgv_tree, &cgv_node->rb_node, cgv_node_less);
 +		bpf_spin_unlock(&cgv_tree_lock);
 +		stat_inc(FCG_STAT_PNC_RACE);
-+	} else {
-+		cgv_node = bpf_kptr_xchg(&stash->node, cgv_node);
-+		if (cgv_node) {
-+			scx_bpf_error("unexpected !NULL cgv_node stash");
-+			goto out_free;
-+		}
++		return false;
 +	}
-+
-+	return false;
 +
 +out_free:
 +	bpf_obj_drop(cgv_node);
