@@ -1,0 +1,5860 @@
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 4fff6ed..7ee7701 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -28,6 +28,7 @@ config X86_64
+ 	select ARCH_HAS_GIGANTIC_PAGE
+ 	select ARCH_SUPPORTS_INT128 if CC_HAS_INT128
+ 	select ARCH_SUPPORTS_PER_VMA_LOCK
++	select ARCH_SUPPORTS_RT
+ 	select HAVE_ARCH_SOFT_DIRTY
+ 	select MODULES_USE_ELF_RELA
+ 	select NEED_DMA_MAP_STATE
+@@ -119,6 +120,7 @@ config X86
+ 	select ARCH_USES_CFI_TRAPS		if X86_64 && CFI_CLANG
+ 	select ARCH_SUPPORTS_LTO_CLANG
+ 	select ARCH_SUPPORTS_LTO_CLANG_THIN
++	select ARCH_SUPPORTS_RT
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF		if X86_CMPXCHG64
+ 	select ARCH_USE_MEMTEST
+@@ -276,6 +278,7 @@ config X86
+ 	select HAVE_STATIC_CALL
+ 	select HAVE_STATIC_CALL_INLINE		if HAVE_OBJTOOL
+ 	select HAVE_PREEMPT_DYNAMIC_CALL
++	select HAVE_PREEMPT_AUTO
+ 	select HAVE_RSEQ
+ 	select HAVE_RUST			if X86_64
+ 	select HAVE_SYSCALL_TRACEPOINTS
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index 12da7df..38e2cf0 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -87,8 +87,9 @@ struct thread_info {
+ #define TIF_NOTIFY_RESUME	1	/* callback before returning to user */
+ #define TIF_SIGPENDING		2	/* signal pending */
+ #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
+-#define TIF_SINGLESTEP		4	/* reenable singlestep on user return*/
+-#define TIF_SSBD		5	/* Speculative store bypass disable */
++#define TIF_ARCH_RESCHED_LAZY	4	/* Lazy rescheduling */
++#define TIF_SINGLESTEP		5	/* reenable singlestep on user return*/
++#define TIF_SSBD		6	/* Speculative store bypass disable */
+ #define TIF_SPEC_IB		9	/* Indirect branch speculation mitigation */
+ #define TIF_SPEC_L1D_FLUSH	10	/* Flush L1D on mm switches (processes) */
+ #define TIF_USER_RETURN_NOTIFY	11	/* notify kernel of userspace return */
+@@ -110,6 +111,7 @@ struct thread_info {
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
++#define _TIF_ARCH_RESCHED_LAZY	(1 << TIF_ARCH_RESCHED_LAZY)
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
+ #define _TIF_SSBD		(1 << TIF_SSBD)
+ #define _TIF_SPEC_IB		(1 << TIF_SPEC_IB)
+diff --git a/drivers/acpi/processor_idle.c b/drivers/acpi/processor_idle.c
+index bd6a785..d45dfd1 100644
+--- a/drivers/acpi/processor_idle.c
++++ b/drivers/acpi/processor_idle.c
+@@ -108,7 +108,7 @@ static const struct dmi_system_id processor_power_dmi_table[] = {
+  */
+ static void __cpuidle acpi_safe_halt(void)
+ {
+-	if (!tif_need_resched()) {
++	if (!need_resched()) {
+ 		raw_safe_halt();
+ 		raw_local_irq_disable();
+ 	}
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index f0639df..00c6260 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -57,6 +57,41 @@ static void zram_free_page(struct zram *zram, size_t index);
+ static int zram_read_page(struct zram *zram, struct page *page, u32 index,
+ 			  struct bio *parent);
+ 
++#ifdef CONFIG_PREEMPT_RT
++static void zram_meta_init_table_locks(struct zram *zram, size_t num_pages)
++{
++	size_t index;
++
++	for (index = 0; index < num_pages; index++)
++		spin_lock_init(&zram->table[index].lock);
++}
++
++static int zram_slot_trylock(struct zram *zram, u32 index)
++{
++	int ret;
++
++	ret = spin_trylock(&zram->table[index].lock);
++	if (ret)
++		__set_bit(ZRAM_LOCK, &zram->table[index].flags);
++	return ret;
++}
++
++static void zram_slot_lock(struct zram *zram, u32 index)
++{
++	spin_lock(&zram->table[index].lock);
++	__set_bit(ZRAM_LOCK, &zram->table[index].flags);
++}
++
++static void zram_slot_unlock(struct zram *zram, u32 index)
++{
++	__clear_bit(ZRAM_LOCK, &zram->table[index].flags);
++	spin_unlock(&zram->table[index].lock);
++}
++
++#else
++
++static void zram_meta_init_table_locks(struct zram *zram, size_t num_pages) { }
++
+ static int zram_slot_trylock(struct zram *zram, u32 index)
+ {
+ 	return bit_spin_trylock(ZRAM_LOCK, &zram->table[index].flags);
+@@ -71,6 +106,7 @@ static void zram_slot_unlock(struct zram *zram, u32 index)
+ {
+ 	bit_spin_unlock(ZRAM_LOCK, &zram->table[index].flags);
+ }
++#endif
+ 
+ static inline bool init_done(struct zram *zram)
+ {
+@@ -1241,6 +1277,7 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
+ 
+ 	if (!huge_class_size)
+ 		huge_class_size = zs_huge_class_size(zram->mem_pool);
++	zram_meta_init_table_locks(zram, num_pages);
+ 	return true;
+ }
+ 
+diff --git a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+index 37bf29f..f0c0d9f 100644
+--- a/drivers/block/zram/zram_drv.h
++++ b/drivers/block/zram/zram_drv.h
+@@ -69,6 +69,9 @@ struct zram_table_entry {
+ 		unsigned long element;
+ 	};
+ 	unsigned long flags;
++#ifdef CONFIG_PREEMPT_RT
++	spinlock_t lock;
++#endif
+ #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
+ 	ktime_t ac_time;
+ #endif
+diff --git a/drivers/gpu/drm/i915/Kconfig b/drivers/gpu/drm/i915/Kconfig
+index 5932024..a02162d 100644
+--- a/drivers/gpu/drm/i915/Kconfig
++++ b/drivers/gpu/drm/i915/Kconfig
+@@ -3,7 +3,6 @@ config DRM_I915
+ 	tristate "Intel 8xx/9xx/G3x/G4x/HD Graphics"
+ 	depends on DRM
+ 	depends on X86 && PCI
+-	depends on !PREEMPT_RT
+ 	select INTEL_GTT if X86
+ 	select INTERVAL_TREE
+ 	# we need shmfs for the swappable backing store, and in particular
+diff --git a/drivers/gpu/drm/i915/display/intel_crtc.c b/drivers/gpu/drm/i915/display/intel_crtc.c
+index 25593f6..22b8000 100644
+--- a/drivers/gpu/drm/i915/display/intel_crtc.c
++++ b/drivers/gpu/drm/i915/display/intel_crtc.c
+@@ -512,7 +512,8 @@ void intel_pipe_update_start(struct intel_atomic_state *state,
+ 	 */
+ 	intel_psr_wait_for_idle_locked(new_crtc_state);
+ 
+-	local_irq_disable();
++	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
++		local_irq_disable();
+ 
+ 	crtc->debug.min_vbl = evade.min;
+ 	crtc->debug.max_vbl = evade.max;
+@@ -530,7 +531,8 @@ void intel_pipe_update_start(struct intel_atomic_state *state,
+ 	return;
+ 
+ irq_disable:
+-	local_irq_disable();
++	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
++		local_irq_disable();
+ }
+ 
+ #if IS_ENABLED(CONFIG_DRM_I915_DEBUG_VBLANK_EVADE)
+@@ -632,7 +634,8 @@ void intel_pipe_update_end(struct intel_atomic_state *state,
+ 	 */
+ 	intel_vrr_send_push(new_crtc_state);
+ 
+-	local_irq_enable();
++	if (!IS_ENABLED(CONFIG_PREEMPT_RT))
++		local_irq_enable();
+ 
+ 	if (intel_vgpu_active(dev_priv))
+ 		goto out;
+diff --git a/drivers/gpu/drm/i915/display/intel_vblank.c b/drivers/gpu/drm/i915/display/intel_vblank.c
+index baf7354..d639b51 100644
+--- a/drivers/gpu/drm/i915/display/intel_vblank.c
++++ b/drivers/gpu/drm/i915/display/intel_vblank.c
+@@ -276,6 +276,26 @@ int intel_crtc_scanline_to_hw(struct intel_crtc *crtc, int scanline)
+  * all register accesses to the same cacheline to be serialized,
+  * otherwise they may hang.
+  */
++static void intel_vblank_section_enter_irqsave(struct drm_i915_private *i915, unsigned long *flags)
++	__acquires(i915->uncore.lock)
++{
++#ifdef I915
++	spin_lock_irqsave(&i915->uncore.lock, *flags);
++#else
++	*flags = 0;
++#endif
++}
++
++static void intel_vblank_section_exit_irqrestore(struct drm_i915_private *i915, unsigned long flags)
++	__releases(i915->uncore.lock)
++{
++#ifdef I915
++	spin_unlock_irqrestore(&i915->uncore.lock, flags);
++#else
++	if (flags)
++		return;
++#endif
++}
+ static void intel_vblank_section_enter(struct drm_i915_private *i915)
+ 	__acquires(i915->uncore.lock)
+ {
+@@ -333,10 +353,10 @@ static bool i915_get_crtc_scanoutpos(struct drm_crtc *_crtc,
+ 	 * timing critical raw register reads, potentially with
+ 	 * preemption disabled, so the following code must not block.
+ 	 */
+-	local_irq_save(irqflags);
+-	intel_vblank_section_enter(dev_priv);
++	intel_vblank_section_enter_irqsave(dev_priv, &irqflags);
+ 
+-	/* preempt_disable_rt() should go right here in PREEMPT_RT patchset. */
++	if (IS_ENABLED(CONFIG_PREEMPT_RT))
++		preempt_disable();
+ 
+ 	/* Get optional system timestamp before query. */
+ 	if (stime)
+@@ -400,10 +420,10 @@ static bool i915_get_crtc_scanoutpos(struct drm_crtc *_crtc,
+ 	if (etime)
+ 		*etime = ktime_get();
+ 
+-	/* preempt_enable_rt() should go right here in PREEMPT_RT patchset. */
++	if (IS_ENABLED(CONFIG_PREEMPT_RT))
++		preempt_enable();
+ 
+-	intel_vblank_section_exit(dev_priv);
+-	local_irq_restore(irqflags);
++	intel_vblank_section_exit_irqrestore(dev_priv, irqflags);
+ 
+ 	/*
+ 	 * While in vblank, position will be negative
+@@ -441,13 +461,11 @@ int intel_get_crtc_scanline(struct intel_crtc *crtc)
+ 	unsigned long irqflags;
+ 	int position;
+ 
+-	local_irq_save(irqflags);
+-	intel_vblank_section_enter(dev_priv);
++	intel_vblank_section_enter_irqsave(dev_priv, &irqflags);
+ 
+ 	position = __intel_get_crtc_scanline(crtc);
+ 
+-	intel_vblank_section_exit(dev_priv);
+-	local_irq_restore(irqflags);
++	intel_vblank_section_exit_irqrestore(dev_priv, irqflags);
+ 
+ 	return position;
+ }
+@@ -682,11 +700,13 @@ int intel_vblank_evade(struct intel_vblank_evade_ctx *evade)
+ 			break;
+ 		}
+ 
+-		local_irq_enable();
++		if (!IS_ENABLED(CONFIG_PREEMPT_RT))
++			local_irq_enable();
+ 
+ 		timeout = schedule_timeout(timeout);
+ 
+-		local_irq_disable();
++		if (!IS_ENABLED(CONFIG_PREEMPT_RT))
++			local_irq_disable();
+ 	}
+ 
+ 	finish_wait(wq, &wait);
+diff --git a/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c b/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
+index d650beb..3dd3e51 100644
+--- a/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
++++ b/drivers/gpu/drm/i915/gt/intel_breadcrumbs.c
+@@ -317,10 +317,9 @@ void __intel_breadcrumbs_park(struct intel_breadcrumbs *b)
+ 	/* Kick the work once more to drain the signalers, and disarm the irq */
+ 	irq_work_sync(&b->irq_work);
+ 	while (READ_ONCE(b->irq_armed) && !atomic_read(&b->active)) {
+-		local_irq_disable();
+-		signal_irq_work(&b->irq_work);
+-		local_irq_enable();
++		irq_work_queue(&b->irq_work);
+ 		cond_resched();
++		irq_work_sync(&b->irq_work);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index b061a0a..80240ec 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -1303,7 +1303,7 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 	 * and context switches) submission.
+ 	 */
+ 
+-	spin_lock(&sched_engine->lock);
++	spin_lock_irq(&sched_engine->lock);
+ 
+ 	/*
+ 	 * If the queue is higher priority than the last
+@@ -1403,7 +1403,7 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 				 * Even if ELSP[1] is occupied and not worthy
+ 				 * of timeslices, our queue might be.
+ 				 */
+-				spin_unlock(&sched_engine->lock);
++				spin_unlock_irq(&sched_engine->lock);
+ 				return;
+ 			}
+ 		}
+@@ -1429,7 +1429,7 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 
+ 		if (last && !can_merge_rq(last, rq)) {
+ 			spin_unlock(&ve->base.sched_engine->lock);
+-			spin_unlock(&engine->sched_engine->lock);
++			spin_unlock_irq(&engine->sched_engine->lock);
+ 			return; /* leave this for another sibling */
+ 		}
+ 
+@@ -1591,7 +1591,7 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 	 */
+ 	sched_engine->queue_priority_hint = queue_prio(sched_engine);
+ 	i915_sched_engine_reset_on_empty(sched_engine);
+-	spin_unlock(&sched_engine->lock);
++	spin_unlock_irq(&sched_engine->lock);
+ 
+ 	/*
+ 	 * We can skip poking the HW if we ended up with exactly the same set
+@@ -1617,13 +1617,6 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
+ 	}
+ }
+ 
+-static void execlists_dequeue_irq(struct intel_engine_cs *engine)
+-{
+-	local_irq_disable(); /* Suspend interrupts across request submission */
+-	execlists_dequeue(engine);
+-	local_irq_enable(); /* flush irq_work (e.g. breadcrumb enabling) */
+-}
+-
+ static void clear_ports(struct i915_request **ports, int count)
+ {
+ 	memset_p((void **)ports, NULL, count);
+@@ -2478,7 +2471,7 @@ static void execlists_submission_tasklet(struct tasklet_struct *t)
+ 	}
+ 
+ 	if (!engine->execlists.pending[0]) {
+-		execlists_dequeue_irq(engine);
++		execlists_dequeue(engine);
+ 		start_timeslice(engine);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc.h b/drivers/gpu/drm/i915/gt/uc/intel_guc.h
+index be70c46..387cc19 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc.h
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc.h
+@@ -360,7 +360,7 @@ static inline int intel_guc_send_busy_loop(struct intel_guc *guc,
+ {
+ 	int err;
+ 	unsigned int sleep_period_ms = 1;
+-	bool not_atomic = !in_atomic() && !irqs_disabled();
++	bool not_atomic = !in_atomic() && !irqs_disabled() && !rcu_preempt_depth();
+ 
+ 	/*
+ 	 * FIXME: Have caller pass in if we are in an atomic context to avoid
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index 519e096..466b5ee 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -608,7 +608,6 @@ bool __i915_request_submit(struct i915_request *request)
+ 
+ 	RQ_TRACE(request, "\n");
+ 
+-	GEM_BUG_ON(!irqs_disabled());
+ 	lockdep_assert_held(&engine->sched_engine->lock);
+ 
+ 	/*
+@@ -717,7 +716,6 @@ void __i915_request_unsubmit(struct i915_request *request)
+ 	 */
+ 	RQ_TRACE(request, "\n");
+ 
+-	GEM_BUG_ON(!irqs_disabled());
+ 	lockdep_assert_held(&engine->sched_engine->lock);
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/i915/i915_trace.h b/drivers/gpu/drm/i915/i915_trace.h
+index ce1cbee..3c51620 100644
+--- a/drivers/gpu/drm/i915/i915_trace.h
++++ b/drivers/gpu/drm/i915/i915_trace.h
+@@ -6,6 +6,10 @@
+ #if !defined(_I915_TRACE_H_) || defined(TRACE_HEADER_MULTI_READ)
+ #define _I915_TRACE_H_
+ 
++#ifdef CONFIG_PREEMPT_RT
++#define NOTRACE
++#endif
++
+ #include <linux/stringify.h>
+ #include <linux/types.h>
+ #include <linux/tracepoint.h>
+@@ -322,7 +326,7 @@ DEFINE_EVENT(i915_request, i915_request_add,
+ 	     TP_ARGS(rq)
+ );
+ 
+-#if defined(CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS)
++#if defined(CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS) && !defined(NOTRACE)
+ DEFINE_EVENT(i915_request, i915_request_guc_submit,
+ 	     TP_PROTO(struct i915_request *rq),
+ 	     TP_ARGS(rq)
+diff --git a/drivers/gpu/drm/i915/i915_utils.h b/drivers/gpu/drm/i915/i915_utils.h
+index b45ef05..7c6077d 100644
+--- a/drivers/gpu/drm/i915/i915_utils.h
++++ b/drivers/gpu/drm/i915/i915_utils.h
+@@ -288,7 +288,7 @@ wait_remaining_ms_from_jiffies(unsigned long timestamp_jiffies, int to_wait_ms)
+ #define wait_for(COND, MS)		_wait_for((COND), (MS) * 1000, 10, 1000)
+ 
+ /* If CONFIG_PREEMPT_COUNT is disabled, in_atomic() always reports false. */
+-#if defined(CONFIG_DRM_I915_DEBUG) && defined(CONFIG_PREEMPT_COUNT)
++#if defined(CONFIG_DRM_I915_DEBUG) && defined(CONFIG_PREEMPT_COUNT) && !defined(CONFIG_PREEMPT_RT)
+ # define _WAIT_FOR_ATOMIC_CHECK(ATOMIC) WARN_ON_ONCE((ATOMIC) && !in_atomic())
+ #else
+ # define _WAIT_FOR_ATOMIC_CHECK(ATOMIC) do { } while (0)
+diff --git a/drivers/gpu/drm/ttm/tests/ttm_bo_test.c b/drivers/gpu/drm/ttm/tests/ttm_bo_test.c
+index 1f8a4f8..9cc367a 100644
+--- a/drivers/gpu/drm/ttm/tests/ttm_bo_test.c
++++ b/drivers/gpu/drm/ttm/tests/ttm_bo_test.c
+@@ -18,6 +18,12 @@
+ 
+ #define BO_SIZE		SZ_8K
+ 
++#ifdef CONFIG_PREEMPT_RT
++#define ww_mutex_base_lock(b)			rt_mutex_lock(b)
++#else
++#define ww_mutex_base_lock(b)			mutex_lock(b)
++#endif
++
+ struct ttm_bo_test_case {
+ 	const char *description;
+ 	bool interruptible;
+@@ -142,7 +148,7 @@ static void ttm_bo_reserve_deadlock(struct kunit *test)
+ 	bo2 = ttm_bo_kunit_init(test, test->priv, BO_SIZE);
+ 
+ 	ww_acquire_init(&ctx1, &reservation_ww_class);
+-	mutex_lock(&bo2->base.resv->lock.base);
++	ww_mutex_base_lock(&bo2->base.resv->lock.base);
+ 
+ 	/* The deadlock will be caught by WW mutex, don't warn about it */
+ 	lock_release(&bo2->base.resv->lock.base.dep_map, 1);
+diff --git a/drivers/tty/serial/8250/8250_core.c b/drivers/tty/serial/8250/8250_core.c
+index b62ad90..4e4f550 100644
+--- a/drivers/tty/serial/8250/8250_core.c
++++ b/drivers/tty/serial/8250/8250_core.c
+@@ -592,6 +592,7 @@ serial8250_register_ports(struct uart_driver *drv, struct device *dev)
+ 
+ #ifdef CONFIG_SERIAL_8250_CONSOLE
+ 
++#ifdef CONFIG_SERIAL_8250_LEGACY_CONSOLE
+ static void univ8250_console_write(struct console *co, const char *s,
+ 				   unsigned int count)
+ {
+@@ -599,6 +600,39 @@ static void univ8250_console_write(struct console *co, const char *s,
+ 
+ 	serial8250_console_write(up, s, count);
+ }
++#else
++static void univ8250_console_write_atomic(struct console *co,
++					  struct nbcon_write_context *wctxt)
++{
++	struct uart_8250_port *up = &serial8250_ports[co->index];
++
++	serial8250_console_write_atomic(up, wctxt);
++}
++
++static void univ8250_console_write_thread(struct console *co,
++					  struct nbcon_write_context *wctxt)
++{
++	struct uart_8250_port *up = &serial8250_ports[co->index];
++
++	serial8250_console_write_thread(up, wctxt);
++}
++
++static void univ8250_console_device_lock(struct console *con, unsigned long *flags)
++{
++	struct uart_port *up = &serial8250_ports[con->index].port;
++
++	__uart_port_lock_irqsave(up, flags);
++}
++
++static void univ8250_console_device_unlock(struct console *con, unsigned long flags)
++{
++	struct uart_port *up = &serial8250_ports[con->index].port;
++
++	__uart_port_unlock_irqrestore(up, flags);
++}
++
++static struct nbcon_drvdata serial8250_nbcon_drvdata;
++#endif /* CONFIG_SERIAL_8250_LEGACY_CONSOLE */
+ 
+ static int univ8250_console_setup(struct console *co, char *options)
+ {
+@@ -627,11 +661,11 @@ static int univ8250_console_setup(struct console *co, char *options)
+ 
+ 	port = &serial8250_ports[co->index].port;
+ 	/* link port to console */
+-	port->cons = co;
++	uart_port_set_cons(port, co);
+ 
+ 	retval = serial8250_console_setup(port, options, false);
+ 	if (retval != 0)
+-		port->cons = NULL;
++		uart_port_set_cons(port, NULL);
+ 	return retval;
+ }
+ 
+@@ -689,7 +723,7 @@ static int univ8250_console_match(struct console *co, char *name, int idx,
+ 			continue;
+ 
+ 		co->index = i;
+-		port->cons = co;
++		uart_port_set_cons(port, co);
+ 		return serial8250_console_setup(port, options, true);
+ 	}
+ 
+@@ -698,12 +732,21 @@ static int univ8250_console_match(struct console *co, char *name, int idx,
+ 
+ static struct console univ8250_console = {
+ 	.name		= "ttyS",
++#ifdef CONFIG_SERIAL_8250_LEGACY_CONSOLE
+ 	.write		= univ8250_console_write,
++	.flags		= CON_PRINTBUFFER | CON_ANYTIME,
++#else
++	.write_atomic	= univ8250_console_write_atomic,
++	.write_thread	= univ8250_console_write_thread,
++	.device_lock	= univ8250_console_device_lock,
++	.device_unlock	= univ8250_console_device_unlock,
++	.flags		= CON_PRINTBUFFER | CON_ANYTIME | CON_NBCON,
++	.nbcon_drvdata	= &serial8250_nbcon_drvdata,
++#endif
+ 	.device		= uart_console_device,
+ 	.setup		= univ8250_console_setup,
+ 	.exit		= univ8250_console_exit,
+ 	.match		= univ8250_console_match,
+-	.flags		= CON_PRINTBUFFER | CON_ANYTIME,
+ 	.index		= -1,
+ 	.data		= &serial8250_reg,
+ };
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index fc9dd5d..191d149 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -546,6 +546,13 @@ static int serial8250_em485_init(struct uart_8250_port *p)
+ 	if (!p->em485)
+ 		return -ENOMEM;
+ 
++#ifndef CONFIG_SERIAL_8250_LEGACY_CONSOLE
++	if (uart_console(&p->port)) {
++		dev_warn(p->port.dev, "no atomic printing for rs485 consoles\n");
++		p->port.cons->write_atomic = NULL;
++	}
++#endif
++
+ 	hrtimer_init(&p->em485->stop_tx_timer, CLOCK_MONOTONIC,
+ 		     HRTIMER_MODE_REL);
+ 	hrtimer_init(&p->em485->start_tx_timer, CLOCK_MONOTONIC,
+@@ -698,7 +705,11 @@ static void serial8250_set_sleep(struct uart_8250_port *p, int sleep)
+ 	serial8250_rpm_put(p);
+ }
+ 
+-static void serial8250_clear_IER(struct uart_8250_port *up)
++/*
++ * Only to be used by write_atomic() and the legacy write(), which do not
++ * require port lock.
++ */
++static void __serial8250_clear_IER(struct uart_8250_port *up)
+ {
+ 	if (up->capabilities & UART_CAP_UUE)
+ 		serial_out(up, UART_IER, UART_IER_UUE);
+@@ -706,6 +717,14 @@ static void serial8250_clear_IER(struct uart_8250_port *up)
+ 		serial_out(up, UART_IER, 0);
+ }
+ 
++static inline void serial8250_clear_IER(struct uart_8250_port *up)
++{
++	/* Port locked to synchronize UART_IER access against the console. */
++	lockdep_assert_held_once(&up->port.lock);
++
++	__serial8250_clear_IER(up);
++}
++
+ #ifdef CONFIG_SERIAL_8250_RSA
+ /*
+  * Attempts to turn on the RSA FIFO.  Returns zero on failure.
+@@ -3272,6 +3291,11 @@ static void serial8250_console_putchar(struct uart_port *port, unsigned char ch)
+ 
+ 	wait_for_xmitr(up, UART_LSR_THRE);
+ 	serial_port_out(port, UART_TX, ch);
++
++	if (ch == '\n')
++		up->console_newline_needed = false;
++	else
++		up->console_newline_needed = true;
+ }
+ 
+ /*
+@@ -3300,6 +3324,7 @@ static void serial8250_console_restore(struct uart_8250_port *up)
+ 	serial8250_out_MCR(up, up->mcr | UART_MCR_DTR | UART_MCR_RTS);
+ }
+ 
++#ifdef CONFIG_SERIAL_8250_LEGACY_CONSOLE
+ /*
+  * Print a string to the serial port using the device FIFO
+  *
+@@ -3358,7 +3383,7 @@ void serial8250_console_write(struct uart_8250_port *up, const char *s,
+ 	 *	First save the IER then disable the interrupts
+ 	 */
+ 	ier = serial_port_in(port, UART_IER);
+-	serial8250_clear_IER(up);
++	__serial8250_clear_IER(up);
+ 
+ 	/* check scratch reg to see if port powered off during system sleep */
+ 	if (up->canary && (up->canary != serial_port_in(port, UART_SCR))) {
+@@ -3424,6 +3449,131 @@ void serial8250_console_write(struct uart_8250_port *up, const char *s,
+ 	if (locked)
+ 		uart_port_unlock_irqrestore(port, flags);
+ }
++#else
++void serial8250_console_write_thread(struct uart_8250_port *up,
++				     struct nbcon_write_context *wctxt)
++{
++	struct uart_8250_em485 *em485 = up->em485;
++	struct uart_port *port = &up->port;
++	unsigned int ier;
++
++	touch_nmi_watchdog();
++
++	if (!nbcon_enter_unsafe(wctxt))
++		return;
++
++	/* First save IER then disable the interrupts. */
++	ier = serial_port_in(port, UART_IER);
++	serial8250_clear_IER(up);
++
++	/* Check scratch reg if port powered off during system sleep. */
++	if (up->canary && (up->canary != serial_port_in(port, UART_SCR))) {
++		serial8250_console_restore(up);
++		up->canary = 0;
++	}
++
++	if (em485) {
++		if (em485->tx_stopped)
++			up->rs485_start_tx(up);
++		mdelay(port->rs485.delay_rts_before_send);
++	}
++
++	if (nbcon_exit_unsafe(wctxt)) {
++		int len = READ_ONCE(wctxt->len);
++		int i;
++
++		/*
++		 * Write out the message. Toggle unsafe for each byte in order
++		 * to give another (higher priority) context the opportunity
++		 * for a friendly takeover. If such a takeover occurs, this
++		 * context must reacquire ownership in order to perform final
++		 * actions (such as re-enabling the interrupts).
++		 *
++		 * IMPORTANT: wctxt->outbuf and wctxt->len are no longer valid
++		 *	      after a reacquire so writing the message must be
++		 *	      aborted.
++		 */
++		for (i = 0; i < len; i++) {
++			if (!nbcon_enter_unsafe(wctxt)) {
++				nbcon_reacquire(wctxt);
++				break;
++			}
++
++			uart_console_write(port, wctxt->outbuf + i, 1, serial8250_console_putchar);
++
++			if (!nbcon_exit_unsafe(wctxt)) {
++				nbcon_reacquire(wctxt);
++				break;
++			}
++		}
++	} else {
++		nbcon_reacquire(wctxt);
++	}
++
++	while (!nbcon_enter_unsafe(wctxt))
++		nbcon_reacquire(wctxt);
++
++	/* Finally, wait for transmitter to become empty and restore IER. */
++	wait_for_xmitr(up, UART_LSR_BOTH_EMPTY);
++	if (em485) {
++		mdelay(port->rs485.delay_rts_after_send);
++		if (em485->tx_stopped)
++			up->rs485_stop_tx(up);
++	}
++	serial_port_out(port, UART_IER, ier);
++
++	/*
++	 * The receive handling will happen properly because the receive ready
++	 * bit will still be set; it is not cleared on read.  However, modem
++	 * control will not, we must call it if we have saved something in the
++	 * saved flags while processing with interrupts off.
++	 */
++	if (up->msr_saved_flags)
++		serial8250_modem_status(up);
++
++	nbcon_exit_unsafe(wctxt);
++}
++
++void serial8250_console_write_atomic(struct uart_8250_port *up,
++				     struct nbcon_write_context *wctxt)
++{
++	struct uart_port *port = &up->port;
++	unsigned int ier;
++
++	/* Atomic console not supported for rs485 mode. */
++	if (WARN_ON_ONCE(up->em485))
++		return;
++
++	touch_nmi_watchdog();
++
++	if (!nbcon_enter_unsafe(wctxt))
++		return;
++
++	/*
++	 * First save IER then disable the interrupts. The special variant to
++	 * clear IER is used because atomic printing may occur without holding
++	 * the port lock.
++	 */
++	ier = serial_port_in(port, UART_IER);
++	__serial8250_clear_IER(up);
++
++	/* Check scratch reg if port powered off during system sleep. */
++	if (up->canary && (up->canary != serial_port_in(port, UART_SCR))) {
++		serial8250_console_restore(up);
++		up->canary = 0;
++	}
++
++	if (up->console_newline_needed)
++		uart_console_write(port, "\n", 1, serial8250_console_putchar);
++	uart_console_write(port, wctxt->outbuf, wctxt->len, serial8250_console_putchar);
++
++	/* Finally, wait for transmitter to become empty and restore IER. */
++	wait_for_xmitr(up, UART_LSR_BOTH_EMPTY);
++	serial_port_out(port, UART_IER, ier);
++
++	nbcon_exit_unsafe(wctxt);
++}
++#endif /* CONFIG_SERIAL_8250_LEGACY_CONSOLE */
+ 
+ static unsigned int probe_baud(struct uart_port *port)
+ {
+@@ -3442,6 +3592,7 @@ static unsigned int probe_baud(struct uart_port *port)
+ 
+ int serial8250_console_setup(struct uart_port *port, char *options, bool probe)
+ {
++	struct uart_8250_port *up = up_to_u8250p(port);
+ 	int baud = 9600;
+ 	int bits = 8;
+ 	int parity = 'n';
+@@ -3451,6 +3602,8 @@ int serial8250_console_setup(struct uart_port *port, char *options, bool probe)
+ 	if (!port->iobase && !port->membase)
+ 		return -ENODEV;
+ 
++	up->console_newline_needed = false;
++
+ 	if (options)
+ 		uart_parse_options(options, &baud, &parity, &bits, &flow);
+ 	else if (probe)
+diff --git a/drivers/tty/serial/amba-pl011.c b/drivers/tty/serial/amba-pl011.c
+index 2fa3fb3..7618a57 100644
+--- a/drivers/tty/serial/amba-pl011.c
++++ b/drivers/tty/serial/amba-pl011.c
+@@ -2488,7 +2488,7 @@ static int pl011_console_match(struct console *co, char *name, int idx,
+ 			continue;
+ 
+ 		co->index = i;
+-		port->cons = co;
++		uart_port_set_cons(port, co);
+ 		return pl011_console_setup(co, options);
+ 	}
+ 
+diff --git a/drivers/tty/serial/serial_core.c b/drivers/tty/serial/serial_core.c
+index ff85ebd..dd88f30 100644
+--- a/drivers/tty/serial/serial_core.c
++++ b/drivers/tty/serial/serial_core.c
+@@ -3157,8 +3157,15 @@ static int serial_core_add_one_port(struct uart_driver *drv, struct uart_port *u
+ 	state->uart_port = uport;
+ 	uport->state = state;
+ 
++	/*
++	 * If this port is in use as a console then the spinlock is already
++	 * initialised.
++	 */
++	if (!uart_console_registered(uport))
++		uart_port_spin_lock_init(uport);
++
+ 	state->pm_state = UART_PM_STATE_UNDEFINED;
+-	uport->cons = drv->cons;
++	uart_port_set_cons(uport, drv->cons);
+ 	uport->minor = drv->tty_driver->minor_start + uport->line;
+ 	uport->name = kasprintf(GFP_KERNEL, "%s%d", drv->dev_name,
+ 				drv->tty_driver->name_base + uport->line);
+@@ -3167,13 +3174,6 @@ static int serial_core_add_one_port(struct uart_driver *drv, struct uart_port *u
+ 		goto out;
+ 	}
+ 
+-	/*
+-	 * If this port is in use as a console then the spinlock is already
+-	 * initialised.
+-	 */
+-	if (!uart_console_registered(uport))
+-		uart_port_spin_lock_init(uport);
+-
+ 	if (uport->cons && uport->dev)
+ 		of_console_check(uport->dev->of_node, uport->cons->name, uport->line);
+ 
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index 407b0d8..c9c914b 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -3567,8 +3567,13 @@ static ssize_t show_cons_active(struct device *dev,
+ 	for_each_console(c) {
+ 		if (!c->device)
+ 			continue;
+-		if (!c->write)
+-			continue;
++		if (c->flags & CON_NBCON) {
++			if (!c->write_atomic && !c->write_thread)
++				continue;
++		} else {
++			if (!c->write)
++				continue;
++		}
+ 		if ((c->flags & CON_ENABLED) == 0)
+ 			continue;
+ 		cs[i++] = c;
+diff --git a/fs/proc/consoles.c b/fs/proc/consoles.c
+index e0758fe..2703676 100644
+--- a/fs/proc/consoles.c
++++ b/fs/proc/consoles.c
+@@ -21,12 +21,14 @@ static int show_console_dev(struct seq_file *m, void *v)
+ 		{ CON_ENABLED,		'E' },
+ 		{ CON_CONSDEV,		'C' },
+ 		{ CON_BOOT,		'B' },
++		{ CON_NBCON,		'N' },
+ 		{ CON_PRINTBUFFER,	'p' },
+ 		{ CON_BRL,		'b' },
+ 		{ CON_ANYTIME,		'a' },
+ 	};
+ 	char flags[ARRAY_SIZE(con_flags) + 1];
+ 	struct console *con = v;
++	char con_write = '-';
+ 	unsigned int a;
+ 	dev_t dev = 0;
+ 
+@@ -57,9 +59,15 @@ static int show_console_dev(struct seq_file *m, void *v)
+ 	seq_setwidth(m, 21 - 1);
+ 	seq_printf(m, "%s%d", con->name, con->index);
+ 	seq_pad(m, ' ');
+-	seq_printf(m, "%c%c%c (%s)", con->read ? 'R' : '-',
+-			con->write ? 'W' : '-', con->unblank ? 'U' : '-',
+-			flags);
++	if (con->flags & CON_NBCON) {
++		if (con->write_atomic || con->write_thread)
++			con_write = 'W';
++	} else {
++		if (con->write)
++			con_write = 'W';
++	}
++	seq_printf(m, "%c%c%c (%s)", con->read ? 'R' : '-', con_write,
++		   con->unblank ? 'U' : '-', flags);
+ 	if (dev)
+ 		seq_printf(m, " %4d:%d", MAJOR(dev), MINOR(dev));
+ 
+diff --git a/include/linux/bottom_half.h b/include/linux/bottom_half.h
+index fc53e0a..448bbef 100644
+--- a/include/linux/bottom_half.h
++++ b/include/linux/bottom_half.h
+@@ -35,8 +35,10 @@ static inline void local_bh_enable(void)
+ 
+ #ifdef CONFIG_PREEMPT_RT
+ extern bool local_bh_blocked(void);
++extern void softirq_preempt(void);
+ #else
+ static inline bool local_bh_blocked(void) { return false; }
++static inline void softirq_preempt(void) { }
+ #endif
+ 
+ #endif /* _LINUX_BH_H */
+diff --git a/include/linux/console.h b/include/linux/console.h
+index 31a8f5b..e82fe94 100644
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -16,7 +16,9 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/bits.h>
++#include <linux/irq_work.h>
+ #include <linux/rculist.h>
++#include <linux/rcuwait.h>
+ #include <linux/types.h>
+ #include <linux/vesa.h>
+ 
+@@ -300,10 +302,29 @@ struct nbcon_write_context {
+ 	bool			unsafe_takeover;
+ };
+ 
++/**
++ * struct nbcon_drvdata - Data to allow nbcon acquire in non-print context
++ * @ctxt:		The core console context
++ * @srcu_cookie:	Storage for a console_srcu_lock cookie, if needed
++ * @owner_index:	Storage for the owning console index, if needed
++ * @locked:		Storage for the locked state, if needed
++ *
++ * All fields (except for @ctxt) are available exclusively to the driver to
++ * use as needed. They are not used by the printk subsystem.
++ */
++struct nbcon_drvdata {
++	struct nbcon_context	__private ctxt;
++
++	/* reserved for driver use */
++	int			srcu_cookie;
++	short			owner_index;
++	bool			locked;
++};
++
+ /**
+  * struct console - The console descriptor structure
+  * @name:		The name of the console driver
+- * @write:		Write callback to output messages (Optional)
++ * @write:		Legacy write callback to output messages (Optional)
+  * @read:		Read callback for console input (Optional)
+  * @device:		The underlying TTY device driver (Optional)
+  * @unblank:		Callback to unblank the console (Optional)
+@@ -320,10 +341,13 @@ struct nbcon_write_context {
+  * @data:		Driver private data
+  * @node:		hlist node for the console list
+  *
+- * @write_atomic:	Write callback for atomic context
+  * @nbcon_state:	State for nbcon consoles
+  * @nbcon_seq:		Sequence number of the next record for nbcon to print
++ * @nbcon_prev_seq:	Seq num the previous nbcon owner was assigned to print
+  * @pbufs:		Pointer to nbcon private buffer
++ * @kthread:		Printer kthread for this console
++ * @rcuwait:		RCU-safe wait object for @kthread waking
++ * @irq_work:		Defer @kthread waking to IRQ work context
+  */
+ struct console {
+ 	char			name[16];
+@@ -345,11 +369,122 @@ struct console {
+ 	struct hlist_node	node;
+ 
+ 	/* nbcon console specific members */
+-	bool			(*write_atomic)(struct console *con,
+-						struct nbcon_write_context *wctxt);
++
++	/**
++	 * @write_atomic:
++	 *
++	 * NBCON callback to write out text in any context.
++	 *
++	 * This callback is called with the console already acquired. The
++	 * callback can use nbcon_can_proceed() at any time to verify that
++	 * it is still the owner of the console. In the case that it has
++	 * lost ownership, it is no longer allowed to go forward. In this
++	 * case it must back out immediately and carefully. The buffer
++	 * content is also no longer trusted since it no longer belongs to
++	 * the context.
++	 *
++	 * If the callback needs to perform actions where ownership is not
++	 * allowed to be taken over, nbcon_enter_unsafe() and
++	 * nbcon_exit_unsafe() can be used to mark such sections. These
++	 * functions are also points of possible ownership transfer. If
++	 * either function returns false, ownership has been lost.
++	 *
++	 * If the driver must reacquire ownership in order to finalize or
++	 * revert hardware changes, nbcon_reacquire() can be used. However,
++	 * on reacquire the buffer content is no longer available. A
++	 * reacquire cannot be used to resume printing.
++	 *
++	 * This callback can be called from any context (including NMI).
++	 * Therefore it must avoid usage of any locking and instead rely
++	 * on the console ownership for synchronization.
++	 */
++	void (*write_atomic)(struct console *con, struct nbcon_write_context *wctxt);
++
++	/**
++	 * @write_thread:
++	 *
++	 * NBCON callback to write out text in task context. (Optional)
++	 *
++	 * This callback is called with the console already acquired. Any
++	 * additional driver synchronization should have been performed by
++	 * device_lock().
++	 *
++	 * This callback is always called from task context but with migration
++	 * disabled.
++	 *
++	 * The same criteria for console ownership verification and unsafe
++	 * sections applies as with write_atomic(). The difference between
++	 * this callback and write_atomic() is that this callback is used
++	 * during normal operation and is always called from task context.
++	 * This provides drivers with a relatively relaxed locking context
++	 * for synchronizing output to the hardware.
++	 */
++	void (*write_thread)(struct console *con, struct nbcon_write_context *wctxt);
++
++	/**
++	 * @device_lock:
++	 *
++	 * NBCON callback to begin synchronization with driver code.
++	 *
++	 * Console drivers typically must deal with access to the hardware
++	 * via user input/output (such as an interactive login shell) and
++	 * output of kernel messages via printk() calls. This callback is
++	 * called by the printk-subsystem whenever it needs to synchronize
++	 * with hardware access by the driver. It should be implemented to
++	 * use whatever synchronization mechanism the driver is using for
++	 * itself (for example, the port lock for uart serial consoles).
++	 *
++	 * This callback is always called from task context. It may use any
++	 * synchronization method required by the driver. BUT this callback
++	 * MUST also disable migration. The console driver may be using a
++	 * synchronization mechanism that already takes care of this (such as
++	 * spinlocks). Otherwise this function must explicitly call
++	 * migrate_disable().
++	 *
++	 * The flags argument is provided as a convenience to the driver. It
++	 * will be passed again to device_unlock(). It can be ignored if the
++	 * driver does not need it.
++	 */
++	void (*device_lock)(struct console *con, unsigned long *flags);
++
++	/**
++	 * @device_unlock:
++	 *
++	 * NBCON callback to finish synchronization with driver code.
++	 *
++	 * It is the counterpart to device_lock().
++	 *
++	 * This callback is always called from task context. It must
++	 * appropriately re-enable migration (depending on how device_lock()
++	 * disabled migration).
++	 *
++	 * The flags argument is the value of the same variable that was
++	 * passed to device_lock().
++	 */
++	void (*device_unlock)(struct console *con, unsigned long flags);
++
+ 	atomic_t		__private nbcon_state;
+ 	atomic_long_t		__private nbcon_seq;
++	atomic_long_t           __private nbcon_prev_seq;
++
++	/**
++	 * @nbcon_drvdata:
++	 *
++	 * Data for nbcon ownership tracking to allow acquiring nbcon consoles
++	 * in non-printing contexts.
++	 *
++	 * Drivers may need to acquire nbcon consoles in non-printing
++	 * contexts. This is achieved by providing a struct nbcon_drvdata.
++	 * Then the driver can call nbcon_driver_acquire() and
++	 * nbcon_driver_release(). The struct does not require any special
++	 * initialization.
++	 */
++	struct nbcon_drvdata	*nbcon_drvdata;
++
+ 	struct printk_buffers	*pbufs;
++	struct task_struct	*kthread;
++	struct rcuwait		rcuwait;
++	struct irq_work		irq_work;
+ };
+ 
+ #ifdef CONFIG_LOCKDEP
+@@ -378,28 +513,29 @@ extern void console_list_unlock(void) __releases(console_mutex);
+ extern struct hlist_head console_list;
+ 
+ /**
+- * console_srcu_read_flags - Locklessly read the console flags
++ * console_srcu_read_flags - Locklessly read flags of a possibly registered
++ *				console
+  * @con:	struct console pointer of console to read flags from
+  *
+- * This function provides the necessary READ_ONCE() and data_race()
+- * notation for locklessly reading the console flags. The READ_ONCE()
+- * in this function matches the WRITE_ONCE() when @flags are modified
+- * for registered consoles with console_srcu_write_flags().
++ * Locklessly reading @con->flags provides a consistent read value because
++ * there is at most one CPU modifying @con->flags and that CPU is using only
++ * read-modify-write operations to do so.
+  *
+- * Only use this function to read console flags when locklessly
+- * iterating the console list via srcu.
++ * Requires console_srcu_read_lock to be held, which implies that @con might
++ * be a registered console. If the caller is holding the console_list_lock or
++ * it is certain that the console is not registered, the caller may read
++ * @con->flags directly instead.
+  *
+  * Context: Any context.
++ * Return: The current value of the @con->flags field.
+  */
+ static inline short console_srcu_read_flags(const struct console *con)
+ {
+ 	WARN_ON_ONCE(!console_srcu_read_lock_is_held());
+ 
+ 	/*
+-	 * Locklessly reading console->flags provides a consistent
+-	 * read value because there is at most one CPU modifying
+-	 * console->flags and that CPU is using only read-modify-write
+-	 * operations to do so.
++	 * The READ_ONCE() matches the WRITE_ONCE() when @flags are modified
++	 * for registered consoles with console_srcu_write_flags().
+ 	 */
+ 	return data_race(READ_ONCE(con->flags));
+ }
+@@ -477,13 +613,19 @@ static inline bool console_is_registered(const struct console *con)
+ 	hlist_for_each_entry(con, &console_list, node)
+ 
+ #ifdef CONFIG_PRINTK
++extern void nbcon_cpu_emergency_enter(void);
++extern void nbcon_cpu_emergency_exit(void);
+ extern bool nbcon_can_proceed(struct nbcon_write_context *wctxt);
+ extern bool nbcon_enter_unsafe(struct nbcon_write_context *wctxt);
+ extern bool nbcon_exit_unsafe(struct nbcon_write_context *wctxt);
++extern void nbcon_reacquire(struct nbcon_write_context *wctxt);
+ #else
++static inline void nbcon_cpu_emergency_enter(void) { }
++static inline void nbcon_cpu_emergency_exit(void) { }
+ static inline bool nbcon_can_proceed(struct nbcon_write_context *wctxt) { return false; }
+ static inline bool nbcon_enter_unsafe(struct nbcon_write_context *wctxt) { return false; }
+ static inline bool nbcon_exit_unsafe(struct nbcon_write_context *wctxt) { return false; }
++static inline void nbcon_reacquire(struct nbcon_write_context *wctxt) { }
+ #endif
+ 
+ extern int console_set_on_cmdline;
+diff --git a/include/linux/entry-common.h b/include/linux/entry-common.h
+index b0fb775..f5bb193 100644
+--- a/include/linux/entry-common.h
++++ b/include/linux/entry-common.h
+@@ -65,7 +65,7 @@
+ #define EXIT_TO_USER_MODE_WORK						\
+ 	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_UPROBE |		\
+ 	 _TIF_NEED_RESCHED | _TIF_PATCH_PENDING | _TIF_NOTIFY_SIGNAL |	\
+-	 ARCH_EXIT_TO_USER_MODE_WORK)
++	 _TIF_NEED_RESCHED_LAZY | ARCH_EXIT_TO_USER_MODE_WORK)
+ 
+ /**
+  * arch_enter_from_user_mode - Architecture specific sanity check for user mode regs
+diff --git a/include/linux/entry-kvm.h b/include/linux/entry-kvm.h
+index 6813171..674a622 100644
+--- a/include/linux/entry-kvm.h
++++ b/include/linux/entry-kvm.h
+@@ -18,7 +18,7 @@
+ 
+ #define XFER_TO_GUEST_MODE_WORK						\
+ 	(_TIF_NEED_RESCHED | _TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL |	\
+-	 _TIF_NOTIFY_RESUME | ARCH_XFER_TO_GUEST_MODE_WORK)
++	 _TIF_NOTIFY_RESUME | _TIF_NEED_RESCHED_LAZY | ARCH_XFER_TO_GUEST_MODE_WORK)
+ 
+ struct kvm_vcpu;
+ 
+diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
+index 5c9bdd3..42e91ea 100644
+--- a/include/linux/interrupt.h
++++ b/include/linux/interrupt.h
+@@ -612,6 +612,35 @@ extern void __raise_softirq_irqoff(unsigned int nr);
+ extern void raise_softirq_irqoff(unsigned int nr);
+ extern void raise_softirq(unsigned int nr);
+ 
++#ifdef CONFIG_PREEMPT_RT
++DECLARE_PER_CPU(struct task_struct *, timersd);
++DECLARE_PER_CPU(unsigned long, pending_timer_softirq);
++
++extern void raise_timer_softirq(void);
++extern void raise_hrtimer_softirq(void);
++
++static inline unsigned int local_pending_timers(void)
++{
++        return __this_cpu_read(pending_timer_softirq);
++}
++
++#else
++static inline void raise_timer_softirq(void)
++{
++	raise_softirq(TIMER_SOFTIRQ);
++}
++
++static inline void raise_hrtimer_softirq(void)
++{
++	raise_softirq_irqoff(HRTIMER_SOFTIRQ);
++}
++
++static inline unsigned int local_pending_timers(void)
++{
++        return local_softirq_pending();
++}
++#endif
++
+ DECLARE_PER_CPU(struct task_struct *, ksoftirqd);
+ 
+ static inline struct task_struct *this_cpu_ksoftirqd(void)
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index cb37817..e41d30e 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3287,6 +3287,7 @@ static inline void dev_xmit_recursion_dec(void)
+ 	__this_cpu_dec(softnet_data.xmit.recursion);
+ }
+ 
++void kick_defer_list_purge(struct softnet_data *sd, unsigned int cpu);
+ void __netif_schedule(struct Qdisc *q);
+ void netif_schedule_queue(struct netdev_queue *txq);
+ 
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index d2a15c0..c1c6600 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -781,9 +781,9 @@ struct perf_event {
+ 	unsigned int			pending_wakeup;
+ 	unsigned int			pending_kill;
+ 	unsigned int			pending_disable;
+-	unsigned int			pending_sigtrap;
+ 	unsigned long			pending_addr;	/* SIGTRAP */
+ 	struct irq_work			pending_irq;
++	struct irq_work			pending_disable_irq;
+ 	struct callback_head		pending_task;
+ 	unsigned int			pending_work;
+ 
+@@ -959,7 +959,7 @@ struct perf_event_context {
+ 	struct rcu_head			rcu_head;
+ 
+ 	/*
+-	 * Sum (event->pending_sigtrap + event->pending_work)
++	 * Sum (event->pending_work + event->pending_work)
+ 	 *
+ 	 * The SIGTRAP is targeted at ctx->task, as such it won't do changing
+ 	 * that until the signal is delivered.
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index 955e318..f2074b4 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -9,6 +9,8 @@
+ #include <linux/ratelimit_types.h>
+ #include <linux/once_lite.h>
+ 
++struct console;
++
+ extern const char linux_banner[];
+ extern const char linux_proc_banner[];
+ 
+@@ -157,15 +159,16 @@ int _printk(const char *fmt, ...);
+  */
+ __printf(1, 2) __cold int _printk_deferred(const char *fmt, ...);
+ 
+-extern void __printk_safe_enter(void);
+-extern void __printk_safe_exit(void);
++extern void __printk_deferred_enter(void);
++extern void __printk_deferred_exit(void);
++
+ /*
+  * The printk_deferred_enter/exit macros are available only as a hack for
+  * some code paths that need to defer all printk console printing. Interrupts
+  * must be disabled for the deferred duration.
+  */
+-#define printk_deferred_enter __printk_safe_enter
+-#define printk_deferred_exit __printk_safe_exit
++#define printk_deferred_enter() __printk_deferred_enter()
++#define printk_deferred_exit() __printk_deferred_exit()
+ 
+ /*
+  * Please don't use printk_ratelimit(), because it shares ratelimiting state
+@@ -192,6 +195,10 @@ void show_regs_print_info(const char *log_lvl);
+ extern asmlinkage void dump_stack_lvl(const char *log_lvl) __cold;
+ extern asmlinkage void dump_stack(void) __cold;
+ void printk_trigger_flush(void);
++void printk_legacy_allow_panic_sync(void);
++extern void nbcon_driver_acquire(struct console *con);
++extern void nbcon_driver_release(struct console *con);
++void nbcon_atomic_flush_unsafe(void);
+ #else
+ static inline __printf(1, 0)
+ int vprintk(const char *s, va_list args)
+@@ -271,6 +278,23 @@ static inline void dump_stack(void)
+ static inline void printk_trigger_flush(void)
+ {
+ }
++
++static inline void printk_legacy_allow_panic_sync(void)
++{
++}
++
++static inline void nbcon_driver_acquire(struct console *con)
++{
++}
++
++static inline void nbcon_driver_release(struct console *con)
++{
++}
++
++static inline void nbcon_atomic_flush_unsafe(void)
++{
++}
++
+ #endif
+ 
+ bool this_cpu_in_panic(void);
+diff --git a/include/linux/rwbase_rt.h b/include/linux/rwbase_rt.h
+index 29c4e4f..f2394a4 100644
+--- a/include/linux/rwbase_rt.h
++++ b/include/linux/rwbase_rt.h
+@@ -31,9 +31,9 @@ static __always_inline bool rw_base_is_locked(const struct rwbase_rt *rwb)
+ 	return atomic_read(&rwb->readers) != READER_BIAS;
+ }
+ 
+-static inline void rw_base_assert_held_write(const struct rwbase_rt *rwb)
++static __always_inline bool rw_base_is_write_locked(const struct rwbase_rt *rwb)
+ {
+-	WARN_ON(atomic_read(&rwb->readers) != WRITER_BIAS);
++	return atomic_read(&rwb->readers) == WRITER_BIAS;
+ }
+ 
+ static __always_inline bool rw_base_is_contended(const struct rwbase_rt *rwb)
+diff --git a/include/linux/rwsem.h b/include/linux/rwsem.h
+index 4f1c189..c8b543d 100644
+--- a/include/linux/rwsem.h
++++ b/include/linux/rwsem.h
+@@ -167,14 +167,14 @@ static __always_inline int rwsem_is_locked(const struct rw_semaphore *sem)
+ 	return rw_base_is_locked(&sem->rwbase);
+ }
+ 
+-static inline void rwsem_assert_held_nolockdep(const struct rw_semaphore *sem)
++static __always_inline void rwsem_assert_held_nolockdep(const struct rw_semaphore *sem)
+ {
+ 	WARN_ON(!rwsem_is_locked(sem));
+ }
+ 
+-static inline void rwsem_assert_held_write_nolockdep(const struct rw_semaphore *sem)
++static __always_inline void rwsem_assert_held_write_nolockdep(const struct rw_semaphore *sem)
+ {
+-	rw_base_assert_held_write(sem);
++	WARN_ON(!rw_base_is_write_locked(&sem->rwbase));
+ }
+ 
+ static __always_inline int rwsem_is_contended(struct rw_semaphore *sem)
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 3c2abbc..1d3b8dc 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1795,6 +1795,7 @@ static inline int dl_task_check_affinity(struct task_struct *p, const struct cpu
+ }
+ #endif
+ 
++extern bool task_is_pi_boosted(const struct task_struct *p);
+ extern int yield_to(struct task_struct *p, bool preempt);
+ extern void set_user_nice(struct task_struct *p, long nice);
+ extern int task_prio(const struct task_struct *p);
+@@ -1937,17 +1938,17 @@ static inline void update_tsk_thread_flag(struct task_struct *tsk, int flag,
+ 	update_ti_thread_flag(task_thread_info(tsk), flag, value);
+ }
+ 
+-static inline int test_and_set_tsk_thread_flag(struct task_struct *tsk, int flag)
++static inline bool test_and_set_tsk_thread_flag(struct task_struct *tsk, int flag)
+ {
+ 	return test_and_set_ti_thread_flag(task_thread_info(tsk), flag);
+ }
+ 
+-static inline int test_and_clear_tsk_thread_flag(struct task_struct *tsk, int flag)
++static inline bool test_and_clear_tsk_thread_flag(struct task_struct *tsk, int flag)
+ {
+ 	return test_and_clear_ti_thread_flag(task_thread_info(tsk), flag);
+ }
+ 
+-static inline int test_tsk_thread_flag(struct task_struct *tsk, int flag)
++static inline bool test_tsk_thread_flag(struct task_struct *tsk, int flag)
+ {
+ 	return test_ti_thread_flag(task_thread_info(tsk), flag);
+ }
+@@ -1960,9 +1961,11 @@ static inline void set_tsk_need_resched(struct task_struct *tsk)
+ static inline void clear_tsk_need_resched(struct task_struct *tsk)
+ {
+ 	clear_tsk_thread_flag(tsk,TIF_NEED_RESCHED);
++	if (IS_ENABLED(CONFIG_PREEMPT_BUILD_AUTO))
++		clear_tsk_thread_flag(tsk, TIF_NEED_RESCHED_LAZY);
+ }
+ 
+-static inline int test_tsk_need_resched(struct task_struct *tsk)
++static inline bool test_tsk_need_resched(struct task_struct *tsk)
+ {
+ 	return unlikely(test_tsk_thread_flag(tsk,TIF_NEED_RESCHED));
+ }
+@@ -2103,7 +2106,7 @@ static inline bool preempt_model_preemptible(void)
+ 
+ static __always_inline bool need_resched(void)
+ {
+-	return unlikely(tif_need_resched());
++	return unlikely(tif_need_resched_lazy() || tif_need_resched());
+ }
+ 
+ /*
+diff --git a/include/linux/sched/idle.h b/include/linux/sched/idle.h
+index 478084f..719416f 100644
+--- a/include/linux/sched/idle.h
++++ b/include/linux/sched/idle.h
+@@ -63,7 +63,7 @@ static __always_inline bool __must_check current_set_polling_and_test(void)
+ 	 */
+ 	smp_mb__after_atomic();
+ 
+-	return unlikely(tif_need_resched());
++	return unlikely(need_resched());
+ }
+ 
+ static __always_inline bool __must_check current_clr_polling_and_test(void)
+@@ -76,7 +76,7 @@ static __always_inline bool __must_check current_clr_polling_and_test(void)
+ 	 */
+ 	smp_mb__after_atomic();
+ 
+-	return unlikely(tif_need_resched());
++	return unlikely(need_resched());
+ }
+ 
+ #else
+@@ -85,11 +85,11 @@ static inline void __current_clr_polling(void) { }
+ 
+ static inline bool __must_check current_set_polling_and_test(void)
+ {
+-	return unlikely(tif_need_resched());
++	return unlikely(need_resched());
+ }
+ static inline bool __must_check current_clr_polling_and_test(void)
+ {
+-	return unlikely(tif_need_resched());
++	return unlikely(need_resched());
+ }
+ #endif
+ 
+diff --git a/include/linux/serial_8250.h b/include/linux/serial_8250.h
+index fd59ed2..b74eae9 100644
+--- a/include/linux/serial_8250.h
++++ b/include/linux/serial_8250.h
+@@ -153,6 +153,8 @@ struct uart_8250_port {
+ #define MSR_SAVE_FLAGS UART_MSR_ANY_DELTA
+ 	unsigned char		msr_saved_flags;
+ 
++	bool			console_newline_needed;
++
+ 	struct uart_8250_dma	*dma;
+ 	const struct uart_8250_ops *ops;
+ 
+@@ -204,6 +206,10 @@ void serial8250_init_port(struct uart_8250_port *up);
+ void serial8250_set_defaults(struct uart_8250_port *up);
+ void serial8250_console_write(struct uart_8250_port *up, const char *s,
+ 			      unsigned int count);
++void serial8250_console_write_atomic(struct uart_8250_port *up,
++				     struct nbcon_write_context *wctxt);
++void serial8250_console_write_thread(struct uart_8250_port *up,
++				     struct nbcon_write_context *wctxt);
+ int serial8250_console_setup(struct uart_port *port, char *options, bool probe);
+ int serial8250_console_exit(struct uart_port *port);
+ 
+diff --git a/include/linux/serial_core.h b/include/linux/serial_core.h
+index 0a0f6e2..badcf44 100644
+--- a/include/linux/serial_core.h
++++ b/include/linux/serial_core.h
+@@ -8,10 +8,13 @@
+ #define LINUX_SERIAL_CORE_H
+ 
+ #include <linux/bitops.h>
++#include <linux/bug.h>
+ #include <linux/compiler.h>
+ #include <linux/console.h>
+ #include <linux/interrupt.h>
+ #include <linux/circ_buf.h>
++#include <linux/lockdep.h>
++#include <linux/printk.h>
+ #include <linux/spinlock.h>
+ #include <linux/sched.h>
+ #include <linux/tty.h>
+@@ -591,6 +594,101 @@ struct uart_port {
+ 	void			*private_data;		/* generic platform data pointer */
+ };
+ 
++/*
++ * Only for console->device_lock()/_unlock() callbacks and internal
++ * port lock wrapper synchronization.
++ */
++static inline void __uart_port_lock_irqsave(struct uart_port *up, unsigned long *flags)
++{
++	spin_lock_irqsave(&up->lock, *flags);
++}
++
++/*
++ * Only for console->device_lock()/_unlock() callbacks and internal
++ * port lock wrapper synchronization.
++ */
++static inline void __uart_port_unlock_irqrestore(struct uart_port *up, unsigned long flags)
++{
++	spin_unlock_irqrestore(&up->lock, flags);
++}
++
++/**
++ * uart_port_set_cons - Safely set the @cons field for a uart
++ * @up:		The uart port to set
++ * @con:	The new console to set to
++ *
++ * This function must be used to set @up->cons. It uses the port lock to
++ * synchronize with the port lock wrappers in order to ensure that the console
++ * cannot change or disappear while another context is holding the port lock.
++ */
++static inline void uart_port_set_cons(struct uart_port *up, struct console *con)
++{
++	unsigned long flags;
++
++	__uart_port_lock_irqsave(up, &flags);
++	up->cons = con;
++	__uart_port_unlock_irqrestore(up, flags);
++}
++
++/* Only for internal port lock wrapper usage. */
++static inline void __uart_port_nbcon_acquire(struct uart_port *up)
++{
++	lockdep_assert_held_once(&up->lock);
++
++	if (likely(!uart_console(up)))
++		return;
++
++	if (up->cons->nbcon_drvdata) {
++		/*
++		 * If @up->cons is registered, prevent it from fully
++		 * unregistering until this context releases the nbcon.
++		 */
++		int cookie = console_srcu_read_lock();
++
++		/* Ensure console is registered and is an nbcon console. */
++		if (!hlist_unhashed_lockless(&up->cons->node) &&
++		    (console_srcu_read_flags(up->cons) & CON_NBCON)) {
++			WARN_ON_ONCE(up->cons->nbcon_drvdata->locked);
++
++			nbcon_driver_acquire(up->cons);
++
++			/*
++			 * Record @up->line to be used during release because
++			 * @up->cons->index can change while the port and
++			 * nbcon are locked.
++			 */
++			up->cons->nbcon_drvdata->owner_index = up->line;
++			up->cons->nbcon_drvdata->srcu_cookie = cookie;
++			up->cons->nbcon_drvdata->locked = true;
++		} else {
++			console_srcu_read_unlock(cookie);
++		}
++	}
++}
++
++/* Only for internal port lock wrapper usage. */
++static inline void __uart_port_nbcon_release(struct uart_port *up)
++{
++	lockdep_assert_held_once(&up->lock);
++
++	/*
++	 * uart_console() cannot be used here because @up->cons->index might
++	 * have changed. Check against @up->cons->nbcon_drvdata->owner_index
++	 * instead.
++	 */
++
++	if (unlikely(up->cons &&
++		     up->cons->nbcon_drvdata &&
++		     up->cons->nbcon_drvdata->locked &&
++		     up->cons->nbcon_drvdata->owner_index == up->line)) {
++		WARN_ON_ONCE(!up->cons->nbcon_drvdata->locked);
++
++		up->cons->nbcon_drvdata->locked = false;
++		nbcon_driver_release(up->cons);
++		console_srcu_read_unlock(up->cons->nbcon_drvdata->srcu_cookie);
++	}
++}
++
+ /**
+  * uart_port_lock - Lock the UART port
+  * @up:		Pointer to UART port structure
+@@ -598,6 +696,7 @@ struct uart_port {
+ static inline void uart_port_lock(struct uart_port *up)
+ {
+ 	spin_lock(&up->lock);
++	__uart_port_nbcon_acquire(up);
+ }
+ 
+ /**
+@@ -607,6 +706,7 @@ static inline void uart_port_lock(struct uart_port *up)
+ static inline void uart_port_lock_irq(struct uart_port *up)
+ {
+ 	spin_lock_irq(&up->lock);
++	__uart_port_nbcon_acquire(up);
+ }
+ 
+ /**
+@@ -617,6 +717,7 @@ static inline void uart_port_lock_irq(struct uart_port *up)
+ static inline void uart_port_lock_irqsave(struct uart_port *up, unsigned long *flags)
+ {
+ 	spin_lock_irqsave(&up->lock, *flags);
++	__uart_port_nbcon_acquire(up);
+ }
+ 
+ /**
+@@ -627,7 +728,11 @@ static inline void uart_port_lock_irqsave(struct uart_port *up, unsigned long *f
+  */
+ static inline bool uart_port_trylock(struct uart_port *up)
+ {
+-	return spin_trylock(&up->lock);
++	if (!spin_trylock(&up->lock))
++		return false;
++
++	__uart_port_nbcon_acquire(up);
++	return true;
+ }
+ 
+ /**
+@@ -639,7 +744,11 @@ static inline bool uart_port_trylock(struct uart_port *up)
+  */
+ static inline bool uart_port_trylock_irqsave(struct uart_port *up, unsigned long *flags)
+ {
+-	return spin_trylock_irqsave(&up->lock, *flags);
++	if (!spin_trylock_irqsave(&up->lock, *flags))
++		return false;
++
++	__uart_port_nbcon_acquire(up);
++	return true;
+ }
+ 
+ /**
+@@ -648,6 +757,7 @@ static inline bool uart_port_trylock_irqsave(struct uart_port *up, unsigned long
+  */
+ static inline void uart_port_unlock(struct uart_port *up)
+ {
++	__uart_port_nbcon_release(up);
+ 	spin_unlock(&up->lock);
+ }
+ 
+@@ -657,6 +767,7 @@ static inline void uart_port_unlock(struct uart_port *up)
+  */
+ static inline void uart_port_unlock_irq(struct uart_port *up)
+ {
++	__uart_port_nbcon_release(up);
+ 	spin_unlock_irq(&up->lock);
+ }
+ 
+@@ -667,6 +778,7 @@ static inline void uart_port_unlock_irq(struct uart_port *up)
+  */
+ static inline void uart_port_unlock_irqrestore(struct uart_port *up, unsigned long flags)
+ {
++	__uart_port_nbcon_release(up);
+ 	spin_unlock_irqrestore(&up->lock, flags);
+ }
+ 
+diff --git a/include/linux/thread_info.h b/include/linux/thread_info.h
+index 9ea0b28..5ded145 100644
+--- a/include/linux/thread_info.h
++++ b/include/linux/thread_info.h
+@@ -59,6 +59,16 @@ enum syscall_work_bit {
+ 
+ #include <asm/thread_info.h>
+ 
++#ifdef CONFIG_PREEMPT_BUILD_AUTO
++# define TIF_NEED_RESCHED_LAZY		TIF_ARCH_RESCHED_LAZY
++# define _TIF_NEED_RESCHED_LAZY		_TIF_ARCH_RESCHED_LAZY
++# define TIF_NEED_RESCHED_LAZY_OFFSET	(TIF_NEED_RESCHED_LAZY - TIF_NEED_RESCHED)
++#else
++# define TIF_NEED_RESCHED_LAZY		TIF_NEED_RESCHED
++# define _TIF_NEED_RESCHED_LAZY		_TIF_NEED_RESCHED
++# define TIF_NEED_RESCHED_LAZY_OFFSET	0
++#endif
++
+ #ifdef __KERNEL__
+ 
+ #ifndef arch_set_restart_data
+@@ -185,6 +195,13 @@ static __always_inline bool tif_need_resched(void)
+ 			     (unsigned long *)(&current_thread_info()->flags));
+ }
+ 
++static __always_inline bool tif_need_resched_lazy(void)
++{
++	return IS_ENABLED(CONFIG_PREEMPT_BUILD_AUTO) &&
++		arch_test_bit(TIF_NEED_RESCHED_LAZY,
++			      (unsigned long *)(&current_thread_info()->flags));
++}
++
+ #else
+ 
+ static __always_inline bool tif_need_resched(void)
+@@ -193,6 +210,13 @@ static __always_inline bool tif_need_resched(void)
+ 			(unsigned long *)(&current_thread_info()->flags));
+ }
+ 
++static __always_inline bool tif_need_resched_lazy(void)
++{
++	return IS_ENABLED(CONFIG_PREEMPT_BUILD_AUTO) &&
++		test_bit(TIF_NEED_RESCHED_LAZY,
++			 (unsigned long *)(&current_thread_info()->flags));
++}
++
+ #endif /* _ASM_GENERIC_BITOPS_INSTRUMENTED_NON_ATOMIC_H */
+ 
+ #ifndef CONFIG_HAVE_ARCH_WITHIN_STACK_FRAMES
+diff --git a/include/linux/trace_events.h b/include/linux/trace_events.h
+index 6f9bdfb..57f6388 100644
+--- a/include/linux/trace_events.h
++++ b/include/linux/trace_events.h
+@@ -184,8 +184,8 @@ unsigned int tracing_gen_ctx_irq_test(unsigned int irqs_status);
+ 
+ enum trace_flag_type {
+ 	TRACE_FLAG_IRQS_OFF		= 0x01,
+-	TRACE_FLAG_IRQS_NOSUPPORT	= 0x02,
+-	TRACE_FLAG_NEED_RESCHED		= 0x04,
++	TRACE_FLAG_NEED_RESCHED		= 0x02,
++	TRACE_FLAG_NEED_RESCHED_LAZY	= 0x04,
+ 	TRACE_FLAG_HARDIRQ		= 0x08,
+ 	TRACE_FLAG_SOFTIRQ		= 0x10,
+ 	TRACE_FLAG_PREEMPT_RESCHED	= 0x20,
+@@ -211,11 +211,11 @@ static inline unsigned int tracing_gen_ctx(void)
+ 
+ static inline unsigned int tracing_gen_ctx_flags(unsigned long irqflags)
+ {
+-	return tracing_gen_ctx_irq_test(TRACE_FLAG_IRQS_NOSUPPORT);
++	return tracing_gen_ctx_irq_test(0);
+ }
+ static inline unsigned int tracing_gen_ctx(void)
+ {
+-	return tracing_gen_ctx_irq_test(TRACE_FLAG_IRQS_NOSUPPORT);
++	return tracing_gen_ctx_irq_test(0);
+ }
+ #endif
+ 
+diff --git a/kernel/Kconfig.preempt b/kernel/Kconfig.preempt
+index c2f1fd9..337fcd5 100644
+--- a/kernel/Kconfig.preempt
++++ b/kernel/Kconfig.preempt
+@@ -11,6 +11,13 @@ config PREEMPT_BUILD
+ 	select PREEMPTION
+ 	select UNINLINE_SPIN_UNLOCK if !ARCH_INLINE_SPIN_UNLOCK
+ 
++config PREEMPT_BUILD_AUTO
++	bool
++	select PREEMPT_BUILD
++
++config HAVE_PREEMPT_AUTO
++	bool
++
+ choice
+ 	prompt "Preemption Model"
+ 	default PREEMPT_NONE
+@@ -67,9 +74,17 @@ config PREEMPT
+ 	  embedded system with latency requirements in the milliseconds
+ 	  range.
+ 
++config PREEMPT_AUTO
++	bool "Automagic preemption mode with runtime tweaking support"
++	depends on HAVE_PREEMPT_AUTO
++	select PREEMPT_BUILD_AUTO
++	help
++	  Add some sensible blurb here
++
+ config PREEMPT_RT
+ 	bool "Fully Preemptible Kernel (Real-Time)"
+-	depends on EXPERT && ARCH_SUPPORTS_RT
++	depends on ARCH_SUPPORTS_RT
++	select PREEMPT_BUILD_AUTO if HAVE_PREEMPT_AUTO
+ 	select PREEMPTION
+ 	help
+ 	  This option turns the kernel into a real-time kernel by replacing
+@@ -95,7 +110,7 @@ config PREEMPTION
+ 
+ config PREEMPT_DYNAMIC
+ 	bool "Preemption behaviour defined on boot"
+-	depends on HAVE_PREEMPT_DYNAMIC && !PREEMPT_RT
++	depends on HAVE_PREEMPT_DYNAMIC && !PREEMPT_RT && !PREEMPT_AUTO
+ 	select JUMP_LABEL if HAVE_PREEMPT_DYNAMIC_KEY
+ 	select PREEMPT_BUILD
+ 	default y if HAVE_PREEMPT_DYNAMIC_CALL
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index 90843cc..3f31e6b 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -98,7 +98,7 @@ __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
+ 
+ 		local_irq_enable_exit_to_user(ti_work);
+ 
+-		if (ti_work & _TIF_NEED_RESCHED)
++		if (ti_work & (_TIF_NEED_RESCHED | _TIF_NEED_RESCHED_LAZY))
+ 			schedule();
+ 
+ 		if (ti_work & _TIF_UPROBE)
+@@ -307,7 +307,7 @@ void raw_irqentry_exit_cond_resched(void)
+ 		rcu_irq_exit_check_preempt();
+ 		if (IS_ENABLED(CONFIG_DEBUG_ENTRY))
+ 			WARN_ON_ONCE(!on_thread_stack());
+-		if (need_resched())
++		if (test_tsk_need_resched(current))
+ 			preempt_schedule_irq();
+ 	}
+ }
+diff --git a/kernel/entry/kvm.c b/kernel/entry/kvm.c
+index 2e0f75b..d952fa5 100644
+--- a/kernel/entry/kvm.c
++++ b/kernel/entry/kvm.c
+@@ -13,7 +13,7 @@ static int xfer_to_guest_mode_work(struct kvm_vcpu *vcpu, unsigned long ti_work)
+ 			return -EINTR;
+ 		}
+ 
+-		if (ti_work & _TIF_NEED_RESCHED)
++		if (ti_work & (_TIF_NEED_RESCHED | TIF_NEED_RESCHED_LAZY))
+ 			schedule();
+ 
+ 		if (ti_work & _TIF_NOTIFY_RESUME)
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 724e6d7..4389070 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -2283,21 +2283,6 @@ event_sched_out(struct perf_event *event, struct perf_event_context *ctx)
+ 		state = PERF_EVENT_STATE_OFF;
+ 	}
+ 
+-	if (event->pending_sigtrap) {
+-		bool dec = true;
+-
+-		event->pending_sigtrap = 0;
+-		if (state != PERF_EVENT_STATE_OFF &&
+-		    !event->pending_work) {
+-			event->pending_work = 1;
+-			dec = false;
+-			WARN_ON_ONCE(!atomic_long_inc_not_zero(&event->refcount));
+-			task_work_add(current, &event->pending_task, TWA_RESUME);
+-		}
+-		if (dec)
+-			local_dec(&event->ctx->nr_pending);
+-	}
+-
+ 	perf_event_set_state(event, state);
+ 
+ 	if (!is_software_event(event))
+@@ -2464,7 +2449,7 @@ static void __perf_event_disable(struct perf_event *event,
+  * hold the top-level event's child_mutex, so any descendant that
+  * goes to exit will block in perf_event_exit_event().
+  *
+- * When called from perf_pending_irq it's OK because event->ctx
++ * When called from perf_pending_disable it's OK because event->ctx
+  * is the current context on this CPU and preemption is disabled,
+  * hence we can't get into perf_event_task_sched_out for this context.
+  */
+@@ -2504,7 +2489,7 @@ EXPORT_SYMBOL_GPL(perf_event_disable);
+ void perf_event_disable_inatomic(struct perf_event *event)
+ {
+ 	event->pending_disable = 1;
+-	irq_work_queue(&event->pending_irq);
++	irq_work_queue(&event->pending_disable_irq);
+ }
+ 
+ #define MAX_INTERRUPTS (~0ULL)
+@@ -5190,6 +5175,7 @@ static void perf_addr_filters_splice(struct perf_event *event,
+ static void _free_event(struct perf_event *event)
+ {
+ 	irq_work_sync(&event->pending_irq);
++	irq_work_sync(&event->pending_disable_irq);
+ 
+ 	unaccount_event(event);
+ 
+@@ -6726,7 +6712,7 @@ static void perf_sigtrap(struct perf_event *event)
+ /*
+  * Deliver the pending work in-event-context or follow the context.
+  */
+-static void __perf_pending_irq(struct perf_event *event)
++static void __perf_pending_disable(struct perf_event *event)
+ {
+ 	int cpu = READ_ONCE(event->oncpu);
+ 
+@@ -6741,11 +6727,6 @@ static void __perf_pending_irq(struct perf_event *event)
+ 	 * Yay, we hit home and are in the context of the event.
+ 	 */
+ 	if (cpu == smp_processor_id()) {
+-		if (event->pending_sigtrap) {
+-			event->pending_sigtrap = 0;
+-			perf_sigtrap(event);
+-			local_dec(&event->ctx->nr_pending);
+-		}
+ 		if (event->pending_disable) {
+ 			event->pending_disable = 0;
+ 			perf_event_disable_local(event);
+@@ -6769,11 +6750,26 @@ static void __perf_pending_irq(struct perf_event *event)
+ 	 *				  irq_work_queue(); // FAILS
+ 	 *
+ 	 *  irq_work_run()
+-	 *    perf_pending_irq()
++	 *    perf_pending_disable()
+ 	 *
+ 	 * But the event runs on CPU-B and wants disabling there.
+ 	 */
+-	irq_work_queue_on(&event->pending_irq, cpu);
++	irq_work_queue_on(&event->pending_disable_irq, cpu);
++}
++
++static void perf_pending_disable(struct irq_work *entry)
++{
++	struct perf_event *event = container_of(entry, struct perf_event, pending_disable_irq);
++	int rctx;
++
++	/*
++	 * If we 'fail' here, that's OK, it means recursion is already disabled
++	 * and we won't recurse 'further'.
++	 */
++	rctx = perf_swevent_get_recursion_context();
++	__perf_pending_disable(event);
++	if (rctx >= 0)
++		perf_swevent_put_recursion_context(rctx);
+ }
+ 
+ static void perf_pending_irq(struct irq_work *entry)
+@@ -6796,8 +6792,6 @@ static void perf_pending_irq(struct irq_work *entry)
+ 		perf_event_wakeup(event);
+ 	}
+ 
+-	__perf_pending_irq(event);
+-
+ 	if (rctx >= 0)
+ 		perf_swevent_put_recursion_context(rctx);
+ }
+@@ -6805,14 +6799,6 @@ static void perf_pending_irq(struct irq_work *entry)
+ static void perf_pending_task(struct callback_head *head)
+ {
+ 	struct perf_event *event = container_of(head, struct perf_event, pending_task);
+-	int rctx;
+-
+-	/*
+-	 * If we 'fail' here, that's OK, it means recursion is already disabled
+-	 * and we won't recurse 'further'.
+-	 */
+-	preempt_disable_notrace();
+-	rctx = perf_swevent_get_recursion_context();
+ 
+ 	if (event->pending_work) {
+ 		event->pending_work = 0;
+@@ -6820,10 +6806,6 @@ static void perf_pending_task(struct callback_head *head)
+ 		local_dec(&event->ctx->nr_pending);
+ 	}
+ 
+-	if (rctx >= 0)
+-		perf_swevent_put_recursion_context(rctx);
+-	preempt_enable_notrace();
+-
+ 	put_event(event);
+ }
+ 
+@@ -9588,13 +9570,23 @@ static int __perf_event_overflow(struct perf_event *event,
+ 
+ 		if (regs)
+ 			pending_id = hash32_ptr((void *)instruction_pointer(regs)) ?: 1;
+-		if (!event->pending_sigtrap) {
+-			event->pending_sigtrap = pending_id;
++		if (!event->pending_work) {
++			event->pending_work = pending_id;
+ 			local_inc(&event->ctx->nr_pending);
++			WARN_ON_ONCE(!atomic_long_inc_not_zero(&event->refcount));
++			task_work_add(current, &event->pending_task, TWA_RESUME);
++			/*
++			 * The NMI path returns directly to userland. The
++			 * irq_work is raised as a dummy interrupt to ensure
++			 * regular return path to user is taken and task_work
++			 * is processed.
++			 */
++			if (in_nmi())
++				irq_work_queue(&event->pending_disable_irq);
+ 		} else if (event->attr.exclude_kernel && valid_sample) {
+ 			/*
+ 			 * Should not be able to return to user space without
+-			 * consuming pending_sigtrap; with exceptions:
++			 * consuming pending_work; with exceptions:
+ 			 *
+ 			 *  1. Where !exclude_kernel, events can overflow again
+ 			 *     in the kernel without returning to user space.
+@@ -9604,13 +9596,12 @@ static int __perf_event_overflow(struct perf_event *event,
+ 			 *     To approximate progress (with false negatives),
+ 			 *     check 32-bit hash of the current IP.
+ 			 */
+-			WARN_ON_ONCE(event->pending_sigtrap != pending_id);
++			WARN_ON_ONCE(event->pending_work != pending_id);
+ 		}
+ 
+ 		event->pending_addr = 0;
+ 		if (valid_sample && (data->sample_flags & PERF_SAMPLE_ADDR))
+ 			event->pending_addr = data->addr;
+-		irq_work_queue(&event->pending_irq);
+ 	}
+ 
+ 	READ_ONCE(event->overflow_handler)(event, data, regs);
+@@ -11931,6 +11922,7 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
+ 
+ 	init_waitqueue_head(&event->waitq);
+ 	init_irq_work(&event->pending_irq, perf_pending_irq);
++	event->pending_disable_irq = IRQ_WORK_INIT_HARD(perf_pending_disable);
+ 	init_task_work(&event->pending_task, perf_pending_task);
+ 
+ 	mutex_init(&event->mmap_mutex);
+@@ -13045,6 +13037,13 @@ static void sync_child_event(struct perf_event *child_event)
+ 		     &parent_event->child_total_time_running);
+ }
+ 
++static bool task_work_cb_match(struct callback_head *cb, void *data)
++{
++	struct perf_event *event = container_of(cb, struct perf_event, pending_task);
++
++	return event == data;
++}
++
+ static void
+ perf_event_exit_event(struct perf_event *event, struct perf_event_context *ctx)
+ {
+@@ -13084,6 +13083,17 @@ perf_event_exit_event(struct perf_event *event, struct perf_event_context *ctx)
+ 		 * Kick perf_poll() for is_event_hup();
+ 		 */
+ 		perf_event_wakeup(parent_event);
++		/*
++		 * Cancel pending task_work and update counters if it has not
++		 * yet been delivered to userland. free_event() expects the
++		 * reference counter at 1 and keeping the event around until the
++		 * task return to userland will be a unexpected.
++		 */
++		if (event->pending_work &&
++		    task_work_cancel_match(current, task_work_cb_match, event)) {
++			put_event(event);
++			local_dec(&event->ctx->nr_pending);
++		}
+ 		free_event(event);
+ 		put_event(parent_event);
+ 		return;
+diff --git a/kernel/ksysfs.c b/kernel/ksysfs.c
+index 495b69a..620145a 100644
+--- a/kernel/ksysfs.c
++++ b/kernel/ksysfs.c
+@@ -181,6 +181,15 @@ KERNEL_ATTR_RO(crash_elfcorehdr_size);
+ 
+ #endif /* CONFIG_VMCORE_INFO */
+ 
++#if defined(CONFIG_PREEMPT_RT)
++static ssize_t realtime_show(struct kobject *kobj,
++			     struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%d\n", 1);
++}
++KERNEL_ATTR_RO(realtime);
++#endif
++
+ /* whether file capabilities are enabled */
+ static ssize_t fscaps_show(struct kobject *kobj,
+ 				  struct kobj_attribute *attr, char *buf)
+@@ -278,6 +287,9 @@ static struct attribute * kernel_attrs[] = {
+ #ifndef CONFIG_TINY_RCU
+ 	&rcu_expedited_attr.attr,
+ 	&rcu_normal_attr.attr,
++#endif
++#ifdef CONFIG_PREEMPT_RT
++	&realtime_attr.attr,
+ #endif
+ 	NULL
+ };
+diff --git a/kernel/locking/lockdep.c b/kernel/locking/lockdep.c
+index 151bd3d..80cfbe7 100644
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@ -56,6 +56,7 @@
+ #include <linux/kprobes.h>
+ #include <linux/lockdep.h>
+ #include <linux/context_tracking.h>
++#include <linux/console.h>
+ 
+ #include <asm/sections.h>
+ 
+@@ -574,8 +575,10 @@ static struct lock_trace *save_trace(void)
+ 		if (!debug_locks_off_graph_unlock())
+ 			return NULL;
+ 
++		nbcon_cpu_emergency_enter();
+ 		print_lockdep_off("BUG: MAX_STACK_TRACE_ENTRIES too low!");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 
+ 		return NULL;
+ 	}
+@@ -782,6 +785,8 @@ static void lockdep_print_held_locks(struct task_struct *p)
+ {
+ 	int i, depth = READ_ONCE(p->lockdep_depth);
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	if (!depth)
+ 		printk("no locks held by %s/%d.\n", p->comm, task_pid_nr(p));
+ 	else
+@@ -792,11 +797,13 @@ static void lockdep_print_held_locks(struct task_struct *p)
+ 	 * and it's not the current task.
+ 	 */
+ 	if (p != current && task_is_running(p))
+-		return;
++		goto out;
+ 	for (i = 0; i < depth; i++) {
+ 		printk(" #%d: ", i);
+ 		print_lock(p->held_locks + i);
+ 	}
++out:
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ static void print_kernel_ident(void)
+@@ -888,11 +895,13 @@ look_up_lock_class(const struct lockdep_map *lock, unsigned int subclass)
+ 	if (unlikely(subclass >= MAX_LOCKDEP_SUBCLASSES)) {
+ 		instrumentation_begin();
+ 		debug_locks_off();
++		nbcon_cpu_emergency_enter();
+ 		printk(KERN_ERR
+ 			"BUG: looking up invalid subclass: %u\n", subclass);
+ 		printk(KERN_ERR
+ 			"turning off the locking correctness validator.\n");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 		instrumentation_end();
+ 		return NULL;
+ 	}
+@@ -969,11 +978,13 @@ static bool assign_lock_key(struct lockdep_map *lock)
+ 	else {
+ 		/* Debug-check: all keys must be persistent! */
+ 		debug_locks_off();
++		nbcon_cpu_emergency_enter();
+ 		pr_err("INFO: trying to register non-static key.\n");
+ 		pr_err("The code is fine but needs lockdep annotation, or maybe\n");
+ 		pr_err("you didn't initialize this object before use?\n");
+ 		pr_err("turning off the locking correctness validator.\n");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 		return false;
+ 	}
+ 
+@@ -1317,8 +1328,10 @@ register_lock_class(struct lockdep_map *lock, unsigned int subclass, int force)
+ 			return NULL;
+ 		}
+ 
++		nbcon_cpu_emergency_enter();
+ 		print_lockdep_off("BUG: MAX_LOCKDEP_KEYS too low!");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 		return NULL;
+ 	}
+ 	nr_lock_classes++;
+@@ -1350,11 +1363,13 @@ register_lock_class(struct lockdep_map *lock, unsigned int subclass, int force)
+ 	if (verbose(class)) {
+ 		graph_unlock();
+ 
++		nbcon_cpu_emergency_enter();
+ 		printk("\nnew class %px: %s", class->key, class->name);
+ 		if (class->name_version > 1)
+ 			printk(KERN_CONT "#%d", class->name_version);
+ 		printk(KERN_CONT "\n");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 
+ 		if (!graph_lock()) {
+ 			return NULL;
+@@ -1393,8 +1408,10 @@ static struct lock_list *alloc_list_entry(void)
+ 		if (!debug_locks_off_graph_unlock())
+ 			return NULL;
+ 
++		nbcon_cpu_emergency_enter();
+ 		print_lockdep_off("BUG: MAX_LOCKDEP_ENTRIES too low!");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 		return NULL;
+ 	}
+ 	nr_list_entries++;
+@@ -2040,6 +2057,8 @@ static noinline void print_circular_bug(struct lock_list *this,
+ 
+ 	depth = get_lock_depth(target);
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	print_circular_bug_header(target, depth, check_src, check_tgt);
+ 
+ 	parent = get_lock_parent(target);
+@@ -2058,6 +2077,8 @@ static noinline void print_circular_bug(struct lock_list *this,
+ 
+ 	printk("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ static noinline void print_bfs_bug(int ret)
+@@ -2570,6 +2591,8 @@ print_bad_irq_dependency(struct task_struct *curr,
+ 	if (!debug_locks_off_graph_unlock() || debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("=====================================================\n");
+ 	pr_warn("WARNING: %s-safe -> %s-unsafe lock order detected\n",
+@@ -2619,11 +2642,13 @@ print_bad_irq_dependency(struct task_struct *curr,
+ 	pr_warn(" and %s-irq-unsafe lock:\n", irqclass);
+ 	next_root->trace = save_trace();
+ 	if (!next_root->trace)
+-		return;
++		goto out;
+ 	print_shortest_lock_dependencies(forwards_entry, next_root);
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++out:
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ static const char *state_names[] = {
+@@ -2988,6 +3013,8 @@ print_deadlock_bug(struct task_struct *curr, struct held_lock *prev,
+ 	if (!debug_locks_off_graph_unlock() || debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("============================================\n");
+ 	pr_warn("WARNING: possible recursive locking detected\n");
+@@ -3010,6 +3037,8 @@ print_deadlock_bug(struct task_struct *curr, struct held_lock *prev,
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ /*
+@@ -3607,6 +3636,8 @@ static void print_collision(struct task_struct *curr,
+ 			struct held_lock *hlock_next,
+ 			struct lock_chain *chain)
+ {
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("============================\n");
+ 	pr_warn("WARNING: chain_key collision\n");
+@@ -3623,6 +3654,8 @@ static void print_collision(struct task_struct *curr,
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ #endif
+ 
+@@ -3713,8 +3746,10 @@ static inline int add_chain_cache(struct task_struct *curr,
+ 		if (!debug_locks_off_graph_unlock())
+ 			return 0;
+ 
++		nbcon_cpu_emergency_enter();
+ 		print_lockdep_off("BUG: MAX_LOCKDEP_CHAINS too low!");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 		return 0;
+ 	}
+ 	chain->chain_key = chain_key;
+@@ -3731,8 +3766,10 @@ static inline int add_chain_cache(struct task_struct *curr,
+ 		if (!debug_locks_off_graph_unlock())
+ 			return 0;
+ 
++		nbcon_cpu_emergency_enter();
+ 		print_lockdep_off("BUG: MAX_LOCKDEP_CHAIN_HLOCKS too low!");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 		return 0;
+ 	}
+ 
+@@ -3971,6 +4008,8 @@ print_usage_bug(struct task_struct *curr, struct held_lock *this,
+ 	if (!debug_locks_off() || debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("================================\n");
+ 	pr_warn("WARNING: inconsistent lock state\n");
+@@ -3999,6 +4038,8 @@ print_usage_bug(struct task_struct *curr, struct held_lock *this,
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ /*
+@@ -4033,6 +4074,8 @@ print_irq_inversion_bug(struct task_struct *curr,
+ 	if (!debug_locks_off_graph_unlock() || debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("========================================================\n");
+ 	pr_warn("WARNING: possible irq lock inversion dependency detected\n");
+@@ -4073,11 +4116,13 @@ print_irq_inversion_bug(struct task_struct *curr,
+ 	pr_warn("\nthe shortest dependencies between 2nd lock and 1st lock:\n");
+ 	root->trace = save_trace();
+ 	if (!root->trace)
+-		return;
++		goto out;
+ 	print_shortest_lock_dependencies(other, root);
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++out:
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ /*
+@@ -4154,6 +4199,8 @@ void print_irqtrace_events(struct task_struct *curr)
+ {
+ 	const struct irqtrace_events *trace = &curr->irqtrace;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	printk("irq event stamp: %u\n", trace->irq_events);
+ 	printk("hardirqs last  enabled at (%u): [<%px>] %pS\n",
+ 		trace->hardirq_enable_event, (void *)trace->hardirq_enable_ip,
+@@ -4167,6 +4214,8 @@ void print_irqtrace_events(struct task_struct *curr)
+ 	printk("softirqs last disabled at (%u): [<%px>] %pS\n",
+ 		trace->softirq_disable_event, (void *)trace->softirq_disable_ip,
+ 		(void *)trace->softirq_disable_ip);
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ static int HARDIRQ_verbose(struct lock_class *class)
+@@ -4687,10 +4736,12 @@ static int mark_lock(struct task_struct *curr, struct held_lock *this,
+ 	 * We must printk outside of the graph_lock:
+ 	 */
+ 	if (ret == 2) {
++		nbcon_cpu_emergency_enter();
+ 		printk("\nmarked lock as {%s}:\n", usage_str[new_bit]);
+ 		print_lock(this);
+ 		print_irqtrace_events(curr);
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 	}
+ 
+ 	return ret;
+@@ -4731,6 +4782,8 @@ print_lock_invalid_wait_context(struct task_struct *curr,
+ 	if (debug_locks_silent)
+ 		return 0;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("=============================\n");
+ 	pr_warn("[ BUG: Invalid wait context ]\n");
+@@ -4750,6 +4803,8 @@ print_lock_invalid_wait_context(struct task_struct *curr,
+ 	pr_warn("stack backtrace:\n");
+ 	dump_stack();
+ 
++	nbcon_cpu_emergency_exit();
++
+ 	return 0;
+ }
+ 
+@@ -4954,6 +5009,8 @@ print_lock_nested_lock_not_held(struct task_struct *curr,
+ 	if (debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("==================================\n");
+ 	pr_warn("WARNING: Nested lock was not taken\n");
+@@ -4974,6 +5031,8 @@ print_lock_nested_lock_not_held(struct task_struct *curr,
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ static int __lock_is_held(const struct lockdep_map *lock, int read);
+@@ -5019,11 +5078,13 @@ static int __lock_acquire(struct lockdep_map *lock, unsigned int subclass,
+ 	debug_class_ops_inc(class);
+ 
+ 	if (very_verbose(class)) {
++		nbcon_cpu_emergency_enter();
+ 		printk("\nacquire class [%px] %s", class->key, class->name);
+ 		if (class->name_version > 1)
+ 			printk(KERN_CONT "#%d", class->name_version);
+ 		printk(KERN_CONT "\n");
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 	}
+ 
+ 	/*
+@@ -5150,6 +5211,7 @@ static int __lock_acquire(struct lockdep_map *lock, unsigned int subclass,
+ #endif
+ 	if (unlikely(curr->lockdep_depth >= MAX_LOCK_DEPTH)) {
+ 		debug_locks_off();
++		nbcon_cpu_emergency_enter();
+ 		print_lockdep_off("BUG: MAX_LOCK_DEPTH too low!");
+ 		printk(KERN_DEBUG "depth: %i  max: %lu!\n",
+ 		       curr->lockdep_depth, MAX_LOCK_DEPTH);
+@@ -5157,6 +5219,7 @@ static int __lock_acquire(struct lockdep_map *lock, unsigned int subclass,
+ 		lockdep_print_held_locks(current);
+ 		debug_show_all_locks();
+ 		dump_stack();
++		nbcon_cpu_emergency_exit();
+ 
+ 		return 0;
+ 	}
+@@ -5176,6 +5239,8 @@ static void print_unlock_imbalance_bug(struct task_struct *curr,
+ 	if (debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("=====================================\n");
+ 	pr_warn("WARNING: bad unlock balance detected!\n");
+@@ -5192,6 +5257,8 @@ static void print_unlock_imbalance_bug(struct task_struct *curr,
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ static noinstr int match_held_lock(const struct held_lock *hlock,
+@@ -5895,6 +5962,8 @@ static void print_lock_contention_bug(struct task_struct *curr,
+ 	if (debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("=================================\n");
+ 	pr_warn("WARNING: bad contention detected!\n");
+@@ -5911,6 +5980,8 @@ static void print_lock_contention_bug(struct task_struct *curr,
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ static void
+@@ -6524,6 +6595,8 @@ print_freed_lock_bug(struct task_struct *curr, const void *mem_from,
+ 	if (debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("=========================\n");
+ 	pr_warn("WARNING: held lock freed!\n");
+@@ -6536,6 +6609,8 @@ print_freed_lock_bug(struct task_struct *curr, const void *mem_from,
+ 
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ static inline int not_in_range(const void* mem_from, unsigned long mem_len,
+@@ -6582,6 +6657,8 @@ static void print_held_locks_bug(void)
+ 	if (debug_locks_silent)
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	pr_warn("\n");
+ 	pr_warn("====================================\n");
+ 	pr_warn("WARNING: %s/%d still has locks held!\n",
+@@ -6591,6 +6668,8 @@ static void print_held_locks_bug(void)
+ 	lockdep_print_held_locks(current);
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ void debug_check_no_locks_held(void)
+@@ -6609,6 +6688,7 @@ void debug_show_all_locks(void)
+ 		pr_warn("INFO: lockdep is turned off.\n");
+ 		return;
+ 	}
++	nbcon_cpu_emergency_enter();
+ 	pr_warn("\nShowing all locks held in the system:\n");
+ 
+ 	rcu_read_lock();
+@@ -6623,6 +6703,7 @@ void debug_show_all_locks(void)
+ 
+ 	pr_warn("\n");
+ 	pr_warn("=============================================\n\n");
++	nbcon_cpu_emergency_exit();
+ }
+ EXPORT_SYMBOL_GPL(debug_show_all_locks);
+ #endif
+@@ -6648,6 +6729,7 @@ asmlinkage __visible void lockdep_sys_exit(void)
+ 	if (unlikely(curr->lockdep_depth)) {
+ 		if (!debug_locks_off())
+ 			return;
++		nbcon_cpu_emergency_enter();
+ 		pr_warn("\n");
+ 		pr_warn("================================================\n");
+ 		pr_warn("WARNING: lock held when returning to user space!\n");
+@@ -6656,6 +6738,7 @@ asmlinkage __visible void lockdep_sys_exit(void)
+ 		pr_warn("%s/%d is leaving the kernel with locks still held!\n",
+ 				curr->comm, curr->pid);
+ 		lockdep_print_held_locks(curr);
++		nbcon_cpu_emergency_exit();
+ 	}
+ 
+ 	/*
+@@ -6672,6 +6755,7 @@ void lockdep_rcu_suspicious(const char *file, const int line, const char *s)
+ 	bool rcu = warn_rcu_enter();
+ 
+ 	/* Note: the following can be executed concurrently, so be careful. */
++	nbcon_cpu_emergency_enter();
+ 	pr_warn("\n");
+ 	pr_warn("=============================\n");
+ 	pr_warn("WARNING: suspicious RCU usage\n");
+@@ -6710,6 +6794,7 @@ void lockdep_rcu_suspicious(const char *file, const int line, const char *s)
+ 	lockdep_print_held_locks(curr);
+ 	pr_warn("\nstack backtrace:\n");
+ 	dump_stack();
++	nbcon_cpu_emergency_exit();
+ 	warn_rcu_exit(rcu);
+ }
+ EXPORT_SYMBOL_GPL(lockdep_rcu_suspicious);
+diff --git a/kernel/panic.c b/kernel/panic.c
+index 747c3f3..8adff85 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -368,6 +368,8 @@ void panic(const char *fmt, ...)
+ 
+ 	panic_other_cpus_shutdown(_crash_kexec_post_notifiers);
+ 
++	printk_legacy_allow_panic_sync();
++
+ 	/*
+ 	 * Run any panic handlers, including those that might need to
+ 	 * add information to the kmsg dump output.
+@@ -457,6 +459,7 @@ void panic(const char *fmt, ...)
+ 	 * Explicitly flush the kernel log buffer one last time.
+ 	 */
+ 	console_flush_on_panic(CONSOLE_FLUSH_PENDING);
++	nbcon_atomic_flush_unsafe();
+ 
+ 	local_irq_enable();
+ 	for (i = 0; ; i += PANIC_TIMER_STEP) {
+@@ -635,6 +638,7 @@ bool oops_may_print(void)
+  */
+ void oops_enter(void)
+ {
++	nbcon_cpu_emergency_enter();
+ 	tracing_off();
+ 	/* can't trust the integrity of the kernel anymore: */
+ 	debug_locks_off();
+@@ -657,6 +661,7 @@ void oops_exit(void)
+ {
+ 	do_oops_enter_exit();
+ 	print_oops_end_marker();
++	nbcon_cpu_emergency_exit();
+ 	kmsg_dump(KMSG_DUMP_OOPS);
+ }
+ 
+@@ -668,6 +673,8 @@ struct warn_args {
+ void __warn(const char *file, int line, void *caller, unsigned taint,
+ 	    struct pt_regs *regs, struct warn_args *args)
+ {
++	nbcon_cpu_emergency_enter();
++
+ 	disable_trace_on_warning();
+ 
+ 	if (file)
+@@ -703,6 +710,8 @@ void __warn(const char *file, int line, void *caller, unsigned taint,
+ 
+ 	/* Just a warning, don't kill lockdep. */
+ 	add_taint(taint, LOCKDEP_STILL_OK);
++
++	nbcon_cpu_emergency_exit();
+ }
+ 
+ #ifdef CONFIG_BUG
+diff --git a/kernel/printk/internal.h b/kernel/printk/internal.h
+index 6c2afee..fdf455c 100644
+--- a/kernel/printk/internal.h
++++ b/kernel/printk/internal.h
+@@ -2,11 +2,13 @@
+ /*
+  * internal.h - printk internal definitions
+  */
+-#include <linux/percpu.h>
+ #include <linux/console.h>
+-#include "printk_ringbuffer.h"
++#include <linux/jump_label.h>
++#include <linux/percpu.h>
++#include <linux/types.h>
+ 
+ #if defined(CONFIG_PRINTK) && defined(CONFIG_SYSCTL)
++struct ctl_table;
+ void __init printk_sysctl_init(void);
+ int devkmsg_sysctl_set_loglvl(struct ctl_table *table, int write,
+ 			      void *buffer, size_t *lenp, loff_t *ppos);
+@@ -20,6 +22,13 @@ int devkmsg_sysctl_set_loglvl(struct ctl_table *table, int write,
+ 		(con->flags & CON_BOOT) ? "boot" : "",		\
+ 		con->name, con->index, ##__VA_ARGS__)
+ 
++#ifdef CONFIG_PREEMPT_RT
++# define force_printkthreads()		(true)
++#else
++DECLARE_STATIC_KEY_FALSE(force_printkthreads_key);
++# define force_printkthreads()		(static_branch_unlikely(&force_printkthreads_key))
++#endif
++
+ #ifdef CONFIG_PRINTK
+ 
+ #ifdef CONFIG_PRINTK_CALLER
+@@ -43,7 +52,11 @@ enum printk_info_flags {
+ 	LOG_CONT	= 8,	/* text is a fragment of a continuation line */
+ };
+ 
++struct printk_ringbuffer;
++struct dev_printk_info;
++
+ extern struct printk_ringbuffer *prb;
++extern bool printk_threads_enabled;
+ 
+ __printf(4, 0)
+ int vprintk_store(int facility, int level,
+@@ -53,6 +66,9 @@ int vprintk_store(int facility, int level,
+ __printf(1, 0) int vprintk_default(const char *fmt, va_list args);
+ __printf(1, 0) int vprintk_deferred(const char *fmt, va_list args);
+ 
++void __printk_safe_enter(void);
++void __printk_safe_exit(void);
++
+ bool printk_percpu_data_ready(void);
+ 
+ #define printk_safe_enter_irqsave(flags)	\
+@@ -71,12 +87,79 @@ void defer_console_output(void);
+ 
+ u16 printk_parse_prefix(const char *text, int *level,
+ 			enum printk_info_flags *flags);
++void console_lock_spinning_enable(void);
++int console_lock_spinning_disable_and_check(int cookie);
+ 
+ u64 nbcon_seq_read(struct console *con);
+ void nbcon_seq_force(struct console *con, u64 seq);
+ bool nbcon_alloc(struct console *con);
+ void nbcon_init(struct console *con);
+ void nbcon_free(struct console *con);
++enum nbcon_prio nbcon_get_default_prio(void);
++void nbcon_atomic_flush_pending(void);
++bool nbcon_legacy_emit_next_record(struct console *con, bool *handover,
++				   int cookie, bool use_atomic);
++void nbcon_kthread_create(struct console *con);
++void nbcon_wake_threads(void);
++void nbcon_legacy_kthread_create(void);
++
++/*
++ * Check if the given console is currently capable and allowed to print
++ * records. Note that this function does not consider the current context,
++ * which can also play a role in deciding if @con can be used to print
++ * records.
++ */
++static inline bool console_is_usable(struct console *con, short flags, bool use_atomic)
++{
++	if (!(flags & CON_ENABLED))
++		return false;
++
++	if ((flags & CON_SUSPENDED))
++		return false;
++
++	if (flags & CON_NBCON) {
++		if (use_atomic) {
++			if (!con->write_atomic)
++				return false;
++		} else {
++			if (!con->write_thread)
++				return false;
++		}
++	} else {
++		if (!con->write)
++			return false;
++	}
++
++	/*
++	 * Console drivers may assume that per-cpu resources have been
++	 * allocated. So unless they're explicitly marked as being able to
++	 * cope (CON_ANYTIME) don't call them until this CPU is officially up.
++	 */
++	if (!cpu_online(raw_smp_processor_id()) && !(flags & CON_ANYTIME))
++		return false;
++
++	return true;
++}
++
++/**
++ * nbcon_kthread_wake - Wake up a printk thread
++ * @con:        Console to operate on
++ */
++static inline void nbcon_kthread_wake(struct console *con)
++{
++	/*
++	 * Guarantee any new records can be seen by tasks preparing to wait
++	 * before this context checks if the rcuwait is empty.
++	 *
++	 * The full memory barrier in rcuwait_wake_up() pairs with the full
++	 * memory barrier within set_current_state() of
++	 * ___rcuwait_wait_event(), which is called after prepare_to_rcuwait()
++	 * adds the waiter but before it has checked the wait condition.
++	 *
++	 * This pairs with nbcon_kthread_func:A.
++	 */
++	rcuwait_wake_up(&con->rcuwait); /* LMM(nbcon_kthread_wake:A) */
++}
+ 
+ #else
+ 
+@@ -84,6 +167,10 @@ void nbcon_free(struct console *con);
+ #define PRINTK_MESSAGE_MAX	0
+ #define PRINTKRB_RECORD_MAX	0
+ 
++static inline void nbcon_kthread_wake(struct console *con) { }
++static inline void nbcon_kthread_create(struct console *con) { }
++#define printk_threads_enabled (false)
++
+ /*
+  * In !PRINTK builds we still export console_sem
+  * semaphore and some of console functions (console_unlock()/etc.), so
+@@ -98,9 +185,27 @@ static inline void nbcon_seq_force(struct console *con, u64 seq) { }
+ static inline bool nbcon_alloc(struct console *con) { return false; }
+ static inline void nbcon_init(struct console *con) { }
+ static inline void nbcon_free(struct console *con) { }
++static inline enum nbcon_prio nbcon_get_default_prio(void) { return NBCON_PRIO_NONE; }
++static inline void nbcon_atomic_flush_pending(void) { }
++static inline bool nbcon_legacy_emit_next_record(struct console *con, bool *handover,
++						 int cookie, bool use_atomic) { return false; }
++
++static inline bool console_is_usable(struct console *con, short flags,
++				     bool use_atomic) { return false; }
+ 
+ #endif /* CONFIG_PRINTK */
+ 
++extern bool have_boot_console;
++extern bool have_legacy_console;
++
++/*
++ * Specifies if the console lock/unlock dance is needed for console
++ * printing. If @have_boot_console is true, the nbcon consoles will
++ * be printed serially along with the legacy consoles because nbcon
++ * consoles cannot print simultaneously with boot consoles.
++ */
++#define printing_via_unlock (have_legacy_console || have_boot_console)
++
+ extern struct printk_buffers printk_shared_pbufs;
+ 
+ /**
+@@ -135,4 +240,5 @@ bool printk_get_next_message(struct printk_message *pmsg, u64 seq,
+ 
+ #ifdef CONFIG_PRINTK
+ void console_prepend_dropped(struct printk_message *pmsg, unsigned long dropped);
++void console_prepend_replay(struct printk_message *pmsg);
+ #endif
+diff --git a/kernel/printk/nbcon.c b/kernel/printk/nbcon.c
+index c8093bc..932b888 100644
+--- a/kernel/printk/nbcon.c
++++ b/kernel/printk/nbcon.c
+@@ -2,11 +2,26 @@
+ // Copyright (C) 2022 Linutronix GmbH, John Ogness
+ // Copyright (C) 2022 Intel, Thomas Gleixner
+ 
+-#include <linux/kernel.h>
++#include <linux/atomic.h>
++#include <linux/bug.h>
+ #include <linux/console.h>
+ #include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/init.h>
++#include <linux/irqflags.h>
++#include <linux/kthread.h>
++#include <linux/minmax.h>
++#include <linux/percpu.h>
++#include <linux/preempt.h>
+ #include <linux/slab.h>
++#include <linux/smp.h>
++#include <linux/stddef.h>
++#include <linux/string.h>
++#include <linux/syscore_ops.h>
++#include <linux/types.h>
+ #include "internal.h"
++#include "printk_ringbuffer.h"
+ /*
+  * Printk console printing implementation for consoles which does not depend
+  * on the legacy style console_lock mechanism.
+@@ -172,9 +187,6 @@ void nbcon_seq_force(struct console *con, u64 seq)
+ 	u64 valid_seq = max_t(u64, seq, prb_first_valid_seq(prb));
+ 
+ 	atomic_long_set(&ACCESS_PRIVATE(con, nbcon_seq), __u64seq_to_ulseq(valid_seq));
+-
+-	/* Clear con->seq since nbcon consoles use con->nbcon_seq instead. */
+-	con->seq = 0;
+ }
+ 
+ /**
+@@ -201,6 +213,8 @@ static void nbcon_seq_try_update(struct nbcon_context *ctxt, u64 new_seq)
+ 	}
+ }
+ 
++bool printk_threads_enabled __ro_after_init;
++
+ /**
+  * nbcon_context_try_acquire_direct - Try to acquire directly
+  * @ctxt:	The context of the caller
+@@ -531,6 +545,7 @@ static struct printk_buffers panic_nbcon_pbufs;
+  * nbcon_context_try_acquire - Try to acquire nbcon console
+  * @ctxt:	The context of the caller
+  *
++ * Context:	Any context which could not be migrated to another CPU.
+  * Return:	True if the console was acquired. False otherwise.
+  *
+  * If the caller allowed an unsafe hostile takeover, on success the
+@@ -538,7 +553,6 @@ static struct printk_buffers panic_nbcon_pbufs;
+  * in an unsafe state. Otherwise, on success the caller may assume
+  * the console is not in an unsafe state.
+  */
+-__maybe_unused
+ static bool nbcon_context_try_acquire(struct nbcon_context *ctxt)
+ {
+ 	unsigned int cpu = smp_processor_id();
+@@ -824,9 +838,42 @@ bool nbcon_exit_unsafe(struct nbcon_write_context *wctxt)
+ }
+ EXPORT_SYMBOL_GPL(nbcon_exit_unsafe);
+ 
++/**
++ * nbcon_reacquire - Reacquire a console after losing ownership
++ * @wctxt:	The write context that was handed to the write function
++ *
++ * Since ownership can be lost at any time due to handover or takeover, a
++ * printing context _should_ be prepared to back out immediately and
++ * carefully. However, there are many scenarios where the context _must_
++ * reacquire ownership in order to finalize or revert hardware changes.
++ *
++ * This function allows a context to reacquire ownership using the same
++ * priority as its previous ownership.
++ *
++ * Note that for printing contexts, after a successful reacquire the
++ * context will have no output buffer because that has been lost. This
++ * function cannot be used to resume printing.
++ */
++void nbcon_reacquire(struct nbcon_write_context *wctxt)
++{
++	struct nbcon_context *ctxt = &ACCESS_PRIVATE(wctxt, ctxt);
++	struct console *con = ctxt->console;
++	struct nbcon_state cur;
++
++	while (!nbcon_context_try_acquire(ctxt))
++		cpu_relax();
++
++	wctxt->outbuf = NULL;
++	wctxt->len = 0;
++	nbcon_state_read(con, &cur);
++	wctxt->unsafe_takeover = cur.unsafe_takeover;
++}
++EXPORT_SYMBOL_GPL(nbcon_reacquire);
++
+ /**
+  * nbcon_emit_next_record - Emit a record in the acquired context
+  * @wctxt:	The write context that will be handed to the write function
++ * @use_atomic:	True if the write_atomic callback is to be used
+  *
+  * Return:	True if this context still owns the console. False if
+  *		ownership was handed over or taken.
+@@ -840,8 +887,7 @@ EXPORT_SYMBOL_GPL(nbcon_exit_unsafe);
+  * When true is returned, @wctxt->ctxt.backlog indicates whether there are
+  * still records pending in the ringbuffer,
+  */
+-__maybe_unused
+-static bool nbcon_emit_next_record(struct nbcon_write_context *wctxt)
++static bool nbcon_emit_next_record(struct nbcon_write_context *wctxt, bool use_atomic)
+ {
+ 	struct nbcon_context *ctxt = &ACCESS_PRIVATE(wctxt, ctxt);
+ 	struct console *con = ctxt->console;
+@@ -852,7 +898,7 @@ static bool nbcon_emit_next_record(struct nbcon_write_context *wctxt)
+ 	unsigned long con_dropped;
+ 	struct nbcon_state cur;
+ 	unsigned long dropped;
+-	bool done;
++	unsigned long ulseq;
+ 
+ 	/*
+ 	 * The printk buffers are filled within an unsafe section. This
+@@ -878,6 +924,28 @@ static bool nbcon_emit_next_record(struct nbcon_write_context *wctxt)
+ 	if (dropped && !is_extended)
+ 		console_prepend_dropped(&pmsg, dropped);
+ 
++	/*
++	 * If the previous owner was assigned the same record, this context
++	 * has taken over ownership and is replaying the record. Prepend a
++	 * message to let the user know the record is replayed.
++	 */
++	ulseq = atomic_long_read(&ACCESS_PRIVATE(con, nbcon_prev_seq));
++	if (__ulseq_to_u64seq(prb, ulseq) == pmsg.seq) {
++		console_prepend_replay(&pmsg);
++	} else {
++		/*
++		 * Ensure this context is still the owner before trying to
++		 * update @nbcon_prev_seq. Otherwise the value in @ulseq may
++		 * not be from the previous owner.
++		 */
++		nbcon_state_read(con, &cur);
++		if (!nbcon_context_can_proceed(ctxt, &cur))
++			return false;
++
++		atomic_long_try_cmpxchg(&ACCESS_PRIVATE(con, nbcon_prev_seq), &ulseq,
++					__u64seq_to_ulseq(pmsg.seq));
++	}
++
+ 	if (!nbcon_context_exit_unsafe(ctxt))
+ 		return false;
+ 
+@@ -891,17 +959,32 @@ static bool nbcon_emit_next_record(struct nbcon_write_context *wctxt)
+ 	nbcon_state_read(con, &cur);
+ 	wctxt->unsafe_takeover = cur.unsafe_takeover;
+ 
+-	if (con->write_atomic) {
+-		done = con->write_atomic(con, wctxt);
++	if (use_atomic &&
++	    con->write_atomic) {
++		con->write_atomic(con, wctxt);
++
++	} else if (!use_atomic &&
++		   con->write_thread) {
++		con->write_thread(con, wctxt);
++
+ 	} else {
+-		nbcon_context_release(ctxt);
++		/*
++		 * This function should never be called for legacy consoles.
++		 * Handle it as if ownership was lost and try to continue.
++		 */
+ 		WARN_ON_ONCE(1);
+-		done = false;
++		nbcon_context_release(ctxt);
++		return false;
+ 	}
+ 
+-	/* If not done, the emit was aborted. */
+-	if (!done)
++	if (!wctxt->outbuf) {
++		/*
++		 * Ownership was lost and reacquired by the driver.
++		 * Handle it as if ownership was lost and try to continue.
++		 */
++		nbcon_context_release(ctxt);
+ 		return false;
++	}
+ 
+ 	/*
+ 	 * Since any dropped message was successfully output, reset the
+@@ -928,6 +1011,550 @@ static bool nbcon_emit_next_record(struct nbcon_write_context *wctxt)
+ 	return nbcon_context_exit_unsafe(ctxt);
+ }
+ 
++/**
++ * nbcon_kthread_should_wakeup - Check whether a printer thread should wakeup
++ * @con:	Console to operate on
++ * @ctxt:	The acquire context that contains the state
++ *		at console_acquire()
++ *
++ * Return:	True if the thread should shutdown or if the console is
++ *		allowed to print and a record is available. False otherwise.
++ *
++ * After the thread wakes up, it must first check if it should shutdown before
++ * attempting any printing.
++ */
++static bool nbcon_kthread_should_wakeup(struct console *con, struct nbcon_context *ctxt)
++{
++	bool ret = false;
++	short flags;
++	int cookie;
++
++	if (kthread_should_stop())
++		return true;
++
++	cookie = console_srcu_read_lock();
++
++	flags = console_srcu_read_flags(con);
++	if (console_is_usable(con, flags, false)) {
++		/* Bring the sequence in @ctxt up to date */
++		ctxt->seq = nbcon_seq_read(con);
++
++		ret = prb_read_valid(prb, ctxt->seq, NULL);
++	}
++
++	console_srcu_read_unlock(cookie);
++	return ret;
++}
++
++/**
++ * nbcon_kthread_func - The printer thread function
++ * @__console:	Console to operate on
++ */
++static int nbcon_kthread_func(void *__console)
++{
++	struct console *con = __console;
++	struct nbcon_write_context wctxt = {
++		.ctxt.console	= con,
++		.ctxt.prio	= NBCON_PRIO_NORMAL,
++	};
++	struct nbcon_context *ctxt = &ACCESS_PRIVATE(&wctxt, ctxt);
++	unsigned long flags;
++	short con_flags;
++	bool backlog;
++	int cookie;
++	int ret;
++
++wait_for_event:
++	/*
++	 * Guarantee this task is visible on the rcuwait before
++	 * checking the wake condition.
++	 *
++	 * The full memory barrier within set_current_state() of
++	 * ___rcuwait_wait_event() pairs with the full memory
++	 * barrier within rcuwait_has_sleeper().
++	 *
++	 * This pairs with rcuwait_has_sleeper:A and nbcon_kthread_wake:A.
++	 */
++	ret = rcuwait_wait_event(&con->rcuwait,
++				 nbcon_kthread_should_wakeup(con, ctxt),
++				 TASK_INTERRUPTIBLE); /* LMM(nbcon_kthread_func:A) */
++
++	if (kthread_should_stop())
++		return 0;
++
++	/* Wait was interrupted by a spurious signal, go back to sleep. */
++	if (ret)
++		goto wait_for_event;
++
++	do {
++		backlog = false;
++
++		cookie = console_srcu_read_lock();
++
++		con_flags = console_srcu_read_flags(con);
++
++		if (console_is_usable(con, con_flags, false)) {
++			con->device_lock(con, &flags);
++
++			/*
++			 * Ensure this stays on the CPU to make handover and
++			 * takeover possible.
++			 */
++			cant_migrate();
++
++			if (nbcon_context_try_acquire(ctxt)) {
++				/*
++				 * If the emit fails, this context is no
++				 * longer the owner.
++				 */
++				if (nbcon_emit_next_record(&wctxt, false)) {
++					nbcon_context_release(ctxt);
++					backlog = ctxt->backlog;
++				}
++			}
++
++			con->device_unlock(con, flags);
++		}
++
++		console_srcu_read_unlock(cookie);
++
++	} while (backlog);
++
++	goto wait_for_event;
++}
++
++/**
++ * nbcon_irq_work - irq work to wake printk thread
++ * @irq_work:	The irq work to operate on
++ */
++static void nbcon_irq_work(struct irq_work *irq_work)
++{
++	struct console *con = container_of(irq_work, struct console, irq_work);
++
++	nbcon_kthread_wake(con);
++}
++
++static inline bool rcuwait_has_sleeper(struct rcuwait *w)
++{
++	bool has_sleeper;
++
++	rcu_read_lock();
++	/*
++	 * Guarantee any new records can be seen by tasks preparing to wait
++	 * before this context checks if the rcuwait is empty.
++	 *
++	 * This full memory barrier pairs with the full memory barrier within
++	 * set_current_state() of ___rcuwait_wait_event(), which is called
++	 * after prepare_to_rcuwait() adds the waiter but before it has
++	 * checked the wait condition.
++	 *
++	 * This pairs with nbcon_kthread_func:A.
++	 */
++	smp_mb(); /* LMM(rcuwait_has_sleeper:A) */
++	has_sleeper = !!rcu_dereference(w->task);
++	rcu_read_unlock();
++
++	return has_sleeper;
++}
++
++/**
++ * nbcon_wake_threads - Wake up printing threads using irq_work
++ */
++void nbcon_wake_threads(void)
++{
++	struct console *con;
++	int cookie;
++
++	cookie = console_srcu_read_lock();
++	for_each_console_srcu(con) {
++		/*
++		 * Only schedule irq_work if the printing thread is
++		 * actively waiting. If not waiting, the thread will
++		 * notice by itself that it has work to do.
++		 */
++		if (con->kthread && rcuwait_has_sleeper(&con->rcuwait))
++			irq_work_queue(&con->irq_work);
++	}
++	console_srcu_read_unlock(cookie);
++}
++
++/* Track the nbcon emergency nesting per CPU. */
++static DEFINE_PER_CPU(unsigned int, nbcon_pcpu_emergency_nesting);
++static unsigned int early_nbcon_pcpu_emergency_nesting __initdata;
++
++/**
++ * nbcon_get_cpu_emergency_nesting - Get the per CPU emergency nesting pointer
++ *
++ * Return:	Either a pointer to the per CPU emergency nesting counter of
++ *		the current CPU or to the init data during early boot.
++ */
++static __ref unsigned int *nbcon_get_cpu_emergency_nesting(void)
++{
++	/*
++	 * The value of __printk_percpu_data_ready gets set in normal
++	 * context and before SMP initialization. As a result it could
++	 * never change while inside an nbcon emergency section.
++	 */
++	if (!printk_percpu_data_ready())
++		return &early_nbcon_pcpu_emergency_nesting;
++
++	return this_cpu_ptr(&nbcon_pcpu_emergency_nesting);
++}
++
++/**
++ * nbcon_emit_one - Print one record for an nbcon console using the
++ *			specified callback
++ * @wctxt:	An initialized write context struct to use for this context
++ * @use_atomic:	True if the write_atomic callback is to be used
++ *
++ * Return:	False if it is known there are no more records to print,
++ *		otherwise true.
++ *
++ * This is an internal helper to handle the locking of the console before
++ * calling nbcon_emit_next_record().
++ */
++static bool nbcon_emit_one(struct nbcon_write_context *wctxt, bool use_atomic)
++{
++	struct nbcon_context *ctxt = &ACCESS_PRIVATE(wctxt, ctxt);
++
++	if (!nbcon_context_try_acquire(ctxt))
++		return true;
++
++	/*
++	 * nbcon_emit_next_record() returns false when the console was
++	 * handed over or taken over. In both cases the context is no
++	 * longer valid.
++	 */
++	if (!nbcon_emit_next_record(wctxt, use_atomic))
++		return true;
++
++	nbcon_context_release(ctxt);
++
++	return ctxt->backlog;
++}
++
++/**
++ * nbcon_get_default_prio - The appropriate nbcon priority to use for nbcon
++ *				printing on the current CPU
++ *
++ * Context:	Any context which could not be migrated to another CPU.
++ * Return:	The nbcon_prio to use for acquiring an nbcon console in this
++ *		context for printing.
++ */
++enum nbcon_prio nbcon_get_default_prio(void)
++{
++	unsigned int *cpu_emergency_nesting;
++
++	if (this_cpu_in_panic())
++		return NBCON_PRIO_PANIC;
++
++	cpu_emergency_nesting = nbcon_get_cpu_emergency_nesting();
++	if (*cpu_emergency_nesting)
++		return NBCON_PRIO_EMERGENCY;
++
++	return NBCON_PRIO_NORMAL;
++}
++
++/**
++ * nbcon_legacy_emit_next_record - Print one record for an nbcon console
++ *					in legacy contexts
++ * @con:	The console to print on
++ * @handover:	Will be set to true if a printk waiter has taken over the
++ *		console_lock, in which case the caller is no longer holding
++ *		both the console_lock and the SRCU read lock. Otherwise it
++ *		is set to false.
++ * @cookie:	The cookie from the SRCU read lock.
++ * @use_atomic:	True if the write_atomic callback is to be used
++ *
++ * Context:	Any context except NMI.
++ * Return:	False if the given console has no next record to print,
++ *		otherwise true.
++ *
++ * This function is meant to be called by console_flush_all() to print records
++ * on nbcon consoles from legacy context (printing via console unlocking).
++ * Essentially it is the nbcon version of console_emit_next_record().
++ */
++bool nbcon_legacy_emit_next_record(struct console *con, bool *handover,
++				   int cookie, bool use_atomic)
++{
++	struct nbcon_write_context wctxt = { };
++	struct nbcon_context *ctxt = &ACCESS_PRIVATE(&wctxt, ctxt);
++	unsigned long flags;
++	bool progress;
++
++	*handover = false;
++
++	ctxt->console = con;
++
++	if (use_atomic) {
++		/* Use the same procedure as console_emit_next_record(). */
++		printk_safe_enter_irqsave(flags);
++		console_lock_spinning_enable();
++		stop_critical_timings();
++
++		ctxt->prio = nbcon_get_default_prio();
++		progress = nbcon_emit_one(&wctxt, use_atomic);
++
++		start_critical_timings();
++		*handover = console_lock_spinning_disable_and_check(cookie);
++		printk_safe_exit_irqrestore(flags);
++	} else {
++		con->device_lock(con, &flags);
++		cant_migrate();
++
++		ctxt->prio = nbcon_get_default_prio();
++		progress = nbcon_emit_one(&wctxt, use_atomic);
++
++		con->device_unlock(con, flags);
++	}
++
++	return progress;
++}
++
++/**
++ * __nbcon_atomic_flush_pending_con - Flush specified nbcon console using its
++ *					write_atomic() callback
++ * @con:			The nbcon console to flush
++ * @stop_seq:			Flush up until this record
++ * @allow_unsafe_takeover:	True, to allow unsafe hostile takeovers
++ *
++ * Return:	True if taken over while printing. Otherwise false.
++ *
++ * If flushing up to @stop_seq was not successful, it only makes sense for the
++ * caller to try again when true was returned. When false is returned, either
++ * there are no more records available to read or this context is not allowed
++ * to acquire the console.
++ */
++static bool __nbcon_atomic_flush_pending_con(struct console *con, u64 stop_seq,
++					     bool allow_unsafe_takeover)
++{
++	struct nbcon_write_context wctxt = { };
++	struct nbcon_context *ctxt = &ACCESS_PRIVATE(&wctxt, ctxt);
++
++	ctxt->console			= con;
++	ctxt->spinwait_max_us		= 2000;
++	ctxt->prio			= nbcon_get_default_prio();
++	ctxt->allow_unsafe_takeover	= allow_unsafe_takeover;
++
++	if (!nbcon_context_try_acquire(ctxt))
++		return false;
++
++	while (nbcon_seq_read(con) < stop_seq) {
++		/*
++		 * nbcon_emit_next_record() returns false when the console was
++		 * handed over or taken over. In both cases the context is no
++		 * longer valid.
++		 */
++		if (!nbcon_emit_next_record(&wctxt, true))
++			return true;
++
++		if (!ctxt->backlog)
++			break;
++	}
++
++	nbcon_context_release(ctxt);
++
++	return false;
++}
++
++/**
++ * __nbcon_atomic_flush_pending - Flush all nbcon consoles using their
++ *					write_atomic() callback
++ * @stop_seq:			Flush up until this record
++ * @allow_unsafe_takeover:	True, to allow unsafe hostile takeovers
++ */
++static void __nbcon_atomic_flush_pending(u64 stop_seq, bool allow_unsafe_takeover)
++{
++	struct console *con;
++	bool should_retry;
++	int cookie;
++
++	do {
++		should_retry = false;
++
++		cookie = console_srcu_read_lock();
++		for_each_console_srcu(con) {
++			short flags = console_srcu_read_flags(con);
++			unsigned long irq_flags;
++
++			if (!(flags & CON_NBCON))
++				continue;
++
++			if (!console_is_usable(con, flags, true))
++				continue;
++
++			if (nbcon_seq_read(con) >= stop_seq)
++				continue;
++
++			/*
++			 * Atomic flushing does not use console driver
++			 * synchronization (i.e. it does not hold the port
++			 * lock for uart consoles). Therefore IRQs must be
++			 * disabled to avoid being interrupted and then
++			 * calling into a driver that will deadlock trying
++			 * to acquire console ownership.
++			 */
++			local_irq_save(irq_flags);
++
++			should_retry |= __nbcon_atomic_flush_pending_con(con, stop_seq,
++									 allow_unsafe_takeover);
++			local_irq_restore(irq_flags);
++		}
++		console_srcu_read_unlock(cookie);
++	} while (should_retry);
++}
++
++/**
++ * nbcon_atomic_flush_pending - Flush all nbcon consoles using their
++ *				write_atomic() callback
++ *
++ * Flush the backlog up through the currently newest record. Any new
++ * records added while flushing will not be flushed. This is to avoid
++ * one CPU printing unbounded because other CPUs continue to add records.
++ */
++void nbcon_atomic_flush_pending(void)
++{
++	__nbcon_atomic_flush_pending(prb_next_reserve_seq(prb), false);
++}
++
++/**
++ * nbcon_atomic_flush_unsafe - Flush all nbcon consoles using their
++ *	write_atomic() callback and allowing unsafe hostile takeovers
++ *
++ * Flush the backlog up through the currently newest record. Unsafe hostile
++ * takeovers will be performed, if necessary.
++ */
++void nbcon_atomic_flush_unsafe(void)
++{
++	__nbcon_atomic_flush_pending(prb_next_reserve_seq(prb), true);
++}
++
++/**
++ * nbcon_cpu_emergency_enter - Enter an emergency section where printk()
++ *	messages for that CPU are only stored
++ *
++ * Upon exiting the emergency section, all stored messages are flushed.
++ *
++ * Context:	Any context. Disables preemption.
++ *
++ * When within an emergency section, no printing occurs on that CPU. This
++ * is to allow all emergency messages to be dumped into the ringbuffer before
++ * flushing the ringbuffer. The actual printing occurs when exiting the
++ * outermost emergency section.
++ */
++void nbcon_cpu_emergency_enter(void)
++{
++	unsigned int *cpu_emergency_nesting;
++
++	preempt_disable();
++
++	cpu_emergency_nesting = nbcon_get_cpu_emergency_nesting();
++	(*cpu_emergency_nesting)++;
++}
++
++/**
++ * nbcon_cpu_emergency_exit - Exit an emergency section and flush the
++ *	stored messages
++ *
++ * Flushing only occurs when exiting all nesting for the CPU.
++ *
++ * Context:	Any context. Enables preemption.
++ */
++void nbcon_cpu_emergency_exit(void)
++{
++	unsigned int *cpu_emergency_nesting;
++	bool do_trigger_flush = false;
++
++	cpu_emergency_nesting = nbcon_get_cpu_emergency_nesting();
++
++	WARN_ON_ONCE(*cpu_emergency_nesting == 0);
++
++	if (*cpu_emergency_nesting == 1) {
++		nbcon_atomic_flush_pending();
++		do_trigger_flush = true;
++	}
++
++	/* Undo the nesting count of nbcon_cpu_emergency_enter(). */
++	(*cpu_emergency_nesting)--;
++
++	preempt_enable();
++
++	if (do_trigger_flush)
++		printk_trigger_flush();
++}
++
++/**
++ * nbcon_kthread_stop - Stop a printer thread
++ * @con:	Console to operate on
++ */
++static void nbcon_kthread_stop(struct console *con)
++{
++	lockdep_assert_console_list_lock_held();
++
++	if (!con->kthread)
++		return;
++
++	kthread_stop(con->kthread);
++	con->kthread = NULL;
++}
++
++/**
++ * nbcon_kthread_create - Create a printer thread
++ * @con:	Console to operate on
++ *
++ * If it fails, let the console proceed. The atomic part might
++ * be usable and useful.
++ */
++void nbcon_kthread_create(struct console *con)
++{
++	struct task_struct *kt;
++
++	lockdep_assert_console_list_lock_held();
++
++	if (!(con->flags & CON_NBCON) || !con->write_thread)
++		return;
++
++	if (!printk_threads_enabled || con->kthread)
++		return;
++
++	/*
++	 * Printer threads cannot be started as long as any boot console is
++	 * registered because there is no way to synchronize the hardware
++	 * registers between boot console code and regular console code.
++	 */
++	if (have_boot_console)
++		return;
++
++	kt = kthread_run(nbcon_kthread_func, con, "pr/%s%d", con->name, con->index);
++	if (IS_ERR(kt)) {
++		con_printk(KERN_ERR, con, "failed to start printing thread\n");
++		return;
++	}
++
++	con->kthread = kt;
++
++	/*
++	 * It is important that console printing threads are scheduled
++	 * shortly after a printk call and with generous runtime budgets.
++	 */
++	sched_set_normal(con->kthread, -20);
++}
++
++static int __init printk_setup_threads(void)
++{
++	struct console *con;
++
++	console_list_lock();
++	printk_threads_enabled = true;
++	for_each_console(con)
++		nbcon_kthread_create(con);
++	if (force_printkthreads() && printing_via_unlock)
++		nbcon_legacy_kthread_create();
++	console_list_unlock();
++	return 0;
++}
++early_initcall(printk_setup_threads);
++
+ /**
+  * nbcon_alloc - Allocate buffers needed by the nbcon console
+  * @con:	Console to allocate buffers for
+@@ -964,8 +1591,6 @@ bool nbcon_alloc(struct console *con)
+  *
+  * nbcon_alloc() *must* be called and succeed before this function
+  * is called.
+- *
+- * This function expects that the legacy @con->seq has been set.
+  */
+ void nbcon_init(struct console *con)
+ {
+@@ -974,8 +1599,12 @@ void nbcon_init(struct console *con)
+ 	/* nbcon_alloc() must have been called and successful! */
+ 	BUG_ON(!con->pbufs);
+ 
+-	nbcon_seq_force(con, con->seq);
++	rcuwait_init(&con->rcuwait);
++	init_irq_work(&con->irq_work, nbcon_irq_work);
++	nbcon_seq_force(con, 0);
++	atomic_long_set(&ACCESS_PRIVATE(con, nbcon_prev_seq), -1UL);
+ 	nbcon_state_set(con, &state);
++	nbcon_kthread_create(con);
+ }
+ 
+ /**
+@@ -986,6 +1615,7 @@ void nbcon_free(struct console *con)
+ {
+ 	struct nbcon_state state = { };
+ 
++	nbcon_kthread_stop(con);
+ 	nbcon_state_set(con, &state);
+ 
+ 	/* Boot consoles share global printk buffers. */
+@@ -994,3 +1624,82 @@ void nbcon_free(struct console *con)
+ 
+ 	con->pbufs = NULL;
+ }
++
++/**
++ * nbcon_driver_acquire - Acquire nbcon console and enter unsafe section
++ * @con:	The nbcon console to acquire
++ *
++ * Context:	Any context which could not be migrated to another CPU.
++ *
++ * Console drivers will usually use their own internal synchronization
++ * mechasism to synchronize between console printing and non-printing
++ * activities (such as setting baud rates). However, nbcon console drivers
++ * supporting atomic consoles may also want to mark unsafe sections when
++ * performing non-printing activities.
++ *
++ * This function acquires the nbcon console using priority NBCON_PRIO_NORMAL
++ * and marks it unsafe for handover/takeover.
++ *
++ * Console drivers using this function must have provided @nbcon_drvdata in
++ * their struct console, which is used to track ownership and state
++ * information.
++ */
++void nbcon_driver_acquire(struct console *con)
++{
++	struct nbcon_context *ctxt = &ACCESS_PRIVATE(con->nbcon_drvdata, ctxt);
++
++	cant_migrate();
++
++	do {
++		do {
++			memset(ctxt, 0, sizeof(*ctxt));
++			ctxt->console	= con;
++			ctxt->prio	= NBCON_PRIO_NORMAL;
++		} while (!nbcon_context_try_acquire(ctxt));
++
++	} while (!nbcon_context_enter_unsafe(ctxt));
++}
++EXPORT_SYMBOL_GPL(nbcon_driver_acquire);
++
++/**
++ * nbcon_driver_release - Exit unsafe section and release the nbcon console
++ * @con:	The nbcon console acquired in nbcon_driver_acquire()
++ */
++void nbcon_driver_release(struct console *con)
++{
++	struct nbcon_context *ctxt = &ACCESS_PRIVATE(con->nbcon_drvdata, ctxt);
++
++	if (nbcon_context_exit_unsafe(ctxt))
++		nbcon_context_release(ctxt);
++}
++EXPORT_SYMBOL_GPL(nbcon_driver_release);
++
++/**
++ * printk_kthread_shutdown - shutdown all threaded printers
++ *
++ * On system shutdown all threaded printers are stopped. This allows printk
++ * to transition back to atomic printing, thus providing a robust mechanism
++ * for the final shutdown/reboot messages to be output.
++ */
++static void printk_kthread_shutdown(void)
++{
++	struct console *con;
++
++	console_list_lock();
++	for_each_console(con) {
++		if (con->flags & CON_NBCON)
++			nbcon_kthread_stop(con);
++	}
++	console_list_unlock();
++}
++
++static struct syscore_ops printk_syscore_ops = {
++	.shutdown = printk_kthread_shutdown,
++};
++
++static int __init printk_init_ops(void)
++{
++	register_syscore_ops(&printk_syscore_ops);
++	return 0;
++}
++device_initcall(printk_init_ops);
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index adf99c0..5453593 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -195,6 +195,17 @@ static int __init control_devkmsg(char *str)
+ }
+ __setup("printk.devkmsg=", control_devkmsg);
+ 
++#if !defined(CONFIG_PREEMPT_RT)
++DEFINE_STATIC_KEY_FALSE(force_printkthreads_key);
++
++static int __init setup_forced_printkthreads(char *arg)
++{
++	static_branch_enable(&force_printkthreads_key);
++	return 0;
++}
++early_param("threadprintk", setup_forced_printkthreads);
++#endif
++
+ char devkmsg_log_str[DEVKMSG_STR_MAX_SIZE] = "ratelimit";
+ #if defined(CONFIG_PRINTK) && defined(CONFIG_SYSCTL)
+ int devkmsg_sysctl_set_loglvl(struct ctl_table *table, int write,
+@@ -282,6 +293,7 @@ EXPORT_SYMBOL(console_list_unlock);
+  * Return: A cookie to pass to console_srcu_read_unlock().
+  */
+ int console_srcu_read_lock(void)
++	__acquires(&console_srcu)
+ {
+ 	return srcu_read_lock_nmisafe(&console_srcu);
+ }
+@@ -295,6 +307,7 @@ EXPORT_SYMBOL(console_srcu_read_lock);
+  * Counterpart to console_srcu_read_lock()
+  */
+ void console_srcu_read_unlock(int cookie)
++	__releases(&console_srcu)
+ {
+ 	srcu_read_unlock_nmisafe(&console_srcu, cookie);
+ }
+@@ -461,8 +474,33 @@ static int console_msg_format = MSG_FORMAT_DEFAULT;
+ /* syslog_lock protects syslog_* variables and write access to clear_seq. */
+ static DEFINE_MUTEX(syslog_lock);
+ 
++/*
++ * Specifies if a legacy console is registered. If legacy consoles are
++ * present, it is necessary to perform the console lock/unlock dance
++ * whenever console flushing should occur.
++ */
++bool have_legacy_console;
++
++/*
++ * Specifies if an nbcon console is registered. If nbcon consoles are present,
++ * synchronous printing of legacy consoles will not occur during panic until
++ * the backtrace has been stored to the ringbuffer.
++ */
++static bool have_nbcon_console;
++
++/*
++ * Specifies if a boot console is registered. If boot consoles are present,
++ * nbcon consoles cannot print simultaneously and must be synchronized by
++ * the console lock. This is because boot consoles and nbcon consoles may
++ * have mapped the same hardware.
++ */
++bool have_boot_console;
++
+ #ifdef CONFIG_PRINTK
+ DECLARE_WAIT_QUEUE_HEAD(log_wait);
++
++static DECLARE_WAIT_QUEUE_HEAD(legacy_wait);
++
+ /* All 3 protected by @syslog_lock. */
+ /* the next printk record to read by syslog(READ) or /proc/kmsg */
+ static u64 syslog_seq;
+@@ -1850,7 +1888,7 @@ static bool console_waiter;
+  * there may be a waiter spinning (like a spinlock). Also it must be
+  * ready to hand over the lock at the end of the section.
+  */
+-static void console_lock_spinning_enable(void)
++void console_lock_spinning_enable(void)
+ {
+ 	/*
+ 	 * Do not use spinning in panic(). The panic CPU wants to keep the lock.
+@@ -1889,7 +1927,7 @@ static void console_lock_spinning_enable(void)
+  *
+  * Return: 1 if the lock rights were passed, 0 otherwise.
+  */
+-static int console_lock_spinning_disable_and_check(int cookie)
++int console_lock_spinning_disable_and_check(int cookie)
+ {
+ 	int waiter;
+ 
+@@ -2300,12 +2338,30 @@ int vprintk_store(int facility, int level,
+ 	return ret;
+ }
+ 
++static bool legacy_allow_panic_sync;
++
++/*
++ * This acts as a one-way switch to allow legacy consoles to print from
++ * the printk() caller context on a panic CPU. It also attempts to flush
++ * the legacy consoles in this context.
++ */
++void printk_legacy_allow_panic_sync(void)
++{
++	legacy_allow_panic_sync = true;
++
++	if (printing_via_unlock && !in_nmi()) {
++		if (console_trylock())
++			console_unlock();
++	}
++}
++
+ asmlinkage int vprintk_emit(int facility, int level,
+ 			    const struct dev_printk_info *dev_info,
+ 			    const char *fmt, va_list args)
+ {
++	bool do_trylock_unlock = printing_via_unlock &&
++				 !force_printkthreads();
+ 	int printed_len;
+-	bool in_sched = false;
+ 
+ 	/* Suppress unimportant messages after panic happens */
+ 	if (unlikely(suppress_printk))
+@@ -2321,38 +2377,85 @@ asmlinkage int vprintk_emit(int facility, int level,
+ 
+ 	if (level == LOGLEVEL_SCHED) {
+ 		level = LOGLEVEL_DEFAULT;
+-		in_sched = true;
++		/* If called from the scheduler, we can not call up(). */
++		do_trylock_unlock = false;
+ 	}
+ 
+ 	printk_delay(level);
+ 
+ 	printed_len = vprintk_store(facility, level, dev_info, fmt, args);
+ 
+-	/* If called from the scheduler, we can not call up(). */
+-	if (!in_sched) {
++	if (have_nbcon_console && !have_boot_console) {
++		bool is_panic_context = this_cpu_in_panic();
++
++		/*
++		 * In panic, the legacy consoles are not allowed to print from
++		 * the printk calling context unless explicitly allowed. This
++		 * gives the safe nbcon consoles a chance to print out all the
++		 * panic messages first. This restriction only applies if
++		 * there are nbcon consoles registered.
++		 */
++		if (is_panic_context)
++			do_trylock_unlock &= legacy_allow_panic_sync;
++
++		/*
++		 * There are situations where nbcon atomic printing should
++		 * happen in the printk() caller context:
++		 *
++		 * - When this CPU is in panic.
++		 *
++		 * - When booting, before the printing threads have been
++		 *   started.
++		 *
++		 * - During shutdown, since the printing threads may not get
++		 *   a chance to print the final messages.
++		 *
++		 * Note that if boot consoles are registered, the console
++		 * lock/unlock dance must be relied upon instead because nbcon
++		 * consoles cannot print simultaneously with boot consoles.
++		 */
++		if (is_panic_context ||
++		    !printk_threads_enabled ||
++		    (system_state > SYSTEM_RUNNING)) {
++			nbcon_atomic_flush_pending();
++		}
++	}
++
++	nbcon_wake_threads();
++
++	if (do_trylock_unlock) {
+ 		/*
+ 		 * The caller may be holding system-critical or
+ 		 * timing-sensitive locks. Disable preemption during
+ 		 * printing of all remaining records to all consoles so that
+ 		 * this context can return as soon as possible. Hopefully
+ 		 * another printk() caller will take over the printing.
++		 *
++		 * Also, nbcon_get_default_prio() requires migration disabled.
+ 		 */
+ 		preempt_disable();
++
+ 		/*
+ 		 * Try to acquire and then immediately release the console
+ 		 * semaphore. The release will print out buffers. With the
+ 		 * spinning variant, this context tries to take over the
+ 		 * printing from another printing context.
++		 *
++		 * Skip it in EMERGENCY priority. The console will be
++		 * explicitly flushed when exiting the emergency section.
+ 		 */
+-		if (console_trylock_spinning())
+-			console_unlock();
++		if (nbcon_get_default_prio() != NBCON_PRIO_EMERGENCY) {
++			if (console_trylock_spinning())
++				console_unlock();
++		}
++
+ 		preempt_enable();
+ 	}
+ 
+-	if (in_sched)
+-		defer_console_output();
+-	else
++	if (do_trylock_unlock)
+ 		wake_up_klogd();
++	else
++		defer_console_output();
+ 
+ 	return printed_len;
+ }
+@@ -2380,6 +2483,14 @@ EXPORT_SYMBOL(_printk);
+ static bool pr_flush(int timeout_ms, bool reset_on_progress);
+ static bool __pr_flush(struct console *con, int timeout_ms, bool reset_on_progress);
+ 
++static struct task_struct *nbcon_legacy_kthread;
++
++static inline void wake_up_legacy_kthread(void)
++{
++	if (nbcon_legacy_kthread)
++		wake_up_interruptible(&legacy_wait);
++}
++
+ #else /* CONFIG_PRINTK */
+ 
+ #define printk_time		false
+@@ -2393,6 +2504,8 @@ static u64 syslog_seq;
+ static bool pr_flush(int timeout_ms, bool reset_on_progress) { return true; }
+ static bool __pr_flush(struct console *con, int timeout_ms, bool reset_on_progress) { return true; }
+ 
++static inline void nbcon_legacy_kthread_create(void) { }
++static inline void wake_up_legacy_kthread(void) { }
+ #endif /* CONFIG_PRINTK */
+ 
+ #ifdef CONFIG_EARLY_PRINTK
+@@ -2608,6 +2721,8 @@ void suspend_console(void)
+ void resume_console(void)
+ {
+ 	struct console *con;
++	short flags;
++	int cookie;
+ 
+ 	if (!console_suspend_enabled)
+ 		return;
+@@ -2624,6 +2739,20 @@ void resume_console(void)
+ 	 */
+ 	synchronize_srcu(&console_srcu);
+ 
++	/*
++	 * Since this runs in task context, wake the threaded printers
++	 * directly rather than scheduling irq_work to do it.
++	 */
++	cookie = console_srcu_read_lock();
++	for_each_console_srcu(con) {
++		flags = console_srcu_read_flags(con);
++		if (flags & CON_NBCON)
++			nbcon_kthread_wake(con);
++	}
++	console_srcu_read_unlock(cookie);
++
++	wake_up_legacy_kthread();
++
+ 	pr_flush(1000, true);
+ }
+ 
+@@ -2638,7 +2767,8 @@ void resume_console(void)
+  */
+ static int console_cpu_notify(unsigned int cpu)
+ {
+-	if (!cpuhp_tasks_frozen) {
++	if (!cpuhp_tasks_frozen && printing_via_unlock &&
++	    !force_printkthreads()) {
+ 		/* If trylock fails, someone else is doing the printing */
+ 		if (console_trylock())
+ 			console_unlock();
+@@ -2695,36 +2825,6 @@ int is_console_locked(void)
+ }
+ EXPORT_SYMBOL(is_console_locked);
+ 
+-/*
+- * Check if the given console is currently capable and allowed to print
+- * records.
+- *
+- * Requires the console_srcu_read_lock.
+- */
+-static inline bool console_is_usable(struct console *con)
+-{
+-	short flags = console_srcu_read_flags(con);
+-
+-	if (!(flags & CON_ENABLED))
+-		return false;
+-
+-	if ((flags & CON_SUSPENDED))
+-		return false;
+-
+-	if (!con->write)
+-		return false;
+-
+-	/*
+-	 * Console drivers may assume that per-cpu resources have been
+-	 * allocated. So unless they're explicitly marked as being able to
+-	 * cope (CON_ANYTIME) don't call them until this CPU is officially up.
+-	 */
+-	if (!cpu_online(raw_smp_processor_id()) && !(flags & CON_ANYTIME))
+-		return false;
+-
+-	return true;
+-}
+-
+ static void __console_unlock(void)
+ {
+ 	console_locked = 0;
+@@ -2734,30 +2834,25 @@ static void __console_unlock(void)
+ #ifdef CONFIG_PRINTK
+ 
+ /*
+- * Prepend the message in @pmsg->pbufs->outbuf with a "dropped message". This
+- * is achieved by shifting the existing message over and inserting the dropped
+- * message.
++ * Prepend the message in @pmsg->pbufs->outbuf with the message in
++ * @pmsg->pbufs->scratchbuf. This is achieved by shifting the existing message
++ * over and inserting the scratchbuf message.
+  *
+  * @pmsg is the printk message to prepend.
+  *
+- * @dropped is the dropped count to report in the dropped message.
++ * @len is the length of the message in @pmsg->pbufs->scratchbuf.
+  *
+  * If the message text in @pmsg->pbufs->outbuf does not have enough space for
+- * the dropped message, the message text will be sufficiently truncated.
++ * the scratchbuf message, the message text will be sufficiently truncated.
+  *
+  * If @pmsg->pbufs->outbuf is modified, @pmsg->outbuf_len is updated.
+  */
+-void console_prepend_dropped(struct printk_message *pmsg, unsigned long dropped)
++static void __console_prepend_scratch(struct printk_message *pmsg, size_t len)
+ {
+ 	struct printk_buffers *pbufs = pmsg->pbufs;
+-	const size_t scratchbuf_sz = sizeof(pbufs->scratchbuf);
+ 	const size_t outbuf_sz = sizeof(pbufs->outbuf);
+ 	char *scratchbuf = &pbufs->scratchbuf[0];
+ 	char *outbuf = &pbufs->outbuf[0];
+-	size_t len;
+-
+-	len = scnprintf(scratchbuf, scratchbuf_sz,
+-		       "** %lu printk messages dropped **\n", dropped);
+ 
+ 	/*
+ 	 * Make sure outbuf is sufficiently large before prepending.
+@@ -2779,6 +2874,46 @@ void console_prepend_dropped(struct printk_message *pmsg, unsigned long dropped)
+ 	pmsg->outbuf_len += len;
+ }
+ 
++/*
++ * Prepend the message in @pmsg->pbufs->outbuf with a "dropped message".
++ * @pmsg->outbuf_len is updated appropriately.
++ *
++ * @pmsg is the printk message to prepend.
++ *
++ * @dropped is the dropped count to report in the dropped message.
++ */
++void console_prepend_dropped(struct printk_message *pmsg, unsigned long dropped)
++{
++	struct printk_buffers *pbufs = pmsg->pbufs;
++	const size_t scratchbuf_sz = sizeof(pbufs->scratchbuf);
++	char *scratchbuf = &pbufs->scratchbuf[0];
++	size_t len;
++
++	len = scnprintf(scratchbuf, scratchbuf_sz,
++		       "** %lu printk messages dropped **\n", dropped);
++
++	__console_prepend_scratch(pmsg, len);
++}
++
++/*
++ * Prepend the message in @pmsg->pbufs->outbuf with a "replay message".
++ * @pmsg->outbuf_len is updated appropriately.
++ *
++ * @pmsg is the printk message to prepend.
++ */
++void console_prepend_replay(struct printk_message *pmsg)
++{
++	struct printk_buffers *pbufs = pmsg->pbufs;
++	const size_t scratchbuf_sz = sizeof(pbufs->scratchbuf);
++	char *scratchbuf = &pbufs->scratchbuf[0];
++	size_t len;
++
++	len = scnprintf(scratchbuf, scratchbuf_sz,
++			"** replaying previous printk message **\n");
++
++	__console_prepend_scratch(pmsg, len);
++}
++
+ /*
+  * Read and format the specified record (or a later record if the specified
+  * record is not available).
+@@ -2844,6 +2979,33 @@ bool printk_get_next_message(struct printk_message *pmsg, u64 seq,
+ 	return true;
+ }
+ 
++/*
++ * Legacy console printing from printk() caller context does not respect
++ * raw_spinlock/spinlock nesting. For !PREEMPT_RT the lockdep warning is a
++ * false positive. For PREEMPT_RT the false positive condition does not
++ * occur.
++ *
++ * This map is used to establish LD_WAIT_SLEEP context for the console write
++ * callbacks when legacy printing to avoid false positive lockdep complaints,
++ * thus allowing lockdep to continue to function for real issues.
++ */
++#ifdef CONFIG_PREEMPT_RT
++static inline void printk_legacy_lock_map_acquire_try(void) { }
++static inline void printk_legacy_lock_map_release(void) { }
++#else
++static DEFINE_WAIT_OVERRIDE_MAP(printk_legacy_map, LD_WAIT_SLEEP);
++
++static inline void printk_legacy_lock_map_acquire_try(void)
++{
++	lock_map_acquire_try(&printk_legacy_map);
++}
++
++static inline void printk_legacy_lock_map_release(void)
++{
++	lock_map_release(&printk_legacy_map);
++}
++#endif /* CONFIG_PREEMPT_RT */
++
+ /*
+  * Used as the printk buffers for non-panic, serialized console printing.
+  * This is for legacy (!CON_NBCON) as well as all boot (CON_BOOT) consoles.
+@@ -2893,31 +3055,45 @@ static bool console_emit_next_record(struct console *con, bool *handover, int co
+ 		con->dropped = 0;
+ 	}
+ 
+-	/*
+-	 * While actively printing out messages, if another printk()
+-	 * were to occur on another CPU, it may wait for this one to
+-	 * finish. This task can not be preempted if there is a
+-	 * waiter waiting to take over.
+-	 *
+-	 * Interrupts are disabled because the hand over to a waiter
+-	 * must not be interrupted until the hand over is completed
+-	 * (@console_waiter is cleared).
+-	 */
+-	printk_safe_enter_irqsave(flags);
+-	console_lock_spinning_enable();
++	/* Write everything out to the hardware. */
+ 
+-	/* Do not trace print latency. */
+-	stop_critical_timings();
++	if (force_printkthreads()) {
++		/*
++		 * With forced threading this function is either in a thread
++		 * or panic context. So there is no need for concern about
++		 * printk reentrance, handovers, or lockdep complaints.
++		 */
+ 
+-	/* Write everything out to the hardware. */
+-	con->write(con, outbuf, pmsg.outbuf_len);
++		con->write(con, outbuf, pmsg.outbuf_len);
++		con->seq = pmsg.seq + 1;
++	} else {
++		/*
++		 * While actively printing out messages, if another printk()
++		 * were to occur on another CPU, it may wait for this one to
++		 * finish. This task can not be preempted if there is a
++		 * waiter waiting to take over.
++		 *
++		 * Interrupts are disabled because the hand over to a waiter
++		 * must not be interrupted until the hand over is completed
++		 * (@console_waiter is cleared).
++		 */
++		printk_safe_enter_irqsave(flags);
++		console_lock_spinning_enable();
+ 
+-	start_critical_timings();
++		/* Do not trace print latency. */
++		stop_critical_timings();
+ 
+-	con->seq = pmsg.seq + 1;
++		printk_legacy_lock_map_acquire_try();
++		con->write(con, outbuf, pmsg.outbuf_len);
++		printk_legacy_lock_map_release();
+ 
+-	*handover = console_lock_spinning_disable_and_check(cookie);
+-	printk_safe_exit_irqrestore(flags);
++		start_critical_timings();
++
++		con->seq = pmsg.seq + 1;
++
++		*handover = console_lock_spinning_disable_and_check(cookie);
++		printk_safe_exit_irqrestore(flags);
++	}
+ skip:
+ 	return true;
+ }
+@@ -2970,13 +3146,29 @@ static bool console_flush_all(bool do_cond_resched, u64 *next_seq, bool *handove
+ 
+ 		cookie = console_srcu_read_lock();
+ 		for_each_console_srcu(con) {
++			short flags = console_srcu_read_flags(con);
++			u64 printk_seq;
+ 			bool progress;
+ 
+-			if (!console_is_usable(con))
++			/*
++			 * console_flush_all() is only for legacy consoles,
++			 * unless the nbcon console has no kthread printer.
++			 */
++			if ((flags & CON_NBCON) && con->kthread)
++				continue;
++
++			if (!console_is_usable(con, flags, !do_cond_resched))
+ 				continue;
+ 			any_usable = true;
+ 
+-			progress = console_emit_next_record(con, handover, cookie);
++			if (flags & CON_NBCON) {
++				progress = nbcon_legacy_emit_next_record(con, handover, cookie,
++									 !do_cond_resched);
++				printk_seq = nbcon_seq_read(con);
++			} else {
++				progress = console_emit_next_record(con, handover, cookie);
++				printk_seq = con->seq;
++			}
+ 
+ 			/*
+ 			 * If a handover has occurred, the SRCU read lock
+@@ -2986,8 +3178,8 @@ static bool console_flush_all(bool do_cond_resched, u64 *next_seq, bool *handove
+ 				return false;
+ 
+ 			/* Track the next of the highest seq flushed. */
+-			if (con->seq > *next_seq)
+-				*next_seq = con->seq;
++			if (printk_seq > *next_seq)
++				*next_seq = printk_seq;
+ 
+ 			if (!progress)
+ 				continue;
+@@ -3010,19 +3202,7 @@ static bool console_flush_all(bool do_cond_resched, u64 *next_seq, bool *handove
+ 	return false;
+ }
+ 
+-/**
+- * console_unlock - unblock the console subsystem from printing
+- *
+- * Releases the console_lock which the caller holds to block printing of
+- * the console subsystem.
+- *
+- * While the console_lock was held, console output may have been buffered
+- * by printk().  If this is the case, console_unlock(); emits
+- * the output prior to releasing the lock.
+- *
+- * console_unlock(); may be called from any context.
+- */
+-void console_unlock(void)
++static void console_flush_and_unlock(void)
+ {
+ 	bool do_cond_resched;
+ 	bool handover;
+@@ -3066,6 +3246,32 @@ void console_unlock(void)
+ 		 */
+ 	} while (prb_read_valid(prb, next_seq, NULL) && console_trylock());
+ }
++
++/**
++ * console_unlock - unblock the console subsystem from printing
++ *
++ * Releases the console_lock which the caller holds to block printing of
++ * the console subsystem.
++ *
++ * While the console_lock was held, console output may have been buffered
++ * by printk().  If this is the case, console_unlock(); emits
++ * the output prior to releasing the lock.
++ *
++ * console_unlock(); may be called from any context.
++ */
++void console_unlock(void)
++{
++	/*
++	 * Forced threading relies on kthread and atomic consoles for
++	 * printing. It never attempts to print from console_unlock().
++	 */
++	if (force_printkthreads()) {
++		__console_unlock();
++		return;
++	}
++
++	console_flush_and_unlock();
++}
+ EXPORT_SYMBOL(console_unlock);
+ 
+ /**
+@@ -3199,7 +3405,10 @@ void console_flush_on_panic(enum con_flush_mode mode)
+ 		console_srcu_read_unlock(cookie);
+ 	}
+ 
+-	console_flush_all(false, &next_seq, &handover);
++	nbcon_atomic_flush_pending();
++
++	if (printing_via_unlock)
++		console_flush_all(false, &next_seq, &handover);
+ }
+ 
+ /*
+@@ -3256,13 +3465,122 @@ EXPORT_SYMBOL(console_stop);
+ 
+ void console_start(struct console *console)
+ {
++	short flags;
++
+ 	console_list_lock();
+ 	console_srcu_write_flags(console, console->flags | CON_ENABLED);
++	flags = console->flags;
+ 	console_list_unlock();
++
++	/*
++	 * Ensure that all SRCU list walks have completed. The related
++	 * printing context must be able to see it is enabled so that
++	 * it is guaranteed to wake up and resume printing.
++	 */
++	synchronize_srcu(&console_srcu);
++
++	if (flags & CON_NBCON)
++		nbcon_kthread_wake(console);
++	else
++		wake_up_legacy_kthread();
++
+ 	__pr_flush(console, 1000, true);
+ }
+ EXPORT_SYMBOL(console_start);
+ 
++#ifdef CONFIG_PRINTK
++static bool printer_should_wake(void)
++{
++	bool available = false;
++	struct console *con;
++	int cookie;
++
++	if (kthread_should_stop())
++		return true;
++
++	cookie = console_srcu_read_lock();
++	for_each_console_srcu(con) {
++		short flags = console_srcu_read_flags(con);
++		u64 printk_seq;
++
++		/*
++		 * The legacy printer thread is only for legacy consoles,
++		 * unless the nbcon console has no kthread printer.
++		 */
++		if ((flags & CON_NBCON) && con->kthread)
++			continue;
++
++		if (!console_is_usable(con, flags, true))
++			continue;
++
++		if (flags & CON_NBCON) {
++			printk_seq = nbcon_seq_read(con);
++		} else {
++			/*
++			 * It is safe to read @seq because only this
++			 * thread context updates @seq.
++			 */
++			printk_seq = con->seq;
++		}
++
++		if (prb_read_valid(prb, printk_seq, NULL)) {
++			available = true;
++			break;
++		}
++	}
++	console_srcu_read_unlock(cookie);
++
++	return available;
++}
++
++static int nbcon_legacy_kthread_func(void *unused)
++{
++	int error;
++
++	for (;;) {
++		error = wait_event_interruptible(legacy_wait, printer_should_wake());
++
++		if (kthread_should_stop())
++			break;
++
++		if (error)
++			continue;
++
++		console_lock();
++		console_flush_and_unlock();
++	}
++
++	return 0;
++}
++
++void nbcon_legacy_kthread_create(void)
++{
++	struct task_struct *kt;
++
++	lockdep_assert_held(&console_mutex);
++
++	if (!force_printkthreads())
++		return;
++
++	if (!printk_threads_enabled || nbcon_legacy_kthread)
++		return;
++
++	kt = kthread_run(nbcon_legacy_kthread_func, NULL, "pr/legacy");
++	if (IS_ERR(kt)) {
++		pr_err("unable to start legacy printing thread\n");
++		return;
++	}
++
++	nbcon_legacy_kthread = kt;
++
++	/*
++	 * It is important that console printing threads are scheduled
++	 * shortly after a printk call and with generous runtime budgets.
++	 */
++	sched_set_normal(nbcon_legacy_kthread, -20);
++}
++#endif /* CONFIG_PRINTK */
++
+ static int __read_mostly keep_bootcon;
+ 
+ static int __init keep_bootcon_setup(char *str)
+@@ -3361,6 +3679,7 @@ static void try_enable_default_console(struct console *newcon)
+ 		newcon->flags |= CON_CONSDEV;
+ }
+ 
++/* Set @newcon->seq to the first record this console should print. */
+ static void console_init_seq(struct console *newcon, bool bootcon_registered)
+ {
+ 	struct console *con;
+@@ -3409,11 +3728,20 @@ static void console_init_seq(struct console *newcon, bool bootcon_registered)
+ 
+ 				newcon->seq = prb_next_seq(prb);
+ 				for_each_console(con) {
+-					if ((con->flags & CON_BOOT) &&
+-					    (con->flags & CON_ENABLED) &&
+-					    con->seq < newcon->seq) {
+-						newcon->seq = con->seq;
++					u64 seq;
++
++					if (!((con->flags & CON_BOOT) &&
++					      (con->flags & CON_ENABLED))) {
++						continue;
+ 					}
++
++					if (con->flags & CON_NBCON)
++						seq = nbcon_seq_read(con);
++					else
++						seq = con->seq;
++
++					if (seq < newcon->seq)
++						newcon->seq = seq;
+ 				}
+ 			}
+ 
+@@ -3451,6 +3779,7 @@ void register_console(struct console *newcon)
+ 	struct console *con;
+ 	bool bootcon_registered = false;
+ 	bool realcon_registered = false;
++	unsigned long flags;
+ 	int err;
+ 
+ 	console_list_lock();
+@@ -3530,9 +3859,38 @@ void register_console(struct console *newcon)
+ 	newcon->dropped = 0;
+ 	console_init_seq(newcon, bootcon_registered);
+ 
+-	if (newcon->flags & CON_NBCON)
++	if (newcon->flags & CON_NBCON) {
++		have_nbcon_console = true;
+ 		nbcon_init(newcon);
+ 
++		/*
++		 * nbcon consoles have their own sequence counter. The legacy
++		 * sequence counter is reset so that it is clear it is not
++		 * being used.
++		 */
++		nbcon_seq_force(newcon, newcon->seq);
++		newcon->seq = 0;
++	} else {
++		have_legacy_console = true;
++		nbcon_legacy_kthread_create();
++	}
++
++	if (newcon->flags & CON_BOOT)
++		have_boot_console = true;
++
++	/*
++	 * If another context is actively using the hardware of this new
++	 * console, it will not be aware of the nbcon synchronization. This
++	 * is a risk that two contexts could access the hardware
++	 * simultaneously if this new console is used for atomic printing
++	 * and the other context is still using the hardware.
++	 *
++	 * Use the driver synchronization to ensure that the hardware is not
++	 * in use while this new console transitions to being registered.
++	 */
++	if ((newcon->flags & CON_NBCON) && newcon->write_atomic)
++		newcon->device_lock(newcon, &flags);
++
+ 	/*
+ 	 * Put this console in the list - keep the
+ 	 * preferred driver at the head of the list.
+@@ -3557,6 +3915,10 @@ void register_console(struct console *newcon)
+ 	 * register_console() completes.
+ 	 */
+ 
++	/* This new console is now registered. */
++	if ((newcon->flags & CON_NBCON) && newcon->write_atomic)
++		newcon->device_unlock(newcon, flags);
++
+ 	console_sysfs_notify();
+ 
+ 	/*
+@@ -3585,6 +3947,11 @@ EXPORT_SYMBOL(register_console);
+ /* Must be called under console_list_lock(). */
+ static int unregister_console_locked(struct console *console)
+ {
++	bool is_boot_con = (console->flags & CON_BOOT);
++	bool found_legacy_con = false;
++	bool found_nbcon_con = false;
++	bool found_boot_con = false;
++	struct console *c;
+ 	int res;
+ 
+ 	lockdep_assert_console_list_lock_held();
+@@ -3632,6 +3999,42 @@ static int unregister_console_locked(struct console *console)
+ 	if (console->exit)
+ 		res = console->exit(console);
+ 
++	/*
++	 * With this console gone, the global flags tracking registered
++	 * console types may have changed. Update them.
++	 */
++	for_each_console(c) {
++		if (c->flags & CON_BOOT)
++			found_boot_con = true;
++
++		if (c->flags & CON_NBCON)
++			found_nbcon_con = true;
++		else
++			found_legacy_con = true;
++	}
++	if (!found_boot_con)
++		have_boot_console = found_boot_con;
++	if (!found_legacy_con)
++		have_legacy_console = found_legacy_con;
++	if (!found_nbcon_con)
++		have_nbcon_console = found_nbcon_con;
++
++	/*
++	 * When the last boot console unregisters, start up the
++	 * printing threads.
++	 */
++	if (is_boot_con && !have_boot_console) {
++		for_each_console(c)
++			nbcon_kthread_create(c);
++	}
++
++#ifdef CONFIG_PRINTK
++	if (!printing_via_unlock && nbcon_legacy_kthread) {
++		kthread_stop(nbcon_legacy_kthread);
++		nbcon_legacy_kthread = NULL;
++	}
++#endif
++
+ 	return res;
+ }
+ 
+@@ -3790,23 +4193,39 @@ static bool __pr_flush(struct console *con, int timeout_ms, bool reset_on_progre
+ 
+ 	seq = prb_next_reserve_seq(prb);
+ 
+-	/* Flush the consoles so that records up to @seq are printed. */
+-	console_lock();
+-	console_unlock();
++	/*
++	 * Flush the consoles so that records up to @seq are printed.
++	 * Otherwise this function will just wait for the threaded printers
++	 * to print up to @seq.
++	 */
++	if (printing_via_unlock && !force_printkthreads()) {
++		console_lock();
++		console_unlock();
++	}
+ 
+ 	for (;;) {
+ 		unsigned long begin_jiffies;
+ 		unsigned long slept_jiffies;
+-
+-		diff = 0;
++		bool use_console_lock = printing_via_unlock;
+ 
+ 		/*
+-		 * Hold the console_lock to guarantee safe access to
+-		 * console->seq. Releasing console_lock flushes more
+-		 * records in case @seq is still not printed on all
+-		 * usable consoles.
++		 * Ensure the compiler does not optimize @use_console_lock to
++		 * be @printing_via_unlock since the latter can change at any
++		 * time.
+ 		 */
+-		console_lock();
++		barrier();
++
++		diff = 0;
++
++		if (use_console_lock) {
++			/*
++			 * Hold the console_lock to guarantee safe access to
++			 * console->seq. Releasing console_lock flushes more
++			 * records in case @seq is still not printed on all
++			 * usable consoles.
++			 */
++			console_lock();
++		}
+ 
+ 		cookie = console_srcu_read_lock();
+ 		for_each_console_srcu(c) {
+@@ -3820,12 +4239,15 @@ static bool __pr_flush(struct console *con, int timeout_ms, bool reset_on_progre
+ 			 * that they make forward progress, so only increment
+ 			 * @diff for usable consoles.
+ 			 */
+-			if (!console_is_usable(c))
++			if (!console_is_usable(c, flags, true) &&
++			    !console_is_usable(c, flags, false)) {
+ 				continue;
++			}
+ 
+ 			if (flags & CON_NBCON) {
+ 				printk_seq = nbcon_seq_read(c);
+ 			} else {
++				WARN_ON_ONCE(!use_console_lock);
+ 				printk_seq = c->seq;
+ 			}
+ 
+@@ -3837,7 +4259,8 @@ static bool __pr_flush(struct console *con, int timeout_ms, bool reset_on_progre
+ 		if (diff != last_diff && reset_on_progress)
+ 			remaining_jiffies = timeout_jiffies;
+ 
+-		console_unlock();
++		if (use_console_lock)
++			console_unlock();
+ 
+ 		/* Note: @diff is 0 if there are no usable consoles. */
+ 		if (diff == 0 || remaining_jiffies == 0)
+@@ -3889,9 +4312,16 @@ static void wake_up_klogd_work_func(struct irq_work *irq_work)
+ 	int pending = this_cpu_xchg(printk_pending, 0);
+ 
+ 	if (pending & PRINTK_PENDING_OUTPUT) {
+-		/* If trylock fails, someone else is doing the printing */
+-		if (console_trylock())
+-			console_unlock();
++		if (force_printkthreads()) {
++			wake_up_legacy_kthread();
++		} else {
++			/*
++			 * If trylock fails, some other context
++			 * will do the printing.
++			 */
++			if (console_trylock())
++				console_unlock();
++		}
+ 	}
+ 
+ 	if (pending & PRINTK_PENDING_WAKEUP)
+@@ -3907,6 +4337,7 @@ static void __wake_up_klogd(int val)
+ 		return;
+ 
+ 	preempt_disable();
++
+ 	/*
+ 	 * Guarantee any new records can be seen by tasks preparing to wait
+ 	 * before this context checks if the wait queue is empty.
+@@ -3918,11 +4349,22 @@ static void __wake_up_klogd(int val)
+ 	 *
+ 	 * This pairs with devkmsg_read:A and syslog_print:A.
+ 	 */
+-	if (wq_has_sleeper(&log_wait) || /* LMM(__wake_up_klogd:A) */
+-	    (val & PRINTK_PENDING_OUTPUT)) {
++	if (!wq_has_sleeper(&log_wait)) /* LMM(__wake_up_klogd:A) */
++		val &= ~PRINTK_PENDING_WAKEUP;
++
++	/*
++	 * Simple read is safe. register_console() would flush a newly
++	 * registered legacy console when writing the message about it
++	 * being enabled.
++	 */
++	if (!printing_via_unlock)
++		val &= ~PRINTK_PENDING_OUTPUT;
++
++	if (val) {
+ 		this_cpu_or(printk_pending, val);
+ 		irq_work_queue(this_cpu_ptr(&wake_up_klogd_work));
+ 	}
++
+ 	preempt_enable();
+ }
+ 
+@@ -3964,6 +4406,7 @@ void defer_console_output(void)
+ 
+ void printk_trigger_flush(void)
+ {
++	nbcon_wake_threads();
+ 	defer_console_output();
+ }
+ 
+diff --git a/kernel/printk/printk_ringbuffer.h b/kernel/printk/printk_ringbuffer.h
+index 52626d0..bd2a892 100644
+--- a/kernel/printk/printk_ringbuffer.h
++++ b/kernel/printk/printk_ringbuffer.h
+@@ -5,6 +5,8 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/dev_printk.h>
++#include <linux/stddef.h>
++#include <linux/types.h>
+ 
+ /*
+  * Meta information about each stored message.
+diff --git a/kernel/printk/printk_safe.c b/kernel/printk/printk_safe.c
+index 6d10927..4421cca 100644
+--- a/kernel/printk/printk_safe.c
++++ b/kernel/printk/printk_safe.c
+@@ -26,6 +26,18 @@ void __printk_safe_exit(void)
+ 	this_cpu_dec(printk_context);
+ }
+ 
++void __printk_deferred_enter(void)
++{
++	cant_migrate();
++	__printk_safe_enter();
++}
++
++void __printk_deferred_exit(void)
++{
++	cant_migrate();
++	__printk_safe_exit();
++}
++
+ asmlinkage int vprintk(const char *fmt, va_list args)
+ {
+ #ifdef CONFIG_KGDB_KDB
+diff --git a/kernel/rcu/rcutorture.c b/kernel/rcu/rcutorture.c
+index 45d6b4c..c793b14 100644
+--- a/kernel/rcu/rcutorture.c
++++ b/kernel/rcu/rcutorture.c
+@@ -2413,6 +2413,12 @@ static int rcutorture_booster_init(unsigned int cpu)
+ 		WARN_ON_ONCE(!t);
+ 		sp.sched_priority = 2;
+ 		sched_setscheduler_nocheck(t, SCHED_FIFO, &sp);
++#ifdef CONFIG_PREEMPT_RT
++		t = per_cpu(timersd, cpu);
++		WARN_ON_ONCE(!t);
++		sp.sched_priority = 2;
++		sched_setscheduler_nocheck(t, SCHED_FIFO, &sp);
++#endif
+ 	}
+ 
+ 	/* Don't allow time recalculation while creating a new task. */
+diff --git a/kernel/rcu/tree_exp.h b/kernel/rcu/tree_exp.h
+index 6b83537..0a135e9 100644
+--- a/kernel/rcu/tree_exp.h
++++ b/kernel/rcu/tree_exp.h
+@@ -7,6 +7,7 @@
+  * Authors: Paul E. McKenney <paulmck@linux.ibm.com>
+  */
+ 
++#include <linux/console.h>
+ #include <linux/lockdep.h>
+ 
+ static void rcu_exp_handler(void *unused);
+@@ -571,6 +572,9 @@ static void synchronize_rcu_expedited_wait(void)
+ 			return;
+ 		if (rcu_stall_is_suppressed())
+ 			continue;
++
++		nbcon_cpu_emergency_enter();
++
+ 		j = jiffies;
+ 		rcu_stall_notifier_call_chain(RCU_STALL_NOTIFY_EXP, (void *)(j - jiffies_start));
+ 		trace_rcu_stall_warning(rcu_state.name, TPS("ExpeditedStall"));
+@@ -624,6 +628,9 @@ static void synchronize_rcu_expedited_wait(void)
+ 			rcu_exp_print_detail_task_stall_rnp(rnp);
+ 		}
+ 		jiffies_stall = 3 * rcu_exp_jiffies_till_stall_check() + 3;
++
++		nbcon_cpu_emergency_exit();
++
+ 		panic_on_rcu_stall();
+ 	}
+ }
+diff --git a/kernel/rcu/tree_stall.h b/kernel/rcu/tree_stall.h
+index 5d66642..f4d73ca 100644
+--- a/kernel/rcu/tree_stall.h
++++ b/kernel/rcu/tree_stall.h
+@@ -7,6 +7,7 @@
+  * Author: Paul E. McKenney <paulmck@linux.ibm.com>
+  */
+ 
++#include <linux/console.h>
+ #include <linux/kvm_para.h>
+ #include <linux/rcu_notifier.h>
+ 
+@@ -604,6 +605,8 @@ static void print_other_cpu_stall(unsigned long gp_seq, unsigned long gps)
+ 	if (rcu_stall_is_suppressed())
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	/*
+ 	 * OK, time to rat on our buddy...
+ 	 * See Documentation/RCU/stallwarn.rst for info on how to debug
+@@ -655,6 +658,8 @@ static void print_other_cpu_stall(unsigned long gp_seq, unsigned long gps)
+ 	rcu_check_gp_kthread_expired_fqs_timer();
+ 	rcu_check_gp_kthread_starvation();
+ 
++	nbcon_cpu_emergency_exit();
++
+ 	panic_on_rcu_stall();
+ 
+ 	rcu_force_quiescent_state();  /* Kick them all. */
+@@ -675,6 +680,8 @@ static void print_cpu_stall(unsigned long gps)
+ 	if (rcu_stall_is_suppressed())
+ 		return;
+ 
++	nbcon_cpu_emergency_enter();
++
+ 	/*
+ 	 * OK, time to rat on ourselves...
+ 	 * See Documentation/RCU/stallwarn.rst for info on how to debug
+@@ -703,6 +710,8 @@ static void print_cpu_stall(unsigned long gps)
+ 			   jiffies + 3 * rcu_jiffies_till_stall_check() + 3);
+ 	raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+ 
++	nbcon_cpu_emergency_exit();
++
+ 	panic_on_rcu_stall();
+ 
+ 	/*
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 7019a40..9c1890d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -899,14 +899,15 @@ static inline void hrtick_rq_init(struct rq *rq)
+ 
+ #if defined(CONFIG_SMP) && defined(TIF_POLLING_NRFLAG)
+ /*
+- * Atomically set TIF_NEED_RESCHED and test for TIF_POLLING_NRFLAG,
++ * Atomically set TIF_NEED_RESCHED[_LAZY] and test for TIF_POLLING_NRFLAG,
+  * this avoids any races wrt polling state changes and thereby avoids
+  * spurious IPIs.
+  */
+-static inline bool set_nr_and_not_polling(struct task_struct *p)
++static inline bool set_nr_and_not_polling(struct task_struct *p, int tif_bit)
+ {
+ 	struct thread_info *ti = task_thread_info(p);
+-	return !(fetch_or(&ti->flags, _TIF_NEED_RESCHED) & _TIF_POLLING_NRFLAG);
++
++	return !(fetch_or(&ti->flags, 1 << tif_bit) & _TIF_POLLING_NRFLAG);
+ }
+ 
+ /*
+@@ -923,7 +924,7 @@ static bool set_nr_if_polling(struct task_struct *p)
+ 	do {
+ 		if (!(val & _TIF_POLLING_NRFLAG))
+ 			return false;
+-		if (val & _TIF_NEED_RESCHED)
++		if (val & (_TIF_NEED_RESCHED | _TIF_NEED_RESCHED_LAZY))
+ 			return true;
+ 	} while (!try_cmpxchg(&ti->flags, &val, val | _TIF_NEED_RESCHED));
+ 
+@@ -931,9 +932,9 @@ static bool set_nr_if_polling(struct task_struct *p)
+ }
+ 
+ #else
+-static inline bool set_nr_and_not_polling(struct task_struct *p)
++static inline bool set_nr_and_not_polling(struct task_struct *p, int tif_bit)
+ {
+-	set_tsk_need_resched(p);
++	set_tsk_thread_flag(p, tif_bit);
+ 	return true;
+ }
+ 
+@@ -1038,28 +1039,47 @@ void wake_up_q(struct wake_q_head *head)
+  * might also involve a cross-CPU call to trigger the scheduler on
+  * the target CPU.
+  */
+-void resched_curr(struct rq *rq)
++static void __resched_curr(struct rq *rq, int lazy)
+ {
++	int cpu, tif_bit = TIF_NEED_RESCHED + lazy;
+ 	struct task_struct *curr = rq->curr;
+-	int cpu;
+ 
+ 	lockdep_assert_rq_held(rq);
+ 
+-	if (test_tsk_need_resched(curr))
++	if (unlikely(test_tsk_thread_flag(curr, tif_bit)))
+ 		return;
+ 
+ 	cpu = cpu_of(rq);
+ 
+ 	if (cpu == smp_processor_id()) {
+-		set_tsk_need_resched(curr);
+-		set_preempt_need_resched();
++		set_tsk_thread_flag(curr, tif_bit);
++		if (!lazy)
++			set_preempt_need_resched();
+ 		return;
+ 	}
+ 
+-	if (set_nr_and_not_polling(curr))
+-		smp_send_reschedule(cpu);
+-	else
++	if (set_nr_and_not_polling(curr, tif_bit)) {
++		if (!lazy)
++			smp_send_reschedule(cpu);
++	} else {
+ 		trace_sched_wake_idle_without_ipi(cpu);
++	}
++}
++
++void resched_curr(struct rq *rq)
++{
++	__resched_curr(rq, 0);
++}
++
++void resched_curr_lazy(struct rq *rq)
++{
++	int lazy = IS_ENABLED(CONFIG_PREEMPT_BUILD_AUTO) && !sched_feat(FORCE_NEED_RESCHED) ?
++		TIF_NEED_RESCHED_LAZY_OFFSET : 0;
++
++	if (lazy && unlikely(test_tsk_thread_flag(rq->curr, TIF_NEED_RESCHED)))
++		return;
++
++	__resched_curr(rq, lazy);
+ }
+ 
+ void resched_cpu(int cpu)
+@@ -1154,7 +1174,7 @@ static void wake_up_idle_cpu(int cpu)
+ 	 * and testing of the above solutions didn't appear to report
+ 	 * much benefits.
+ 	 */
+-	if (set_nr_and_not_polling(rq->idle))
++	if (set_nr_and_not_polling(rq->idle, TIF_NEED_RESCHED))
+ 		smp_send_reschedule(cpu);
+ 	else
+ 		trace_sched_wake_idle_without_ipi(cpu);
+@@ -8911,6 +8931,21 @@ static inline void preempt_dynamic_init(void) { }
+ 
+ #endif /* #ifdef CONFIG_PREEMPT_DYNAMIC */
+ 
++/*
++ * task_is_pi_boosted - Check if task has been PI boosted.
++ * @p:	Task to check.
++ *
++ * Return true if task is subject to priority inheritance.
++ */
++bool task_is_pi_boosted(const struct task_struct *p)
++{
++	int prio = p->prio;
++
++	if (!rt_prio(prio))
++		return false;
++	return prio != p->normal_prio;
++}
++
+ /**
+  * yield - yield the current processor to other threads.
+  *
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 8d5d98a..b462333 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -333,6 +333,23 @@ static const struct file_operations sched_debug_fops = {
+ 	.release	= seq_release,
+ };
+ 
++static ssize_t sched_hog_write(struct file *filp, const char __user *ubuf,
++			       size_t cnt, loff_t *ppos)
++{
++	unsigned long end = jiffies + 60 * HZ;
++
++	for (; time_before(jiffies, end) && !signal_pending(current);)
++		cpu_relax();
++
++	return cnt;
++}
++
++static const struct file_operations sched_hog_fops = {
++	.write		= sched_hog_write,
++	.open		= simple_open,
++	.llseek		= default_llseek,
++};
++
+ static struct dentry *debugfs_sched;
+ 
+ static __init int sched_init_debug(void)
+@@ -374,6 +391,8 @@ static __init int sched_init_debug(void)
+ 
+ 	debugfs_create_file("debug", 0444, debugfs_sched, NULL, &sched_debug_fops);
+ 
++	debugfs_create_file("hog", 0200, debugfs_sched, NULL, &sched_hog_fops);
++
+ 	return 0;
+ }
+ late_initcall(sched_init_debug);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 8d38f00..c451c67 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -988,8 +988,10 @@ static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
+  * XXX: strictly: vd_i += N*r_i/w_i such that: vd_i > ve_i
+  * this is probably good enough.
+  */
+-static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
++static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se, bool tick)
+ {
++	struct rq *rq = rq_of(cfs_rq);
++
+ 	if ((s64)(se->vruntime - se->deadline) < 0)
+ 		return;
+ 
+@@ -1008,10 +1010,19 @@ static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 	/*
+ 	 * The task has consumed its request, reschedule.
+ 	 */
+-	if (cfs_rq->nr_running > 1) {
+-		resched_curr(rq_of(cfs_rq));
+-		clear_buddies(cfs_rq, se);
++	if (cfs_rq->nr_running < 2)
++		return;
++
++	if (!IS_ENABLED(CONFIG_PREEMPT_BUILD_AUTO) || sched_feat(FORCE_NEED_RESCHED)) {
++		resched_curr(rq);
++	} else {
++		/* Did the task ignore the lazy reschedule request? */
++		if (tick && test_tsk_thread_flag(rq->curr, TIF_NEED_RESCHED_LAZY))
++			resched_curr(rq);
++		else
++			resched_curr_lazy(rq);
+ 	}
++	clear_buddies(cfs_rq, se);
+ }
+ 
+ #include "pelt.h"
+@@ -1166,7 +1177,7 @@ s64 update_curr_common(struct rq *rq)
+ /*
+  * Update the current task's runtime statistics.
+  */
+-static void update_curr(struct cfs_rq *cfs_rq)
++static void __update_curr(struct cfs_rq *cfs_rq, bool tick)
+ {
+ 	struct sched_entity *curr = cfs_rq->curr;
+ 	s64 delta_exec;
+@@ -1179,7 +1190,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ 		return;
+ 
+ 	curr->vruntime += calc_delta_fair(delta_exec, curr);
+-	update_deadline(cfs_rq, curr);
++	update_deadline(cfs_rq, curr, tick);
+ 	update_min_vruntime(cfs_rq);
+ 
+ 	if (entity_is_task(curr))
+@@ -1188,6 +1199,11 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ 	account_cfs_rq_runtime(cfs_rq, delta_exec);
+ }
+ 
++static inline void update_curr(struct cfs_rq *cfs_rq)
++{
++	__update_curr(cfs_rq, false);
++}
++
+ static void update_curr_fair(struct rq *rq)
+ {
+ 	update_curr(cfs_rq_of(&rq->curr->se));
+@@ -5512,7 +5528,7 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
+ 	/*
+ 	 * Update run-time statistics of the 'current'.
+ 	 */
+-	update_curr(cfs_rq);
++	__update_curr(cfs_rq, true);
+ 
+ 	/*
+ 	 * Ensure that runnable average is periodically updated.
+@@ -5526,7 +5542,7 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
+ 	 * validating it and just reschedule.
+ 	 */
+ 	if (queued) {
+-		resched_curr(rq_of(cfs_rq));
++		resched_curr_lazy(rq_of(cfs_rq));
+ 		return;
+ 	}
+ 	/*
+@@ -5672,7 +5688,7 @@ static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
+ 	 * hierarchy can be throttled
+ 	 */
+ 	if (!assign_cfs_rq_runtime(cfs_rq) && likely(cfs_rq->curr))
+-		resched_curr(rq_of(cfs_rq));
++		resched_curr_lazy(rq_of(cfs_rq));
+ }
+ 
+ static __always_inline
+@@ -5932,7 +5948,7 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ 
+ 	/* Determine whether we need to wake up potentially idle CPU: */
+ 	if (rq->curr == rq->idle && rq->cfs.nr_running)
+-		resched_curr(rq);
++		resched_curr_lazy(rq);
+ }
+ 
+ #ifdef CONFIG_SMP
+@@ -6647,7 +6663,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
+ 
+ 		if (delta < 0) {
+ 			if (task_current(rq, p))
+-				resched_curr(rq);
++				resched_curr_lazy(rq);
+ 			return;
+ 		}
+ 		hrtick_start(rq, delta);
+@@ -8323,7 +8339,7 @@ static void check_preempt_wakeup_fair(struct rq *rq, struct task_struct *p, int
+ 	 * prevents us from potentially nominating it as a false LAST_BUDDY
+ 	 * below.
+ 	 */
+-	if (test_tsk_need_resched(curr))
++	if (need_resched())
+ 		return;
+ 
+ 	/* Idle tasks are by definition preempted by non-idle tasks. */
+@@ -8365,7 +8381,7 @@ static void check_preempt_wakeup_fair(struct rq *rq, struct task_struct *p, int
+ 	return;
+ 
+ preempt:
+-	resched_curr(rq);
++	resched_curr_lazy(rq);
+ }
+ 
+ #ifdef CONFIG_SMP
+@@ -12511,7 +12527,7 @@ static inline void task_tick_core(struct rq *rq, struct task_struct *curr)
+ 	 */
+ 	if (rq->core->core_forceidle_count && rq->cfs.nr_running == 1 &&
+ 	    __entity_slice_used(&curr->se, MIN_NR_TASKS_DURING_FORCEIDLE))
+-		resched_curr(rq);
++		resched_curr_lazy(rq);
+ }
+ 
+ /*
+@@ -12676,7 +12692,7 @@ prio_changed_fair(struct rq *rq, struct task_struct *p, int oldprio)
+ 	 */
+ 	if (task_current(rq, p)) {
+ 		if (p->prio > oldprio)
+-			resched_curr(rq);
++			resched_curr_lazy(rq);
+ 	} else
+ 		wakeup_preempt(rq, p, 0);
+ }
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 143f55d..6de570a 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -87,3 +87,5 @@ SCHED_FEAT(UTIL_EST, true)
+ SCHED_FEAT(LATENCY_WARN, false)
+ 
+ SCHED_FEAT(HZ_BW, true)
++
++SCHED_FEAT(FORCE_NEED_RESCHED, false)
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index 6135fbe..21b36fb 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -57,8 +57,7 @@ static noinline int __cpuidle cpu_idle_poll(void)
+ 	ct_cpuidle_enter();
+ 
+ 	raw_local_irq_enable();
+-	while (!tif_need_resched() &&
+-	       (cpu_idle_force_poll || tick_check_broadcast_expired()))
++	while (!need_resched() && (cpu_idle_force_poll || tick_check_broadcast_expired()))
+ 		cpu_relax();
+ 	raw_local_irq_disable();
+ 
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 3261b06..8771140 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -2194,8 +2194,11 @@ static int rto_next_cpu(struct root_domain *rd)
+ 
+ 		rd->rto_cpu = cpu;
+ 
+-		if (cpu < nr_cpu_ids)
++		if (cpu < nr_cpu_ids) {
++			if (!has_pushable_tasks(cpu_rq(cpu)))
++				continue;
+ 			return cpu;
++		}
+ 
+ 		rd->rto_cpu = -1;
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 3e10293..f32e911 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2463,6 +2463,7 @@ extern void init_sched_fair_class(void);
+ extern void reweight_task(struct task_struct *p, int prio);
+ 
+ extern void resched_curr(struct rq *rq);
++extern void resched_curr_lazy(struct rq *rq);
+ extern void resched_cpu(int cpu);
+ 
+ extern struct rt_bandwidth def_rt_bandwidth;
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index b315b21..abda7fc 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -248,6 +248,19 @@ void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
+ }
+ EXPORT_SYMBOL(__local_bh_enable_ip);
+ 
++void softirq_preempt(void)
++{
++	if (WARN_ON_ONCE(!preemptible()))
++		return;
++
++	if (WARN_ON_ONCE(__this_cpu_read(softirq_ctrl.cnt) != SOFTIRQ_OFFSET))
++		return;
++
++	__local_bh_enable(SOFTIRQ_OFFSET, true);
++	/* preemption point */
++	__local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET);
++}
++
+ /*
+  * Invoked from ksoftirqd_run() outside of the interrupt disabled section
+  * to acquire the per CPU local lock for reentrancy protection.
+@@ -620,6 +633,24 @@ static inline void tick_irq_exit(void)
+ #endif
+ }
+ 
++#ifdef CONFIG_PREEMPT_RT
++DEFINE_PER_CPU(struct task_struct *, timersd);
++DEFINE_PER_CPU(unsigned long, pending_timer_softirq);
++
++static void wake_timersd(void)
++{
++        struct task_struct *tsk = __this_cpu_read(timersd);
++
++        if (tsk)
++                wake_up_process(tsk);
++}
++
++#else
++
++static inline void wake_timersd(void) { }
++
++#endif
++
+ static inline void __irq_exit_rcu(void)
+ {
+ #ifndef __ARCH_IRQ_EXIT_IRQS_DISABLED
+@@ -632,6 +663,10 @@ static inline void __irq_exit_rcu(void)
+ 	if (!in_interrupt() && local_softirq_pending())
+ 		invoke_softirq();
+ 
++	if (IS_ENABLED(CONFIG_PREEMPT_RT) && local_pending_timers() &&
++	    !(in_nmi() | in_hardirq()))
++		wake_timersd();
++
+ 	tick_irq_exit();
+ }
+ 
+@@ -968,12 +1003,70 @@ static struct smp_hotplug_thread softirq_threads = {
+ 	.thread_comm		= "ksoftirqd/%u",
+ };
+ 
++#ifdef CONFIG_PREEMPT_RT
++static void timersd_setup(unsigned int cpu)
++{
++        sched_set_fifo_low(current);
++}
++
++static int timersd_should_run(unsigned int cpu)
++{
++        return local_pending_timers();
++}
++
++static void run_timersd(unsigned int cpu)
++{
++	unsigned int timer_si;
++
++	ksoftirqd_run_begin();
++
++	timer_si = local_pending_timers();
++	__this_cpu_write(pending_timer_softirq, 0);
++	or_softirq_pending(timer_si);
++
++	__do_softirq();
++
++	ksoftirqd_run_end();
++}
++
++static void raise_ktimers_thread(unsigned int nr)
++{
++	trace_softirq_raise(nr);
++	__this_cpu_or(pending_timer_softirq, 1 << nr);
++}
++
++void raise_hrtimer_softirq(void)
++{
++	raise_ktimers_thread(HRTIMER_SOFTIRQ);
++}
++
++void raise_timer_softirq(void)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	raise_ktimers_thread(TIMER_SOFTIRQ);
++	wake_timersd();
++	local_irq_restore(flags);
++}
++
++static struct smp_hotplug_thread timer_threads = {
++        .store                  = &timersd,
++        .setup                  = timersd_setup,
++        .thread_should_run      = timersd_should_run,
++        .thread_fn              = run_timersd,
++        .thread_comm            = "ktimers/%u",
++};
++#endif
++
+ static __init int spawn_ksoftirqd(void)
+ {
+ 	cpuhp_setup_state_nocalls(CPUHP_SOFTIRQ_DEAD, "softirq:dead", NULL,
+ 				  takeover_tasklets);
+ 	BUG_ON(smpboot_register_percpu_thread(&softirq_threads));
+-
++#ifdef CONFIG_PREEMPT_RT
++	BUG_ON(smpboot_register_percpu_thread(&timer_threads));
++#endif
+ 	return 0;
+ }
+ early_initcall(spawn_ksoftirqd);
+diff --git a/kernel/time/hrtimer.c b/kernel/time/hrtimer.c
+index 70625df..29cea88 100644
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -1812,7 +1812,7 @@ void hrtimer_interrupt(struct clock_event_device *dev)
+ 	if (!ktime_before(now, cpu_base->softirq_expires_next)) {
+ 		cpu_base->softirq_expires_next = KTIME_MAX;
+ 		cpu_base->softirq_activated = 1;
+-		raise_softirq_irqoff(HRTIMER_SOFTIRQ);
++		raise_hrtimer_softirq();
+ 	}
+ 
+ 	__hrtimer_run_queues(cpu_base, now, flags, HRTIMER_ACTIVE_HARD);
+@@ -1925,7 +1925,7 @@ void hrtimer_run_queues(void)
+ 	if (!ktime_before(now, cpu_base->softirq_expires_next)) {
+ 		cpu_base->softirq_expires_next = KTIME_MAX;
+ 		cpu_base->softirq_activated = 1;
+-		raise_softirq_irqoff(HRTIMER_SOFTIRQ);
++		raise_hrtimer_softirq();
+ 	}
+ 
+ 	__hrtimer_run_queues(cpu_base, now, flags, HRTIMER_ACTIVE_HARD);
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 269e215..51109e3 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -855,7 +855,7 @@ static void tick_nohz_restart(struct tick_sched *ts, ktime_t now)
+ 
+ static inline bool local_timer_softirq_pending(void)
+ {
+-	return local_softirq_pending() & BIT(TIMER_SOFTIRQ);
++	return local_pending_timers() & BIT(TIMER_SOFTIRQ);
+ }
+ 
+ /*
+diff --git a/kernel/time/timer.c b/kernel/time/timer.c
+index dee29f1..19d21bb 100644
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -1563,9 +1563,16 @@ static inline void timer_base_unlock_expiry(struct timer_base *base)
+  */
+ static void timer_sync_wait_running(struct timer_base *base)
+ {
+-	if (atomic_read(&base->timer_waiters)) {
++	bool need_preempt;
++
++	need_preempt = task_is_pi_boosted(current);
++	if (need_preempt || atomic_read(&base->timer_waiters)) {
+ 		raw_spin_unlock_irq(&base->lock);
+ 		spin_unlock(&base->expiry_lock);
++
++		if (need_preempt)
++			softirq_preempt();
++
+ 		spin_lock(&base->expiry_lock);
+ 		raw_spin_lock_irq(&base->lock);
+ 	}
+@@ -2466,7 +2473,7 @@ static void run_local_timers(void)
+ 		/* Raise the softirq only if required. */
+ 		if (time_after_eq(jiffies, base->next_expiry) ||
+ 		    (i == BASE_DEF && tmigr_requires_handle_remote())) {
+-			raise_softirq(TIMER_SOFTIRQ);
++			raise_timer_softirq();
+ 			return;
+ 		}
+ 	}
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index 233d1af..362c6d1 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -2513,6 +2513,8 @@ unsigned int tracing_gen_ctx_irq_test(unsigned int irqs_status)
+ 
+ 	if (tif_need_resched())
+ 		trace_flags |= TRACE_FLAG_NEED_RESCHED;
++	if (tif_need_resched_lazy())
++		trace_flags |= TRACE_FLAG_NEED_RESCHED_LAZY;
+ 	if (test_preempt_need_resched())
+ 		trace_flags |= TRACE_FLAG_PREEMPT_RESCHED;
+ 	return (trace_flags << 16) | (min_t(unsigned int, pc & 0xff, 0xf)) |
+diff --git a/kernel/trace/trace_output.c b/kernel/trace/trace_output.c
+index d8b302d..4f58a19 100644
+--- a/kernel/trace/trace_output.c
++++ b/kernel/trace/trace_output.c
+@@ -460,17 +460,29 @@ int trace_print_lat_fmt(struct trace_seq *s, struct trace_entry *entry)
+ 		(entry->flags & TRACE_FLAG_IRQS_OFF && bh_off) ? 'D' :
+ 		(entry->flags & TRACE_FLAG_IRQS_OFF) ? 'd' :
+ 		bh_off ? 'b' :
+-		(entry->flags & TRACE_FLAG_IRQS_NOSUPPORT) ? 'X' :
++		!IS_ENABLED(CONFIG_TRACE_IRQFLAGS_SUPPORT) ? 'X' :
+ 		'.';
+ 
+-	switch (entry->flags & (TRACE_FLAG_NEED_RESCHED |
++	switch (entry->flags & (TRACE_FLAG_NEED_RESCHED | TRACE_FLAG_NEED_RESCHED_LAZY |
+ 				TRACE_FLAG_PREEMPT_RESCHED)) {
++	case TRACE_FLAG_NEED_RESCHED | TRACE_FLAG_NEED_RESCHED_LAZY | TRACE_FLAG_PREEMPT_RESCHED:
++		need_resched = 'B';
++		break;
+ 	case TRACE_FLAG_NEED_RESCHED | TRACE_FLAG_PREEMPT_RESCHED:
+ 		need_resched = 'N';
+ 		break;
++	case TRACE_FLAG_NEED_RESCHED_LAZY | TRACE_FLAG_PREEMPT_RESCHED:
++		need_resched = 'L';
++		break;
++	case TRACE_FLAG_NEED_RESCHED | TRACE_FLAG_NEED_RESCHED_LAZY:
++		need_resched = 'b';
++		break;
+ 	case TRACE_FLAG_NEED_RESCHED:
+ 		need_resched = 'n';
+ 		break;
++	case TRACE_FLAG_NEED_RESCHED_LAZY:
++		need_resched = 'l';
++		break;
+ 	case TRACE_FLAG_PREEMPT_RESCHED:
+ 		need_resched = 'p';
+ 		break;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 9a67003..9ce3416 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -78,6 +78,7 @@
+ #include <linux/slab.h>
+ #include <linux/sched.h>
+ #include <linux/sched/mm.h>
++#include <linux/smpboot.h>
+ #include <linux/mutex.h>
+ #include <linux/rwsem.h>
+ #include <linux/string.h>
+@@ -197,35 +198,60 @@ static inline struct hlist_head *dev_index_hash(struct net *net, int ifindex)
+ 	return &net->dev_index_head[ifindex & (NETDEV_HASHENTRIES - 1)];
+ }
+ 
+-static inline void rps_lock_irqsave(struct softnet_data *sd,
+-				    unsigned long *flags)
++#ifndef CONFIG_PREEMPT_RT
++
++static DEFINE_STATIC_KEY_FALSE(use_backlog_threads_key);
++
++static int __init setup_backlog_napi_threads(char *arg)
++{
++	static_branch_enable(&use_backlog_threads_key);
++	return 0;
++}
++early_param("thread_backlog_napi", setup_backlog_napi_threads);
++
++static bool use_backlog_threads(void)
++{
++	return static_branch_unlikely(&use_backlog_threads_key);
++}
++
++#else
++
++static bool use_backlog_threads(void)
+ {
+-	if (IS_ENABLED(CONFIG_RPS))
++	return true;
++}
++
++#endif
++
++static inline void backlog_lock_irq_save(struct softnet_data *sd,
++					 unsigned long *flags)
++{
++	if (IS_ENABLED(CONFIG_RPS) || use_backlog_threads())
+ 		spin_lock_irqsave(&sd->input_pkt_queue.lock, *flags);
+ 	else if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+ 		local_irq_save(*flags);
+ }
+ 
+-static inline void rps_lock_irq_disable(struct softnet_data *sd)
++static inline void backlog_lock_irq_disable(struct softnet_data *sd)
+ {
+-	if (IS_ENABLED(CONFIG_RPS))
++	if (IS_ENABLED(CONFIG_RPS) || use_backlog_threads())
+ 		spin_lock_irq(&sd->input_pkt_queue.lock);
+ 	else if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+ 		local_irq_disable();
+ }
+ 
+-static inline void rps_unlock_irq_restore(struct softnet_data *sd,
+-					  unsigned long *flags)
++static inline void backlog_unlock_irq_restore(struct softnet_data *sd,
++					      unsigned long *flags)
+ {
+-	if (IS_ENABLED(CONFIG_RPS))
++	if (IS_ENABLED(CONFIG_RPS) || use_backlog_threads())
+ 		spin_unlock_irqrestore(&sd->input_pkt_queue.lock, *flags);
+ 	else if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+ 		local_irq_restore(*flags);
+ }
+ 
+-static inline void rps_unlock_irq_enable(struct softnet_data *sd)
++static inline void backlog_unlock_irq_enable(struct softnet_data *sd)
+ {
+-	if (IS_ENABLED(CONFIG_RPS))
++	if (IS_ENABLED(CONFIG_RPS) || use_backlog_threads())
+ 		spin_unlock_irq(&sd->input_pkt_queue.lock);
+ 	else if (!IS_ENABLED(CONFIG_PREEMPT_RT))
+ 		local_irq_enable();
+@@ -4404,6 +4430,7 @@ EXPORT_SYMBOL(__dev_direct_xmit);
+ /*************************************************************************
+  *			Receiver routines
+  *************************************************************************/
++static DEFINE_PER_CPU(struct task_struct *, backlog_napi);
+ 
+ unsigned int sysctl_skb_defer_max __read_mostly = 64;
+ int weight_p __read_mostly = 64;           /* old backlog weight */
+@@ -4427,18 +4454,16 @@ static inline void ____napi_schedule(struct softnet_data *sd,
+ 		 */
+ 		thread = READ_ONCE(napi->thread);
+ 		if (thread) {
+-			/* Avoid doing set_bit() if the thread is in
+-			 * INTERRUPTIBLE state, cause napi_thread_wait()
+-			 * makes sure to proceed with napi polling
+-			 * if the thread is explicitly woken from here.
+-			 */
+-			if (READ_ONCE(thread->__state) != TASK_INTERRUPTIBLE)
+-				set_bit(NAPI_STATE_SCHED_THREADED, &napi->state);
++			if (use_backlog_threads() && thread == raw_cpu_read(backlog_napi))
++				goto use_local_napi;
++
++			set_bit(NAPI_STATE_SCHED_THREADED, &napi->state);
+ 			wake_up_process(thread);
+ 			return;
+ 		}
+ 	}
+ 
++use_local_napi:
+ 	list_add_tail(&napi->poll_list, &sd->poll_list);
+ 	WRITE_ONCE(napi->list_owner, smp_processor_id());
+ 	/* If not called from net_rx_action()
+@@ -4678,6 +4703,11 @@ static void napi_schedule_rps(struct softnet_data *sd)
+ 
+ #ifdef CONFIG_RPS
+ 	if (sd != mysd) {
++		if (use_backlog_threads()) {
++			__napi_schedule_irqoff(&sd->backlog);
++			return;
++		}
++
+ 		sd->rps_ipi_next = mysd->rps_ipi_list;
+ 		mysd->rps_ipi_list = sd;
+ 
+@@ -4692,6 +4722,23 @@ static void napi_schedule_rps(struct softnet_data *sd)
+ 	__napi_schedule_irqoff(&mysd->backlog);
+ }
+ 
++void kick_defer_list_purge(struct softnet_data *sd, unsigned int cpu)
++{
++	unsigned long flags;
++
++	if (use_backlog_threads()) {
++		backlog_lock_irq_save(sd, &flags);
++
++		if (!__test_and_set_bit(NAPI_STATE_SCHED, &sd->backlog.state))
++			__napi_schedule_irqoff(&sd->backlog);
++
++		backlog_unlock_irq_restore(sd, &flags);
++
++	} else if (!cmpxchg(&sd->defer_ipi_scheduled, 0, 1)) {
++		smp_call_function_single_async(cpu, &sd->defer_csd);
++	}
++}
++
+ #ifdef CONFIG_NET_FLOW_LIMIT
+ int netdev_flow_limit_table_len __read_mostly = (1 << 12);
+ #endif
+@@ -4747,7 +4794,7 @@ static int enqueue_to_backlog(struct sk_buff *skb, int cpu,
+ 	reason = SKB_DROP_REASON_NOT_SPECIFIED;
+ 	sd = &per_cpu(softnet_data, cpu);
+ 
+-	rps_lock_irqsave(sd, &flags);
++	backlog_lock_irq_save(sd, &flags);
+ 	if (!netif_running(skb->dev))
+ 		goto drop;
+ 	qlen = skb_queue_len(&sd->input_pkt_queue);
+@@ -4757,7 +4804,7 @@ static int enqueue_to_backlog(struct sk_buff *skb, int cpu,
+ enqueue:
+ 			__skb_queue_tail(&sd->input_pkt_queue, skb);
+ 			input_queue_tail_incr_save(sd, qtail);
+-			rps_unlock_irq_restore(sd, &flags);
++			backlog_unlock_irq_restore(sd, &flags);
+ 			return NET_RX_SUCCESS;
+ 		}
+ 
+@@ -4772,7 +4819,7 @@ static int enqueue_to_backlog(struct sk_buff *skb, int cpu,
+ 
+ drop:
+ 	sd->dropped++;
+-	rps_unlock_irq_restore(sd, &flags);
++	backlog_unlock_irq_restore(sd, &flags);
+ 
+ 	dev_core_stats_rx_dropped_inc(skb->dev);
+ 	kfree_skb_reason(skb, reason);
+@@ -5838,7 +5885,7 @@ static void flush_backlog(struct work_struct *work)
+ 	local_bh_disable();
+ 	sd = this_cpu_ptr(&softnet_data);
+ 
+-	rps_lock_irq_disable(sd);
++	backlog_lock_irq_disable(sd);
+ 	skb_queue_walk_safe(&sd->input_pkt_queue, skb, tmp) {
+ 		if (skb->dev->reg_state == NETREG_UNREGISTERING) {
+ 			__skb_unlink(skb, &sd->input_pkt_queue);
+@@ -5846,7 +5893,7 @@ static void flush_backlog(struct work_struct *work)
+ 			input_queue_head_incr(sd);
+ 		}
+ 	}
+-	rps_unlock_irq_enable(sd);
++	backlog_unlock_irq_enable(sd);
+ 
+ 	skb_queue_walk_safe(&sd->process_queue, skb, tmp) {
+ 		if (skb->dev->reg_state == NETREG_UNREGISTERING) {
+@@ -5864,14 +5911,14 @@ static bool flush_required(int cpu)
+ 	struct softnet_data *sd = &per_cpu(softnet_data, cpu);
+ 	bool do_flush;
+ 
+-	rps_lock_irq_disable(sd);
++	backlog_lock_irq_disable(sd);
+ 
+ 	/* as insertion into process_queue happens with the rps lock held,
+ 	 * process_queue access may race only with dequeue
+ 	 */
+ 	do_flush = !skb_queue_empty(&sd->input_pkt_queue) ||
+ 		   !skb_queue_empty_lockless(&sd->process_queue);
+-	rps_unlock_irq_enable(sd);
++	backlog_unlock_irq_enable(sd);
+ 
+ 	return do_flush;
+ #endif
+@@ -5937,7 +5984,7 @@ static void net_rps_action_and_irq_enable(struct softnet_data *sd)
+ #ifdef CONFIG_RPS
+ 	struct softnet_data *remsd = sd->rps_ipi_list;
+ 
+-	if (remsd) {
++	if (!use_backlog_threads() && remsd) {
+ 		sd->rps_ipi_list = NULL;
+ 
+ 		local_irq_enable();
+@@ -5952,7 +5999,7 @@ static void net_rps_action_and_irq_enable(struct softnet_data *sd)
+ static bool sd_has_rps_ipi_waiting(struct softnet_data *sd)
+ {
+ #ifdef CONFIG_RPS
+-	return sd->rps_ipi_list != NULL;
++	return !use_backlog_threads() && sd->rps_ipi_list;
+ #else
+ 	return false;
+ #endif
+@@ -5986,7 +6033,7 @@ static int process_backlog(struct napi_struct *napi, int quota)
+ 
+ 		}
+ 
+-		rps_lock_irq_disable(sd);
++		backlog_lock_irq_disable(sd);
+ 		if (skb_queue_empty(&sd->input_pkt_queue)) {
+ 			/*
+ 			 * Inline a custom version of __napi_complete().
+@@ -5996,13 +6043,13 @@ static int process_backlog(struct napi_struct *napi, int quota)
+ 			 * We can use a plain write instead of clear_bit(),
+ 			 * and we dont need an smp_mb() memory barrier.
+ 			 */
+-			napi->state = 0;
++			napi->state &= NAPIF_STATE_THREADED;
+ 			again = false;
+ 		} else {
+ 			skb_queue_splice_tail_init(&sd->input_pkt_queue,
+ 						   &sd->process_queue);
+ 		}
+-		rps_unlock_irq_enable(sd);
++		backlog_unlock_irq_enable(sd);
+ 	}
+ 
+ 	return work;
+@@ -6710,8 +6757,6 @@ static int napi_poll(struct napi_struct *n, struct list_head *repoll)
+ 
+ static int napi_thread_wait(struct napi_struct *napi)
+ {
+-	bool woken = false;
+-
+ 	set_current_state(TASK_INTERRUPTIBLE);
+ 
+ 	while (!kthread_should_stop()) {
+@@ -6720,15 +6765,13 @@ static int napi_thread_wait(struct napi_struct *napi)
+ 		 * Testing SCHED bit is not enough because SCHED bit might be
+ 		 * set by some other busy poll thread or by napi_disable().
+ 		 */
+-		if (test_bit(NAPI_STATE_SCHED_THREADED, &napi->state) || woken) {
++		if (test_bit(NAPI_STATE_SCHED_THREADED, &napi->state)) {
+ 			WARN_ON(!list_empty(&napi->poll_list));
+ 			__set_current_state(TASK_RUNNING);
+ 			return 0;
+ 		}
+ 
+ 		schedule();
+-		/* woken being true indicates this thread owns this napi. */
+-		woken = true;
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 	}
+ 	__set_current_state(TASK_RUNNING);
+@@ -6736,43 +6779,48 @@ static int napi_thread_wait(struct napi_struct *napi)
+ 	return -1;
+ }
+ 
+-static int napi_threaded_poll(void *data)
++static void napi_threaded_poll_loop(struct napi_struct *napi)
+ {
+-	struct napi_struct *napi = data;
+ 	struct softnet_data *sd;
+-	void *have;
++	unsigned long last_qs = jiffies;
+ 
+-	while (!napi_thread_wait(napi)) {
+-		unsigned long last_qs = jiffies;
+-
+-		for (;;) {
+-			bool repoll = false;
++	for (;;) {
++		bool repoll = false;
++		void *have;
+ 
+-			local_bh_disable();
+-			sd = this_cpu_ptr(&softnet_data);
+-			sd->in_napi_threaded_poll = true;
++		local_bh_disable();
++		sd = this_cpu_ptr(&softnet_data);
++		sd->in_napi_threaded_poll = true;
+ 
+-			have = netpoll_poll_lock(napi);
+-			__napi_poll(napi, &repoll);
+-			netpoll_poll_unlock(have);
++		have = netpoll_poll_lock(napi);
++		__napi_poll(napi, &repoll);
++		netpoll_poll_unlock(have);
+ 
+-			sd->in_napi_threaded_poll = false;
+-			barrier();
++		sd->in_napi_threaded_poll = false;
++		barrier();
+ 
+-			if (sd_has_rps_ipi_waiting(sd)) {
+-				local_irq_disable();
+-				net_rps_action_and_irq_enable(sd);
+-			}
+-			skb_defer_free_flush(sd);
+-			local_bh_enable();
++		if (sd_has_rps_ipi_waiting(sd)) {
++			local_irq_disable();
++			net_rps_action_and_irq_enable(sd);
++		}
++		skb_defer_free_flush(sd);
++		local_bh_enable();
+ 
+-			if (!repoll)
+-				break;
++		if (!repoll)
++			break;
+ 
+-			rcu_softirq_qs_periodic(last_qs);
+-			cond_resched();
+-		}
++		rcu_softirq_qs_periodic(last_qs);
++		cond_resched();
+ 	}
++}
++
++static int napi_threaded_poll(void *data)
++{
++	struct napi_struct *napi = data;
++
++	while (!napi_thread_wait(napi))
++		napi_threaded_poll_loop(napi);
++
+ 	return 0;
+ }
+ 
+@@ -11373,7 +11421,7 @@ static int dev_cpu_dead(unsigned int oldcpu)
+ 
+ 		list_del_init(&napi->poll_list);
+ 		if (napi->poll == process_backlog)
+-			napi->state = 0;
++			napi->state &= NAPIF_STATE_THREADED;
+ 		else
+ 			____napi_schedule(sd, napi);
+ 	}
+@@ -11381,12 +11429,14 @@ static int dev_cpu_dead(unsigned int oldcpu)
+ 	raise_softirq_irqoff(NET_TX_SOFTIRQ);
+ 	local_irq_enable();
+ 
++	if (!use_backlog_threads()) {
+ #ifdef CONFIG_RPS
+-	remsd = oldsd->rps_ipi_list;
+-	oldsd->rps_ipi_list = NULL;
++		remsd = oldsd->rps_ipi_list;
++		oldsd->rps_ipi_list = NULL;
+ #endif
+-	/* send out pending IPI's on offline CPU */
+-	net_rps_send_ipi(remsd);
++		/* send out pending IPI's on offline CPU */
++		net_rps_send_ipi(remsd);
++	}
+ 
+ 	/* Process offline CPU's input_pkt_queue */
+ 	while ((skb = __skb_dequeue(&oldsd->process_queue))) {
+@@ -11725,6 +11775,38 @@ static int net_page_pool_create(int cpuid)
+ 	return 0;
+ }
+ 
++static int backlog_napi_should_run(unsigned int cpu)
++{
++	struct softnet_data *sd = per_cpu_ptr(&softnet_data, cpu);
++	struct napi_struct *napi = &sd->backlog;
++
++	return test_bit(NAPI_STATE_SCHED_THREADED, &napi->state);
++}
++
++static void run_backlog_napi(unsigned int cpu)
++{
++	struct softnet_data *sd = per_cpu_ptr(&softnet_data, cpu);
++
++	napi_threaded_poll_loop(&sd->backlog);
++}
++
++static void backlog_napi_setup(unsigned int cpu)
++{
++	struct softnet_data *sd = per_cpu_ptr(&softnet_data, cpu);
++	struct napi_struct *napi = &sd->backlog;
++
++	napi->thread = this_cpu_read(backlog_napi);
++	set_bit(NAPI_STATE_THREADED, &napi->state);
++}
++
++static struct smp_hotplug_thread backlog_threads = {
++	.store			= &backlog_napi,
++	.thread_should_run	= backlog_napi_should_run,
++	.thread_fn		= run_backlog_napi,
++	.thread_comm		= "backlog_napi/%u",
++	.setup			= backlog_napi_setup,
++};
++
+ /*
+  *       This is called single threaded during boot, so no need
+  *       to take the rtnl semaphore.
+@@ -11776,10 +11858,13 @@ static int __init net_dev_init(void)
+ 		init_gro_hash(&sd->backlog);
+ 		sd->backlog.poll = process_backlog;
+ 		sd->backlog.weight = weight_p;
++		INIT_LIST_HEAD(&sd->backlog.poll_list);
+ 
+ 		if (net_page_pool_create(i))
+ 			goto out;
+ 	}
++	if (use_backlog_threads())
++		smpboot_register_percpu_thread(&backlog_threads);
+ 
+ 	dev_boot_phase = 0;
+ 
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index b991277..17617c2 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -7039,8 +7039,8 @@ nodefer:	__kfree_skb(skb);
+ 	/* Make sure to trigger NET_RX_SOFTIRQ on the remote CPU
+ 	 * if we are unlucky enough (this seems very unlikely).
+ 	 */
+-	if (unlikely(kick) && !cmpxchg(&sd->defer_ipi_scheduled, 0, 1))
+-		smp_call_function_single_async(cpu, &sd->defer_csd);
++	if (unlikely(kick))
++		kick_defer_list_purge(sd, cpu);
+ }
+ 
+ static void skb_splice_csum_page(struct sk_buff *skb, struct page *page,
