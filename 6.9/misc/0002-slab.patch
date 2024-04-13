@@ -1,0 +1,110 @@
+From 9198ffbd2b494daae3a67cac1d59c3a2754e64cd Mon Sep 17 00:00:00 2001
+From: Chen Jun <chenjun102@huawei.com>
+Date: Sat, 30 Mar 2024 16:23:35 +0800
+Subject: mm/slub: Reduce memory consumption in extreme scenarios
+
+When kmalloc_node() is called without __GFP_THISNODE and the target node
+lacks sufficient memory, SLUB allocates a folio from a different node
+other than the requested node, instead of taking a partial slab from it.
+
+However, since the allocated folio does not belong to the requested
+node, on the following allocation it is deactivated and added to the
+partial slab list of the node it belongs to.
+
+This behavior can result in excessive memory usage when the requested
+node has insufficient memory, as SLUB will repeatedly allocate folios
+from other nodes without reusing the previously allocated ones.
+
+To prevent memory wastage, when a preferred node is indicated (not
+NUMA_NO_NODE) but without a prior __GFP_THISNODE constraint:
+
+1) try to get a partial slab from target node only by having
+   __GFP_THISNODE in pc.flags for get_partial()
+2) if 1) failed, try to allocate a new slab from target node with
+   GFP_NOWAIT | __GFP_THISNODE opportunistically.
+3) if 2) failed, retry with original gfpflags which will allow
+   get_partial() try partial lists of other nodes before potentially
+   allocating new page from other nodes
+
+Without a preferred node, or with __GFP_THISNODE constraint, the
+behavior remains unchanged.
+
+On qemu with 4 numa nodes and each numa has 1G memory. Write a test ko
+to call kmalloc_node(196, GFP_KERNEL, 3) for (4 * 1024 + 4) * 1024 times.
+
+cat /proc/slabinfo shows:
+kmalloc-256       4200530 13519712    256   32    2 : tunables..
+
+after this patch,
+cat /proc/slabinfo shows:
+kmalloc-256       4200558 4200768    256   32    2 : tunables..
+
+Signed-off-by: Chen Jun <chenjun102@huawei.com>
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ mm/slub.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index d35d918776250..f152b5df8ab2e 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2699,7 +2699,7 @@ static struct slab *get_partial(struct kmem_cache *s, int node,
+ 		searchnode = numa_mem_id();
+ 
+ 	slab = get_partial_node(s, get_node(s, searchnode), pc);
+-	if (slab || node != NUMA_NO_NODE)
++	if (slab || (node != NUMA_NO_NODE && (pc->flags & __GFP_THISNODE)))
+ 		return slab;
+ 
+ 	return get_any_partial(s, pc);
+@@ -3375,6 +3375,7 @@ static void *___slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+ 	struct slab *slab;
+ 	unsigned long flags;
+ 	struct partial_context pc;
++	bool try_thisnode = true;
+ 
+ 	stat(s, ALLOC_SLOWPATH);
+ 
+@@ -3501,6 +3502,21 @@ new_slab:
+ new_objects:
+ 
+ 	pc.flags = gfpflags;
++	/*
++	 * When a preferred node is indicated but no __GFP_THISNODE
++	 *
++	 * 1) try to get a partial slab from target node only by having
++	 *    __GFP_THISNODE in pc.flags for get_partial()
++	 * 2) if 1) failed, try to allocate a new slab from target node with
++	 *    GPF_NOWAIT | __GFP_THISNODE opportunistically
++	 * 3) if 2) failed, retry with original gfpflags which will allow
++	 *    get_partial() try partial lists of other nodes before potentially
++	 *    allocating new page from other nodes
++	 */
++	if (unlikely(node != NUMA_NO_NODE && !(gfpflags & __GFP_THISNODE)
++		     && try_thisnode))
++		pc.flags = GFP_NOWAIT | __GFP_THISNODE;
++
+ 	pc.orig_size = orig_size;
+ 	slab = get_partial(s, node, &pc);
+ 	if (slab) {
+@@ -3522,10 +3538,15 @@ new_objects:
+ 	}
+ 
+ 	slub_put_cpu_ptr(s->cpu_slab);
+-	slab = new_slab(s, gfpflags, node);
++	slab = new_slab(s, pc.flags, node);
+ 	c = slub_get_cpu_ptr(s->cpu_slab);
+ 
+ 	if (unlikely(!slab)) {
++		if (node != NUMA_NO_NODE && !(gfpflags & __GFP_THISNODE)
++		    && try_thisnode) {
++			try_thisnode = false;
++			goto new_objects;
++		}
+ 		slab_out_of_memory(s, gfpflags, node);
+ 		return NULL;
+ 	}
+-- 
+cgit 1.2.3-korg
