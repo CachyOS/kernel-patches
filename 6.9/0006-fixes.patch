@@ -3002,3 +3002,267 @@ index 8376fb5e2d0b..f1e508a7ef06 100644
 -- 
 2.45.0
 
+From 4dd993adabd5f3cc200c11385f269640bee6936e Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Sun, 5 May 2024 11:28:43 +0200
+Subject: [PATCH] revert drm/amdgpu: fix visible VRAM handling during faults
+
+a6ff969fe9cbf369e3cd0ac54261fec1122682ec
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c     |  2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 22 ++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.h | 22 ++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c    | 61 ++++++++--------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h    |  3 --
+ 5 files changed, 57 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index ec888fc6ead8..0a4b09709cfb 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -819,7 +819,7 @@ static int amdgpu_cs_bo_validate(void *param, struct amdgpu_bo *bo)
+ 
+ 	p->bytes_moved += ctx.bytes_moved;
+ 	if (!amdgpu_gmc_vram_full_visible(&adev->gmc) &&
+-	    amdgpu_res_cpu_visible(adev, bo->tbo.resource))
++	    amdgpu_bo_in_cpu_visible_vram(bo))
+ 		p->bytes_moved_vis += ctx.bytes_moved;
+ 
+ 	if (unlikely(r == -ENOMEM) && domain != bo->allowed_domains) {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index ce733e3cb35d..dd90241248a4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -619,7 +619,8 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
+ 		return r;
+ 
+ 	if (!amdgpu_gmc_vram_full_visible(&adev->gmc) &&
+-	    amdgpu_res_cpu_visible(adev, bo->tbo.resource))
++	    bo->tbo.resource->mem_type == TTM_PL_VRAM &&
++	    amdgpu_bo_in_cpu_visible_vram(bo))
+ 		amdgpu_cs_report_moved_bytes(adev, ctx.bytes_moved,
+ 					     ctx.bytes_moved);
+ 	else
+@@ -1273,25 +1274,23 @@ void amdgpu_bo_move_notify(struct ttm_buffer_object *bo, bool evict)
+ void amdgpu_bo_get_memory(struct amdgpu_bo *bo,
+ 			  struct amdgpu_mem_stats *stats)
+ {
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+-	struct ttm_resource *res = bo->tbo.resource;
+ 	uint64_t size = amdgpu_bo_size(bo);
+ 	struct drm_gem_object *obj;
+ 	unsigned int domain;
+ 	bool shared;
+ 
+ 	/* Abort if the BO doesn't currently have a backing store */
+-	if (!res)
++	if (!bo->tbo.resource)
+ 		return;
+ 
+ 	obj = &bo->tbo.base;
+ 	shared = drm_gem_object_is_shared_for_memory_stats(obj);
+ 
+-	domain = amdgpu_mem_type_to_domain(res->mem_type);
++	domain = amdgpu_mem_type_to_domain(bo->tbo.resource->mem_type);
+ 	switch (domain) {
+ 	case AMDGPU_GEM_DOMAIN_VRAM:
+ 		stats->vram += size;
+-		if (amdgpu_res_cpu_visible(adev, bo->tbo.resource))
++		if (amdgpu_bo_in_cpu_visible_vram(bo))
+ 			stats->visible_vram += size;
+ 		if (shared)
+ 			stats->vram_shared += size;
+@@ -1392,7 +1391,10 @@ vm_fault_t amdgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 	/* Remember that this BO was accessed by the CPU */
+ 	abo->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+ 
+-	if (amdgpu_res_cpu_visible(adev, bo->resource))
++	if (bo->resource->mem_type != TTM_PL_VRAM)
++		return 0;
++
++	if (amdgpu_bo_in_cpu_visible_vram(abo))
+ 		return 0;
+ 
+ 	/* Can't move a pinned BO to visible VRAM */
+@@ -1415,7 +1417,7 @@ vm_fault_t amdgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+ 
+ 	/* this should never happen */
+ 	if (bo->resource->mem_type == TTM_PL_VRAM &&
+-	    !amdgpu_res_cpu_visible(adev, bo->resource))
++	    !amdgpu_bo_in_cpu_visible_vram(abo))
+ 		return VM_FAULT_SIGBUS;
+ 
+ 	ttm_bo_move_to_lru_tail_unlocked(bo);
+@@ -1579,7 +1581,6 @@ uint32_t amdgpu_bo_get_preferred_domain(struct amdgpu_device *adev,
+  */
+ u64 amdgpu_bo_print_info(int id, struct amdgpu_bo *bo, struct seq_file *m)
+ {
+-	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+ 	struct dma_buf_attachment *attachment;
+ 	struct dma_buf *dma_buf;
+ 	const char *placement;
+@@ -1588,11 +1589,10 @@ u64 amdgpu_bo_print_info(int id, struct amdgpu_bo *bo, struct seq_file *m)
+ 
+ 	if (dma_resv_trylock(bo->tbo.base.resv)) {
+ 		unsigned int domain;
+-
+ 		domain = amdgpu_mem_type_to_domain(bo->tbo.resource->mem_type);
+ 		switch (domain) {
+ 		case AMDGPU_GEM_DOMAIN_VRAM:
+-			if (amdgpu_res_cpu_visible(adev, bo->tbo.resource))
++			if (amdgpu_bo_in_cpu_visible_vram(bo))
+ 				placement = "VRAM VISIBLE";
+ 			else
+ 				placement = "VRAM";
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+index fa03d9e4874c..be679c42b0b8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.h
+@@ -250,6 +250,28 @@ static inline u64 amdgpu_bo_mmap_offset(struct amdgpu_bo *bo)
+ 	return drm_vma_node_offset_addr(&bo->tbo.base.vma_node);
+ }
+ 
++/**
++ * amdgpu_bo_in_cpu_visible_vram - check if BO is (partly) in visible VRAM
++ */
++static inline bool amdgpu_bo_in_cpu_visible_vram(struct amdgpu_bo *bo)
++{
++	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
++	struct amdgpu_res_cursor cursor;
++
++	if (!bo->tbo.resource || bo->tbo.resource->mem_type != TTM_PL_VRAM)
++		return false;
++
++	amdgpu_res_first(bo->tbo.resource, 0, amdgpu_bo_size(bo), &cursor);
++	while (cursor.remaining) {
++		if (cursor.start < adev->gmc.visible_vram_size)
++			return true;
++
++		amdgpu_res_next(&cursor, cursor.size);
++	}
++
++	return false;
++}
++
+ /**
+  * amdgpu_bo_explicit_sync - return whether the bo is explicitly synced
+  */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 1d71729e3f6b..6417cb76ccd4 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -133,7 +133,7 @@ static void amdgpu_evict_flags(struct ttm_buffer_object *bo,
+ 
+ 		} else if (!amdgpu_gmc_vram_full_visible(&adev->gmc) &&
+ 			   !(abo->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) &&
+-			   amdgpu_res_cpu_visible(adev, bo->resource)) {
++			   amdgpu_bo_in_cpu_visible_vram(abo)) {
+ 
+ 			/* Try evicting to the CPU inaccessible part of VRAM
+ 			 * first, but only set GTT as busy placement, so this
+@@ -403,55 +403,40 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
+ 	return r;
+ }
+ 
+-/**
+- * amdgpu_res_cpu_visible - Check that resource can be accessed by CPU
+- * @adev: amdgpu device
+- * @res: the resource to check
++/*
++ * amdgpu_mem_visible - Check that memory can be accessed by ttm_bo_move_memcpy
+  *
+- * Returns: true if the full resource is CPU visible, false otherwise.
++ * Called by amdgpu_bo_move()
+  */
+-bool amdgpu_res_cpu_visible(struct amdgpu_device *adev,
+-			    struct ttm_resource *res)
++static bool amdgpu_mem_visible(struct amdgpu_device *adev,
++			       struct ttm_resource *mem)
+ {
++	u64 mem_size = (u64)mem->size;
+ 	struct amdgpu_res_cursor cursor;
++	u64 end;
+ 
+-	if (!res)
+-		return false;
+-
+-	if (res->mem_type == TTM_PL_SYSTEM || res->mem_type == TTM_PL_TT ||
+-	    res->mem_type == AMDGPU_PL_PREEMPT)
++	if (mem->mem_type == TTM_PL_SYSTEM ||
++	    mem->mem_type == TTM_PL_TT)
+ 		return true;
+-
+-	if (res->mem_type != TTM_PL_VRAM)
++	if (mem->mem_type != TTM_PL_VRAM)
+ 		return false;
+ 
+-	amdgpu_res_first(res, 0, res->size, &cursor);
++	amdgpu_res_first(mem, 0, mem_size, &cursor);
++	end = cursor.start + cursor.size;
+ 	while (cursor.remaining) {
+-		if ((cursor.start + cursor.size) >= adev->gmc.visible_vram_size)
+-			return false;
+ 		amdgpu_res_next(&cursor, cursor.size);
+-	}
+ 
+-	return true;
+-}
++		if (!cursor.remaining)
++			break;
+ 
+-/*
+- * amdgpu_res_copyable - Check that memory can be accessed by ttm_bo_move_memcpy
+- *
+- * Called by amdgpu_bo_move()
+- */
+-static bool amdgpu_res_copyable(struct amdgpu_device *adev,
+-				struct ttm_resource *mem)
+-{
+-	if (!amdgpu_res_cpu_visible(adev, mem))
+-		return false;
++		/* ttm_resource_ioremap only supports contiguous memory */
++		if (end != cursor.start)
++			return false;
+ 
+-	/* ttm_resource_ioremap only supports contiguous memory */
+-	if (mem->mem_type == TTM_PL_VRAM &&
+-	    !(mem->placement & TTM_PL_FLAG_CONTIGUOUS))
+-		return false;
++		end = cursor.start + cursor.size;
++	}
+ 
+-	return true;
++	return end <= adev->gmc.visible_vram_size;
+ }
+ 
+ /*
+@@ -544,8 +529,8 @@ static int amdgpu_bo_move(struct ttm_buffer_object *bo, bool evict,
+ 
+ 	if (r) {
+ 		/* Check that all memory is CPU accessible */
+-		if (!amdgpu_res_copyable(adev, old_mem) ||
+-		    !amdgpu_res_copyable(adev, new_mem)) {
++		if (!amdgpu_mem_visible(adev, old_mem) ||
++		    !amdgpu_mem_visible(adev, new_mem)) {
+ 			pr_err("Move buffer fallback to memcpy unavailable\n");
+ 			return r;
+ 		}
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 32cf6b6f6efd..65ec82141a8e 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -139,9 +139,6 @@ int amdgpu_vram_mgr_reserve_range(struct amdgpu_vram_mgr *mgr,
+ int amdgpu_vram_mgr_query_page_status(struct amdgpu_vram_mgr *mgr,
+ 				      uint64_t start);
+ 
+-bool amdgpu_res_cpu_visible(struct amdgpu_device *adev,
+-			    struct ttm_resource *res);
+-
+ int amdgpu_ttm_init(struct amdgpu_device *adev);
+ void amdgpu_ttm_fini(struct amdgpu_device *adev);
+ void amdgpu_ttm_set_buffer_funcs_status(struct amdgpu_device *adev,
+-- 
+2.45.0
+
