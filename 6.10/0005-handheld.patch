@@ -1,0 +1,1413 @@
+From f6c008bf8f03f17c6d76ee4ec63b184a437466f6 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 27 May 2024 15:19:59 +0200
+Subject: [PATCH 5/7] handheld
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ drivers/extcon/Kconfig                        |   7 +
+ drivers/extcon/Makefile                       |   1 +
+ drivers/extcon/extcon-steamdeck.c             | 180 +++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h      |   2 -
+ .../gpu/drm/amd/amdgpu/atombios_encoders.c    |  10 +-
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  33 +-
+ .../drm/amd/display/dc/link/link_validation.c |  11 +
+ .../gpu/drm/drm_panel_orientation_quirks.c    |  44 +++
+ drivers/hwmon/Kconfig                         |  11 +
+ drivers/hwmon/Makefile                        |   1 +
+ drivers/hwmon/steamdeck-hwmon.c               | 294 ++++++++++++++++++
+ drivers/leds/Kconfig                          |   7 +
+ drivers/leds/Makefile                         |   1 +
+ drivers/leds/leds-steamdeck.c                 |  74 +++++
+ drivers/mfd/Kconfig                           |  11 +
+ drivers/mfd/Makefile                          |   2 +
+ drivers/mfd/steamdeck.c                       | 147 +++++++++
+ drivers/pci/quirks.c                          |   8 +-
+ sound/soc/amd/acp/acp-mach-common.c           | 104 +++++++
+ sound/soc/amd/acp/acp-mach.h                  |   3 +-
+ sound/soc/codecs/max98388.c                   |  24 +-
+ 21 files changed, 957 insertions(+), 18 deletions(-)
+ create mode 100644 drivers/extcon/extcon-steamdeck.c
+ create mode 100644 drivers/hwmon/steamdeck-hwmon.c
+ create mode 100644 drivers/leds/leds-steamdeck.c
+ create mode 100644 drivers/mfd/steamdeck.c
+
+diff --git a/drivers/extcon/Kconfig b/drivers/extcon/Kconfig
+index 3da94b382292..88ac6e28689c 100644
+--- a/drivers/extcon/Kconfig
++++ b/drivers/extcon/Kconfig
+@@ -203,4 +203,11 @@ config EXTCON_RTK_TYPE_C
+ 	  The DHC (Digital Home Hub) RTD series SoC contains a type c module.
+ 	  This driver will detect the status of the type-c port.
+ 
++config EXTCON_STEAMDECK
++	tristate "Steam Deck extcon support"
++	depends on MFD_STEAMDECK
++	help
++	  Say Y here to enable support of USB Type C cable detection extcon
++	  support on Steam Deck devices
++
+ endif
+diff --git a/drivers/extcon/Makefile b/drivers/extcon/Makefile
+index f779adb5e4c7..6e0569b21d2f 100644
+--- a/drivers/extcon/Makefile
++++ b/drivers/extcon/Makefile
+@@ -26,3 +26,4 @@ obj-$(CONFIG_EXTCON_USB_GPIO)	+= extcon-usb-gpio.o
+ obj-$(CONFIG_EXTCON_USBC_CROS_EC) += extcon-usbc-cros-ec.o
+ obj-$(CONFIG_EXTCON_USBC_TUSB320) += extcon-usbc-tusb320.o
+ obj-$(CONFIG_EXTCON_RTK_TYPE_C) += extcon-rtk-type-c.o
++obj-$(CONFIG_EXTCON_STEAMDECK)  += extcon-steamdeck.o
+diff --git a/drivers/extcon/extcon-steamdeck.c b/drivers/extcon/extcon-steamdeck.c
+new file mode 100644
+index 000000000000..49cb5d30bf6b
+--- /dev/null
++++ b/drivers/extcon/extcon-steamdeck.c
+@@ -0,0 +1,180 @@
++
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++#include <linux/extcon-provider.h>
++
++#define ACPI_STEAMDECK_NOTIFY_STATUS	0x80
++
++/* 0 - port connected, 1 -port disconnected */
++#define ACPI_STEAMDECK_PORT_CONNECT	BIT(0)
++/* 0 - Upstream Facing Port, 1 - Downdstream Facing Port */
++#define ACPI_STEAMDECK_CUR_DATA_ROLE	BIT(3)
++/*
++ * Debouncing delay to allow negotiation process to settle. 2s value
++ * was arrived at via trial and error.
++ */
++#define STEAMDECK_ROLE_SWITCH_DELAY	(msecs_to_jiffies(2000))
++
++struct steamdeck_extcon {
++	struct acpi_device *adev;
++	struct delayed_work role_work;
++	struct extcon_dev *edev;
++	struct device *dev;
++};
++
++static int steamdeck_read_pdcs(struct steamdeck_extcon *sd, unsigned long long *pdcs)
++{
++	acpi_status status;
++
++	status = acpi_evaluate_integer(sd->adev->handle, "PDCS", NULL, pdcs);
++	if (ACPI_FAILURE(status)) {
++		dev_err(sd->dev, "PDCS evaluation failed: %s\n",
++			acpi_format_exception(status));
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static void steamdeck_usb_role_work(struct work_struct *work)
++{
++	struct steamdeck_extcon *sd =
++		container_of(work, struct steamdeck_extcon, role_work.work);
++	unsigned long long pdcs;
++	bool usb_host;
++
++	if (steamdeck_read_pdcs(sd, &pdcs))
++		return;
++
++	/*
++	 * We only care about these two
++	 */
++	pdcs &= ACPI_STEAMDECK_PORT_CONNECT | ACPI_STEAMDECK_CUR_DATA_ROLE;
++
++	/*
++	 * For "connect" events our role is determined by a bit in
++	 * PDCS, for "disconnect" we switch to being a gadget
++	 * unconditionally. The thinking for the latter is we don't
++	 * want to start acting as a USB host until we get
++	 * confirmation from the firmware that we are a USB host
++	 */
++	usb_host = (pdcs & ACPI_STEAMDECK_PORT_CONNECT) ?
++		pdcs & ACPI_STEAMDECK_CUR_DATA_ROLE : false;
++
++	dev_dbg(sd->dev, "USB role is %s\n", usb_host ? "host" : "device");
++	WARN_ON(extcon_set_state_sync(sd->edev, EXTCON_USB_HOST,
++				      usb_host));
++
++}
++
++static void steamdeck_notify(acpi_handle handle, u32 event, void *context)
++{
++	struct device *dev = context;
++	struct steamdeck_extcon *sd = dev_get_drvdata(dev);
++	unsigned long long pdcs;
++	unsigned long delay;
++
++	switch (event) {
++	case ACPI_STEAMDECK_NOTIFY_STATUS:
++		if (steamdeck_read_pdcs(sd, &pdcs))
++			return;
++		/*
++		 * We process "disconnect" events immediately and
++		 * "connect" events with a delay to give the HW time
++		 * to settle. For example attaching USB hub (at least
++		 * for HW used for testing) will generate intermediary
++		 * event with "host" bit not set, followed by the one
++		 * that does have it set.
++		 */
++		delay = (pdcs & ACPI_STEAMDECK_PORT_CONNECT) ?
++			STEAMDECK_ROLE_SWITCH_DELAY : 0;
++
++		queue_delayed_work(system_long_wq, &sd->role_work, delay);
++		break;
++	default:
++		dev_warn(dev, "Unsupported event [0x%x]\n", event);
++	}
++}
++
++static void steamdeck_remove_notify_handler(void *data)
++{
++	struct steamdeck_extcon *sd = data;
++
++	acpi_remove_notify_handler(sd->adev->handle, ACPI_DEVICE_NOTIFY,
++				   steamdeck_notify);
++	cancel_delayed_work_sync(&sd->role_work);
++}
++
++static const unsigned int steamdeck_extcon_cable[] = {
++	EXTCON_USB,
++	EXTCON_USB_HOST,
++	EXTCON_CHG_USB_SDP,
++	EXTCON_CHG_USB_CDP,
++	EXTCON_CHG_USB_DCP,
++	EXTCON_CHG_USB_ACA,
++	EXTCON_NONE,
++};
++
++static int steamdeck_extcon_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct steamdeck_extcon *sd;
++	acpi_status status;
++	int ret;
++
++	sd = devm_kzalloc(dev, sizeof(*sd), GFP_KERNEL);
++	if (!sd)
++		return -ENOMEM;
++
++	INIT_DELAYED_WORK(&sd->role_work, steamdeck_usb_role_work);
++	platform_set_drvdata(pdev, sd);
++	sd->adev = ACPI_COMPANION(dev->parent);
++	sd->dev  = dev;
++	sd->edev = devm_extcon_dev_allocate(dev, steamdeck_extcon_cable);
++	if (IS_ERR(sd->edev))
++		return PTR_ERR(sd->edev);
++
++	ret = devm_extcon_dev_register(dev, sd->edev);
++	if (ret < 0) {
++		dev_err(dev, "Failed to register extcon device: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Set initial role value
++	 */
++	queue_delayed_work(system_long_wq, &sd->role_work, 0);
++	flush_delayed_work(&sd->role_work);
++
++	status = acpi_install_notify_handler(sd->adev->handle,
++					     ACPI_DEVICE_NOTIFY,
++					     steamdeck_notify,
++					     dev);
++	if (ACPI_FAILURE(status)) {
++		dev_err(dev, "Error installing ACPI notify handler\n");
++		return -EIO;
++	}
++
++	ret = devm_add_action_or_reset(dev, steamdeck_remove_notify_handler,
++				       sd);
++	return ret;
++}
++
++static const struct platform_device_id steamdeck_extcon_id_table[] = {
++	{ .name = "steamdeck-extcon" },
++	{}
++};
++MODULE_DEVICE_TABLE(platform, steamdeck_extcon_id_table);
++
++static struct platform_driver steamdeck_extcon_driver = {
++	.probe = steamdeck_extcon_probe,
++	.driver = {
++		.name = "steamdeck-extcon",
++	},
++	.id_table = steamdeck_extcon_id_table,
++};
++module_platform_driver(steamdeck_extcon_driver);
++
++MODULE_AUTHOR("Andrey Smirnov <andrew.smirnov@gmail.com>");
++MODULE_DESCRIPTION("Steam Deck extcon driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index 1fe21a70ddd0..1738a580ef51 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -434,8 +434,6 @@ struct amdgpu_mode_info {
+ 	struct drm_property *regamma_tf_property;
+ };
+ 
+-#define AMDGPU_MAX_BL_LEVEL 0xFF
+-
+ struct amdgpu_backlight_privdata {
+ 	struct amdgpu_encoder *encoder;
+ 	uint8_t negative;
+diff --git a/drivers/gpu/drm/amd/amdgpu/atombios_encoders.c b/drivers/gpu/drm/amd/amdgpu/atombios_encoders.c
+index 25feab188dfe..0243abb0e491 100644
+--- a/drivers/gpu/drm/amd/amdgpu/atombios_encoders.c
++++ b/drivers/gpu/drm/amd/amdgpu/atombios_encoders.c
+@@ -39,6 +39,10 @@
+ #include <linux/backlight.h>
+ #include "bif/bif_4_1_d.h"
+ 
++
++/* Maximum backlight level. */
++#define AMDGPU_ATOM_MAX_BL_LEVEL 0xFF
++
+ u8
+ amdgpu_atombios_encoder_get_backlight_level_from_reg(struct amdgpu_device *adev)
+ {
+@@ -127,8 +131,8 @@ static u8 amdgpu_atombios_encoder_backlight_level(struct backlight_device *bd)
+ 	/* Convert brightness to hardware level */
+ 	if (bd->props.brightness < 0)
+ 		level = 0;
+-	else if (bd->props.brightness > AMDGPU_MAX_BL_LEVEL)
+-		level = AMDGPU_MAX_BL_LEVEL;
++	else if (bd->props.brightness > AMDGPU_ATOM_MAX_BL_LEVEL)
++		level = AMDGPU_ATOM_MAX_BL_LEVEL;
+ 	else
+ 		level = bd->props.brightness;
+ 
+@@ -198,7 +202,7 @@ void amdgpu_atombios_encoder_init_backlight(struct amdgpu_encoder *amdgpu_encode
+ 	}
+ 
+ 	memset(&props, 0, sizeof(props));
+-	props.max_brightness = AMDGPU_MAX_BL_LEVEL;
++	props.max_brightness = AMDGPU_ATOM_MAX_BL_LEVEL;
+ 	props.type = BACKLIGHT_RAW;
+ 	snprintf(bl_name, sizeof(bl_name),
+ 		 "amdgpu_bl%d", dev->primary->index);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 8be0845215a4..ce1a1964feed 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -157,6 +157,9 @@ MODULE_FIRMWARE(FIRMWARE_DCN_351_DMUB);
+ /* Number of bytes in PSP footer for firmware. */
+ #define PSP_FOOTER_BYTES 0x100
+ 
++/* Maximum backlight level. */
++#define AMDGPU_MAX_BL_LEVEL 0xFFF
++
+ /**
+  * DOC: overview
+  *
+@@ -4133,7 +4136,7 @@ static int amdgpu_dm_mode_config_init(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
+-#define AMDGPU_DM_DEFAULT_MIN_BACKLIGHT 12
++#define AMDGPU_DM_DEFAULT_MIN_BACKLIGHT 0
+ #define AMDGPU_DM_DEFAULT_MAX_BACKLIGHT 255
+ #define AUX_BL_DEFAULT_TRANSITION_TIME_MS 50
+ 
+@@ -4151,11 +4154,27 @@ static void amdgpu_dm_update_backlight_caps(struct amdgpu_display_manager *dm,
+ 	amdgpu_acpi_get_backlight_caps(&caps);
+ 	if (caps.caps_valid) {
+ 		dm->backlight_caps[bl_idx].caps_valid = true;
++
++		printk(KERN_NOTICE"VLV Successfully queried backlight range over ACPI: %d %d\n",
++		       (int) caps.min_input_signal, (int) caps.max_input_signal);
++
++		if ( caps.min_input_signal != AMDGPU_DM_DEFAULT_MIN_BACKLIGHT ||
++			caps.max_input_signal != AMDGPU_DM_DEFAULT_MAX_BACKLIGHT )
++		{
++			caps.min_input_signal = AMDGPU_DM_DEFAULT_MIN_BACKLIGHT;
++			caps.max_input_signal = AMDGPU_DM_DEFAULT_MAX_BACKLIGHT;
++
++			printk(KERN_NOTICE"VLV OVERRIDE backlight range: %d %d\n",
++			       (int) caps.min_input_signal, (int) caps.max_input_signal);
++		}
++
+ 		if (caps.aux_support)
+ 			return;
+ 		dm->backlight_caps[bl_idx].min_input_signal = caps.min_input_signal;
+ 		dm->backlight_caps[bl_idx].max_input_signal = caps.max_input_signal;
+ 	} else {
++		printk(KERN_NOTICE"VLV ACPI does not provide backlight range, using defaults: %d %d\n",
++		       AMDGPU_DM_DEFAULT_MIN_BACKLIGHT, AMDGPU_DM_DEFAULT_MAX_BACKLIGHT);
+ 		dm->backlight_caps[bl_idx].min_input_signal =
+ 				AMDGPU_DM_DEFAULT_MIN_BACKLIGHT;
+ 		dm->backlight_caps[bl_idx].max_input_signal =
+@@ -4165,6 +4184,9 @@ static void amdgpu_dm_update_backlight_caps(struct amdgpu_display_manager *dm,
+ 	if (dm->backlight_caps[bl_idx].aux_support)
+ 		return;
+ 
++	printk(KERN_NOTICE"VLV Kernel built without ACPI. using backlight range defaults: %d %d\n",
++	       AMDGPU_DM_DEFAULT_MIN_BACKLIGHT, AMDGPU_DM_DEFAULT_MAX_BACKLIGHT);
++
+ 	dm->backlight_caps[bl_idx].min_input_signal = AMDGPU_DM_DEFAULT_MIN_BACKLIGHT;
+ 	dm->backlight_caps[bl_idx].max_input_signal = AMDGPU_DM_DEFAULT_MAX_BACKLIGHT;
+ #endif
+@@ -4196,7 +4218,7 @@ static u32 convert_brightness_from_user(const struct amdgpu_dm_backlight_caps *c
+ 	if (!get_brightness_range(caps, &min, &max))
+ 		return brightness;
+ 
+-	// Rescale 0..255 to min..max
++	// Rescale 0..AMDGPU_MAX_BL_LEVEL to min..max
+ 	return min + DIV_ROUND_CLOSEST((max - min) * brightness,
+ 				       AMDGPU_MAX_BL_LEVEL);
+ }
+@@ -4211,7 +4233,7 @@ static u32 convert_brightness_to_user(const struct amdgpu_dm_backlight_caps *cap
+ 
+ 	if (brightness < min)
+ 		return 0;
+-	// Rescale min..max to 0..255
++	// Rescale min..max to 0..AMDGPU_MAX_BL_LEVEL
+ 	return DIV_ROUND_CLOSEST(AMDGPU_MAX_BL_LEVEL * (brightness - min),
+ 				 max - min);
+ }
+@@ -7615,7 +7637,8 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
+ 				drm_add_modes_noedid(connector, 1920, 1080);
+ 	} else {
+ 		amdgpu_dm_connector_ddc_get_modes(connector, edid);
+-		amdgpu_dm_connector_add_common_modes(encoder, connector);
++		if (connector->connector_type != DRM_MODE_CONNECTOR_eDP)
++			amdgpu_dm_connector_add_common_modes(encoder, connector);
+ 		amdgpu_dm_connector_add_freesync_modes(connector, edid);
+ 	}
+ 	amdgpu_dm_fbc_init(connector);
+@@ -8365,7 +8388,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+ 	int planes_count = 0, vpos, hpos;
+ 	unsigned long flags;
+ 	u32 target_vblank, last_flip_vblank;
+-	bool vrr_active = amdgpu_dm_crtc_vrr_active(acrtc_state);
++	bool vrr_active = true;//amdgpu_dm_crtc_vrr_active(acrtc_state);
+ 	bool cursor_update = false;
+ 	bool pflip_present = false;
+ 	bool dirty_rects_changed = false;
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_validation.c b/drivers/gpu/drm/amd/display/dc/link/link_validation.c
+index 1aed55b0ab6a..27af7505caca 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_validation.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_validation.c
+@@ -35,6 +35,8 @@
+ 
+ #define DC_LOGGER_INIT(logger)
+ 
++static const uint8_t DP_SINK_BRANCH_DEV_NAME_KT50X0[] = "KT50X0!";
++
+ static uint32_t get_tmds_output_pixel_clock_100hz(const struct dc_crtc_timing *timing)
+ {
+ 
+@@ -276,6 +278,15 @@ static bool dp_validate_mode_timing(
+ 		timing->v_addressable == (uint32_t) 480)
+ 		return true;
+ 
++	if (link->ctx->dce_version == DCN_VERSION_3_01 &&
++	    link->dpcd_caps.sink_dev_id == DP_BRANCH_DEVICE_ID_0060AD &&
++	    memcmp(&link->dpcd_caps.branch_dev_name,
++		   DP_SINK_BRANCH_DEV_NAME_KT50X0,
++		   sizeof(link->dpcd_caps.branch_dev_name)) == 0) {
++		if (timing->pix_clk_100hz / 10 >= (uint32_t) 1200000)
++			return false; /* KT50X0 does not support Pxl clock >= 1200MHz */
++	}
++
+ 	link_setting = dp_get_verified_link_cap(link);
+ 
+ 	/* TODO: DYNAMIC_VALIDATION needs to be implemented */
+diff --git a/drivers/gpu/drm/drm_panel_orientation_quirks.c b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+index aa93129c3397..04d1ab4d48c7 100644
+--- a/drivers/gpu/drm/drm_panel_orientation_quirks.c
++++ b/drivers/gpu/drm/drm_panel_orientation_quirks.c
+@@ -184,6 +184,12 @@ static const struct dmi_system_id orientation_data[] = {
+ 		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "T103HAF"),
+ 		},
+ 		.driver_data = (void *)&lcd800x1280_rightside_up,
++	}, {	/* AYA NEO AYANEO 2 */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "AYANEO"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "AYANEO 2"),
++		},
++		.driver_data = (void *)&lcd1200x1920_rightside_up,
+ 	}, {	/* AYA NEO 2021 */
+ 		.matches = {
+ 		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "AYADEVICE"),
+@@ -196,12 +202,36 @@ static const struct dmi_system_id orientation_data[] = {
+ 		  DMI_MATCH(DMI_PRODUCT_NAME, "AIR"),
+ 		},
+ 		.driver_data = (void *)&lcd1080x1920_leftside_up,
++	}, {	/* AYA NEO Founder */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "AYA NEO"),
++		  DMI_MATCH(DMI_PRODUCT_NAME, "AYA NEO Founder"),
++		},
++		.driver_data = (void *)&lcd800x1280_rightside_up,
++	}, {	/* AYA NEO GEEK */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "AYANEO"),
++		  DMI_MATCH(DMI_PRODUCT_NAME, "GEEK"),
++		},
++		.driver_data = (void *)&lcd800x1280_rightside_up,
+ 	}, {	/* AYA NEO NEXT */
+ 		.matches = {
+ 		  DMI_EXACT_MATCH(DMI_BOARD_VENDOR, "AYANEO"),
+ 		  DMI_MATCH(DMI_BOARD_NAME, "NEXT"),
+ 		},
+ 		.driver_data = (void *)&lcd800x1280_rightside_up,
++	}, {    /* AYN Loki Max */
++		.matches = {
++			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ayn"),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Loki Max"),
++		},
++		.driver_data = (void *)&lcd1080x1920_leftside_up,
++	}, {	/* AYN Loki Zero */
++		.matches = {
++			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "ayn"),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Loki Zero"),
++		},
++		.driver_data = (void *)&lcd1080x1920_leftside_up,
+ 	}, {	/* Chuwi HiBook (CWI514) */
+ 		.matches = {
+ 			DMI_MATCH(DMI_BOARD_VENDOR, "Hampoo"),
+@@ -421,6 +451,20 @@ static const struct dmi_system_id orientation_data[] = {
+ 		  DMI_EXACT_MATCH(DMI_PRODUCT_VERSION, "1"),
+ 		},
+ 		.driver_data = (void *)&lcd800x1280_rightside_up,
++	}, {	/* Valve Steam Deck */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Valve"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Galileo"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_VERSION, "1"),
++		},
++		.driver_data = (void *)&lcd800x1280_rightside_up,
++	}, {	/* Valve Steam Deck */
++		.matches = {
++		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Valve"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Galileo"),
++		  DMI_EXACT_MATCH(DMI_PRODUCT_VERSION, "1"),
++		},
++		.driver_data = (void *)&lcd800x1280_rightside_up,
+ 	}, {	/* VIOS LTH17 */
+ 		.matches = {
+ 		  DMI_EXACT_MATCH(DMI_SYS_VENDOR, "VIOS"),
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+index e14ae18a973b..595708f955b6 100644
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -2059,6 +2059,17 @@ config SENSORS_SCH5636
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called sch5636.
+ 
++config SENSORS_STEAMDECK
++	tristate "Steam Deck EC sensors"
++	depends on MFD_STEAMDECK
++	help
++	  If you say yes here you get support for the hardware
++	  monitoring features exposed by EC firmware on Steam Deck
++	  devices
++
++	  This driver can also be built as a module. If so, the module
++	  will be called steamdeck-hwmon.
++
+ config SENSORS_STTS751
+ 	tristate "ST Microelectronics STTS751"
+ 	depends on I2C
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+index e3f25475d1f0..c6eaee13917d 100644
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -207,6 +207,7 @@ obj-$(CONFIG_SENSORS_SMSC47B397)+= smsc47b397.o
+ obj-$(CONFIG_SENSORS_SMSC47M1)	+= smsc47m1.o
+ obj-$(CONFIG_SENSORS_SMSC47M192)+= smsc47m192.o
+ obj-$(CONFIG_SENSORS_SPARX5)	+= sparx5-temp.o
++obj-$(CONFIG_SENSORS_STEAMDECK) += steamdeck-hwmon.o
+ obj-$(CONFIG_SENSORS_STTS751)	+= stts751.o
+ obj-$(CONFIG_SENSORS_SURFACE_FAN)+= surface_fan.o
+ obj-$(CONFIG_SENSORS_SY7636A)	+= sy7636a-hwmon.o
+diff --git a/drivers/hwmon/steamdeck-hwmon.c b/drivers/hwmon/steamdeck-hwmon.c
+new file mode 100644
+index 000000000000..9d0a5471b181
+--- /dev/null
++++ b/drivers/hwmon/steamdeck-hwmon.c
+@@ -0,0 +1,294 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Steam Deck EC sensors driver
++ *
++ * Copyright (C) 2021-2022 Valve Corporation
++ */
++
++#include <linux/acpi.h>
++#include <linux/hwmon.h>
++#include <linux/platform_device.h>
++
++#define STEAMDECK_HWMON_NAME	"steamdeck-hwmon"
++
++struct steamdeck_hwmon {
++	struct acpi_device *adev;
++};
++
++static long
++steamdeck_hwmon_get(struct steamdeck_hwmon *sd, const char *method)
++{
++	unsigned long long val;
++	if (ACPI_FAILURE(acpi_evaluate_integer(sd->adev->handle,
++					       (char *)method, NULL, &val)))
++		return -EIO;
++
++	return val;
++}
++
++static int
++steamdeck_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
++		     u32 attr, int channel, long *out)
++{
++	struct steamdeck_hwmon *sd = dev_get_drvdata(dev);
++
++	switch (type) {
++	case hwmon_curr:
++		if (attr != hwmon_curr_input)
++			return -EOPNOTSUPP;
++
++		*out = steamdeck_hwmon_get(sd, "PDAM");
++		if (*out < 0)
++			return *out;
++		break;
++	case hwmon_in:
++		if (attr != hwmon_in_input)
++			return -EOPNOTSUPP;
++
++		*out = steamdeck_hwmon_get(sd, "PDVL");
++		if (*out < 0)
++			return *out;
++		break;
++	case hwmon_temp:
++		if (attr != hwmon_temp_input)
++			return -EOPNOTSUPP;
++
++		*out = steamdeck_hwmon_get(sd, "BATT");
++		if (*out < 0)
++			return *out;
++		/*
++		 * Assuming BATT returns deg C we need to mutiply it
++		 * by 1000 to convert to mC
++		 */
++		*out *= 1000;
++		break;
++	case hwmon_fan:
++		switch (attr) {
++		case hwmon_fan_input:
++			*out = steamdeck_hwmon_get(sd, "FANR");
++			if (*out < 0)
++				return *out;
++			break;
++		case hwmon_fan_target:
++			*out = steamdeck_hwmon_get(sd, "FSSR");
++			if (*out < 0)
++				return *out;
++			break;
++		case hwmon_fan_fault:
++			*out = steamdeck_hwmon_get(sd, "FANC");
++			if (*out < 0)
++				return *out;
++			/*
++			 * FANC (Fan check):
++			 * 0: Abnormal
++			 * 1: Normal
++			 */
++			*out = !*out;
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
++static int
++steamdeck_hwmon_read_string(struct device *dev, enum hwmon_sensor_types type,
++			    u32 attr, int channel, const char **str)
++{
++	switch (type) {
++		/*
++		 * These two aren't, strictly speaking, measured. EC
++		 * firmware just reports what PD negotiation resulted
++		 * in.
++		 */
++	case hwmon_curr:
++		*str = "PD Contract Current";
++		break;
++	case hwmon_in:
++		*str = "PD Contract Voltage";
++		break;
++	case hwmon_temp:
++		*str = "Battery Temp";
++		break;
++	case hwmon_fan:
++		*str = "System Fan";
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
++static int
++steamdeck_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
++		      u32 attr, int channel, long val)
++{
++	struct steamdeck_hwmon *sd = dev_get_drvdata(dev);
++
++	if (type != hwmon_fan ||
++	    attr != hwmon_fan_target)
++		return -EOPNOTSUPP;
++
++	val = clamp_val(val, 0, 7300);
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    "FANS", val)))
++		return -EIO;
++
++	return 0;
++}
++
++static umode_t
++steamdeck_hwmon_is_visible(const void *data, enum hwmon_sensor_types type,
++			   u32 attr, int channel)
++{
++	if (type == hwmon_fan &&
++	    attr == hwmon_fan_target)
++		return 0644;
++
++	return 0444;
++}
++
++static const struct hwmon_channel_info *steamdeck_hwmon_info[] = {
++	HWMON_CHANNEL_INFO(in,
++			   HWMON_I_INPUT | HWMON_I_LABEL),
++	HWMON_CHANNEL_INFO(curr,
++			   HWMON_C_INPUT | HWMON_C_LABEL),
++	HWMON_CHANNEL_INFO(temp,
++			   HWMON_T_INPUT | HWMON_T_LABEL),
++	HWMON_CHANNEL_INFO(fan,
++			   HWMON_F_INPUT | HWMON_F_LABEL |
++			   HWMON_F_TARGET | HWMON_F_FAULT),
++	NULL
++};
++
++static const struct hwmon_ops steamdeck_hwmon_ops = {
++	.is_visible = steamdeck_hwmon_is_visible,
++	.read = steamdeck_hwmon_read,
++	.read_string = steamdeck_hwmon_read_string,
++	.write = steamdeck_hwmon_write,
++};
++
++static const struct hwmon_chip_info steamdeck_hwmon_chip_info = {
++	.ops = &steamdeck_hwmon_ops,
++	.info = steamdeck_hwmon_info,
++};
++
++
++static ssize_t
++steamdeck_hwmon_simple_store(struct device *dev, const char *buf, size_t count,
++			     const char *method,
++			     unsigned long upper_limit)
++{
++	struct steamdeck_hwmon *sd = dev_get_drvdata(dev);
++	unsigned long value;
++
++	if (kstrtoul(buf, 10, &value) || value >= upper_limit)
++		return -EINVAL;
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    (char *)method, value)))
++		return -EIO;
++
++	return count;
++}
++
++static ssize_t
++steamdeck_hwmon_simple_show(struct device *dev, char *buf,
++			    const char *method)
++{
++	struct steamdeck_hwmon *sd = dev_get_drvdata(dev);
++	unsigned long value;
++
++	value = steamdeck_hwmon_get(sd, method);
++	if (value < 0)
++		return value;
++
++	return sprintf(buf, "%ld\n", value);
++}
++
++#define STEAMDECK_HWMON_ATTR_RW(_name, _set_method, _get_method,	\
++				_upper_limit)				\
++	static ssize_t _name##_show(struct device *dev,			\
++				    struct device_attribute *attr,	\
++				    char *buf)				\
++	{								\
++		return steamdeck_hwmon_simple_show(dev, buf,		\
++						   _get_method);	\
++	}								\
++	static ssize_t _name##_store(struct device *dev,		\
++				     struct device_attribute *attr,	\
++				     const char *buf, size_t count)	\
++	{								\
++		return steamdeck_hwmon_simple_store(dev, buf, count,	\
++						    _set_method,	\
++						    _upper_limit);	\
++	}								\
++	static DEVICE_ATTR_RW(_name)
++
++STEAMDECK_HWMON_ATTR_RW(max_battery_charge_level, "FCBL", "SFBL", 101);
++STEAMDECK_HWMON_ATTR_RW(max_battery_charge_rate,  "CHGR", "GCHR", 101);
++
++static struct attribute *steamdeck_hwmon_attributes[] = {
++	&dev_attr_max_battery_charge_level.attr,
++	&dev_attr_max_battery_charge_rate.attr,
++	NULL
++};
++
++static const struct attribute_group steamdeck_hwmon_group = {
++	.attrs = steamdeck_hwmon_attributes,
++};
++
++static const struct attribute_group *steamdeck_hwmon_groups[] = {
++	&steamdeck_hwmon_group,
++	NULL
++};
++
++static int steamdeck_hwmon_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct steamdeck_hwmon *sd;
++	struct device *hwmon;
++
++	sd = devm_kzalloc(dev, sizeof(*sd), GFP_KERNEL);
++	if (!sd)
++		return -ENOMEM;
++
++	sd->adev = ACPI_COMPANION(dev->parent);
++	hwmon = devm_hwmon_device_register_with_info(dev,
++						     "steamdeck_hwmon",
++						     sd,
++						     &steamdeck_hwmon_chip_info,
++						     steamdeck_hwmon_groups);
++	if (IS_ERR(hwmon)) {
++		dev_err(dev, "Failed to register HWMON device");
++		return PTR_ERR(hwmon);
++	}
++
++	return 0;
++}
++
++static const struct platform_device_id steamdeck_hwmon_id_table[] = {
++	{ .name = STEAMDECK_HWMON_NAME },
++	{}
++};
++MODULE_DEVICE_TABLE(platform, steamdeck_hwmon_id_table);
++
++static struct platform_driver steamdeck_hwmon_driver = {
++	.probe = steamdeck_hwmon_probe,
++	.driver = {
++		.name = STEAMDECK_HWMON_NAME,
++	},
++	.id_table = steamdeck_hwmon_id_table,
++};
++module_platform_driver(steamdeck_hwmon_driver);
++
++MODULE_AUTHOR("Andrey Smirnov <andrew.smirnov@gmail.com>");
++MODULE_DESCRIPTION("Steam Deck EC sensors driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/leds/Kconfig b/drivers/leds/Kconfig
+index 05e6af88b88c..f1967a88ebeb 100644
+--- a/drivers/leds/Kconfig
++++ b/drivers/leds/Kconfig
+@@ -927,6 +927,13 @@ config LEDS_ACER_A500
+ 	  This option enables support for the Power Button LED of
+ 	  Acer Iconia Tab A500.
+ 
++config LEDS_STEAMDECK
++	tristate "LED support for Steam Deck"
++	depends on LEDS_CLASS && MFD_STEAMDECK
++	help
++	  This option enabled support for the status LED (next to the
++	  power button) on Steam Deck
++
+ source "drivers/leds/blink/Kconfig"
+ 
+ comment "Flash and Torch LED drivers"
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+index effdfc6f1e95..f2929021afeb 100644
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -79,6 +79,7 @@ obj-$(CONFIG_LEDS_POWERNV)		+= leds-powernv.o
+ obj-$(CONFIG_LEDS_PWM)			+= leds-pwm.o
+ obj-$(CONFIG_LEDS_REGULATOR)		+= leds-regulator.o
+ obj-$(CONFIG_LEDS_SC27XX_BLTC)		+= leds-sc27xx-bltc.o
++obj-$(CONFIG_LEDS_STEAMDECK)		+= leds-steamdeck.o
+ obj-$(CONFIG_LEDS_SUN50I_A100)		+= leds-sun50i-a100.o
+ obj-$(CONFIG_LEDS_SUNFIRE)		+= leds-sunfire.o
+ obj-$(CONFIG_LEDS_SYSCON)		+= leds-syscon.o
+diff --git a/drivers/leds/leds-steamdeck.c b/drivers/leds/leds-steamdeck.c
+new file mode 100644
+index 000000000000..56d31d2dd099
+--- /dev/null
++++ b/drivers/leds/leds-steamdeck.c
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++/*
++ * Steam Deck EC MFD LED cell driver
++ *
++ * Copyright (C) 2021-2022 Valve Corporation
++ *
++ */
++
++#include <linux/acpi.h>
++#include <linux/leds.h>
++#include <linux/platform_device.h>
++
++struct steamdeck_led {
++	struct acpi_device *adev;
++	struct led_classdev cdev;
++};
++
++static int steamdeck_leds_brightness_set(struct led_classdev *cdev,
++					 enum led_brightness value)
++{
++	struct steamdeck_led *sd = container_of(cdev, struct steamdeck_led,
++						cdev);
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    "CHBV", value)))
++		return -EIO;
++
++	return 0;
++}
++
++static int steamdeck_leds_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct steamdeck_led *sd;
++	int ret;
++
++	sd = devm_kzalloc(dev, sizeof(*sd), GFP_KERNEL);
++	if (!sd)
++		return -ENOMEM;
++
++	sd->adev = ACPI_COMPANION(dev->parent);
++
++	sd->cdev.name = "status:white";
++	sd->cdev.brightness_set_blocking = steamdeck_leds_brightness_set;
++	sd->cdev.max_brightness = 100;
++
++	ret = devm_led_classdev_register(dev, &sd->cdev);
++	if (ret) {
++		dev_err(dev, "Failed to register LEDs device: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static const struct platform_device_id steamdeck_leds_id_table[] = {
++	{ .name = "steamdeck-leds" },
++	{}
++};
++MODULE_DEVICE_TABLE(platform, steamdeck_leds_id_table);
++
++static struct platform_driver steamdeck_leds_driver = {
++	.probe = steamdeck_leds_probe,
++	.driver = {
++		.name = "steamdeck-leds",
++	},
++	.id_table = steamdeck_leds_id_table,
++};
++module_platform_driver(steamdeck_leds_driver);
++
++MODULE_AUTHOR("Andrey Smirnov <andrew.smirnov@gmail.com>");
++MODULE_DESCRIPTION("Steam Deck LEDs driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index 266b4f54af60..ed732715aef5 100644
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -2334,5 +2334,16 @@ config MFD_RSMU_SPI
+ 	  Additional drivers must be enabled in order to use the functionality
+ 	  of the device.
+ 
++config MFD_STEAMDECK
++	tristate "Valve Steam Deck"
++	select MFD_CORE
++	depends on ACPI
++	depends on X86_64 || COMPILE_TEST
++	help
++	  This driver registers various MFD cells that expose aspects
++	  of Steam Deck specific ACPI functionality.
++
++	  Say N here, unless you are running on Steam Deck hardware.
++
+ endmenu
+ endif
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index c66f07edcd0e..2bbdf4127232 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -284,3 +284,5 @@ rsmu-i2c-objs			:= rsmu_core.o rsmu_i2c.o
+ rsmu-spi-objs			:= rsmu_core.o rsmu_spi.o
+ obj-$(CONFIG_MFD_RSMU_I2C)	+= rsmu-i2c.o
+ obj-$(CONFIG_MFD_RSMU_SPI)	+= rsmu-spi.o
++
++obj-$(CONFIG_MFD_STEAMDECK)	+= steamdeck.o
+diff --git a/drivers/mfd/steamdeck.c b/drivers/mfd/steamdeck.c
+new file mode 100644
+index 000000000000..a60fa7db9141
+--- /dev/null
++++ b/drivers/mfd/steamdeck.c
+@@ -0,0 +1,147 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++/*
++ * Steam Deck EC MFD core driver
++ *
++ * Copyright (C) 2021-2022 Valve Corporation
++ *
++ */
++
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++#include <linux/mfd/core.h>
++
++#define STEAMDECK_STA_OK			\
++	(ACPI_STA_DEVICE_ENABLED |		\
++	 ACPI_STA_DEVICE_PRESENT |		\
++	 ACPI_STA_DEVICE_FUNCTIONING)
++
++struct steamdeck {
++	struct acpi_device *adev;
++	struct device *dev;
++};
++
++#define STEAMDECK_ATTR_RO(_name, _method)				\
++	static ssize_t _name##_show(struct device *dev,			\
++				    struct device_attribute *attr,	\
++				    char *buf)				\
++	{								\
++		struct steamdeck *sd = dev_get_drvdata(dev);		\
++		unsigned long long val;					\
++									\
++		if (ACPI_FAILURE(acpi_evaluate_integer(			\
++					 sd->adev->handle,		\
++					 _method, NULL, &val)))		\
++			return -EIO;					\
++									\
++		return sysfs_emit(buf, "%llu\n", val);			\
++	}								\
++	static DEVICE_ATTR_RO(_name)
++
++STEAMDECK_ATTR_RO(firmware_version, "PDFW");
++STEAMDECK_ATTR_RO(board_id, "BOID");
++
++static ssize_t controller_board_power_store(struct device *dev,
++					    struct device_attribute *attr,
++					    const char *buf, size_t count)
++{
++	struct steamdeck *sd = dev_get_drvdata(dev);
++	bool enabled;
++	ssize_t ret = kstrtobool(buf, &enabled);
++
++	if (ret)
++		return ret;
++
++	if (ACPI_FAILURE(acpi_execute_simple_method(sd->adev->handle,
++						    "SCBP", enabled)))
++		return -EIO;
++
++	return count;
++}
++static DEVICE_ATTR_WO(controller_board_power);
++
++static struct attribute *steamdeck_attrs[] = {
++	&dev_attr_firmware_version.attr,
++	&dev_attr_board_id.attr,
++	&dev_attr_controller_board_power.attr,
++	NULL
++};
++
++ATTRIBUTE_GROUPS(steamdeck);
++
++static const struct mfd_cell steamdeck_cells[] = {
++	{ .name = "steamdeck-hwmon"  },
++	{ .name = "steamdeck-leds"   },
++	{ .name = "steamdeck-extcon" },
++};
++
++static void steamdeck_remove_sysfs_groups(void *data)
++{
++	struct steamdeck *sd = data;
++
++	sysfs_remove_groups(&sd->dev->kobj, steamdeck_groups);
++}
++
++static int steamdeck_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	unsigned long long sta;
++	struct steamdeck *sd;
++	acpi_status status;
++	int ret;
++
++	sd = devm_kzalloc(dev, sizeof(*sd), GFP_KERNEL);
++	if (!sd)
++		return -ENOMEM;
++	sd->adev = ACPI_COMPANION(dev);
++	sd->dev = dev;
++	platform_set_drvdata(pdev, sd);
++
++	status = acpi_evaluate_integer(sd->adev->handle, "_STA",
++				       NULL, &sta);
++	if (ACPI_FAILURE(status)) {
++		dev_err(dev, "Status check failed (0x%x)\n", status);
++		return -EINVAL;
++	}
++
++	if ((sta & STEAMDECK_STA_OK) != STEAMDECK_STA_OK) {
++		dev_err(dev, "Device is not ready\n");
++		return -EINVAL;
++	}
++
++	ret = sysfs_create_groups(&dev->kobj, steamdeck_groups);
++	if (ret) {
++		dev_err(dev, "Failed to create sysfs group\n");
++		return ret;
++	}
++
++	ret = devm_add_action_or_reset(dev, steamdeck_remove_sysfs_groups,
++				       sd);
++	if (ret) {
++		dev_err(dev, "Failed to register devres action\n");
++		return ret;
++	}
++
++	return devm_mfd_add_devices(dev, PLATFORM_DEVID_NONE,
++				    steamdeck_cells, ARRAY_SIZE(steamdeck_cells),
++				    NULL, 0, NULL);
++}
++
++static const struct acpi_device_id steamdeck_device_ids[] = {
++	{ "VLV0100", 0 },
++	{ "", 0 },
++};
++MODULE_DEVICE_TABLE(acpi, steamdeck_device_ids);
++
++static struct platform_driver steamdeck_driver = {
++	.probe = steamdeck_probe,
++	.driver = {
++		.name = "steamdeck",
++		.acpi_match_table = steamdeck_device_ids,
++	},
++};
++module_platform_driver(steamdeck_driver);
++
++MODULE_AUTHOR("Andrey Smirnov <andrew.smirnov@gmail.com>");
++MODULE_DESCRIPTION("Steam Deck EC MFD core driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 192d0557fb05..aaa5ddad300b 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -697,7 +697,7 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_ATI,	PCI_DEVICE_ID_ATI_RS100,   quirk_ati_
+ /*
+  * In the AMD NL platform, this device ([1022:7912]) has a class code of
+  * PCI_CLASS_SERIAL_USB_XHCI (0x0c0330), which means the xhci driver will
+- * claim it. The same applies on the VanGogh platform device ([1022:163a]).
++ * claim it.
+  *
+  * But the dwc3 driver is a more specific driver for this device, and we'd
+  * prefer to use it instead of xhci. To prevent xhci from claiming the
+@@ -705,7 +705,7 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_ATI,	PCI_DEVICE_ID_ATI_RS100,   quirk_ati_
+  * defines as "USB device (not host controller)". The dwc3 driver can then
+  * claim it based on its Vendor and Device ID.
+  */
+-static void quirk_amd_dwc_class(struct pci_dev *pdev)
++static void quirk_amd_nl_class(struct pci_dev *pdev)
+ {
+ 	u32 class = pdev->class;
+ 
+@@ -718,9 +718,7 @@ static void quirk_amd_dwc_class(struct pci_dev *pdev)
+ 	}
+ }
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_NL_USB,
+-		quirk_amd_dwc_class);
+-DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_VANGOGH_USB,
+-		quirk_amd_dwc_class);
++		quirk_amd_nl_class);
+ 
+ /*
+  * Synopsys USB 3.x host HAPS platform has a class code of
+diff --git a/sound/soc/amd/acp/acp-mach-common.c b/sound/soc/amd/acp/acp-mach-common.c
+index a36300a4ed8a..6f7604a70e1f 100644
+--- a/sound/soc/amd/acp/acp-mach-common.c
++++ b/sound/soc/amd/acp/acp-mach-common.c
+@@ -26,6 +26,7 @@
+ #include "../../codecs/rt5682s.h"
+ #include "../../codecs/nau8825.h"
+ #include "../../codecs/nau8821.h"
++#include "../../codecs/cs35l41.h"
+ #include "acp-mach.h"
+ 
+ #define PCO_PLAT_CLK 48000000
+@@ -1282,6 +1283,78 @@ SND_SOC_DAILINK_DEF(nau8821,
+ 		    DAILINK_COMP_ARRAY(COMP_CODEC("i2c-NVTN2020:00",
+ 						  NAU8821_CODEC_DAI)));
+ 
++static int acp_cs35l41_init(struct snd_soc_pcm_runtime *rtd)
++{
++	return 0;
++}
++
++static int acp_cs35l41_startup(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++
++	runtime->hw.channels_max = DUAL_CHANNEL;
++	snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
++				   &constraints_channels);
++	snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
++				   &constraints_rates);
++	return 0;
++}
++
++static int acp_cs35l41_hw_params(struct snd_pcm_substream *substream,
++				   struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_card *card = rtd->card;
++	struct snd_soc_dai *codec_dai;
++	int ret, i;
++	unsigned int num_codecs = rtd->dai_link->num_codecs;
++	unsigned int bclk_val;
++
++	ret = 0;
++	for (i = 0; i < num_codecs; i++) {
++		codec_dai = snd_soc_rtd_to_codec(rtd, i);
++		if (strcmp(codec_dai->name, "cs35l41-pcm") == 0) {
++			switch (params_rate(params)) {
++			case 48000:
++				bclk_val = 1536000;
++				break;
++			default:
++				dev_err(card->dev, "Invalid Samplerate:0x%x\n",
++					params_rate(params));
++				return -EINVAL;
++			}
++			ret = snd_soc_component_set_sysclk(codec_dai->component,
++							   0, 0, bclk_val, SND_SOC_CLOCK_IN);
++			if (ret < 0) {
++				dev_err(card->dev, "failed to set sysclk for CS35l41 dai\n");
++				return ret;
++			}
++		}
++	}
++
++	return ret;
++}
++
++static struct snd_soc_codec_conf cs35l41_conf[] = {
++	{
++		.dlc = COMP_CODEC_CONF("spi-VLV1776:00"),
++		.name_prefix = "Left",
++	},
++	{
++		.dlc = COMP_CODEC_CONF("spi-VLV1776:01"),
++		.name_prefix = "Right",
++	},
++};
++
++static const struct snd_soc_ops acp_cs35l41_ops = {
++	.startup = acp_cs35l41_startup,
++	.hw_params = acp_cs35l41_hw_params,
++};
++
++SND_SOC_DAILINK_DEF(cs35l41,
++		    DAILINK_COMP_ARRAY(COMP_CODEC("spi-VLV1776:00", "cs35l41-pcm"),
++				       COMP_CODEC("spi-VLV1776:01", "cs35l41-pcm")));
++
+ /* Declare DMIC codec components */
+ SND_SOC_DAILINK_DEF(dmic_codec,
+ 		DAILINK_COMP_ARRAY(COMP_CODEC("dmic-codec", "dmic-hifi")));
+@@ -1481,6 +1554,7 @@ int acp_sofdsp_dai_links_create(struct snd_soc_card *card)
+ 		links[i].platforms = sof_component;
+ 		links[i].num_platforms = ARRAY_SIZE(sof_component);
+ 		links[i].dpcm_playback = 1;
++		links[i].dpcm_capture = 1;
+ 		links[i].nonatomic = true;
+ 		links[i].no_pcm = 1;
+ 		if (!drv_data->amp_codec_id) {
+@@ -1513,6 +1587,7 @@ int acp_sofdsp_dai_links_create(struct snd_soc_card *card)
+ 		links[i].platforms = sof_component;
+ 		links[i].num_platforms = ARRAY_SIZE(sof_component);
+ 		links[i].dpcm_playback = 1;
++		links[i].dpcm_capture = 1;
+ 		links[i].nonatomic = true;
+ 		links[i].no_pcm = 1;
+ 		if (!drv_data->amp_codec_id) {
+@@ -1597,6 +1672,8 @@ int acp_legacy_dai_links_create(struct snd_soc_card *card)
+ 
+ 	if (drv_data->hs_cpu_id)
+ 		num_links++;
++	if (drv_data->bt_cpu_id)
++		num_links++;
+ 	if (drv_data->amp_cpu_id)
+ 		num_links++;
+ 	if (drv_data->dmic_cpu_id)
+@@ -1744,6 +1821,33 @@ int acp_legacy_dai_links_create(struct snd_soc_card *card)
+ 			card->codec_conf = rt1019_conf;
+ 			card->num_configs = ARRAY_SIZE(rt1019_conf);
+ 		}
++		if (drv_data->amp_codec_id == CS35L41) {
++			links[i].codecs = cs35l41;
++			links[i].num_codecs = ARRAY_SIZE(cs35l41);
++			links[i].init = acp_cs35l41_init;
++			card->codec_conf = cs35l41_conf;
++			card->num_configs = ARRAY_SIZE(cs35l41_conf);
++			links[i].ops = &acp_cs35l41_ops;
++		}
++		i++;
++	}
++
++	if (drv_data->bt_cpu_id == I2S_BT) {
++		links[i].name = "acp-bt-codec";
++		links[i].id = BT_BE_ID;
++		links[i].cpus = sof_bt;
++		links[i].num_cpus = ARRAY_SIZE(sof_bt);
++		links[i].platforms = sof_component;
++		links[i].num_platforms = ARRAY_SIZE(sof_component);
++		links[i].dpcm_playback = 1;
++		links[i].dpcm_capture = 1;
++		links[i].nonatomic = true;
++		links[i].no_pcm = 1;
++		if (!drv_data->bt_codec_id) {
++			/* Use dummy codec if codec id not specified */
++			links[i].codecs = &snd_soc_dummy_dlc;
++			links[i].num_codecs = 1;
++		}
+ 		i++;
+ 	}
+ 
+diff --git a/sound/soc/amd/acp/acp-mach.h b/sound/soc/amd/acp/acp-mach.h
+index a48546d8d407..1d38025307b5 100644
+--- a/sound/soc/amd/acp/acp-mach.h
++++ b/sound/soc/amd/acp/acp-mach.h
+@@ -27,8 +27,8 @@
+ enum be_id {
+ 	HEADSET_BE_ID = 0,
+ 	AMP_BE_ID,
+-	DMIC_BE_ID,
+ 	BT_BE_ID,
++	DMIC_BE_ID,
+ };
+ 
+ enum cpu_endpoints {
+@@ -46,6 +46,7 @@ enum codec_endpoints {
+ 	MAX98360A,
+ 	RT5682S,
+ 	NAU8825,
++	CS35L41,
+ 	NAU8821,
+ 	MAX98388,
+ 	ES83XX,
+diff --git a/sound/soc/codecs/max98388.c b/sound/soc/codecs/max98388.c
+index b847d7c59ec0..bb03fb0c62b4 100644
+--- a/sound/soc/codecs/max98388.c
++++ b/sound/soc/codecs/max98388.c
+@@ -390,27 +390,43 @@ static void max98388_reset(struct max98388_priv *max98388, struct device *dev)
+ {
+ 	int ret, reg, count;
+ 
++
+ 	/* Software Reset */
+ 	ret = regmap_update_bits(max98388->regmap,
+ 				 MAX98388_R2000_SW_RESET,
+ 				 MAX98388_SOFT_RESET,
+ 				 MAX98388_SOFT_RESET);
+-	if (ret)
++
++	if (ret) {
+ 		dev_err(dev, "Reset command failed. (ret:%d)\n", ret);
++		goto exit;
++	}
++
+ 
+ 	count = 0;
+ 	while (count < 3) {
+ 		usleep_range(10000, 11000);
++
+ 		/* Software Reset Verification */
+ 		ret = regmap_read(max98388->regmap,
+ 				  MAX98388_R22FF_REV_ID, &reg);
++
+ 		if (!ret) {
+ 			dev_info(dev, "Reset completed (retry:%d)\n", count);
+-			return;
++			goto exit;
+ 		}
+ 		count++;
+ 	}
++
+ 	dev_err(dev, "Reset failed. (ret:%d)\n", ret);
++
++
++exit:
++	regcache_cache_only(max98388->regmap, true);
++	ret = regmap_update_bits(max98388->regmap,
++				 MAX98388_R2000_SW_RESET,
++				 MAX98388_SOFT_RESET, 0);
++	regcache_cache_only(max98388->regmap, false);
+ }
+ 
+ static int max98388_probe(struct snd_soc_component *component)
+@@ -419,6 +435,7 @@ static int max98388_probe(struct snd_soc_component *component)
+ 
+ 	/* Software Reset */
+ 	max98388_reset(max98388, component->dev);
++	usleep_range(400, 1000);
+ 
+ 	/* General channel source configuration */
+ 	regmap_write(max98388->regmap,
+@@ -811,6 +828,7 @@ static bool max98388_readable_register(struct device *dev,
+ 	case MAX98388_R210E_AUTO_RESTART:
+ 	case MAX98388_R210F_GLOBAL_EN:
+ 	case MAX98388_R22FF_REV_ID:
++	case MAX98388_R2000_SW_RESET:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -823,6 +841,7 @@ static bool max98388_volatile_reg(struct device *dev, unsigned int reg)
+ 	case MAX98388_R2001_INT_RAW1 ... MAX98388_R2005_INT_STATE2:
+ 	case MAX98388_R210F_GLOBAL_EN:
+ 	case MAX98388_R22FF_REV_ID:
++	case MAX98388_R2000_SW_RESET:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -866,6 +885,7 @@ static int max98388_resume(struct device *dev)
+ 
+ 	regcache_cache_only(max98388->regmap, false);
+ 	max98388_reset(max98388, dev);
++	usleep_range(400, 1000);
+ 	regcache_sync(max98388->regmap);
+ 
+ 	return 0;
+-- 
+2.45.1
+
