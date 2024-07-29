@@ -1,0 +1,1343 @@
+From 2610de0f9172456ce908aafcc621c2a56b68558a Mon Sep 17 00:00:00 2001
+From: Rong Xu <xur@google.com>
+Date: Sun, 28 Jul 2024 13:29:54 -0700
+Subject: [PATCH 1/6] Add AutoFDO support for Clang build
+
+Add the build support for using Clang's AutoFDO. Building the kernel
+with AutoFDO does not reduce the optimization level from the
+compiler. AutoFDO uses hardware sampling to gather information about
+the frequency of execution of different code paths within a binary.
+This information is then used to guide the compiler's optimization
+decisions, resulting in a more efficient binary. Experiments
+showed that the kernel can improve up to 10% in latency.
+
+The support requires a Clang compiler after LLVM 17. This submission
+is limited to x86 platforms that support PMU features like LBR on
+Intel machines and AMD Zen3 BRS. Support for SPE on ARM 1,
+ and BRBE on ARM 1 is part of planned future work.
+
+Here is an example workflow for AutoFDO kernel:
+
+1) Build the kernel on the HOST machine with LLVM enabled, for example,
+       $ make menuconfig LLVM=1
+    Turn on AutoFDO build config:
+      CONFIG_AUTOFDO_CLANG=y
+    With a configuration that has LLVM enabled, use the following
+    command:
+       scripts/config -e AUTOFDO_CLANG
+    After getting the config, build with
+      $ make LLVM=1
+
+2) Install the kernel on the TEST machine.
+
+3) Run the load tests. The '-c' option in perf specifies the sample
+   event period. We suggest     using a suitable prime number,
+   like 500009, for this purpose.
+   For Intel platforms:
+      $ perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -a -N -b -c <count> \
+        -o <perf_file> -- <loadtest>
+   For AMD platforms:
+      The supported system are: Zen3 with BRS, or Zen4 with amd_lbr_v2
+     For Zen3:
+      $ cat proc/cpuinfo | grep " brs"
+      For Zen4:
+      $ cat proc/cpuinfo | grep amd_lbr_v2
+      $ perf record --pfm-events RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k -a \
+        -N -b -c <count> -o <perf_file> -- <loadtest>
+
+4) (Optional) Download the raw perf file to the HOST machine.
+
+5) To generate an AutoFDO profile, two offline tools are available:
+   create_llvm_prof and llvm_profgen. The create_llvm_prof tool is part
+   of the AutoFDO project and can be found on GitHub
+   (https://github.com/google/autofdo), version v0.30.1 or later. The
+   llvm_profgen tool is included in the LLVM compiler itself. It's
+   important to note that the version of llvm_profgen doesn't need to
+   match the version of Clang. It needs to be the LLVM 19 release or
+   later, or from the LLVM trunk.
+      $ llvm-profgen --kernel --binary=<vmlinux> --perfdata=<perf_file> \
+        -o <profile_file>
+   or
+      $ create_llvm_prof --binary=<vmlinux> --profile=<perf_file> \
+        --format=extbinary -o <profile_file>
+
+   Note that multiple AutoFDO profile files can be merged into one via:
+      $ llvm-profdata merge -o <profile_file>  <profile_1> ... <profile_n>
+
+6) Rebuild the kernel using the AutoFDO profile file with the same config
+   as step 1, (Note CONFIG_AUTOFDO_CLANG needs to be enabled):
+      $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<profile_file>
+
+Co-developed-by: Han Shen <shenhan@google.com>
+Signed-off-by: Han Shen <shenhan@google.com>
+Signed-off-by: Rong Xu <xur@google.com>
+Suggested-by: Sriraman Tallam <tmsriram@google.com>
+Suggested-by: Krzysztof Pszeniczny <kpszeniczny@google.com>
+Suggested-by: Nick Desaulniers <ndesaulniers@google.com>
+Suggested-by: Stephane Eranian <eranian@google.com>
+---
+ Documentation/dev-tools/autofdo.rst | 203 ++++++++++++++++++++++++++++
+ Documentation/dev-tools/index.rst   |   1 +
+ MAINTAINERS                         |   7 +
+ Makefile                            |   1 +
+ arch/Kconfig                        |  20 +++
+ arch/x86/Kconfig                    |   1 +
+ scripts/Makefile.autofdo            |  20 +++
+ scripts/Makefile.lib                |  10 ++
+ tools/objtool/check.c               |   1 +
+ 9 files changed, 264 insertions(+)
+ create mode 100644 Documentation/dev-tools/autofdo.rst
+ create mode 100644 scripts/Makefile.autofdo
+
+diff --git a/Documentation/dev-tools/autofdo.rst b/Documentation/dev-tools/autofdo.rst
+new file mode 100644
+index 000000000000..e3f7ee8ee6bb
+--- /dev/null
++++ b/Documentation/dev-tools/autofdo.rst
+@@ -0,0 +1,203 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++===================================
++Using AutoFDO with the Linux kernel
++===================================
++
++This enables AutoFDO build support for the kernel when using
++the Clang compiler. AutoFDO (Auto-Feedback-Directed Optimization)
++is a type of profile-guided optimization (PGO) used to enhance the
++performance of binary executables. It gathers information about the
++frequency of execution of various code paths within a binary using
++hardware sampling. This data is then used to guide the compiler's
++optimization decisions, resulting in a more efficient binary. AutoFDO
++is a powerful optimization technique, and data indicates that it can
++significantly improve kernel performance. It's especially beneficial
++for workloads affected by front-end stalls.
++
++For AutoFDO builds, unlike non-FDO builds, the user must supply a
++profile. Acquiring an AutoFDO profile can be done in several ways.
++AutoFDO profiles are created by converting hardware sampling using
++the "perf" tool. It is crucial that the workload used to create these
++perf files is representative; they must exhibit runtime
++characteristics similar to the workloads that are intended to be
++optimized. Failure to do so will result in the compiler optimizing
++for the wrong objective.
++
++The AutoFDO profile often encapsulates the program's behavior. If the
++performance-critical codes are architecture-independent, the profile
++can be applied across platforms to achieve performance gains. For
++instance, using the profile generated on Intel architecture to build
++a kernel for AMD architecture can also yield performance improvements.
++
++There are two methods for acquiring a representative profile:
++(1) Sample real workloads using a production environment.
++(2) Generate the profile using a representative load test.
++When enabling the AutoFDO build configuration without providing an
++AutoFDO profile, the compiler only modifies the dwarf information in
++the kernel without impacting runtime performance. It's advisable to
++use a kernel binary built with the same AutoFDO configuration to
++collect the perf profile. While it's possible to use a kernel built
++with different options, it may result in inferior performance.
++
++One can collect profiles using AutoFDO build for the previous kernel.
++AutoFDO employs relative line numbers to match the profiles, offering
++some tolerance for source changes. This mode is commonly used in a
++production environment for profile collection.
++
++In a profile collection based on a load test, the AutoFDO collection
++process consists of the following steps:
++
++#. Initial build: The kernel is built with AutoFDO options
++   without a profile.
++
++#. Profiling: The above kernel is then run with a representative
++   workload to gather execution frequency data. This data is
++   collected using hardware sampling, via perf. AutoFDO is most
++   effective on platforms supporting advanced PMU features like
++   LBR on Intel machines.
++
++#. AutoFDO profile generation: Perf output file is converted to
++   the AutoFDO profile via offline tools.
++
++The support requires a Clang compiler LLVM 17 or later.
++
++Preparation
++===========
++
++Configure the kernel with:
++
++   .. code-block:: make
++
++      CONFIG_AUTOFDO_CLANG=y
++
++Customization
++=============
++
++You can enable or disable AutoFDO build for individual file and directories by
++adding a line similar to the following to the respective kernel Makefile:
++
++- For enabling a single file (e.g. foo.o)
++
++     .. code-block:: make
++
++        AUTOFDO_PROFILE_foo.o := y
++
++- For enabling all files in one directory
++
++     .. code-block:: make
++
++        AUTOFDO_PROFILE := y
++
++- For disabling one file
++
++     .. code-block:: make
++
++        AUTOFDO_PROFILE_foo.o := n
++
++- For disabling all files in one directory
++
++     .. code-block:: make
++
++        AUTOFDO_PROFILE := n
++
++
++Workflow
++========
++
++Here is an example workflow for AutoFDO kernel:
++
++
++
++1)  Build the kernel on the HOST machine with LLVM enabled, for example,
++
++      .. code-block:: make
++
++         $ make menuconfig LLVM=1
++
++
++    Turn on AutoFDO build config:
++
++      .. code-block:: make
++
++         CONFIG_AUTOFDO_CLANG=y
++
++    With a configuration that with LLVM enabled, use the following command:
++
++      .. code-block:: sh
++
++         $ scripts/config -e AUTOFDO_CLANG
++
++    After getting the config, build with
++
++      .. code-block:: make
++
++         $ make LLVM=1
++
++2) Install the kernel on the TEST machine.
++
++3) Run the load tests. The '-c' option in perf specifies the sample
++   event period. We suggest using a suitable prime number, like 500009,
++   for this purpose.
++
++   - For Intel platforms:
++
++      .. code-block:: sh
++
++         $ perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -a -N -b -c <count> -o <perf_file> -- <loadtest>
++
++   - For AMD platforms: For Intel platforms:
++     The supported systems are: Zen3 with BRS, or Zen4 with amd_lbr_v2. To check,
++     For Zen3:
++
++      .. code-block:: sh
++
++         $ cat proc/cpuinfo | grep " brs"
++
++      For Zen4:
++
++      .. code-block:: sh
++
++         $ cat proc/cpuinfo | grep amd_lbr_v2
++
++      The following command generated the perf data file:
++
++      .. code-block:: sh
++
++         $ perf record --pfm-events RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k -a -N -b \
++           -c <count> -o <perf_file> -- <loadtest>
++
++4) (Optional) Download the raw perf file to the HOST machine.
++
++5) To generate an AutoFDO profile, two offline tools are available:
++   create_llvm_prof and llvm_profgen. The create_llvm_prof tool is part
++   of the AutoFDO project and can be found on GitHub
++   (https://github.com/google/autofdo),  version v0.30.1 or later.
++   The llvm_profgen tool is included in the LLVM compiler itself. It's
++   important to note that the version of llvm_profgen doesn't need to match
++   the version of Clang. It needs to be the LLVM 19 release of Clang
++   or later, or just from the LLVM trunk.
++
++      .. code-block:: sh
++
++         $ llvm-profgen --kernel --binary=<vmlinux> --perfdata=<perf_file> -o <profile_file>
++
++   or
++      .. code-block:: sh
++
++         $ create_llvm_prof --binary=<vmlinux> --profile=<perf_file> --format=extbinary -o <profile_file>
++
++   Note that multiple AutoFDO profile files can be merged into one via:
++
++      .. code-block:: sh
++
++         $ llvm-profdata merge -o <profile_file>  <profile_1> <profile_2> ... <profile_n>
++
++
++6) Rebuild the kernel using the AutoFDO profile file with the same config as step 1,
++    (Note CONFIG_AUTOFDO_CLANG needs to be enabled):
++
++      .. code-block:: sh
++
++         $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<profile_file
++
+diff --git a/Documentation/dev-tools/index.rst b/Documentation/dev-tools/index.rst
+index efa49cdc8e2e..46636e4efe15 100644
+--- a/Documentation/dev-tools/index.rst
++++ b/Documentation/dev-tools/index.rst
+@@ -32,6 +32,7 @@ Documentation/dev-tools/testing-overview.rst
+    kunit/index
+    ktap
+    checkuapi
++   autofdo
+ 
+ 
+ .. only::  subproject and html
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 958e935449e5..40e507bb88f0 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -3479,6 +3479,13 @@ F:	kernel/audit*
+ F:	lib/*audit.c
+ K:	\baudit_[a-z_0-9]\+\b
+ 
++AUTOFDO BUILD
++M:	Rong Xu <xur@google.com>
++M:	Han Shen <shenhan@google.com>
++S:	Supported
++F:	Documentation/dev-tools/autofdo.rst
++F:	scripts/Makefile.autofdo
++
+ AUXILIARY BUS DRIVER
+ M:	Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+ R:	Dave Ertman <david.m.ertman@intel.com>
+diff --git a/Makefile b/Makefile
+index 07e1aec72c17..d6296dd21377 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1024,6 +1024,7 @@ include-$(CONFIG_UBSAN)		+= scripts/Makefile.ubsan
+ include-$(CONFIG_KCOV)		+= scripts/Makefile.kcov
+ include-$(CONFIG_RANDSTRUCT)	+= scripts/Makefile.randstruct
+ include-$(CONFIG_GCC_PLUGINS)	+= scripts/Makefile.gcc-plugins
++include-$(CONFIG_AUTOFDO_CLANG)	+= scripts/Makefile.autofdo
+ 
+ include $(addprefix $(srctree)/, $(include-y))
+ 
+diff --git a/arch/Kconfig b/arch/Kconfig
+index 975dd22a2dbd..e12599c4ab63 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -802,6 +802,26 @@ config LTO_CLANG_THIN
+ 	  If unsure, say Y.
+ endchoice
+ 
++config ARCH_SUPPORTS_AUTOFDO_CLANG
++	bool
++
++config AUTOFDO_CLANG
++	bool "Enable Clang's AutoFDO build (EXPERIMENTAL)"
++	depends on ARCH_SUPPORTS_AUTOFDO_CLANG
++	depends on CC_IS_CLANG && CLANG_VERSION >= 170000
++	help
++	  This option enables Clang’s AutoFDO build. When
++	  an AutoFDO profile is specified in variable
++	  CLANG_AUTOFDO_PROFILE during the build process,
++	  Clang uses the profile to optimize the kernel.
++
++	  If no profile is specified, AutoFDO options are
++	  still passed to Clang to facilitate the collection
++	  of perf data for creating an AutoFDO profile in
++	  subsequent builds.
++
++	  If unsure, say N.
++
+ config ARCH_SUPPORTS_CFI_CLANG
+ 	bool
+ 	help
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 1d7122a1883e..dca526b1364f 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -122,6 +122,7 @@ config X86
+ 	select ARCH_USES_CFI_TRAPS		if X86_64 && CFI_CLANG
+ 	select ARCH_SUPPORTS_LTO_CLANG
+ 	select ARCH_SUPPORTS_LTO_CLANG_THIN
++	select ARCH_SUPPORTS_AUTOFDO_CLANG
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF		if X86_CMPXCHG64
+ 	select ARCH_USE_MEMTEST
+diff --git a/scripts/Makefile.autofdo b/scripts/Makefile.autofdo
+new file mode 100644
+index 000000000000..882fa7e801ba
+--- /dev/null
++++ b/scripts/Makefile.autofdo
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: GPL-2.0
++
++# Enable available and selected Clang AutoFDO features.
++
++CFLAGS_AUTOFDO_CLANG := -fdebug-info-for-profiling -mllvm -enable-fs-discriminator=true -mllvm -improved-fs-discriminator=true
++
++ifdef CLANG_AUTOFDO_PROFILE
++CFLAGS_AUTOFDO_CLANG += -fprofile-sample-use=$(CLANG_AUTOFDO_PROFILE)
++endif
++
++ifdef CONFIG_LTO_CLANG
++ifdef CONFIG_LTO_CLANG_THIN
++ifdef CLANG_AUTOFDO_PROFILE
++KBUILD_LDFLAGS += --lto-sample-profile=$(CLANG_AUTOFDO_PROFILE)
++endif
++KBUILD_LDFLAGS += --mllvm=-enable-fs-discriminator=true --mllvm=-improved-fs-discriminator=true -plugin-opt=thinlto
++endif
++endif
++
++export CFLAGS_AUTOFDO_CLANG
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index 9f06f6aaf7fc..c2cab5adaf25 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -209,6 +209,16 @@ _c_flags += $(if $(patsubst n%,, \
+ 	-D__KCSAN_INSTRUMENT_BARRIERS__)
+ endif
+ 
++#
++# Enable Clang's AutoFDO build flags for a file or directory depending on
++# variables AUTOFDO_PROFILE_obj.o and AUTOFDO_PROFILE.
++#
++ifeq ($(CONFIG_AUTOFDO_CLANG),y)
++_c_flags += $(if $(patsubst n%,, \
++	$(AUTOFDO_PROFILE_$(target-stem).o)$(AUTOFDO_PROFILE)y), \
++	$(CFLAGS_AUTOFDO_CLANG))
++endif
++
+ # $(src) for including checkin headers from generated source files
+ # $(obj) for including generated headers from checkin source files
+ ifeq ($(KBUILD_EXTMOD),)
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 0a33d9195b7a..254913498c3c 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -4488,6 +4488,7 @@ static int validate_ibt(struct objtool_file *file)
+ 		    !strcmp(sec->name, "__jump_table")			||
+ 		    !strcmp(sec->name, "__mcount_loc")			||
+ 		    !strcmp(sec->name, ".kcfi_traps")			||
++		    !strcmp(sec->name, ".llvm.call-graph-profile")	||
+ 		    strstr(sec->name, "__patchable_function_entries"))
+ 			continue;
+ 
+-- 
+2.46.0.rc1
+
+From 9b6f1df065690adf59dd11229935ad41d5f59890 Mon Sep 17 00:00:00 2001
+From: Rong Xu <xur@google.com>
+Date: Sun, 28 Jul 2024 13:29:55 -0700
+Subject: [PATCH 2/6] objtool: Fix unreachable instruction warnings for weak
+ funcitons
+
+In the presence of both weak and strong function definitions, the
+linker drops the weak symbol in favor of a strong symbol, but
+leaves the code in place. Code in ignore_unreachable_insn() has
+some heuristics to suppress the warning, but it does not work when
+-ffunction-sections is enabled.
+
+Suppose function foo has both strong and weak definitions.
+Case 1: The strong definition has an annotated section name,
+like .init.text. Only the weak definition will be placed into
+.text.foo. But since the section has no symbols, there will be no
+"hole" in the section.
+
+Case 2: Both sections are without an annotated section name.
+Both will be placed into .text.foo section, but there will be only one
+symbol (the strong one). If the weak code is before the strong code,
+there is no "hole" as it fails to find the right-most symbol before
+the offset.
+
+The fix is to use the first node to compute the hole if hole.sym
+is empty. If there is no symbol in the section, the first node
+will be NULL, in which case, -1 is returned to skip the whole
+section.
+
+Co-developed-by: Han Shen <shenhan@google.com>
+Signed-off-by: Han Shen <shenhan@google.com>
+Signed-off-by: Rong Xu <xur@google.com>
+Suggested-by: Sriraman Tallam <tmsriram@google.com>
+Suggested-by: Krzysztof Pszeniczny <kpszeniczny@google.com>
+---
+ tools/objtool/elf.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/tools/objtool/elf.c b/tools/objtool/elf.c
+index 3d27983dc908..fa88bb254ccc 100644
+--- a/tools/objtool/elf.c
++++ b/tools/objtool/elf.c
+@@ -224,12 +224,15 @@ int find_symbol_hole_containing(const struct section *sec, unsigned long offset)
+ 	if (n)
+ 		return 0; /* not a hole */
+ 
+-	/* didn't find a symbol for which @offset is after it */
+-	if (!hole.sym)
+-		return 0; /* not a hole */
++	/*
++	 * @offset >= sym->offset + sym->len, find symbol after it.
++	 * Use the first node in rb_tree when hole.sym is NULL.
++	 */
++	if (hole.sym)
++		n = rb_next(&hole.sym->node);
++	else
++		n = rb_first_cached(&sec->symbol_tree);
+ 
+-	/* @offset >= sym->offset + sym->len, find symbol after it */
+-	n = rb_next(&hole.sym->node);
+ 	if (!n)
+ 		return -1; /* until end of address space */
+ 
+-- 
+2.46.0.rc1
+
+From 9f2edce7f4d6e4165d174460c1d71037bfce7aa5 Mon Sep 17 00:00:00 2001
+From: Rong Xu <xur@google.com>
+Date: Sun, 28 Jul 2024 13:29:56 -0700
+Subject: [PATCH 3/6] Change the symbols order when --ffuntion-sections is
+ enabled
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the -ffunction-sections compiler option is enabled, each function
+is placed in a separate section named .text.function_name rather than
+putting all functions in a single .text section.
+
+However, using -function-sections can cause problems with the
+linker script. The comments included in include/asm-generic/vmlinux.lds.h
+note these issues.:
+  “TEXT_MAIN here will match .text.fixup and .text.unlikely if dead
+   code elimination is enabled, so these sections should be converted
+   to use ".." first.”
+
+It is unclear whether there is a straightforward method for converting
+a suffix to "..". This patch modifies the order of subsections within the
+text output section when the -ffunction-sections flag is enabled.
+Specifically, it repositions sections with certain fixed patterns (for
+example .text.unlikely) before TEXT_MAIN, ensuring that they are grouped
+and matched together.
+
+Note that the limitation arises because the linker script employs glob
+patterns instead of regular expressions for string matching. While there
+is a method to maintain the current order using complex patterns, this
+significantly complicates the pattern and increases the likelihood of
+errors.
+
+Co-developed-by: Han Shen <shenhan@google.com>
+Signed-off-by: Han Shen <shenhan@google.com>
+Signed-off-by: Rong Xu <xur@google.com>
+Suggested-by: Sriraman Tallam <tmsriram@google.com>
+Suggested-by: Krzysztof Pszeniczny <kpszeniczny@google.com>
+---
+ include/asm-generic/vmlinux.lds.h | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 5703526d6ebf..f3de66bda293 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -582,9 +582,21 @@
+  * during second ld run in second ld pass when generating System.map
+  *
+  * TEXT_MAIN here will match .text.fixup and .text.unlikely if dead
+- * code elimination is enabled, so these sections should be converted
+- * to use ".." first.
++ * code elimination or function-section is enabled. Match these symbols
++ * first when in these builds.
+  */
++#if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG)
++#define TEXT_TEXT							\
++		*(.text.asan.* .text.tsan.*)				\
++		*(.text.unknown .text.unknown.*)			\
++		*(.text.unlikely .text.unlikely.*)			\
++		ALIGN_FUNCTION();					\
++		*(.text.hot .text.hot.*)				\
++		*(TEXT_MAIN .text.fixup)				\
++		NOINSTR_TEXT						\
++		*(.ref.text)						\
++	MEM_KEEP(init.text*)
++#else
+ #define TEXT_TEXT							\
+ 		ALIGN_FUNCTION();					\
+ 		*(.text.hot .text.hot.*)				\
+@@ -594,7 +606,8 @@
+ 		NOINSTR_TEXT						\
+ 		*(.ref.text)						\
+ 		*(.text.asan.* .text.tsan.*)				\
+-	MEM_KEEP(init.text*)						\
++	MEM_KEEP(init.text*)
++#endif
+ 
+ 
+ /* sched.text is aling to function alignment to secure we have same
+-- 
+2.46.0.rc1
+
+From 6ad6d53f8fcc18fc499ea63af71694b78fef9cea Mon Sep 17 00:00:00 2001
+From: Rong Xu <xur@google.com>
+Date: Sun, 28 Jul 2024 13:29:57 -0700
+Subject: [PATCH 4/6] AutoFDO: Enable -ffunction-sections for the AutoFDO build
+
+Enable -ffunction-sections by default for the AutoFDO build.
+
+With -ffunction-sections, the compiler places each function in its own
+section named .text.function_name instead of placing all functions in
+the .text section. In the AutoFDO build, this allows the linker to
+utilize profile information to reorganize functions for improved
+utilization of iCache and iTLB.
+
+Co-developed-by: Han Shen <shenhan@google.com>
+Signed-off-by: Han Shen <shenhan@google.com>
+Signed-off-by: Rong Xu <xur@google.com>
+Suggested-by: Sriraman Tallam <tmsriram@google.com>
+---
+ include/asm-generic/vmlinux.lds.h | 37 ++++++++++++++++++++++++-------
+ scripts/Makefile.autofdo          |  2 +-
+ 2 files changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index f3de66bda293..97c8399e5532 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -95,18 +95,25 @@
+  * With LTO_CLANG, the linker also splits sections by default, so we need
+  * these macros to combine the sections during the final link.
+  *
++ * With LTO_CLANG, the linker also splits sections by default, so we need
++ * these macros to combine the sections during the final link.
++ *
+  * RODATA_MAIN is not used because existing code already defines .rodata.x
+  * sections to be brought in with rodata.
+  */
+-#if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG)
++#if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG) || \
++defined(CONFIG_AUTOFDO_CLANG)
+ #define TEXT_MAIN .text .text.[0-9a-zA-Z_]*
++#else
++#define TEXT_MAIN .text
++#endif
++#if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG)
+ #define DATA_MAIN .data .data.[0-9a-zA-Z_]* .data..L* .data..compoundliteral* .data.$__unnamed_* .data.$L*
+ #define SDATA_MAIN .sdata .sdata.[0-9a-zA-Z_]*
+ #define RODATA_MAIN .rodata .rodata.[0-9a-zA-Z_]* .rodata..L*
+ #define BSS_MAIN .bss .bss.[0-9a-zA-Z_]* .bss..compoundliteral*
+ #define SBSS_MAIN .sbss .sbss.[0-9a-zA-Z_]*
+ #else
+-#define TEXT_MAIN .text
+ #define DATA_MAIN .data
+ #define SDATA_MAIN .sdata
+ #define RODATA_MAIN .rodata
+@@ -577,6 +584,20 @@
+ 		__cpuidle_text_end = .;					\
+ 		__noinstr_text_end = .;
+ 
++#ifdef CONFIG_AUTOFDO_CLANG
++#define TEXT_HOT							\
++		__hot_text_start = .;					\
++		*(.text.hot .text.hot.*)				\
++		__hot_text_end = .;
++#define TEXT_UNLIKELY							\
++		__unlikely_text_start = .;				\
++		*(.text.unlikely .text.unlikely.*)			\
++		__unlikely_text_end = .;
++#else
++#define TEXT_HOT *(.text.hot .text.hot.*)
++#define TEXT_UNLIKELY *(.text.unlikely .text.unlikely.*)
++#endif
++
+ /*
+  * .text section. Map to function alignment to avoid address changes
+  * during second ld run in second ld pass when generating System.map
+@@ -585,13 +606,14 @@
+  * code elimination or function-section is enabled. Match these symbols
+  * first when in these builds.
+  */
+-#if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG)
++#if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG) || \
++defined(CONFIG_AUTOFDO_CLANG)
+ #define TEXT_TEXT							\
+ 		*(.text.asan.* .text.tsan.*)				\
+ 		*(.text.unknown .text.unknown.*)			\
+-		*(.text.unlikely .text.unlikely.*)			\
++		TEXT_UNLIKELY						\
+ 		ALIGN_FUNCTION();					\
+-		*(.text.hot .text.hot.*)				\
++		TEXT_HOT						\
+ 		*(TEXT_MAIN .text.fixup)				\
+ 		NOINSTR_TEXT						\
+ 		*(.ref.text)						\
+@@ -599,9 +621,9 @@
+ #else
+ #define TEXT_TEXT							\
+ 		ALIGN_FUNCTION();					\
+-		*(.text.hot .text.hot.*)				\
++		TEXT_HOT						\
+ 		*(TEXT_MAIN .text.fixup)				\
+-		*(.text.unlikely .text.unlikely.*)			\
++		TEXT_UNLIKELY						\
+ 		*(.text.unknown .text.unknown.*)			\
+ 		NOINSTR_TEXT						\
+ 		*(.ref.text)						\
+@@ -609,7 +631,6 @@
+ 	MEM_KEEP(init.text*)
+ #endif
+ 
+-
+ /* sched.text is aling to function alignment to secure we have same
+  * address even at second ld pass when generating System.map */
+ #define SCHED_TEXT							\
+diff --git a/scripts/Makefile.autofdo b/scripts/Makefile.autofdo
+index 882fa7e801ba..f765bd9e81d7 100644
+--- a/scripts/Makefile.autofdo
++++ b/scripts/Makefile.autofdo
+@@ -5,7 +5,7 @@
+ CFLAGS_AUTOFDO_CLANG := -fdebug-info-for-profiling -mllvm -enable-fs-discriminator=true -mllvm -improved-fs-discriminator=true
+ 
+ ifdef CLANG_AUTOFDO_PROFILE
+-CFLAGS_AUTOFDO_CLANG += -fprofile-sample-use=$(CLANG_AUTOFDO_PROFILE)
++CFLAGS_AUTOFDO_CLANG += -fprofile-sample-use=$(CLANG_AUTOFDO_PROFILE) -ffunction-sections
+ endif
+ 
+ ifdef CONFIG_LTO_CLANG
+-- 
+2.46.0.rc1
+
+From 9816b91c2d87ded54e9b418a20da3fcb89ec6184 Mon Sep 17 00:00:00 2001
+From: Rong Xu <xur@google.com>
+Date: Sun, 28 Jul 2024 13:29:58 -0700
+Subject: [PATCH 5/6] AutoFDO: Enable machine function split optimization for
+ AutoFDO
+
+Enable the machine function split optimization for AutoFDO in Clang.
+
+Machine function split (MFS) is a pass in the Clang compiler that
+splits a function into hot and cold parts. The linker groups all
+cold blocks across functions together. This decreases hot code
+fragmentation and improves iCache and iTLB utilization.
+
+MFS requires a profile so this is enabled only for the AutoFDO builds.
+
+Co-developed-by: Han Shen <shenhan@google.com>
+Signed-off-by: Han Shen <shenhan@google.com>
+Signed-off-by: Rong Xu <xur@google.com>
+Suggested-by: Sriraman Tallam <tmsriram@google.com>
+Suggested-by: Krzysztof Pszeniczny <kpszeniczny@google.com>
+---
+ include/asm-generic/vmlinux.lds.h | 6 ++++++
+ scripts/Makefile.autofdo          | 2 ++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 97c8399e5532..7d9dc8a3c046 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -593,9 +593,14 @@ defined(CONFIG_AUTOFDO_CLANG)
+ 		__unlikely_text_start = .;				\
+ 		*(.text.unlikely .text.unlikely.*)			\
+ 		__unlikely_text_end = .;
++#define TEXT_SPLIT							\
++		__split_text_start = .;					\
++		*(.text.split .text.split.[0-9a-zA-Z_]*)		\
++		__split_text_end = .;
+ #else
+ #define TEXT_HOT *(.text.hot .text.hot.*)
+ #define TEXT_UNLIKELY *(.text.unlikely .text.unlikely.*)
++#define TEXT_SPLIT
+ #endif
+ 
+ /*
+@@ -611,6 +616,7 @@ defined(CONFIG_AUTOFDO_CLANG)
+ #define TEXT_TEXT							\
+ 		*(.text.asan.* .text.tsan.*)				\
+ 		*(.text.unknown .text.unknown.*)			\
++		TEXT_SPLIT						\
+ 		TEXT_UNLIKELY						\
+ 		ALIGN_FUNCTION();					\
+ 		TEXT_HOT						\
+diff --git a/scripts/Makefile.autofdo b/scripts/Makefile.autofdo
+index f765bd9e81d7..80ad06689947 100644
+--- a/scripts/Makefile.autofdo
++++ b/scripts/Makefile.autofdo
+@@ -6,6 +6,7 @@ CFLAGS_AUTOFDO_CLANG := -fdebug-info-for-profiling -mllvm -enable-fs-discriminat
+ 
+ ifdef CLANG_AUTOFDO_PROFILE
+ CFLAGS_AUTOFDO_CLANG += -fprofile-sample-use=$(CLANG_AUTOFDO_PROFILE) -ffunction-sections
++CFLAGS_AUTOFDO_CLANG += -fsplit-machine-functions
+ endif
+ 
+ ifdef CONFIG_LTO_CLANG
+@@ -14,6 +15,7 @@ ifdef CLANG_AUTOFDO_PROFILE
+ KBUILD_LDFLAGS += --lto-sample-profile=$(CLANG_AUTOFDO_PROFILE)
+ endif
+ KBUILD_LDFLAGS += --mllvm=-enable-fs-discriminator=true --mllvm=-improved-fs-discriminator=true -plugin-opt=thinlto
++KBUILD_LDFLAGS += -plugin-opt=-split-machine-functions
+ endif
+ endif
+ 
+-- 
+2.46.0.rc1
+
+From 1a29c0016c2315aa34bfdfc8c1fc334aeaa01b5c Mon Sep 17 00:00:00 2001
+From: Rong Xu <xur@google.com>
+Date: Sun, 28 Jul 2024 13:29:59 -0700
+Subject: [PATCH 6/6] Add Propeller configuration for kernel build.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the build support for using Clang's Propeller optimizer. Like
+AutoFDO, Propeller uses hardware sampling to gather information
+about the frequency of execution of different code paths within a
+binary. This information is then used to guide the compiler's
+optimization decisions, resulting in a more efficient binary.
+
+The support requires a Clang compiler LLVM 19 or later, and the
+create_llvm_prof tool
+(https://github.com/google/autofdo/releases/tag/v0.30.1). This
+submission is limited to x86 platforms that support PMU features
+like LBR on Intel machines and AMD Zen3 BRS.
+
+For Arm, we plan to send patches for SPE-based Propeller when
+AutoFDO for Arm is ready.
+
+Here is an example workflow for building an AutoFDO+Propeller
+optimized kernel:
+
+1) Build the kernel on the HOST machine, with AutoFDO and Propeller
+   build config
+      CONFIG_AUTOFDO_CLANG=y
+      CONFIG_PROPELLER_CLANG=y
+   then
+      $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<autofdo_profile>
+
+“<autofdo_profile>” is the profile collected when doing a non-Propeller
+AutoFDO build. This step builds a kernel that has the same optimization
+level as AutoFDO, plus a metadata section that records basic block
+information. This kernel image runs as fast as an AutoFDO optimized
+kernel.
+
+2) Install the kernel on test/production machines.
+
+3) Run the load tests. The '-c' option in perf specifies the sample
+   event period. We suggest using a suitable prime number,
+   like 500009, for this purpose.
+   For Intel platforms:
+      $ perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -a -N -b -c <count> \
+        -o <perf_file> -- <loadtest>
+   For AMD platforms:
+      The supported system are: Zen3 with BRS, or Zen4 with amd_lbr_v2
+      # To see if Zen3 support LBR:
+      $ cat proc/cpuinfo | grep " brs"
+      # To see if Zen4 support LBR:
+      $ cat proc/cpuinfo | grep amd_lbr_v2
+      # If the result is yes, then collect the profile using:
+      $ perf record --pfm-events RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k -a \
+        -N -b -c <count> -o <perf_file> -- <loadtest>
+
+4) (Optional) Download the raw perf file to the HOST machine.
+
+5) Generate Propeller profile:
+   $ create_llvm_prof --binary=<vmlinux> --profile=<perf_file> \
+     --format=propeller --propeller_output_module_name \
+     --out=<propeller_profile_prefix>_cc_profile.txt \
+     --propeller_symorder=<propeller_profile_prefix>_ld_profile.txt
+
+   “create_llvm_prof” is the profile conversion tool, and a prebuilt
+   binary for linux can be found on
+   https://github.com/google/autofdo/releases/tag/v0.30.1 (can also build
+   from source).
+
+   "<propeller_profile_prefix>" can be something like
+   "/home/user/dir/any_string".
+
+   This command generates a pair of Propeller profiles:
+   "<propeller_profile_prefix>_cc_profile.txt" and
+   "<propeller_profile_prefix>_ld_profile.txt".
+
+6) Rebuild the kernel using the AutoFDO and Propeller profile files.
+      CONFIG_AUTOFDO_CLANG=y
+      CONFIG_PROPELLER_CLANG=y
+   and
+      $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<autofdo_profile> \
+        CLANG_PROPELLER_PROFILE_PREFIX=<propeller_profile_prefix>
+
+Co-developed-by: Han Shen <shenhan@google.com>
+Signed-off-by: Han Shen <shenhan@google.com>
+Signed-off-by: Rong Xu <xur@google.com>
+Suggested-by: Sriraman Tallam <tmsriram@google.com>
+Suggested-by: Krzysztof Pszeniczny <kpszeniczny@google.com>
+Suggested-by: Nick Desaulniers <ndesaulniers@google.com>
+Suggested-by: Stephane Eranian <eranian@google.com>
+---
+ Documentation/dev-tools/index.rst     |   1 +
+ Documentation/dev-tools/propeller.rst | 188 ++++++++++++++++++++++++++
+ MAINTAINERS                           |   7 +
+ Makefile                              |   1 +
+ arch/Kconfig                          |  22 +++
+ arch/x86/Kconfig                      |   1 +
+ arch/x86/boot/compressed/Makefile     |   3 +
+ arch/x86/kernel/vmlinux.lds.S         |   4 +
+ arch/x86/platform/efi/Makefile        |   1 +
+ drivers/firmware/efi/libstub/Makefile |   2 +
+ include/asm-generic/vmlinux.lds.h     |   8 +-
+ scripts/Makefile.lib                  |  10 ++
+ scripts/Makefile.propeller            |  25 ++++
+ tools/objtool/check.c                 |   1 +
+ 14 files changed, 270 insertions(+), 4 deletions(-)
+ create mode 100644 Documentation/dev-tools/propeller.rst
+ create mode 100644 scripts/Makefile.propeller
+
+diff --git a/Documentation/dev-tools/index.rst b/Documentation/dev-tools/index.rst
+index 46636e4efe15..16e33eadb73b 100644
+--- a/Documentation/dev-tools/index.rst
++++ b/Documentation/dev-tools/index.rst
+@@ -33,6 +33,7 @@ Documentation/dev-tools/testing-overview.rst
+    ktap
+    checkuapi
+    autofdo
++   propeller
+ 
+ 
+ .. only::  subproject and html
+diff --git a/Documentation/dev-tools/propeller.rst b/Documentation/dev-tools/propeller.rst
+new file mode 100644
+index 000000000000..15ef0e6d973e
+--- /dev/null
++++ b/Documentation/dev-tools/propeller.rst
+@@ -0,0 +1,188 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++=====================================
++Using Propeller with the Linux kernel
++=====================================
++
++This enables Propeller build support for the kernel when using Clang
++compiler. Propeller is a profile-guided optimization (PGO) method used
++to optimize binary executables. Like AutoFDO, it utilizes hardware
++sampling to gather information about the frequency of execution of
++different code paths within a binary. Unlike AutoFDO, this information
++is then used right before linking phase to optimize (among others)
++block layout within and across functions.
++
++A few important notes about adopting Propeller optimization:
++
++#. Although it can be used as a standalone optimization step, it is
++   strongly recommended to apply Propeller on top of AutoFDO,
++   AutoFDO+ThinLTO or Instrument FDO. The rest of this document
++   assumes this paradigm.
++
++#. Propeller uses another round of profiling on top of
++   AutoFDO/AutoFDO+ThinLTO/iFDO. The whole build process involves
++   "build-afdo - train-afdo - build-propeller - train-propeller -
++   build-optimized".
++
++#. Propeller requires LLVM 19 release or later for Clang/Clang++
++   and the linker(ld.lld).
++
++#. In addition to LLVM toolchain, Propeller requires a profiling
++   conversion tool: https://github.com/google/autofdo with a release
++   after v0.30.1: https://github.com/google/autofdo/releases/tag/v0.30.1.
++
++The Propeller optimization process involves the following steps:
++
++#. Initial building: Build the AutoFDO or AutoFDO+ThinLTO binary as
++   you would normally do, but with a set of compile-time / link-time
++   flags, so that a special metadata section is created within the
++   kernel binary. The special section is only intend to be used by the
++   profiling tool, it is not part of the runtime image, nor does it
++   change kernel run time text sections.
++
++#. Profiling: The above kernel is then run with a representative
++   workload to gather execution frequency data. This data is collected
++   using hardware sampling, via perf. Propeller is most effective on
++   platforms supporting advanced PMU features like LBR on Intel
++   machines. This step is the same as profiling the kernel for AutoFDO
++   (the exact perf parameters can be different).
++
++#. Propeller profile generation: Perf output file is converted to a
++   pair of Propeller profiles via an offline tool.
++
++#. Optimized build: Build the AutoFDO or AutoFDO+ThinLTO optimized
++   binary as you would normally do, but with a compile-time /
++   link-time flag to pick up the Propeller compile time and link time
++   profiles. This build step uses 3 profiles - the AutoFDO profile,
++   the Propeller compile-time profile and the Propeller link-time
++   profile.
++
++#. Deployment: The optimized kernel binary is deployed and used
++   in production environments, providing improved performance
++   and reduced latency.
++
++Preparation
++===========
++
++Configure the kernel with:
++
++   .. code-block:: make
++
++      CONFIG_AUTOFDO_CLANG=y
++      CONFIG_PROPELLER_CLANG=y
++
++Customization
++=============
++
++You can enable or disable Propeller build for individual file and
++directories by adding a line similar to the following to the
++respective kernel Makefile:
++
++- For enabling a single file (e.g. foo.o)
++
++     .. code-block:: make
++
++        PROPELLER_PROFILE_foo.o := y
++
++- For enabling all files in one directory
++
++     .. code-block:: make
++
++        PROPELLER_PROFILE := y
++
++- For disabling one file
++
++     .. code-block:: make
++
++        PROPELLER_PROFILE_foo.o := n
++
++- For disabling all files in one directory
++
++     .. code-block:: make
++
++        PROPELLER__PROFILE := n
++
++
++Workflow
++========
++
++Here is an example workflow for building an AutoFDO+Propeller kernel:
++
++1) Assuming an AutoFDO profile is already collected following
++   instructions in the AutoFDO document, build the kernel on the HOST
++   machine, with AutoFDO and Propeller build configs:
++
++      .. code-block:: make
++
++         CONFIG_AUTOFDO_CLANG=y
++         CONFIG_PROPELLER_CLANG=y
++
++   and
++
++      .. code-block:: sh
++
++         $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<autofdo-profile-name>
++
++2) Install the kernel on the TEST machine.
++
++3) Run the load tests. The '-c' option in perf specifies the sample
++   event period. We suggest using a suitable prime number, like 500009,
++   for this purpose.
++
++   - For Intel platforms:
++
++      .. code-block:: sh
++
++         $ perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -a -N -b -c \
++           <count> -o <perf_file> -- <loadtest>
++
++   - For AMD platforms:
++
++      .. code-block:: sh
++
++         $ perf record --pfm-event RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k \
++           -a -N -b -c <count> -o <perf_file> -- <loadtest>
++
++   Note you can repeat the above steps to collect multiple <perf_file>s.
++
++4) (Optional) Download the raw perf file(s) to the HOST machine.
++
++5) Use the create_llvm_prof tool (https://github.com/google/autofdo) to Generate Propeller profile.
++
++      .. code-block:: sh
++
++         $ create_llvm_prof --binary=<vmlinux> --profile=<perf_file> \
++                            --format=propeller --propeller_output_module_name \
++                            --out=<propeller_profile_prefix>_cc_profile.txt \
++                            --propeller_symorder=<propeller_profile_prefix>_ld_profile.txt
++
++   "<propeller_profile_prefix>" can be something like
++   "/home/user/dir/any_string".
++
++   This command generates a pair of Propeller profiles:
++   "<propeller_profile_prefix>_cc_profile.txt" and
++   "<propeller_profile_prefix>_ld_profile.txt".
++
++   If there are more than 1 perf_file collected in the previous step,
++   you can create a temp list file "<perf_file_list>" with each line
++   containing one perf file name and run:
++
++      .. code-block:: sh
++
++         $ create_llvm_prof --binary=<vmlinux> --profile=@<perf_file_list> \
++                            --format=propeller --propeller_output_module_name \
++                            --out=<propeller_profile_prefix>_cc_profile.txt \
++                            --propeller_symorder=<propeller_profile_prefix>_ld_profile.txt
++
++6) Rebuild the kernel using the AutoFDO and Propeller profiles.
++
++      .. code-block:: make
++
++         CONFIG_AUTOFDO_CLANG=y
++         CONFIG_PROPELLER_CLANG=y
++
++   and
++
++      .. code-block:: sh
++
++         $ make LLVM=1 CLANG_AUTOFDO_PROFILE=<profile_file> CLANG_PROPELLER_PROFILE_PREFIX=<propeller_profile_prefix>
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 40e507bb88f0..c8720f905651 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -17956,6 +17956,13 @@ S:	Maintained
+ F:	include/linux/psi*
+ F:	kernel/sched/psi.c
+ 
++PROPELLER BUILD
++M:	Rong Xu <xur@google.com>
++M:	Han Shen <shenhan@google.com>
++S:	Supported
++F:	Documentation/dev-tools/propeller.rst
++F:	scripts/Makefile.propeller
++
+ PRINTK
+ M:	Petr Mladek <pmladek@suse.com>
+ R:	Steven Rostedt <rostedt@goodmis.org>
+diff --git a/Makefile b/Makefile
+index d6296dd21377..92f485fc9bec 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1025,6 +1025,7 @@ include-$(CONFIG_KCOV)		+= scripts/Makefile.kcov
+ include-$(CONFIG_RANDSTRUCT)	+= scripts/Makefile.randstruct
+ include-$(CONFIG_GCC_PLUGINS)	+= scripts/Makefile.gcc-plugins
+ include-$(CONFIG_AUTOFDO_CLANG)	+= scripts/Makefile.autofdo
++include-$(CONFIG_PROPELLER_CLANG)	+= scripts/Makefile.propeller
+ 
+ include $(addprefix $(srctree)/, $(include-y))
+ 
+diff --git a/arch/Kconfig b/arch/Kconfig
+index e12599c4ab63..5b136e904400 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -822,6 +822,28 @@ config AUTOFDO_CLANG
+ 
+ 	  If unsure, say N.
+ 
++config ARCH_SUPPORTS_PROPELLER_CLANG
++	bool
++
++config PROPELLER_CLANG
++	bool "Enable Clang's Propeller build"
++	depends on ARCH_SUPPORTS_PROPELLER_CLANG
++	depends on AUTOFDO_CLANG
++	depends on CC_IS_CLANG && CLANG_VERSION >= 190000
++	help
++	  This option enables Clang’s Propeller build which
++	  is on top of AutoFDO build. When the Propeller profiles
++	  is specified in variable CLANG_PROPELLER_PROFILE_PREFIX
++	  during the build process, Clang uses the profiles to
++	  optimize the kernel.
++
++	  If no profile is specified, Proepller options are
++	  still passed to Clang to facilitate the collection
++	  of perf data for creating the Propeller profiles in
++	  subsequent builds.
++
++	  If unsure, say N.
++
+ config ARCH_SUPPORTS_CFI_CLANG
+ 	bool
+ 	help
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index dca526b1364f..6fb5269d39b0 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -123,6 +123,7 @@ config X86
+ 	select ARCH_SUPPORTS_LTO_CLANG
+ 	select ARCH_SUPPORTS_LTO_CLANG_THIN
+ 	select ARCH_SUPPORTS_AUTOFDO_CLANG
++	select ARCH_SUPPORTS_PROPELLER_CLANG    if X86_64
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF		if X86_CMPXCHG64
+ 	select ARCH_USE_MEMTEST
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+index f2051644de94..35d19b4e6361 100644
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -17,6 +17,9 @@
+ #	(see scripts/Makefile.lib size_append)
+ #	compressed vmlinux.bin.all + u32 size of vmlinux.bin.all
+ 
++# Do not run Propeller optimizer for early boot code.
++PROPELLER_PROFILE              := n
++
+ targets := vmlinux vmlinux.bin vmlinux.bin.gz vmlinux.bin.bz2 vmlinux.bin.lzma \
+ 	vmlinux.bin.xz vmlinux.bin.lzo vmlinux.bin.lz4 vmlinux.bin.zst
+ 
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index 3509afc6a672..167dd05323cf 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -440,6 +440,10 @@ SECTIONS
+ 
+ 	STABS_DEBUG
+ 	DWARF_DEBUG
++#ifdef CONFIG_PROPELLER_CLANG
++	.llvm_bb_addr_map : { *(.llvm_bb_addr_map) }
++#endif
++
+ 	ELF_DETAILS
+ 
+ 	DISCARDS
+diff --git a/arch/x86/platform/efi/Makefile b/arch/x86/platform/efi/Makefile
+index 543df9a1379d..e0c846b6d636 100644
+--- a/arch/x86/platform/efi/Makefile
++++ b/arch/x86/platform/efi/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ KASAN_SANITIZE := n
+ GCOV_PROFILE := n
++PROPELLER_PROFILE := n
+ 
+ obj-$(CONFIG_EFI) 		+= memmap.o quirks.o efi.o efi_$(BITS).o \
+ 				   efi_stub_$(BITS).o
+diff --git a/drivers/firmware/efi/libstub/Makefile b/drivers/firmware/efi/libstub/Makefile
+index 06f0428a723c..55ca5250df1a 100644
+--- a/drivers/firmware/efi/libstub/Makefile
++++ b/drivers/firmware/efi/libstub/Makefile
+@@ -56,6 +56,8 @@ KBUILD_CFLAGS := $(filter-out $(CC_FLAGS_CFI), $(KBUILD_CFLAGS))
+ # disable LTO
+ KBUILD_CFLAGS := $(filter-out $(CC_FLAGS_LTO), $(KBUILD_CFLAGS))
+ 
++PROPELLER_PROFILE		:= n
++
+ lib-y				:= efi-stub-helper.o gop.o secureboot.o tpm.o \
+ 				   file.o mem.o random.o randomalloc.o pci.o \
+ 				   skip_spaces.o lib-cmdline.o lib-ctype.o \
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 7d9dc8a3c046..ea3d8bf51edd 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -95,14 +95,14 @@
+  * With LTO_CLANG, the linker also splits sections by default, so we need
+  * these macros to combine the sections during the final link.
+  *
+- * With LTO_CLANG, the linker also splits sections by default, so we need
+- * these macros to combine the sections during the final link.
++ * CONFIG_AUTOFD_CLANG and CONFIG_PROPELLER_CLANG will also split text sections
++ * and cluster them in the linking time.
+  *
+  * RODATA_MAIN is not used because existing code already defines .rodata.x
+  * sections to be brought in with rodata.
+  */
+ #if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG) || \
+-defined(CONFIG_AUTOFDO_CLANG)
++defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
+ #define TEXT_MAIN .text .text.[0-9a-zA-Z_]*
+ #else
+ #define TEXT_MAIN .text
+@@ -612,7 +612,7 @@ defined(CONFIG_AUTOFDO_CLANG)
+  * first when in these builds.
+  */
+ #if defined(CONFIG_LD_DEAD_CODE_DATA_ELIMINATION) || defined(CONFIG_LTO_CLANG) || \
+-defined(CONFIG_AUTOFDO_CLANG)
++defined(CONFIG_AUTOFDO_CLANG) || defined(CONFIG_PROPELLER_CLANG)
+ #define TEXT_TEXT							\
+ 		*(.text.asan.* .text.tsan.*)				\
+ 		*(.text.unknown .text.unknown.*)			\
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index c2cab5adaf25..e239fa709c20 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -219,6 +219,16 @@ _c_flags += $(if $(patsubst n%,, \
+ 	$(CFLAGS_AUTOFDO_CLANG))
+ endif
+ 
++#
++# Enable Clang's Propeller build flags for a file or directory depending on
++# variables AUTOFDO_PROPELLER_obj.o and PROPELLER_PROFILE.
++#
++ifeq ($(CONFIG_PROPELLER_CLANG),y)
++_c_flags += $(if $(patsubst n%,, \
++	$(AUTOFDO_PROFILE_$(basetarget).o)$(AUTOFDO_PROFILE)$(PGO_PROFILE)$(PROPELLER_PROFILE)y), \
++	$(CFLAGS_PROPELLER_CLANG))
++endif
++
+ # $(src) for including checkin headers from generated source files
+ # $(obj) for including generated headers from checkin source files
+ ifeq ($(KBUILD_EXTMOD),)
+diff --git a/scripts/Makefile.propeller b/scripts/Makefile.propeller
+new file mode 100644
+index 000000000000..0c9318be5f64
+--- /dev/null
++++ b/scripts/Makefile.propeller
+@@ -0,0 +1,25 @@
++# SPDX-License-Identifier: GPL-2.0
++
++# Enable available and selected Clang Propeller features.
++# Propeller required debug information to embed module names in the profiles.
++CFLAGS_PROPELLER_CLANG := -fdebug-info-for-profiling
++
++ifdef CLANG_PROPELLER_PROFILE_PREFIX
++CFLAGS_PROPELLER_CLANG += -fbasic-block-sections=list=$(CLANG_PROPELLER_PROFILE_PREFIX)_cc_profile.txt -ffunction-sections
++KBUILD_LDFLAGS += --symbol-ordering-file=$(CLANG_PROPELLER_PROFILE_PREFIX)_ld_profile.txt --no-warn-symbol-ordering
++else
++CFLAGS_PROPELLER_CLANG += -fbasic-block-sections=labels
++endif
++
++ifdef CONFIG_LTO_CLANG
++ifdef CONFIG_LTO_CLANG_THIN
++ifdef CLANG_PROPELLER_PROFILE_PREFIX
++KBUILD_LDFLAGS += --lto-basic-block-sections=$(CLANG_PROPELLER_PROFILE_PREFIX)_cc_profile.txt
++else
++KBUILD_LDFLAGS += --lto-basic-block-sections=labels
++endif
++endif
++else
++endif
++
++export CFLAGS_PROPELLER_CLANG
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 254913498c3c..7cea8ba53cf4 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -4489,6 +4489,7 @@ static int validate_ibt(struct objtool_file *file)
+ 		    !strcmp(sec->name, "__mcount_loc")			||
+ 		    !strcmp(sec->name, ".kcfi_traps")			||
+ 		    !strcmp(sec->name, ".llvm.call-graph-profile")	||
++		    !strcmp(sec->name, ".llvm_bb_addr_map")		||
+ 		    strstr(sec->name, "__patchable_function_entries"))
+ 			continue;
+ 
+-- 
+2.46.0.rc1
+
