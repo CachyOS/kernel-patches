@@ -1,0 +1,568 @@
+From 9473eff38f79f125d7698d9725bca3129beb83d9 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Sat, 3 Aug 2024 09:33:55 +0200
+Subject: [PATCH 07/12] intel-pstate
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/include/asm/topology.h  |  19 ++-
+ arch/x86/kernel/cpu/aperfmperf.c |  91 +++++++++++++-
+ arch/x86/kernel/itmt.c           |  12 +-
+ arch/x86/kernel/smpboot.c        |  10 +-
+ drivers/cpufreq/intel_pstate.c   | 210 ++++++++++++++++++++++++++++++-
+ 5 files changed, 326 insertions(+), 16 deletions(-)
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index abe3a8f22cbd..e5b203fe7956 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -235,8 +235,6 @@ struct pci_bus;
+ int x86_pci_root_bus_node(int bus);
+ void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ 
+-extern bool x86_topology_update;
+-
+ #ifdef CONFIG_SCHED_MC_PRIO
+ #include <asm/percpu.h>
+ 
+@@ -282,11 +280,28 @@ static inline long arch_scale_freq_capacity(int cpu)
+ }
+ #define arch_scale_freq_capacity arch_scale_freq_capacity
+ 
++bool arch_enable_hybrid_capacity_scale(void);
++void arch_set_cpu_capacity(int cpu, unsigned long cap, unsigned long base_cap,
++			   unsigned long max_freq, unsigned long base_freq);
++
++unsigned long arch_scale_cpu_capacity(int cpu);
++#define arch_scale_cpu_capacity arch_scale_cpu_capacity
++
+ extern void arch_set_max_freq_ratio(bool turbo_disabled);
+ extern void freq_invariance_set_perf_ratio(u64 ratio, bool turbo_disabled);
++
++void arch_rebuild_sched_domains(void);
+ #else
++static inline bool arch_enable_hybrid_capacity_scale(void) { return false; }
++static inline void arch_set_cpu_capacity(int cpu, unsigned long cap,
++					 unsigned long base_cap,
++					 unsigned long max_freq,
++					 unsigned long base_freq) { }
++
+ static inline void arch_set_max_freq_ratio(bool turbo_disabled) { }
+ static inline void freq_invariance_set_perf_ratio(u64 ratio, bool turbo_disabled) { }
++
++static inline void arch_rebuild_sched_domains(void) { }
+ #endif
+ 
+ extern void arch_scale_freq_tick(void);
+diff --git a/arch/x86/kernel/cpu/aperfmperf.c b/arch/x86/kernel/cpu/aperfmperf.c
+index b3fa61d45352..0b002b181a01 100644
+--- a/arch/x86/kernel/cpu/aperfmperf.c
++++ b/arch/x86/kernel/cpu/aperfmperf.c
+@@ -300,6 +300,8 @@ static void register_freq_invariance_syscore_ops(void)
+ static inline void register_freq_invariance_syscore_ops(void) {}
+ #endif
+ 
++static DEFINE_STATIC_KEY_FALSE(arch_hybrid_cap_scale_key);
++
+ static void freq_invariance_enable(void)
+ {
+ 	if (static_branch_unlikely(&arch_scale_freq_key)) {
+@@ -332,6 +334,7 @@ static void disable_freq_invariance_workfn(struct work_struct *work)
+ 	int cpu;
+ 
+ 	static_branch_disable(&arch_scale_freq_key);
++	static_branch_disable(&arch_hybrid_cap_scale_key);
+ 
+ 	/*
+ 	 * Set arch_freq_scale to a default value on all cpus
+@@ -347,9 +350,90 @@ static DECLARE_WORK(disable_freq_invariance_work,
+ DEFINE_PER_CPU(unsigned long, arch_freq_scale) = SCHED_CAPACITY_SCALE;
+ EXPORT_PER_CPU_SYMBOL_GPL(arch_freq_scale);
+ 
++struct arch_hybrid_cpu_scale {
++	unsigned long capacity;
++	unsigned long freq_ratio;
++};
++
++static struct arch_hybrid_cpu_scale __percpu *arch_cpu_scale;
++
++/**
++ * arch_enable_hybrid_capacity_scale - Enable hybrid CPU capacity scaling
++ *
++ * Allocate memory for per-CPU data used by hybrid CPU capacity scaling,
++ * initialize it and set the static key controlling its code paths.
++ *
++ * Must be called before arch_set_cpu_capacity().
++ */
++bool arch_enable_hybrid_capacity_scale(void)
++{
++	int cpu;
++
++	if (!arch_scale_freq_invariant())
++		return false;
++
++	if (static_branch_unlikely(&arch_hybrid_cap_scale_key)) {
++		WARN_ON_ONCE(1);
++		return false;
++	}
++	arch_cpu_scale = alloc_percpu(struct arch_hybrid_cpu_scale);
++	if (!arch_cpu_scale)
++		return false;
++
++	for_each_possible_cpu(cpu) {
++		per_cpu_ptr(arch_cpu_scale, cpu)->capacity = SCHED_CAPACITY_SCALE;
++		per_cpu_ptr(arch_cpu_scale, cpu)->freq_ratio = arch_max_freq_ratio;
++	}
++
++	static_branch_enable(&arch_hybrid_cap_scale_key);
++
++	pr_info("Hybrid CPU capacity scaling enabled\n");
++
++	return true;
++}
++
++/**
++ * arch_set_cpu_capacity - Set scale-invariance parameters for a CPU
++ * @cpu: Target CPU.
++ * @cap: Capacity of @cpu, relative to @base_cap, at its maximum frequency.
++ * @base_cap: System-wide maximum CPU capacity.
++ * @max_freq: Frequency of @cpu corresponding to @cap.
++ * @base_freq: Frequency of @cpu at which APERF and MPERF count.
++ *
++ * The units in which @cap and @base_cap are expressed do not matter, so long
++ * as they are consistent, because the former is effectively divided by the
++ * latter.  Analogously for @max_freq and @base_freq.
++ *
++ * After calling this function for all CPUs, call arch_rebuild_sched_domains()
++ * to let the scheduler know that capacity-aware scheduling can be used going
++ * forward.
++ */
++void arch_set_cpu_capacity(int cpu, unsigned long cap, unsigned long base_cap,
++			   unsigned long max_freq, unsigned long base_freq)
++{
++	if (static_branch_likely(&arch_hybrid_cap_scale_key)) {
++		WRITE_ONCE(per_cpu_ptr(arch_cpu_scale, cpu)->capacity,
++			   div_u64(cap << SCHED_CAPACITY_SHIFT, base_cap));
++		WRITE_ONCE(per_cpu_ptr(arch_cpu_scale, cpu)->freq_ratio,
++			   div_u64(max_freq << SCHED_CAPACITY_SHIFT, base_freq));
++	} else {
++		WARN_ON_ONCE(1);
++	}
++}
++
++unsigned long arch_scale_cpu_capacity(int cpu)
++{
++	if (static_branch_unlikely(&arch_hybrid_cap_scale_key))
++		return READ_ONCE(per_cpu_ptr(arch_cpu_scale, cpu)->capacity);
++
++	return SCHED_CAPACITY_SCALE;
++}
++EXPORT_SYMBOL_GPL(arch_scale_cpu_capacity);
++
+ static void scale_freq_tick(u64 acnt, u64 mcnt)
+ {
+ 	u64 freq_scale;
++	u64 freq_ratio;
+ 
+ 	if (!arch_scale_freq_invariant())
+ 		return;
+@@ -357,7 +441,12 @@ static void scale_freq_tick(u64 acnt, u64 mcnt)
+ 	if (check_shl_overflow(acnt, 2*SCHED_CAPACITY_SHIFT, &acnt))
+ 		goto error;
+ 
+-	if (check_mul_overflow(mcnt, arch_max_freq_ratio, &mcnt) || !mcnt)
++	if (static_branch_unlikely(&arch_hybrid_cap_scale_key))
++		freq_ratio = READ_ONCE(this_cpu_ptr(arch_cpu_scale)->freq_ratio);
++	else
++		freq_ratio = arch_max_freq_ratio;
++
++	if (check_mul_overflow(mcnt, freq_ratio, &mcnt) || !mcnt)
+ 		goto error;
+ 
+ 	freq_scale = div64_u64(acnt, mcnt);
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 9a7c03d47861..af2f60c094a8 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -54,10 +54,8 @@ static int sched_itmt_update_handler(struct ctl_table *table, int write,
+ 	old_sysctl = sysctl_sched_itmt_enabled;
+ 	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+ 
+-	if (!ret && write && old_sysctl != sysctl_sched_itmt_enabled) {
+-		x86_topology_update = true;
+-		rebuild_sched_domains();
+-	}
++	if (!ret && write && old_sysctl != sysctl_sched_itmt_enabled)
++		arch_rebuild_sched_domains();
+ 
+ 	mutex_unlock(&itmt_update_mutex);
+ 
+@@ -114,8 +112,7 @@ int sched_set_itmt_support(void)
+ 
+ 	sysctl_sched_itmt_enabled = 1;
+ 
+-	x86_topology_update = true;
+-	rebuild_sched_domains();
++	arch_rebuild_sched_domains();
+ 
+ 	mutex_unlock(&itmt_update_mutex);
+ 
+@@ -150,8 +147,7 @@ void sched_clear_itmt_support(void)
+ 	if (sysctl_sched_itmt_enabled) {
+ 		/* disable sched_itmt if we are no longer ITMT capable */
+ 		sysctl_sched_itmt_enabled = 0;
+-		x86_topology_update = true;
+-		rebuild_sched_domains();
++		arch_rebuild_sched_domains();
+ 	}
+ 
+ 	mutex_unlock(&itmt_update_mutex);
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 0c35207320cb..90a6fb54a128 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -39,6 +39,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/cpuset.h>
+ #include <linux/init.h>
+ #include <linux/smp.h>
+ #include <linux/export.h>
+@@ -125,7 +126,7 @@ static DEFINE_PER_CPU_ALIGNED(struct mwait_cpu_dead, mwait_cpu_dead);
+ int __read_mostly __max_smt_threads = 1;
+ 
+ /* Flag to indicate if a complete sched domain rebuild is required */
+-bool x86_topology_update;
++static bool x86_topology_update;
+ 
+ int arch_update_cpu_topology(void)
+ {
+@@ -135,6 +136,13 @@ int arch_update_cpu_topology(void)
+ 	return retval;
+ }
+ 
++#ifdef CONFIG_X86_64
++void arch_rebuild_sched_domains(void) {
++	x86_topology_update = true;
++	rebuild_sched_domains();
++}
++#endif
++
+ static unsigned int smpboot_warm_reset_vector_count;
+ 
+ static inline void smpboot_setup_warm_reset_vector(unsigned long start_eip)
+diff --git a/drivers/cpufreq/intel_pstate.c b/drivers/cpufreq/intel_pstate.c
+index 1035c074f36a..56425f5dac70 100644
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@ -16,6 +16,7 @@
+ #include <linux/tick.h>
+ #include <linux/slab.h>
+ #include <linux/sched/cpufreq.h>
++#include <linux/sched/smt.h>
+ #include <linux/list.h>
+ #include <linux/cpu.h>
+ #include <linux/cpufreq.h>
+@@ -215,6 +216,7 @@ struct global_params {
+  * @hwp_req_cached:	Cached value of the last HWP Request MSR
+  * @hwp_cap_cached:	Cached value of the last HWP Capabilities MSR
+  * @last_io_update:	Last time when IO wake flag was set
++ * @capacity_perf:	Highest perf used for scale invariance
+  * @sched_flags:	Store scheduler flags for possible cross CPU update
+  * @hwp_boost_min:	Last HWP boosted min performance
+  * @suspended:		Whether or not the driver has been suspended.
+@@ -253,6 +255,7 @@ struct cpudata {
+ 	u64 hwp_req_cached;
+ 	u64 hwp_cap_cached;
+ 	u64 last_io_update;
++	unsigned int capacity_perf;
+ 	unsigned int sched_flags;
+ 	u32 hwp_boost_min;
+ 	bool suspended;
+@@ -295,6 +298,7 @@ static int hwp_mode_bdw __ro_after_init;
+ static bool per_cpu_limits __ro_after_init;
+ static bool hwp_forced __ro_after_init;
+ static bool hwp_boost __read_mostly;
++static bool hwp_is_hybrid;
+ 
+ static struct cpufreq_driver *intel_pstate_driver __read_mostly;
+ 
+@@ -933,6 +937,106 @@ static struct freq_attr *hwp_cpufreq_attrs[] = {
+ 	NULL,
+ };
+ 
++static struct cpudata *hybrid_max_perf_cpu __read_mostly;
++/*
++ * Protects hybrid_max_perf_cpu, the capacity_perf fields in struct cpudata,
++ * and the x86 arch scale-invariance information from concurrent updates.
++ */
++static DEFINE_MUTEX(hybrid_capacity_lock);
++
++static void hybrid_set_cpu_capacity(struct cpudata *cpu)
++{
++	arch_set_cpu_capacity(cpu->cpu, cpu->capacity_perf,
++			      hybrid_max_perf_cpu->capacity_perf,
++			      cpu->capacity_perf,
++			      cpu->pstate.max_pstate_physical);
++
++	pr_debug("CPU%d: perf = %u, max. perf = %u, base perf = %d\n", cpu->cpu,
++		 cpu->capacity_perf, hybrid_max_perf_cpu->capacity_perf,
++		 cpu->pstate.max_pstate_physical);
++}
++
++static void hybrid_clear_cpu_capacity(unsigned int cpunum)
++{
++	arch_set_cpu_capacity(cpunum, 1, 1, 1, 1);
++}
++
++static void hybrid_get_capacity_perf(struct cpudata *cpu)
++{
++	if (READ_ONCE(global.no_turbo)) {
++		cpu->capacity_perf = cpu->pstate.max_pstate_physical;
++		return;
++	}
++
++	cpu->capacity_perf = HWP_HIGHEST_PERF(READ_ONCE(cpu->hwp_cap_cached));
++}
++
++static void hybrid_set_capacity_of_cpus(void)
++{
++	int cpunum;
++
++	for_each_online_cpu(cpunum) {
++		struct cpudata *cpu = all_cpu_data[cpunum];
++
++		if (cpu)
++			hybrid_set_cpu_capacity(cpu);
++	}
++}
++
++static void hybrid_update_cpu_scaling(void)
++{
++	struct cpudata *max_perf_cpu = NULL;
++	unsigned int max_cap_perf = 0;
++	int cpunum;
++
++	for_each_online_cpu(cpunum) {
++		struct cpudata *cpu = all_cpu_data[cpunum];
++
++		if (!cpu)
++			continue;
++
++		/*
++		 * During initialization, CPU performance at full capacity needs
++		 * to be determined.
++		 */
++		if (!hybrid_max_perf_cpu)
++			hybrid_get_capacity_perf(cpu);
++
++		/*
++		 * If hybrid_max_perf_cpu is not NULL at this point, it is
++		 * being replaced, so don't take it into account when looking
++		 * for the new one.
++		 */
++		if (cpu == hybrid_max_perf_cpu)
++			continue;
++
++		if (cpu->capacity_perf > max_cap_perf) {
++			max_cap_perf = cpu->capacity_perf;
++			max_perf_cpu = cpu;
++		}
++	}
++
++	if (max_perf_cpu) {
++		hybrid_max_perf_cpu = max_perf_cpu;
++		hybrid_set_capacity_of_cpus();
++	} else {
++		pr_info("Found no CPUs with nonzero maximum performance\n");
++		/* Revert to the flat CPU capacity structure. */
++		for_each_online_cpu(cpunum)
++			hybrid_clear_cpu_capacity(cpunum);
++	}
++}
++
++static void hybrid_init_cpu_scaling(void)
++{
++	mutex_lock(&hybrid_capacity_lock);
++
++	hybrid_max_perf_cpu = NULL;
++	hybrid_update_cpu_scaling();
++
++	mutex_unlock(&hybrid_capacity_lock);
++}
++
+ static void __intel_pstate_get_hwp_cap(struct cpudata *cpu)
+ {
+ 	u64 cap;
+@@ -961,6 +1065,43 @@ static void intel_pstate_get_hwp_cap(struct cpudata *cpu)
+ 	}
+ }
+ 
++static void hybrid_update_capacity(struct cpudata *cpu)
++{
++	unsigned int max_cap_perf;
++
++	mutex_lock(&hybrid_capacity_lock);
++
++	if (!hybrid_max_perf_cpu)
++		goto unlock;
++
++	/*
++	 * The maximum performance of the CPU may have changed, but assume
++	 * that the performance of the other CPUs has not changed.
++	 */
++	max_cap_perf = hybrid_max_perf_cpu->capacity_perf;
++
++	intel_pstate_get_hwp_cap(cpu);
++
++	hybrid_get_capacity_perf(cpu);
++	/* Should hybrid_max_perf_cpu be replaced by this CPU? */
++	if (cpu->capacity_perf > max_cap_perf) {
++		hybrid_max_perf_cpu = cpu;
++		hybrid_set_capacity_of_cpus();
++		goto unlock;
++	}
++
++	/* If this CPU is hybrid_max_perf_cpu, should it be replaced? */
++	if (cpu == hybrid_max_perf_cpu && cpu->capacity_perf < max_cap_perf) {
++		hybrid_update_cpu_scaling();
++		goto unlock;
++	}
++
++	hybrid_set_cpu_capacity(cpu);
++
++unlock:
++	mutex_unlock(&hybrid_capacity_lock);
++}
++
+ static void intel_pstate_hwp_set(unsigned int cpu)
+ {
+ 	struct cpudata *cpu_data = all_cpu_data[cpu];
+@@ -1069,6 +1210,22 @@ static void intel_pstate_hwp_offline(struct cpudata *cpu)
+ 		value |= HWP_ENERGY_PERF_PREFERENCE(HWP_EPP_POWERSAVE);
+ 
+ 	wrmsrl_on_cpu(cpu->cpu, MSR_HWP_REQUEST, value);
++
++	mutex_lock(&hybrid_capacity_lock);
++
++	if (!hybrid_max_perf_cpu) {
++		mutex_unlock(&hybrid_capacity_lock);
++
++		return;
++	}
++
++	if (hybrid_max_perf_cpu == cpu)
++		hybrid_update_cpu_scaling();
++
++	mutex_unlock(&hybrid_capacity_lock);
++
++	/* Reset the capacity of the CPU going offline to the initial value. */
++	hybrid_clear_cpu_capacity(cpu->cpu);
+ }
+ 
+ #define POWER_CTL_EE_ENABLE	1
+@@ -1164,21 +1321,41 @@ static void __intel_pstate_update_max_freq(struct cpudata *cpudata,
+ static void intel_pstate_update_limits(unsigned int cpu)
+ {
+ 	struct cpufreq_policy *policy = cpufreq_cpu_acquire(cpu);
++	struct cpudata *cpudata;
+ 
+ 	if (!policy)
+ 		return;
+ 
+-	__intel_pstate_update_max_freq(all_cpu_data[cpu], policy);
++	cpudata = all_cpu_data[cpu];
++
++	__intel_pstate_update_max_freq(cpudata, policy);
++
++	/* Prevent the driver from being unregistered now. */
++	mutex_lock(&intel_pstate_driver_lock);
+ 
+ 	cpufreq_cpu_release(policy);
++
++	hybrid_update_capacity(cpudata);
++
++	mutex_unlock(&intel_pstate_driver_lock);
+ }
+ 
+ static void intel_pstate_update_limits_for_all(void)
+ {
+ 	int cpu;
+ 
+-	for_each_possible_cpu(cpu)
+-		intel_pstate_update_limits(cpu);
++	for_each_possible_cpu(cpu) {
++		struct cpufreq_policy *policy = cpufreq_cpu_acquire(cpu);
++
++		if (!policy)
++			continue;
++
++		__intel_pstate_update_max_freq(all_cpu_data[cpu], policy);
++
++		cpufreq_cpu_release(policy);
++	}
++
++	hybrid_init_cpu_scaling();
+ }
+ 
+ /************************** sysfs begin ************************/
+@@ -1617,6 +1794,13 @@ static void intel_pstate_notify_work(struct work_struct *work)
+ 		__intel_pstate_update_max_freq(cpudata, policy);
+ 
+ 		cpufreq_cpu_release(policy);
++
++		/*
++		 * The driver will not be unregistered while this function is
++		 * running, so update the capacity without acquiring the driver
++		 * lock.
++		 */
++		hybrid_update_capacity(cpudata);
+ 	}
+ 
+ 	wrmsrl_on_cpu(cpudata->cpu, MSR_HWP_STATUS, 0);
+@@ -2018,8 +2202,10 @@ static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
+ 
+ 		if (pstate_funcs.get_cpu_scaling) {
+ 			cpu->pstate.scaling = pstate_funcs.get_cpu_scaling(cpu->cpu);
+-			if (cpu->pstate.scaling != perf_ctl_scaling)
++			if (cpu->pstate.scaling != perf_ctl_scaling) {
+ 				intel_pstate_hybrid_hwp_adjust(cpu);
++				hwp_is_hybrid = true;
++			}
+ 		} else {
+ 			cpu->pstate.scaling = perf_ctl_scaling;
+ 		}
+@@ -2687,6 +2873,8 @@ static int intel_pstate_cpu_online(struct cpufreq_policy *policy)
+ 		 */
+ 		intel_pstate_hwp_reenable(cpu);
+ 		cpu->suspended = false;
++
++		hybrid_update_capacity(cpu);
+ 	}
+ 
+ 	return 0;
+@@ -3129,6 +3317,20 @@ static int intel_pstate_register_driver(struct cpufreq_driver *driver)
+ 
+ 	global.min_perf_pct = min_perf_pct_min();
+ 
++	/*
++	 * On hybrid systems, use asym capacity instead of ITMT, but because
++	 * the capacity of SMT threads is not deterministic even approximately,
++	 * do not do that when SMT is in use.
++	 */
++	if (hwp_is_hybrid && !sched_smt_active() &&
++	    arch_enable_hybrid_capacity_scale()) {
++		sched_clear_itmt_support();
++
++		hybrid_init_cpu_scaling();
++
++		arch_rebuild_sched_domains();
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.46.0.rc1
+

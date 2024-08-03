@@ -1,7 +1,7 @@
-From 4041ba345a45e562c35f6b4d797a35e8f33f21d1 Mon Sep 17 00:00:00 2001
+From 06c02d91fcfeb0fde264f03f0e364161b11a678d Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:46:20 +0200
-Subject: [PATCH 01/11] amd-pstate
+Date: Sat, 3 Aug 2024 09:32:45 +0200
+Subject: [PATCH 01/12] amd-pstate
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -11,11 +11,10 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  arch/x86/kernel/cpu/scattered.c             |   1 +
  drivers/cpufreq/Kconfig.x86                 |   1 +
  drivers/cpufreq/acpi-cpufreq.c              |   3 +-
- drivers/cpufreq/amd-pstate-ut.c             |  12 +-
- drivers/cpufreq/amd-pstate.c                | 350 ++++++++++++++------
+ drivers/cpufreq/amd-pstate.c                | 307 ++++++++++++++------
  drivers/cpufreq/amd-pstate.h                |   2 +
  drivers/cpufreq/cpufreq.c                   |  11 +-
- 10 files changed, 281 insertions(+), 120 deletions(-)
+ 9 files changed, 251 insertions(+), 95 deletions(-)
 
 diff --git a/Documentation/admin-guide/pm/amd-pstate.rst b/Documentation/admin-guide/pm/amd-pstate.rst
 index 1e0d101b020a..d0324d44f548 100644
@@ -123,54 +122,8 @@ index 4ac3a35dcd98..f4f8587c4ea0 100644
  
  	return 0;
  }
-diff --git a/drivers/cpufreq/amd-pstate-ut.c b/drivers/cpufreq/amd-pstate-ut.c
-index fc275d41d51e..66b73c308ce6 100644
---- a/drivers/cpufreq/amd-pstate-ut.c
-+++ b/drivers/cpufreq/amd-pstate-ut.c
-@@ -202,6 +202,7 @@ static void amd_pstate_ut_check_freq(u32 index)
- 	int cpu = 0;
- 	struct cpufreq_policy *policy = NULL;
- 	struct amd_cpudata *cpudata = NULL;
-+	u32 nominal_freq_khz;
- 
- 	for_each_possible_cpu(cpu) {
- 		policy = cpufreq_cpu_get(cpu);
-@@ -209,13 +210,14 @@ static void amd_pstate_ut_check_freq(u32 index)
- 			break;
- 		cpudata = policy->driver_data;
- 
--		if (!((cpudata->max_freq >= cpudata->nominal_freq) &&
--			(cpudata->nominal_freq > cpudata->lowest_nonlinear_freq) &&
-+		nominal_freq_khz = cpudata->nominal_freq*1000;
-+		if (!((cpudata->max_freq >= nominal_freq_khz) &&
-+			(nominal_freq_khz > cpudata->lowest_nonlinear_freq) &&
- 			(cpudata->lowest_nonlinear_freq > cpudata->min_freq) &&
- 			(cpudata->min_freq > 0))) {
- 			amd_pstate_ut_cases[index].result = AMD_PSTATE_UT_RESULT_FAIL;
- 			pr_err("%s cpu%d max=%d >= nominal=%d > lowest_nonlinear=%d > min=%d > 0, the formula is incorrect!\n",
--				__func__, cpu, cpudata->max_freq, cpudata->nominal_freq,
-+				__func__, cpu, cpudata->max_freq, nominal_freq_khz,
- 				cpudata->lowest_nonlinear_freq, cpudata->min_freq);
- 			goto skip_test;
- 		}
-@@ -229,13 +231,13 @@ static void amd_pstate_ut_check_freq(u32 index)
- 
- 		if (cpudata->boost_supported) {
- 			if ((policy->max == cpudata->max_freq) ||
--					(policy->max == cpudata->nominal_freq))
-+					(policy->max == nominal_freq_khz))
- 				amd_pstate_ut_cases[index].result = AMD_PSTATE_UT_RESULT_PASS;
- 			else {
- 				amd_pstate_ut_cases[index].result = AMD_PSTATE_UT_RESULT_FAIL;
- 				pr_err("%s cpu%d policy_max=%d should be equal cpu_max=%d or cpu_nominal=%d !\n",
- 					__func__, cpu, policy->max, cpudata->max_freq,
--					cpudata->nominal_freq);
-+					nominal_freq_khz);
- 				goto skip_test;
- 			}
- 		} else {
 diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
-index 9ad62dbe8bfb..804fab4ebb26 100644
+index a092b13ffbc2..804fab4ebb26 100644
 --- a/drivers/cpufreq/amd-pstate.c
 +++ b/drivers/cpufreq/amd-pstate.c
 @@ -51,6 +51,7 @@
@@ -215,32 +168,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		if (!cppc_req_cached) {
  			epp = rdmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ,
  					&cppc_req_cached);
-@@ -247,12 +239,32 @@ static int amd_pstate_get_energy_pref_index(struct amd_cpudata *cpudata)
- 	return index;
- }
- 
-+static void pstate_update_perf(struct amd_cpudata *cpudata, u32 min_perf,
-+			       u32 des_perf, u32 max_perf, bool fast_switch)
-+{
-+	if (fast_switch)
-+		wrmsrl(MSR_AMD_CPPC_REQ, READ_ONCE(cpudata->cppc_req_cached));
-+	else
-+		wrmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ,
-+			      READ_ONCE(cpudata->cppc_req_cached));
-+}
-+
-+DEFINE_STATIC_CALL(amd_pstate_update_perf, pstate_update_perf);
-+
-+static inline void amd_pstate_update_perf(struct amd_cpudata *cpudata,
-+					  u32 min_perf, u32 des_perf,
-+					  u32 max_perf, bool fast_switch)
-+{
-+	static_call(amd_pstate_update_perf)(cpudata, min_perf, des_perf,
-+					    max_perf, fast_switch);
-+}
-+
- static int amd_pstate_set_epp(struct amd_cpudata *cpudata, u32 epp)
- {
+@@ -272,7 +264,7 @@ static int amd_pstate_set_epp(struct amd_cpudata *cpudata, u32 epp)
  	int ret;
  	struct cppc_perf_ctrls perf_ctrls;
  
@@ -249,17 +177,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		u64 value = READ_ONCE(cpudata->cppc_req_cached);
  
  		value &= ~GENMASK_ULL(31, 24);
-@@ -263,6 +275,9 @@ static int amd_pstate_set_epp(struct amd_cpudata *cpudata, u32 epp)
- 		if (!ret)
- 			cpudata->epp_cached = epp;
- 	} else {
-+		amd_pstate_update_perf(cpudata, cpudata->min_limit_perf, 0U,
-+					     cpudata->max_limit_perf, false);
-+
- 		perf_ctrls.energy_perf = epp;
- 		ret = cppc_set_epp_perf(cpudata->cpu, &perf_ctrls, 1);
- 		if (ret) {
-@@ -281,10 +296,8 @@ static int amd_pstate_set_energy_pref_index(struct amd_cpudata *cpudata,
+@@ -304,10 +296,8 @@ static int amd_pstate_set_energy_pref_index(struct amd_cpudata *cpudata,
  	int epp = -EINVAL;
  	int ret;
  
@@ -272,41 +190,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  
  	if (epp == -EINVAL)
  		epp = epp_values[pref_index];
-@@ -452,16 +465,6 @@ static inline int amd_pstate_init_perf(struct amd_cpudata *cpudata)
- 	return static_call(amd_pstate_init_perf)(cpudata);
- }
- 
--static void pstate_update_perf(struct amd_cpudata *cpudata, u32 min_perf,
--			       u32 des_perf, u32 max_perf, bool fast_switch)
--{
--	if (fast_switch)
--		wrmsrl(MSR_AMD_CPPC_REQ, READ_ONCE(cpudata->cppc_req_cached));
--	else
--		wrmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ,
--			      READ_ONCE(cpudata->cppc_req_cached));
--}
--
- static void cppc_update_perf(struct amd_cpudata *cpudata,
- 			     u32 min_perf, u32 des_perf,
- 			     u32 max_perf, bool fast_switch)
-@@ -475,16 +478,6 @@ static void cppc_update_perf(struct amd_cpudata *cpudata,
- 	cppc_set_perf(cpudata->cpu, &perf_ctrls);
- }
- 
--DEFINE_STATIC_CALL(amd_pstate_update_perf, pstate_update_perf);
--
--static inline void amd_pstate_update_perf(struct amd_cpudata *cpudata,
--					  u32 min_perf, u32 des_perf,
--					  u32 max_perf, bool fast_switch)
--{
--	static_call(amd_pstate_update_perf)(cpudata, min_perf, des_perf,
--					    max_perf, fast_switch);
--}
--
- static inline bool amd_pstate_sample(struct amd_cpudata *cpudata)
- {
- 	u64 aperf, mperf, tsc;
-@@ -521,7 +514,10 @@ static inline bool amd_pstate_sample(struct amd_cpudata *cpudata)
+@@ -524,7 +514,10 @@ static inline bool amd_pstate_sample(struct amd_cpudata *cpudata)
  static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
  			      u32 des_perf, u32 max_perf, bool fast_switch, int gov_flags)
  {
@@ -317,7 +201,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	u64 value = prev;
  
  	min_perf = clamp_t(unsigned long, min_perf, cpudata->min_limit_perf,
-@@ -530,6 +526,9 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
+@@ -533,6 +526,9 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
  			cpudata->max_limit_perf);
  	des_perf = clamp_t(unsigned long, des_perf, min_perf, max_perf);
  
@@ -327,7 +211,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	if ((cppc_state == AMD_PSTATE_GUIDED) && (gov_flags & CPUFREQ_GOV_DYNAMIC_SWITCHING)) {
  		min_perf = des_perf;
  		des_perf = 0;
-@@ -541,6 +540,10 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
+@@ -544,6 +540,10 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
  	value &= ~AMD_CPPC_DES_PERF(~0L);
  	value |= AMD_CPPC_DES_PERF(des_perf);
  
@@ -338,7 +222,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	value &= ~AMD_CPPC_MAX_PERF(~0L);
  	value |= AMD_CPPC_MAX_PERF(max_perf);
  
-@@ -651,10 +654,9 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
+@@ -654,10 +654,9 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
  				   unsigned long capacity)
  {
  	unsigned long max_perf, min_perf, des_perf,
@@ -350,7 +234,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  
  	if (policy->min != cpudata->min_limit_freq || policy->max != cpudata->max_limit_freq)
  		amd_pstate_update_min_max_limit(policy);
-@@ -662,7 +664,6 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
+@@ -665,7 +664,6 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
  
  	cap_perf = READ_ONCE(cpudata->highest_perf);
  	lowest_nonlinear_perf = READ_ONCE(cpudata->lowest_nonlinear_perf);
@@ -358,7 +242,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  
  	des_perf = cap_perf;
  	if (target_perf < capacity)
-@@ -680,51 +681,111 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
+@@ -683,51 +681,111 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
  		max_perf = min_perf;
  
  	des_perf = clamp_t(unsigned long, des_perf, min_perf, max_perf);
@@ -454,7 +338,8 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
 -		return;
 +	return ret;
 +}
-+
+ 
+-	cpudata->boost_supported = true;
 +static int amd_pstate_init_boost_support(struct amd_cpudata *cpudata)
 +{
 +	u64 boost_val;
@@ -469,8 +354,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
 +		ret = 0;
 +		goto exit_err;
 +	}
- 
--	cpudata->boost_supported = true;
++
 +	/* at least one CPU supports CPB, even if others fail later on to set up */
  	current_pstate_driver->boost_enabled = true;
 +
@@ -492,7 +376,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  }
  
  static void amd_perf_ctl_reset(unsigned int cpu)
-@@ -753,7 +814,7 @@ static int amd_pstate_get_highest_perf(int cpu, u32 *highest_perf)
+@@ -756,7 +814,7 @@ static int amd_pstate_get_highest_perf(int cpu, u32 *highest_perf)
  {
  	int ret;
  
@@ -501,7 +385,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		u64 cap1;
  
  		ret = rdmsrl_safe_on_cpu(cpu, MSR_AMD_CPPC_CAP1, &cap1);
-@@ -849,8 +910,12 @@ static u32 amd_pstate_get_transition_delay_us(unsigned int cpu)
+@@ -852,8 +910,12 @@ static u32 amd_pstate_get_transition_delay_us(unsigned int cpu)
  	u32 transition_delay_ns;
  
  	transition_delay_ns = cppc_get_transition_latency(cpu);
@@ -516,7 +400,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  
  	return transition_delay_ns / NSEC_PER_USEC;
  }
-@@ -921,12 +986,30 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
+@@ -924,12 +986,30 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
  	WRITE_ONCE(cpudata->nominal_freq, nominal_freq);
  	WRITE_ONCE(cpudata->max_freq, max_freq);
  
@@ -548,7 +432,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	struct device *dev;
  	struct amd_cpudata *cpudata;
  
-@@ -955,18 +1038,12 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+@@ -958,18 +1038,12 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
  	if (ret)
  		goto free_cpudata1;
  
@@ -571,7 +455,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  
  	policy->cpuinfo.transition_latency = amd_pstate_get_transition_latency(policy->cpu);
  	policy->transition_delay_us = amd_pstate_get_transition_delay_us(policy->cpu);
-@@ -977,10 +1054,12 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+@@ -980,10 +1054,12 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
  	policy->cpuinfo.min_freq = min_freq;
  	policy->cpuinfo.max_freq = max_freq;
  
@@ -585,7 +469,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		policy->fast_switch_possible = true;
  
  	ret = freq_qos_add_request(&policy->constraints, &cpudata->req[0],
-@@ -1002,7 +1081,6 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+@@ -1005,7 +1081,6 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
  
  	policy->driver_data = cpudata;
  
@@ -593,7 +477,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	if (!current_pstate_driver->adjust_perf)
  		current_pstate_driver->adjust_perf = amd_pstate_adjust_perf;
  
-@@ -1213,7 +1291,7 @@ static int amd_pstate_change_mode_without_dvr_change(int mode)
+@@ -1216,7 +1291,7 @@ static int amd_pstate_change_mode_without_dvr_change(int mode)
  
  	cppc_state = mode;
  
@@ -602,7 +486,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		return 0;
  
  	for_each_present_cpu(cpu) {
-@@ -1386,7 +1464,7 @@ static bool amd_pstate_acpi_pm_profile_undefined(void)
+@@ -1389,7 +1464,7 @@ static bool amd_pstate_acpi_pm_profile_undefined(void)
  
  static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
  {
@@ -611,7 +495,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	struct amd_cpudata *cpudata;
  	struct device *dev;
  	u64 value;
-@@ -1417,17 +1495,12 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+@@ -1420,17 +1495,12 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
  	if (ret)
  		goto free_cpudata1;
  
@@ -633,7 +517,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  
  	policy->cpuinfo.min_freq = min_freq;
  	policy->cpuinfo.max_freq = max_freq;
-@@ -1436,11 +1509,13 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+@@ -1439,11 +1509,13 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
  
  	policy->driver_data = cpudata;
  
@@ -648,7 +532,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	/*
  	 * Set the policy to provide a valid fallback value in case
  	 * the default cpufreq governor is neither powersave nor performance.
-@@ -1451,7 +1526,7 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+@@ -1454,7 +1526,7 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
  	else
  		policy->policy = CPUFREQ_POLICY_POWERSAVE;
  
@@ -657,7 +541,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		ret = rdmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, &value);
  		if (ret)
  			return ret;
-@@ -1462,7 +1537,6 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+@@ -1465,7 +1537,6 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
  			return ret;
  		WRITE_ONCE(cpudata->cppc_cap1_cached, value);
  	}
@@ -665,7 +549,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  
  	return 0;
  
-@@ -1541,7 +1615,7 @@ static void amd_pstate_epp_update_limit(struct cpufreq_policy *policy)
+@@ -1544,7 +1615,7 @@ static void amd_pstate_epp_update_limit(struct cpufreq_policy *policy)
  		epp = 0;
  
  	/* Set initial EPP value */
@@ -674,7 +558,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		value &= ~GENMASK_ULL(31, 24);
  		value |= (u64)epp << 24;
  	}
-@@ -1564,6 +1638,12 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
+@@ -1567,6 +1638,12 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
  
  	amd_pstate_epp_update_limit(policy);
  
@@ -687,7 +571,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	return 0;
  }
  
-@@ -1580,7 +1660,7 @@ static void amd_pstate_epp_reenable(struct amd_cpudata *cpudata)
+@@ -1583,7 +1660,7 @@ static void amd_pstate_epp_reenable(struct amd_cpudata *cpudata)
  	value = READ_ONCE(cpudata->cppc_req_cached);
  	max_perf = READ_ONCE(cpudata->highest_perf);
  
@@ -696,7 +580,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		wrmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, value);
  	} else {
  		perf_ctrls.max_perf = max_perf;
-@@ -1614,7 +1694,7 @@ static void amd_pstate_epp_offline(struct cpufreq_policy *policy)
+@@ -1617,7 +1694,7 @@ static void amd_pstate_epp_offline(struct cpufreq_policy *policy)
  	value = READ_ONCE(cpudata->cppc_req_cached);
  
  	mutex_lock(&amd_pstate_limits_lock);
@@ -705,7 +589,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		cpudata->epp_policy = CPUFREQ_POLICY_UNKNOWN;
  
  		/* Set max perf same as min perf */
-@@ -1718,6 +1798,7 @@ static struct cpufreq_driver amd_pstate_epp_driver = {
+@@ -1721,6 +1798,7 @@ static struct cpufreq_driver amd_pstate_epp_driver = {
  	.suspend	= amd_pstate_epp_suspend,
  	.resume		= amd_pstate_epp_resume,
  	.update_limits	= amd_pstate_update_limits,
@@ -713,7 +597,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	.name		= "amd-pstate-epp",
  	.attr		= amd_pstate_epp_attr,
  };
-@@ -1741,6 +1822,46 @@ static int __init amd_pstate_set_driver(int mode_idx)
+@@ -1744,6 +1822,46 @@ static int __init amd_pstate_set_driver(int mode_idx)
  	return -EINVAL;
  }
  
@@ -760,7 +644,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  static int __init amd_pstate_init(void)
  {
  	struct device *dev_root;
-@@ -1749,6 +1870,11 @@ static int __init amd_pstate_init(void)
+@@ -1752,6 +1870,11 @@ static int __init amd_pstate_init(void)
  	if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD)
  		return -ENODEV;
  
@@ -772,7 +656,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  	if (!acpi_cpc_valid()) {
  		pr_warn_once("the _CPC object is not present in SBIOS or ACPI disabled\n");
  		return -ENODEV;
-@@ -1763,35 +1889,43 @@ static int __init amd_pstate_init(void)
+@@ -1766,35 +1889,43 @@ static int __init amd_pstate_init(void)
  	/* check if this machine need CPPC quirks */
  	dmi_check_system(amd_pstate_quirks_table);
  
@@ -826,7 +710,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  		pr_debug("AMD CPPC MSR based functionality is supported\n");
  		if (cppc_state != AMD_PSTATE_ACTIVE)
  			current_pstate_driver->adjust_perf = amd_pstate_adjust_perf;
-@@ -1805,13 +1939,15 @@ static int __init amd_pstate_init(void)
+@@ -1808,13 +1939,15 @@ static int __init amd_pstate_init(void)
  	/* enable amd pstate feature */
  	ret = amd_pstate_enable(true);
  	if (ret) {
@@ -844,7 +728,7 @@ index 9ad62dbe8bfb..804fab4ebb26 100644
  
  	dev_root = bus_get_dev_root(&cpu_subsys);
  	if (dev_root) {
-@@ -1827,6 +1963,8 @@ static int __init amd_pstate_init(void)
+@@ -1830,6 +1963,8 @@ static int __init amd_pstate_init(void)
  
  global_attr_free:
  	cpufreq_unregister_driver(current_pstate_driver);
@@ -900,10 +784,10 @@ index 9e5060b27864..270ea04fb616 100644
 -- 
 2.46.0.rc1
 
-From 0132106b255f9f40f5d78bb185cd920d8ccc25cd Mon Sep 17 00:00:00 2001
+From b8584936a7a1eb2149d0c10de2ac05ca7acc5c9f Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:46:56 +0200
-Subject: [PATCH 02/11] bbr3
+Date: Sat, 3 Aug 2024 09:32:56 +0200
+Subject: [PATCH 02/12] bbr3
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -956,7 +840,7 @@ index c0deaafebfdc..d53f042d936e 100644
  
  #define ICSK_TIME_RETRANS	1	/* Retransmit timer */
 diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 060e95b331a2..953244eefe7d 100644
+index 32815a40dea1..109b8d1ddc31 100644
 --- a/include/net/tcp.h
 +++ b/include/net/tcp.h
 @@ -375,6 +375,8 @@ static inline void tcp_dec_quickack_mode(struct sock *sk)
@@ -968,7 +852,7 @@ index 060e95b331a2..953244eefe7d 100644
  
  enum tcp_tw_status {
  	TCP_TW_SUCCESS = 0,
-@@ -778,6 +780,15 @@ static inline void tcp_fast_path_check(struct sock *sk)
+@@ -779,6 +781,15 @@ static inline void tcp_fast_path_check(struct sock *sk)
  
  u32 tcp_delack_max(const struct sock *sk);
  
@@ -984,7 +868,7 @@ index 060e95b331a2..953244eefe7d 100644
  /* Compute the actual rto_min value */
  static inline u32 tcp_rto_min(const struct sock *sk)
  {
-@@ -883,6 +894,11 @@ static inline u32 tcp_stamp_us_delta(u64 t1, u64 t0)
+@@ -884,6 +895,11 @@ static inline u32 tcp_stamp_us_delta(u64 t1, u64 t0)
  	return max_t(s64, t1 - t0, 0);
  }
  
@@ -996,7 +880,7 @@ index 060e95b331a2..953244eefe7d 100644
  /* provide the departure time in us unit */
  static inline u64 tcp_skb_timestamp_us(const struct sk_buff *skb)
  {
-@@ -972,9 +988,14 @@ struct tcp_skb_cb {
+@@ -973,9 +989,14 @@ struct tcp_skb_cb {
  			/* pkts S/ACKed so far upon tx of skb, incl retrans: */
  			__u32 delivered;
  			/* start of send pipeline phase */
@@ -1013,7 +897,7 @@ index 060e95b331a2..953244eefe7d 100644
  		} tx;   /* only used for outgoing skbs */
  		union {
  			struct inet_skb_parm	h4;
-@@ -1078,6 +1099,7 @@ enum tcp_ca_event {
+@@ -1079,6 +1100,7 @@ enum tcp_ca_event {
  	CA_EVENT_LOSS,		/* loss timeout */
  	CA_EVENT_ECN_NO_CE,	/* ECT set, but not CE marked */
  	CA_EVENT_ECN_IS_CE,	/* received CE marked IP packet */
@@ -1021,7 +905,7 @@ index 060e95b331a2..953244eefe7d 100644
  };
  
  /* Information about inbound ACK, passed to cong_ops->in_ack_event() */
-@@ -1100,7 +1122,11 @@ enum tcp_ca_ack_event_flags {
+@@ -1101,7 +1123,11 @@ enum tcp_ca_ack_event_flags {
  #define TCP_CONG_NON_RESTRICTED 0x1
  /* Requires ECN/ECT set on all packets */
  #define TCP_CONG_NEEDS_ECN	0x2
@@ -1034,7 +918,7 @@ index 060e95b331a2..953244eefe7d 100644
  
  union tcp_cc_info;
  
-@@ -1120,10 +1146,13 @@ struct ack_sample {
+@@ -1121,10 +1147,13 @@ struct ack_sample {
   */
  struct rate_sample {
  	u64  prior_mstamp; /* starting timestamp for interval */
@@ -1049,7 +933,7 @@ index 060e95b331a2..953244eefe7d 100644
  	long interval_us;	/* time for tp->delivered to incr "delivered" */
  	u32 snd_interval_us;	/* snd interval for delivered packets */
  	u32 rcv_interval_us;	/* rcv interval for delivered packets */
-@@ -1134,7 +1163,9 @@ struct rate_sample {
+@@ -1135,7 +1164,9 @@ struct rate_sample {
  	u32  last_end_seq;	/* end_seq of most recently ACKed packet */
  	bool is_app_limited;	/* is sample from packet with bubble in pipe? */
  	bool is_retrans;	/* is sample from retransmission? */
@@ -1059,7 +943,7 @@ index 060e95b331a2..953244eefe7d 100644
  };
  
  struct tcp_congestion_ops {
-@@ -1158,8 +1189,11 @@ struct tcp_congestion_ops {
+@@ -1159,8 +1190,11 @@ struct tcp_congestion_ops {
  	/* hook for packet ack accounting (optional) */
  	void (*pkts_acked)(struct sock *sk, const struct ack_sample *sample);
  
@@ -1073,7 +957,7 @@ index 060e95b331a2..953244eefe7d 100644
  
  	/* call when packets are delivered to update cwnd and pacing rate,
  	 * after all the ca_state processing. (optional)
-@@ -1225,6 +1259,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
+@@ -1226,6 +1260,14 @@ static inline char *tcp_ca_get_name_by_key(u32 key, char *buffer)
  }
  #endif
  
@@ -1088,7 +972,7 @@ index 060e95b331a2..953244eefe7d 100644
  static inline bool tcp_ca_needs_ecn(const struct sock *sk)
  {
  	const struct inet_connection_sock *icsk = inet_csk(sk);
-@@ -1244,6 +1286,7 @@ static inline void tcp_ca_event(struct sock *sk, const enum tcp_ca_event event)
+@@ -1245,6 +1287,7 @@ static inline void tcp_ca_event(struct sock *sk, const enum tcp_ca_event event)
  void tcp_set_ca_state(struct sock *sk, const u8 ca_state);
  
  /* From tcp_rate.c */
@@ -1096,7 +980,7 @@ index 060e95b331a2..953244eefe7d 100644
  void tcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb);
  void tcp_rate_skb_delivered(struct sock *sk, struct sk_buff *skb,
  			    struct rate_sample *rs);
-@@ -1256,6 +1299,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
+@@ -1257,6 +1300,21 @@ static inline bool tcp_skb_sent_after(u64 t1, u64 t2, u32 seq1, u32 seq2)
  	return t1 > t2 || (t1 == t2 && after(seq1, seq2));
  }
  
@@ -1118,7 +1002,7 @@ index 060e95b331a2..953244eefe7d 100644
  /* These functions determine how the current flow behaves in respect of SACK
   * handling. SACK is negotiated with the peer, and therefore it can vary
   * between different flows.
-@@ -2418,7 +2476,7 @@ struct tcp_plb_state {
+@@ -2419,7 +2477,7 @@ struct tcp_plb_state {
  	u8	consec_cong_rounds:5, /* consecutive congested rounds */
  		unused:3;
  	u32	pause_until; /* jiffies32 when PLB can resume rerouting */
@@ -1257,7 +1141,7 @@ index 18227757ec0c..f180befc28bd 100644
  	.undo_cwnd = bpf_tcp_ca_undo_cwnd,
  	.sndbuf_expand = bpf_tcp_ca_sndbuf_expand,
 diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
-index e6790ea74877..b63e27eba536 100644
+index ec6911034138..df7731a30198 100644
 --- a/net/ipv4/tcp.c
 +++ b/net/ipv4/tcp.c
 @@ -3120,6 +3120,7 @@ int tcp_disconnect(struct sock *sk, int flags)
@@ -3934,7 +3818,7 @@ index 28ffcfbeef14..7b13915ba288 100644
  		icsk->icsk_ca_ops->init(sk);
  	if (tcp_ca_needs_ecn(sk))
 diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-index 38da23f991d6..37d2b393088a 100644
+index 570e87ad9a56..c539ac50f7a6 100644
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
 @@ -365,7 +365,7 @@ static void __tcp_ecn_check_ce(struct sock *sk, const struct sk_buff *skb)
@@ -4050,7 +3934,7 @@ index 38da23f991d6..37d2b393088a 100644
  	return 1;
  
  old_ack:
-@@ -5704,13 +5729,14 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+@@ -5714,13 +5739,14 @@ static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
  
  	    /* More than one full frame received... */
  	if (((tp->rcv_nxt - tp->rcv_wup) > inet_csk(sk)->icsk_ack.rcv_mss &&
@@ -4068,7 +3952,7 @@ index 38da23f991d6..37d2b393088a 100644
  	    tcp_in_quickack_mode(sk) ||
  	    /* Protocol state mandates a one-time immediate ACK */
 diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
-index 538c06f95918..e4c861c071ae 100644
+index 0fbebf6266e9..6eb1d369c584 100644
 --- a/net/ipv4/tcp_minisocks.c
 +++ b/net/ipv4/tcp_minisocks.c
 @@ -460,6 +460,8 @@ void tcp_ca_openreq_child(struct sock *sk, const struct dst_entry *dst)
@@ -4272,10 +4156,10 @@ index a8f6d9d06f2e..8737f2134648 100644
  	rs->interval_us = max(snd_us, ack_us);
  
 diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
-index 892c86657fbc..33c2c9252364 100644
+index 4d40615dc8fc..f27941201ef2 100644
 --- a/net/ipv4/tcp_timer.c
 +++ b/net/ipv4/tcp_timer.c
-@@ -693,6 +693,7 @@ void tcp_write_timer_handler(struct sock *sk)
+@@ -689,6 +689,7 @@ void tcp_write_timer_handler(struct sock *sk)
  		return;
  	}
  
@@ -4286,10 +4170,10 @@ index 892c86657fbc..33c2c9252364 100644
 -- 
 2.46.0.rc1
 
-From 7ca78ca637dc6bceb4233c60907e70507625476e Mon Sep 17 00:00:00 2001
+From bbee24678a3eef2513debdb999d302394638f90b Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:47:07 +0200
-Subject: [PATCH 03/11] block
+Date: Sat, 3 Aug 2024 09:33:05 +0200
+Subject: [PATCH 03/12] block
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -4557,7 +4441,7 @@ index 467e8cfc41a2..f44f5d4ec2f4 100644
  	 * bic associated with the task issuing current bio for
  	 * merging. This and the next field are used as a support to
 diff --git a/block/mq-deadline.c b/block/mq-deadline.c
-index 94eede4fb9eb..567fd69a146c 100644
+index acdc28756d9d..8b214233a061 100644
 --- a/block/mq-deadline.c
 +++ b/block/mq-deadline.c
 @@ -79,10 +79,23 @@ struct dd_per_prio {
@@ -4677,7 +4561,7 @@ index 94eede4fb9eb..567fd69a146c 100644
  	return rq;
  }
  
-@@ -571,6 +629,12 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
+@@ -585,6 +643,12 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
  
  	eq->elevator_data = dd;
  
@@ -4690,7 +4574,7 @@ index 94eede4fb9eb..567fd69a146c 100644
  	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
  		struct dd_per_prio *per_prio = &dd->per_prio[prio];
  
-@@ -587,7 +651,6 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
+@@ -601,7 +665,6 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
  	dd->last_dir = DD_WRITE;
  	dd->fifo_batch = fifo_batch;
  	dd->prio_aging_expire = prio_aging_expire;
@@ -4698,7 +4582,7 @@ index 94eede4fb9eb..567fd69a146c 100644
  
  	/* We dispatch from request queue wide instead of hw queue */
  	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
-@@ -643,7 +706,19 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
+@@ -657,7 +720,19 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
  	struct request *free = NULL;
  	bool ret;
  
@@ -4719,7 +4603,7 @@ index 94eede4fb9eb..567fd69a146c 100644
  	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
  	spin_unlock(&dd->lock);
  
-@@ -656,10 +731,9 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
+@@ -670,10 +745,9 @@ static bool dd_bio_merge(struct request_queue *q, struct bio *bio,
  /*
   * add rq to rbtree and fifo
   */
@@ -4731,7 +4615,7 @@ index 94eede4fb9eb..567fd69a146c 100644
  	struct deadline_data *dd = q->elevator->elevator_data;
  	const enum dd_data_dir data_dir = rq_data_dir(rq);
  	u16 ioprio = req_get_ioprio(rq);
-@@ -713,19 +787,13 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
+@@ -727,19 +801,13 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
  {
  	struct request_queue *q = hctx->queue;
  	struct deadline_data *dd = q->elevator->elevator_data;
@@ -4757,7 +4641,7 @@ index 94eede4fb9eb..567fd69a146c 100644
  }
  
  /* Callback from inside blk_mq_rq_ctx_init(). */
-@@ -766,6 +834,10 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
+@@ -780,6 +848,10 @@ static bool dd_has_work(struct blk_mq_hw_ctx *hctx)
  	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
  	enum dd_prio prio;
  
@@ -4771,10 +4655,10 @@ index 94eede4fb9eb..567fd69a146c 100644
 -- 
 2.46.0.rc1
 
-From 54932df65673dcb915c1cc74330fc8cb7574f01b Mon Sep 17 00:00:00 2001
+From df3a7d7bec6c1585510d19fe23800cb0d0294d44 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:47:38 +0200
-Subject: [PATCH 04/11] cachy
+Date: Sat, 3 Aug 2024 09:33:18 +0200
+Subject: [PATCH 04/12] cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -4803,8 +4687,6 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  .../amd/display/amdgpu_dm/amdgpu_dm_color.c   |    2 +-
  .../amd/display/amdgpu_dm/amdgpu_dm_crtc.c    |    6 +-
  .../amd/display/amdgpu_dm/amdgpu_dm_plane.c   |    6 +-
- .../amd/display/dc/optc/dcn10/dcn10_optc.c    |   15 +-
- .../amd/display/dc/optc/dcn20/dcn20_optc.c    |   10 +
  drivers/gpu/drm/amd/pm/amdgpu_pm.c            |    3 +
  drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     |   14 +-
  drivers/gpu/drm/drm_atomic_uapi.c             |   11 +-
@@ -4843,7 +4725,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  mm/vmscan.c                                   |    8 +
  scripts/Makefile.package                      |   14 +
  scripts/package/PKGBUILD                      |  108 +
- 65 files changed, 5948 insertions(+), 118 deletions(-)
+ 63 files changed, 5935 insertions(+), 106 deletions(-)
  create mode 100644 drivers/i2c/busses/i2c-nct6775.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.h
@@ -4869,7 +4751,7 @@ index c59dc60ba62e..7902adf4f7f1 100644
  # We don't want to ignore the following even if they are dot-files
  #
 diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
-index 27ec49af1bf2..07ac4c81a7dd 100644
+index 2569e7f19b47..21c6506ea9ef 100644
 --- a/Documentation/admin-guide/kernel-parameters.txt
 +++ b/Documentation/admin-guide/kernel-parameters.txt
 @@ -2229,6 +2229,9 @@
@@ -4917,7 +4799,7 @@ index 958e935449e5..b27470be2e6a 100644
  M:	Thorsten Leemhuis <linux@leemhuis.info>
  L:	regressions@lists.linux.dev
 diff --git a/Makefile b/Makefile
-index 07e1aec72c17..51567fe7c60a 100644
+index c0af6d8aeb05..e76ef51326b9 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -817,6 +817,9 @@ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
@@ -6206,54 +6088,6 @@ index 8a4c40b4c27e..779880c64575 100644
  	dm_atomic_plane_attach_color_mgmt_properties(dm, plane);
  #endif
  	/* Create (reset) the plane state */
-diff --git a/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c b/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
-index 5574bc628053..f109a101d84f 100644
---- a/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
-+++ b/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
-@@ -945,19 +945,10 @@ void optc1_set_drr(
- 				OTG_FORCE_LOCK_ON_EVENT, 0,
- 				OTG_SET_V_TOTAL_MIN_MASK_EN, 0,
- 				OTG_SET_V_TOTAL_MIN_MASK, 0);
--
--		// Setup manual flow control for EOF via TRIG_A
--		optc->funcs->setup_manual_trigger(optc);
--
--	} else {
--		REG_UPDATE_4(OTG_V_TOTAL_CONTROL,
--				OTG_SET_V_TOTAL_MIN_MASK, 0,
--				OTG_V_TOTAL_MIN_SEL, 0,
--				OTG_V_TOTAL_MAX_SEL, 0,
--				OTG_FORCE_LOCK_ON_EVENT, 0);
--
--		optc->funcs->set_vtotal_min_max(optc, 0, 0);
- 	}
-+
-+	// Setup manual flow control for EOF via TRIG_A
-+	optc->funcs->setup_manual_trigger(optc);
- }
- 
- void optc1_set_vtotal_min_max(struct timing_generator *optc, int vtotal_min, int vtotal_max)
-diff --git a/drivers/gpu/drm/amd/display/dc/optc/dcn20/dcn20_optc.c b/drivers/gpu/drm/amd/display/dc/optc/dcn20/dcn20_optc.c
-index d6f095b4555d..58bdbd859bf9 100644
---- a/drivers/gpu/drm/amd/display/dc/optc/dcn20/dcn20_optc.c
-+++ b/drivers/gpu/drm/amd/display/dc/optc/dcn20/dcn20_optc.c
-@@ -462,6 +462,16 @@ void optc2_setup_manual_trigger(struct timing_generator *optc)
- {
- 	struct optc *optc1 = DCN10TG_FROM_TG(optc);
- 
-+	/* Set the min/max selectors unconditionally so that
-+	 * DMCUB fw may change OTG timings when necessary
-+	 * TODO: Remove the w/a after fixing the issue in DMCUB firmware
-+	 */
-+	REG_UPDATE_4(OTG_V_TOTAL_CONTROL,
-+				 OTG_V_TOTAL_MIN_SEL, 1,
-+				 OTG_V_TOTAL_MAX_SEL, 1,
-+				 OTG_FORCE_LOCK_ON_EVENT, 0,
-+				 OTG_SET_V_TOTAL_MIN_MASK, (1 << 1)); /* TRIGA */
-+
- 	REG_SET_8(OTG_TRIGA_CNTL, 0,
- 			OTG_TRIGA_SOURCE_SELECT, 21,
- 			OTG_TRIGA_SOURCE_PIPE_SELECT, optc->inst,
 diff --git a/drivers/gpu/drm/amd/pm/amdgpu_pm.c b/drivers/gpu/drm/amd/pm/amdgpu_pm.c
 index c11952a4389b..52f54a228b39 100644
 --- a/drivers/gpu/drm/amd/pm/amdgpu_pm.c
@@ -11691,7 +11525,7 @@ index 99076dbe27d8..18750b83c564 100644
  	if (err)
  		goto bad_unshare_out;
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 24dda708b699..c2bb8eb1d6ba 100644
+index 483c137b9d3d..1fee282d40aa 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -73,10 +73,19 @@ unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
@@ -11728,7 +11562,7 @@ index 24dda708b699..c2bb8eb1d6ba 100644
  #ifdef CONFIG_NUMA_BALANCING
  /* Restrict the NUMA promotion throughput (MB/s) for each target node. */
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index ef20c61004eb..10c1caff5e06 100644
+index 38aeedd8a6cc..556466836cd5 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -2544,7 +2544,7 @@ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
@@ -11818,7 +11652,7 @@ index 739b1bf3d637..3a4269c02fb2 100644
  static int __read_mostly sysctl_compact_memory;
  
 diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index 2120f7478e55..765ea6197e1e 100644
+index 374a0d54b08d..7d97486bae43 100644
 --- a/mm/huge_memory.c
 +++ b/mm/huge_memory.c
 @@ -63,7 +63,11 @@ unsigned long transparent_hugepage_flags __read_mostly =
@@ -11862,7 +11696,7 @@ index 8a1c92090129..a415623cde8f 100644
  EXPORT_SYMBOL_GPL(dirty_writeback_interval);
  
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 9ecf99190ea2..6191be6c5de9 100644
+index df2c442f1c47..0d2e014af058 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
 @@ -271,7 +271,11 @@ const char * const migratetype_names[MIGRATE_TYPES] = {
@@ -11915,7 +11749,7 @@ index bd5183dfd879..3a410f53a07c 100644
  
  /*
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 2e34de9cd0d4..be9e40acc93b 100644
+index 68ac33bea3a3..9ede4f0c1c0e 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -191,7 +191,11 @@ struct scan_control {
@@ -11930,7 +11764,7 @@ index 2e34de9cd0d4..be9e40acc93b 100644
  
  #ifdef CONFIG_MEMCG
  
-@@ -3949,7 +3953,11 @@ static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc
+@@ -3973,7 +3977,11 @@ static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc
  }
  
  /* to protect the working set of the last N jiffies */
@@ -12091,10 +11925,10 @@ index 000000000000..663ce300dd06
 -- 
 2.46.0.rc1
 
-From 8bcaaf83dd4cc8585ef780d7c9638152c3ab88c2 Mon Sep 17 00:00:00 2001
+From b15809173a8ed3743d527f7407008a25d21a95cb Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:47:48 +0200
-Subject: [PATCH 05/11] crypto
+Date: Sat, 3 Aug 2024 09:33:30 +0200
+Subject: [PATCH 05/12] crypto
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -20280,10 +20114,10 @@ index ef031655b2d3..cd37de5ec404 100644
 -- 
 2.46.0.rc1
 
-From c319d3c41878133f182b45a59cbca9c8beb9a5c0 Mon Sep 17 00:00:00 2001
+From 6942a00e7c32ec880fc6c5078e7d906710fea21c Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:48:10 +0200
-Subject: [PATCH 06/11] fixes
+Date: Sat, 3 Aug 2024 09:33:41 +0200
+Subject: [PATCH 06/12] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -20315,10 +20149,578 @@ index 975dd22a2dbd..de69b8f5b5be 100644
 -- 
 2.46.0.rc1
 
-From ee1fe1c008768212b2fbffb8b9ac8795cf9bc55a Mon Sep 17 00:00:00 2001
+From 9473eff38f79f125d7698d9725bca3129beb83d9 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:48:31 +0200
-Subject: [PATCH 07/11] ksm
+Date: Sat, 3 Aug 2024 09:33:55 +0200
+Subject: [PATCH 07/12] intel-pstate
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/include/asm/topology.h  |  19 ++-
+ arch/x86/kernel/cpu/aperfmperf.c |  91 +++++++++++++-
+ arch/x86/kernel/itmt.c           |  12 +-
+ arch/x86/kernel/smpboot.c        |  10 +-
+ drivers/cpufreq/intel_pstate.c   | 210 ++++++++++++++++++++++++++++++-
+ 5 files changed, 326 insertions(+), 16 deletions(-)
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index abe3a8f22cbd..e5b203fe7956 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -235,8 +235,6 @@ struct pci_bus;
+ int x86_pci_root_bus_node(int bus);
+ void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ 
+-extern bool x86_topology_update;
+-
+ #ifdef CONFIG_SCHED_MC_PRIO
+ #include <asm/percpu.h>
+ 
+@@ -282,11 +280,28 @@ static inline long arch_scale_freq_capacity(int cpu)
+ }
+ #define arch_scale_freq_capacity arch_scale_freq_capacity
+ 
++bool arch_enable_hybrid_capacity_scale(void);
++void arch_set_cpu_capacity(int cpu, unsigned long cap, unsigned long base_cap,
++			   unsigned long max_freq, unsigned long base_freq);
++
++unsigned long arch_scale_cpu_capacity(int cpu);
++#define arch_scale_cpu_capacity arch_scale_cpu_capacity
++
+ extern void arch_set_max_freq_ratio(bool turbo_disabled);
+ extern void freq_invariance_set_perf_ratio(u64 ratio, bool turbo_disabled);
++
++void arch_rebuild_sched_domains(void);
+ #else
++static inline bool arch_enable_hybrid_capacity_scale(void) { return false; }
++static inline void arch_set_cpu_capacity(int cpu, unsigned long cap,
++					 unsigned long base_cap,
++					 unsigned long max_freq,
++					 unsigned long base_freq) { }
++
+ static inline void arch_set_max_freq_ratio(bool turbo_disabled) { }
+ static inline void freq_invariance_set_perf_ratio(u64 ratio, bool turbo_disabled) { }
++
++static inline void arch_rebuild_sched_domains(void) { }
+ #endif
+ 
+ extern void arch_scale_freq_tick(void);
+diff --git a/arch/x86/kernel/cpu/aperfmperf.c b/arch/x86/kernel/cpu/aperfmperf.c
+index b3fa61d45352..0b002b181a01 100644
+--- a/arch/x86/kernel/cpu/aperfmperf.c
++++ b/arch/x86/kernel/cpu/aperfmperf.c
+@@ -300,6 +300,8 @@ static void register_freq_invariance_syscore_ops(void)
+ static inline void register_freq_invariance_syscore_ops(void) {}
+ #endif
+ 
++static DEFINE_STATIC_KEY_FALSE(arch_hybrid_cap_scale_key);
++
+ static void freq_invariance_enable(void)
+ {
+ 	if (static_branch_unlikely(&arch_scale_freq_key)) {
+@@ -332,6 +334,7 @@ static void disable_freq_invariance_workfn(struct work_struct *work)
+ 	int cpu;
+ 
+ 	static_branch_disable(&arch_scale_freq_key);
++	static_branch_disable(&arch_hybrid_cap_scale_key);
+ 
+ 	/*
+ 	 * Set arch_freq_scale to a default value on all cpus
+@@ -347,9 +350,90 @@ static DECLARE_WORK(disable_freq_invariance_work,
+ DEFINE_PER_CPU(unsigned long, arch_freq_scale) = SCHED_CAPACITY_SCALE;
+ EXPORT_PER_CPU_SYMBOL_GPL(arch_freq_scale);
+ 
++struct arch_hybrid_cpu_scale {
++	unsigned long capacity;
++	unsigned long freq_ratio;
++};
++
++static struct arch_hybrid_cpu_scale __percpu *arch_cpu_scale;
++
++/**
++ * arch_enable_hybrid_capacity_scale - Enable hybrid CPU capacity scaling
++ *
++ * Allocate memory for per-CPU data used by hybrid CPU capacity scaling,
++ * initialize it and set the static key controlling its code paths.
++ *
++ * Must be called before arch_set_cpu_capacity().
++ */
++bool arch_enable_hybrid_capacity_scale(void)
++{
++	int cpu;
++
++	if (!arch_scale_freq_invariant())
++		return false;
++
++	if (static_branch_unlikely(&arch_hybrid_cap_scale_key)) {
++		WARN_ON_ONCE(1);
++		return false;
++	}
++	arch_cpu_scale = alloc_percpu(struct arch_hybrid_cpu_scale);
++	if (!arch_cpu_scale)
++		return false;
++
++	for_each_possible_cpu(cpu) {
++		per_cpu_ptr(arch_cpu_scale, cpu)->capacity = SCHED_CAPACITY_SCALE;
++		per_cpu_ptr(arch_cpu_scale, cpu)->freq_ratio = arch_max_freq_ratio;
++	}
++
++	static_branch_enable(&arch_hybrid_cap_scale_key);
++
++	pr_info("Hybrid CPU capacity scaling enabled\n");
++
++	return true;
++}
++
++/**
++ * arch_set_cpu_capacity - Set scale-invariance parameters for a CPU
++ * @cpu: Target CPU.
++ * @cap: Capacity of @cpu, relative to @base_cap, at its maximum frequency.
++ * @base_cap: System-wide maximum CPU capacity.
++ * @max_freq: Frequency of @cpu corresponding to @cap.
++ * @base_freq: Frequency of @cpu at which APERF and MPERF count.
++ *
++ * The units in which @cap and @base_cap are expressed do not matter, so long
++ * as they are consistent, because the former is effectively divided by the
++ * latter.  Analogously for @max_freq and @base_freq.
++ *
++ * After calling this function for all CPUs, call arch_rebuild_sched_domains()
++ * to let the scheduler know that capacity-aware scheduling can be used going
++ * forward.
++ */
++void arch_set_cpu_capacity(int cpu, unsigned long cap, unsigned long base_cap,
++			   unsigned long max_freq, unsigned long base_freq)
++{
++	if (static_branch_likely(&arch_hybrid_cap_scale_key)) {
++		WRITE_ONCE(per_cpu_ptr(arch_cpu_scale, cpu)->capacity,
++			   div_u64(cap << SCHED_CAPACITY_SHIFT, base_cap));
++		WRITE_ONCE(per_cpu_ptr(arch_cpu_scale, cpu)->freq_ratio,
++			   div_u64(max_freq << SCHED_CAPACITY_SHIFT, base_freq));
++	} else {
++		WARN_ON_ONCE(1);
++	}
++}
++
++unsigned long arch_scale_cpu_capacity(int cpu)
++{
++	if (static_branch_unlikely(&arch_hybrid_cap_scale_key))
++		return READ_ONCE(per_cpu_ptr(arch_cpu_scale, cpu)->capacity);
++
++	return SCHED_CAPACITY_SCALE;
++}
++EXPORT_SYMBOL_GPL(arch_scale_cpu_capacity);
++
+ static void scale_freq_tick(u64 acnt, u64 mcnt)
+ {
+ 	u64 freq_scale;
++	u64 freq_ratio;
+ 
+ 	if (!arch_scale_freq_invariant())
+ 		return;
+@@ -357,7 +441,12 @@ static void scale_freq_tick(u64 acnt, u64 mcnt)
+ 	if (check_shl_overflow(acnt, 2*SCHED_CAPACITY_SHIFT, &acnt))
+ 		goto error;
+ 
+-	if (check_mul_overflow(mcnt, arch_max_freq_ratio, &mcnt) || !mcnt)
++	if (static_branch_unlikely(&arch_hybrid_cap_scale_key))
++		freq_ratio = READ_ONCE(this_cpu_ptr(arch_cpu_scale)->freq_ratio);
++	else
++		freq_ratio = arch_max_freq_ratio;
++
++	if (check_mul_overflow(mcnt, freq_ratio, &mcnt) || !mcnt)
+ 		goto error;
+ 
+ 	freq_scale = div64_u64(acnt, mcnt);
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 9a7c03d47861..af2f60c094a8 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -54,10 +54,8 @@ static int sched_itmt_update_handler(struct ctl_table *table, int write,
+ 	old_sysctl = sysctl_sched_itmt_enabled;
+ 	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+ 
+-	if (!ret && write && old_sysctl != sysctl_sched_itmt_enabled) {
+-		x86_topology_update = true;
+-		rebuild_sched_domains();
+-	}
++	if (!ret && write && old_sysctl != sysctl_sched_itmt_enabled)
++		arch_rebuild_sched_domains();
+ 
+ 	mutex_unlock(&itmt_update_mutex);
+ 
+@@ -114,8 +112,7 @@ int sched_set_itmt_support(void)
+ 
+ 	sysctl_sched_itmt_enabled = 1;
+ 
+-	x86_topology_update = true;
+-	rebuild_sched_domains();
++	arch_rebuild_sched_domains();
+ 
+ 	mutex_unlock(&itmt_update_mutex);
+ 
+@@ -150,8 +147,7 @@ void sched_clear_itmt_support(void)
+ 	if (sysctl_sched_itmt_enabled) {
+ 		/* disable sched_itmt if we are no longer ITMT capable */
+ 		sysctl_sched_itmt_enabled = 0;
+-		x86_topology_update = true;
+-		rebuild_sched_domains();
++		arch_rebuild_sched_domains();
+ 	}
+ 
+ 	mutex_unlock(&itmt_update_mutex);
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 0c35207320cb..90a6fb54a128 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -39,6 +39,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/cpuset.h>
+ #include <linux/init.h>
+ #include <linux/smp.h>
+ #include <linux/export.h>
+@@ -125,7 +126,7 @@ static DEFINE_PER_CPU_ALIGNED(struct mwait_cpu_dead, mwait_cpu_dead);
+ int __read_mostly __max_smt_threads = 1;
+ 
+ /* Flag to indicate if a complete sched domain rebuild is required */
+-bool x86_topology_update;
++static bool x86_topology_update;
+ 
+ int arch_update_cpu_topology(void)
+ {
+@@ -135,6 +136,13 @@ int arch_update_cpu_topology(void)
+ 	return retval;
+ }
+ 
++#ifdef CONFIG_X86_64
++void arch_rebuild_sched_domains(void) {
++	x86_topology_update = true;
++	rebuild_sched_domains();
++}
++#endif
++
+ static unsigned int smpboot_warm_reset_vector_count;
+ 
+ static inline void smpboot_setup_warm_reset_vector(unsigned long start_eip)
+diff --git a/drivers/cpufreq/intel_pstate.c b/drivers/cpufreq/intel_pstate.c
+index 1035c074f36a..56425f5dac70 100644
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@ -16,6 +16,7 @@
+ #include <linux/tick.h>
+ #include <linux/slab.h>
+ #include <linux/sched/cpufreq.h>
++#include <linux/sched/smt.h>
+ #include <linux/list.h>
+ #include <linux/cpu.h>
+ #include <linux/cpufreq.h>
+@@ -215,6 +216,7 @@ struct global_params {
+  * @hwp_req_cached:	Cached value of the last HWP Request MSR
+  * @hwp_cap_cached:	Cached value of the last HWP Capabilities MSR
+  * @last_io_update:	Last time when IO wake flag was set
++ * @capacity_perf:	Highest perf used for scale invariance
+  * @sched_flags:	Store scheduler flags for possible cross CPU update
+  * @hwp_boost_min:	Last HWP boosted min performance
+  * @suspended:		Whether or not the driver has been suspended.
+@@ -253,6 +255,7 @@ struct cpudata {
+ 	u64 hwp_req_cached;
+ 	u64 hwp_cap_cached;
+ 	u64 last_io_update;
++	unsigned int capacity_perf;
+ 	unsigned int sched_flags;
+ 	u32 hwp_boost_min;
+ 	bool suspended;
+@@ -295,6 +298,7 @@ static int hwp_mode_bdw __ro_after_init;
+ static bool per_cpu_limits __ro_after_init;
+ static bool hwp_forced __ro_after_init;
+ static bool hwp_boost __read_mostly;
++static bool hwp_is_hybrid;
+ 
+ static struct cpufreq_driver *intel_pstate_driver __read_mostly;
+ 
+@@ -933,6 +937,106 @@ static struct freq_attr *hwp_cpufreq_attrs[] = {
+ 	NULL,
+ };
+ 
++static struct cpudata *hybrid_max_perf_cpu __read_mostly;
++/*
++ * Protects hybrid_max_perf_cpu, the capacity_perf fields in struct cpudata,
++ * and the x86 arch scale-invariance information from concurrent updates.
++ */
++static DEFINE_MUTEX(hybrid_capacity_lock);
++
++static void hybrid_set_cpu_capacity(struct cpudata *cpu)
++{
++	arch_set_cpu_capacity(cpu->cpu, cpu->capacity_perf,
++			      hybrid_max_perf_cpu->capacity_perf,
++			      cpu->capacity_perf,
++			      cpu->pstate.max_pstate_physical);
++
++	pr_debug("CPU%d: perf = %u, max. perf = %u, base perf = %d\n", cpu->cpu,
++		 cpu->capacity_perf, hybrid_max_perf_cpu->capacity_perf,
++		 cpu->pstate.max_pstate_physical);
++}
++
++static void hybrid_clear_cpu_capacity(unsigned int cpunum)
++{
++	arch_set_cpu_capacity(cpunum, 1, 1, 1, 1);
++}
++
++static void hybrid_get_capacity_perf(struct cpudata *cpu)
++{
++	if (READ_ONCE(global.no_turbo)) {
++		cpu->capacity_perf = cpu->pstate.max_pstate_physical;
++		return;
++	}
++
++	cpu->capacity_perf = HWP_HIGHEST_PERF(READ_ONCE(cpu->hwp_cap_cached));
++}
++
++static void hybrid_set_capacity_of_cpus(void)
++{
++	int cpunum;
++
++	for_each_online_cpu(cpunum) {
++		struct cpudata *cpu = all_cpu_data[cpunum];
++
++		if (cpu)
++			hybrid_set_cpu_capacity(cpu);
++	}
++}
++
++static void hybrid_update_cpu_scaling(void)
++{
++	struct cpudata *max_perf_cpu = NULL;
++	unsigned int max_cap_perf = 0;
++	int cpunum;
++
++	for_each_online_cpu(cpunum) {
++		struct cpudata *cpu = all_cpu_data[cpunum];
++
++		if (!cpu)
++			continue;
++
++		/*
++		 * During initialization, CPU performance at full capacity needs
++		 * to be determined.
++		 */
++		if (!hybrid_max_perf_cpu)
++			hybrid_get_capacity_perf(cpu);
++
++		/*
++		 * If hybrid_max_perf_cpu is not NULL at this point, it is
++		 * being replaced, so don't take it into account when looking
++		 * for the new one.
++		 */
++		if (cpu == hybrid_max_perf_cpu)
++			continue;
++
++		if (cpu->capacity_perf > max_cap_perf) {
++			max_cap_perf = cpu->capacity_perf;
++			max_perf_cpu = cpu;
++		}
++	}
++
++	if (max_perf_cpu) {
++		hybrid_max_perf_cpu = max_perf_cpu;
++		hybrid_set_capacity_of_cpus();
++	} else {
++		pr_info("Found no CPUs with nonzero maximum performance\n");
++		/* Revert to the flat CPU capacity structure. */
++		for_each_online_cpu(cpunum)
++			hybrid_clear_cpu_capacity(cpunum);
++	}
++}
++
++static void hybrid_init_cpu_scaling(void)
++{
++	mutex_lock(&hybrid_capacity_lock);
++
++	hybrid_max_perf_cpu = NULL;
++	hybrid_update_cpu_scaling();
++
++	mutex_unlock(&hybrid_capacity_lock);
++}
++
+ static void __intel_pstate_get_hwp_cap(struct cpudata *cpu)
+ {
+ 	u64 cap;
+@@ -961,6 +1065,43 @@ static void intel_pstate_get_hwp_cap(struct cpudata *cpu)
+ 	}
+ }
+ 
++static void hybrid_update_capacity(struct cpudata *cpu)
++{
++	unsigned int max_cap_perf;
++
++	mutex_lock(&hybrid_capacity_lock);
++
++	if (!hybrid_max_perf_cpu)
++		goto unlock;
++
++	/*
++	 * The maximum performance of the CPU may have changed, but assume
++	 * that the performance of the other CPUs has not changed.
++	 */
++	max_cap_perf = hybrid_max_perf_cpu->capacity_perf;
++
++	intel_pstate_get_hwp_cap(cpu);
++
++	hybrid_get_capacity_perf(cpu);
++	/* Should hybrid_max_perf_cpu be replaced by this CPU? */
++	if (cpu->capacity_perf > max_cap_perf) {
++		hybrid_max_perf_cpu = cpu;
++		hybrid_set_capacity_of_cpus();
++		goto unlock;
++	}
++
++	/* If this CPU is hybrid_max_perf_cpu, should it be replaced? */
++	if (cpu == hybrid_max_perf_cpu && cpu->capacity_perf < max_cap_perf) {
++		hybrid_update_cpu_scaling();
++		goto unlock;
++	}
++
++	hybrid_set_cpu_capacity(cpu);
++
++unlock:
++	mutex_unlock(&hybrid_capacity_lock);
++}
++
+ static void intel_pstate_hwp_set(unsigned int cpu)
+ {
+ 	struct cpudata *cpu_data = all_cpu_data[cpu];
+@@ -1069,6 +1210,22 @@ static void intel_pstate_hwp_offline(struct cpudata *cpu)
+ 		value |= HWP_ENERGY_PERF_PREFERENCE(HWP_EPP_POWERSAVE);
+ 
+ 	wrmsrl_on_cpu(cpu->cpu, MSR_HWP_REQUEST, value);
++
++	mutex_lock(&hybrid_capacity_lock);
++
++	if (!hybrid_max_perf_cpu) {
++		mutex_unlock(&hybrid_capacity_lock);
++
++		return;
++	}
++
++	if (hybrid_max_perf_cpu == cpu)
++		hybrid_update_cpu_scaling();
++
++	mutex_unlock(&hybrid_capacity_lock);
++
++	/* Reset the capacity of the CPU going offline to the initial value. */
++	hybrid_clear_cpu_capacity(cpu->cpu);
+ }
+ 
+ #define POWER_CTL_EE_ENABLE	1
+@@ -1164,21 +1321,41 @@ static void __intel_pstate_update_max_freq(struct cpudata *cpudata,
+ static void intel_pstate_update_limits(unsigned int cpu)
+ {
+ 	struct cpufreq_policy *policy = cpufreq_cpu_acquire(cpu);
++	struct cpudata *cpudata;
+ 
+ 	if (!policy)
+ 		return;
+ 
+-	__intel_pstate_update_max_freq(all_cpu_data[cpu], policy);
++	cpudata = all_cpu_data[cpu];
++
++	__intel_pstate_update_max_freq(cpudata, policy);
++
++	/* Prevent the driver from being unregistered now. */
++	mutex_lock(&intel_pstate_driver_lock);
+ 
+ 	cpufreq_cpu_release(policy);
++
++	hybrid_update_capacity(cpudata);
++
++	mutex_unlock(&intel_pstate_driver_lock);
+ }
+ 
+ static void intel_pstate_update_limits_for_all(void)
+ {
+ 	int cpu;
+ 
+-	for_each_possible_cpu(cpu)
+-		intel_pstate_update_limits(cpu);
++	for_each_possible_cpu(cpu) {
++		struct cpufreq_policy *policy = cpufreq_cpu_acquire(cpu);
++
++		if (!policy)
++			continue;
++
++		__intel_pstate_update_max_freq(all_cpu_data[cpu], policy);
++
++		cpufreq_cpu_release(policy);
++	}
++
++	hybrid_init_cpu_scaling();
+ }
+ 
+ /************************** sysfs begin ************************/
+@@ -1617,6 +1794,13 @@ static void intel_pstate_notify_work(struct work_struct *work)
+ 		__intel_pstate_update_max_freq(cpudata, policy);
+ 
+ 		cpufreq_cpu_release(policy);
++
++		/*
++		 * The driver will not be unregistered while this function is
++		 * running, so update the capacity without acquiring the driver
++		 * lock.
++		 */
++		hybrid_update_capacity(cpudata);
+ 	}
+ 
+ 	wrmsrl_on_cpu(cpudata->cpu, MSR_HWP_STATUS, 0);
+@@ -2018,8 +2202,10 @@ static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
+ 
+ 		if (pstate_funcs.get_cpu_scaling) {
+ 			cpu->pstate.scaling = pstate_funcs.get_cpu_scaling(cpu->cpu);
+-			if (cpu->pstate.scaling != perf_ctl_scaling)
++			if (cpu->pstate.scaling != perf_ctl_scaling) {
+ 				intel_pstate_hybrid_hwp_adjust(cpu);
++				hwp_is_hybrid = true;
++			}
+ 		} else {
+ 			cpu->pstate.scaling = perf_ctl_scaling;
+ 		}
+@@ -2687,6 +2873,8 @@ static int intel_pstate_cpu_online(struct cpufreq_policy *policy)
+ 		 */
+ 		intel_pstate_hwp_reenable(cpu);
+ 		cpu->suspended = false;
++
++		hybrid_update_capacity(cpu);
+ 	}
+ 
+ 	return 0;
+@@ -3129,6 +3317,20 @@ static int intel_pstate_register_driver(struct cpufreq_driver *driver)
+ 
+ 	global.min_perf_pct = min_perf_pct_min();
+ 
++	/*
++	 * On hybrid systems, use asym capacity instead of ITMT, but because
++	 * the capacity of SMT threads is not deterministic even approximately,
++	 * do not do that when SMT is in use.
++	 */
++	if (hwp_is_hybrid && !sched_smt_active() &&
++	    arch_enable_hybrid_capacity_scale()) {
++		sched_clear_itmt_support();
++
++		hybrid_init_cpu_scaling();
++
++		arch_rebuild_sched_domains();
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.46.0.rc1
+
+From 8ebc33b4882fc984010beb7b46c01f894809d763 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Sat, 3 Aug 2024 09:34:06 +0200
+Subject: [PATCH 08/12] ksm
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -20508,7 +20910,7 @@ index cfdfb3707c16..0d79fd772854 100644
 +464	common	process_ksm_disable		sys_process_ksm_disable
 +465	common	process_ksm_status		sys_process_ksm_status
 diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
-index d6ebcab1d8b2..ae5d147f05f2 100644
+index 4b71a2607bf5..812085b21a3f 100644
 --- a/arch/x86/entry/syscalls/syscall_32.tbl
 +++ b/arch/x86/entry/syscalls/syscall_32.tbl
 @@ -467,3 +467,6 @@
@@ -20519,7 +20921,7 @@ index d6ebcab1d8b2..ae5d147f05f2 100644
 +464	i386	process_ksm_disable		sys_process_ksm_disable
 +465	i386	process_ksm_status		sys_process_ksm_status
 diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
-index a396f6e6ab5b..472c23b39a70 100644
+index a8068f937290..bc2e635389cc 100644
 --- a/arch/x86/entry/syscalls/syscall_64.tbl
 +++ b/arch/x86/entry/syscalls/syscall_64.tbl
 @@ -384,6 +384,9 @@
@@ -20755,10 +21157,10 @@ index b696b85ac63e..cf7f3d841b1e 100644
 -- 
 2.46.0.rc1
 
-From c99a397d0d3d672ae11ac3d70a049528b3e89420 Mon Sep 17 00:00:00 2001
+From 36ef0070410e229e52c9de58d6021df36a4b1707 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:48:44 +0200
-Subject: [PATCH 08/11] ntsync
+Date: Sat, 3 Aug 2024 09:34:15 +0200
+Subject: [PATCH 09/12] ntsync
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -23844,10 +24246,10 @@ index 000000000000..5fa2c9a0768c
 -- 
 2.46.0.rc1
 
-From 2c8a302830c85df2a2c93e3b1886df56c5f80e3b Mon Sep 17 00:00:00 2001
+From a2c8bc637c7a2e45c1189f2e92f3712715d957ba Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:48:56 +0200
-Subject: [PATCH 09/11] perf-per-core
+Date: Sat, 3 Aug 2024 09:34:27 +0200
+Subject: [PATCH 10/12] perf-per-core
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -24714,7 +25116,7 @@ index cb4f6c513c48..1ffe4260bef6 100644
  	// AMD Node ID and Nodes per Package info
  	u32			amd_node_id;
 diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
-index abe3a8f22cbd..2a6dbf965d92 100644
+index e5b203fe7956..8c2fea7dd065 100644
 --- a/arch/x86/include/asm/topology.h
 +++ b/arch/x86/include/asm/topology.h
 @@ -137,6 +137,7 @@ extern const struct cpumask *cpu_clustergroup_mask(int cpu);
@@ -24752,10 +25154,10 @@ index 9a6069e7133c..23722aa21e2f 100644
 -- 
 2.46.0.rc1
 
-From cea17b9cdf2b32d24a2e5d13b36d95ec61ad4551 Mon Sep 17 00:00:00 2001
+From c8abbeaccc5bbcc5a1239c15298e453a90c76add Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:49:06 +0200
-Subject: [PATCH 10/11] t2
+Date: Sat, 3 Aug 2024 09:34:40 +0200
+Subject: [PATCH 11/12] t2
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -25106,7 +25508,7 @@ index c217de2cc8d5..f31410d7e7e1 100644
  
  		if (!len)
 diff --git a/drivers/firmware/efi/libstub/x86-stub.c b/drivers/firmware/efi/libstub/x86-stub.c
-index 1983fd3bf392..ca7bb218c448 100644
+index 99d39eda5134..0a2342c0bc16 100644
 --- a/drivers/firmware/efi/libstub/x86-stub.c
 +++ b/drivers/firmware/efi/libstub/x86-stub.c
 @@ -225,6 +225,68 @@ static void retrieve_apple_device_properties(struct boot_params *boot_params)
@@ -35455,10 +35857,10 @@ index 2b812210b412..4c3a8cc6ef15 100755
 -- 
 2.46.0.rc1
 
-From f6c38c502916ce04a02b8f103b24dcb183ec6c7d Mon Sep 17 00:00:00 2001
+From 1be86d2b5a1217ada1b7122db8e4184610191238 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sat, 27 Jul 2024 11:49:15 +0200
-Subject: [PATCH 11/11] zstd
+Date: Sat, 3 Aug 2024 09:34:52 +0200
+Subject: [PATCH 12/12] zstd
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
