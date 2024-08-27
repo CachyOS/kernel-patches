@@ -1,0 +1,552 @@
+From 1bd3c44f6cf328cab75909660c54190f77de2940 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 27 Aug 2024 15:34:50 +0200
+Subject: [PATCH 01/11] amd-pstate
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/include/asm/processor.h |   3 -
+ arch/x86/kernel/acpi/cppc.c      | 159 ++++++++++++++++++++++++++++++-
+ arch/x86/kernel/cpu/amd.c        |  16 ----
+ drivers/cpufreq/acpi-cpufreq.c   |  12 ++-
+ drivers/cpufreq/amd-pstate.c     | 132 ++++++-------------------
+ include/acpi/cppc_acpi.h         |  10 ++
+ 6 files changed, 202 insertions(+), 130 deletions(-)
+
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index a75a07f4931fd..775acbdea1a96 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -691,8 +691,6 @@ static inline u32 per_cpu_l2c_id(unsigned int cpu)
+ }
+ 
+ #ifdef CONFIG_CPU_SUP_AMD
+-extern u32 amd_get_highest_perf(void);
+-
+ /*
+  * Issue a DIV 0/1 insn to clear any division data from previous DIV
+  * operations.
+@@ -705,7 +703,6 @@ static __always_inline void amd_clear_divider(void)
+ 
+ extern void amd_check_microcode(void);
+ #else
+-static inline u32 amd_get_highest_perf(void)		{ return 0; }
+ static inline void amd_clear_divider(void)		{ }
+ static inline void amd_check_microcode(void)		{ }
+ #endif
+diff --git a/arch/x86/kernel/acpi/cppc.c b/arch/x86/kernel/acpi/cppc.c
+index ff8f25faca3dd..44b13a4e28740 100644
+--- a/arch/x86/kernel/acpi/cppc.c
++++ b/arch/x86/kernel/acpi/cppc.c
+@@ -9,6 +9,17 @@
+ #include <asm/processor.h>
+ #include <asm/topology.h>
+ 
++#define CPPC_HIGHEST_PERF_PERFORMANCE	196
++#define CPPC_HIGHEST_PERF_PREFCORE	166
++
++enum amd_pref_core {
++	AMD_PREF_CORE_UNKNOWN = 0,
++	AMD_PREF_CORE_SUPPORTED,
++	AMD_PREF_CORE_UNSUPPORTED,
++};
++static enum amd_pref_core amd_pref_core_detected;
++static u64 boost_numerator;
++
+ /* Refer to drivers/acpi/cppc_acpi.c for the description of functions */
+ 
+ bool cpc_supported_by_cpu(void)
+@@ -75,15 +86,17 @@ static void amd_set_max_freq_ratio(void)
+ 
+ 	rc = cppc_get_perf_caps(0, &perf_caps);
+ 	if (rc) {
+-		pr_debug("Could not retrieve perf counters (%d)\n", rc);
++		pr_warn("Could not retrieve perf counters (%d)\n", rc);
+ 		return;
+ 	}
+ 
+-	highest_perf = amd_get_highest_perf();
++	rc = amd_get_boost_ratio_numerator(0, &highest_perf);
++	if (rc)
++		pr_warn("Could not retrieve highest performance\n");
+ 	nominal_perf = perf_caps.nominal_perf;
+ 
+-	if (!highest_perf || !nominal_perf) {
+-		pr_debug("Could not retrieve highest or nominal performance\n");
++	if (!nominal_perf) {
++		pr_warn("Could not retrieve nominal performance\n");
+ 		return;
+ 	}
+ 
+@@ -91,7 +104,7 @@ static void amd_set_max_freq_ratio(void)
+ 	/* midpoint between max_boost and max_P */
+ 	perf_ratio = (perf_ratio + SCHED_CAPACITY_SCALE) >> 1;
+ 	if (!perf_ratio) {
+-		pr_debug("Non-zero highest/nominal perf values led to a 0 ratio\n");
++		pr_warn("Non-zero highest/nominal perf values led to a 0 ratio\n");
+ 		return;
+ 	}
+ 
+@@ -116,3 +129,139 @@ void init_freq_invariance_cppc(void)
+ 	init_done = true;
+ 	mutex_unlock(&freq_invariance_lock);
+ }
++
++/*
++ * Get the highest performance register value.
++ * @cpu: CPU from which to get highest performance.
++ * @highest_perf: Return address for highest performance value.
++ *
++ * Return: 0 for success, negative error code otherwise.
++ */
++int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf)
++{
++	u64 val;
++	int ret;
++
++	if (cpu_feature_enabled(X86_FEATURE_CPPC)) {
++		ret = rdmsrl_safe_on_cpu(cpu, MSR_AMD_CPPC_CAP1, &val);
++		if (ret)
++			goto out;
++
++		val = AMD_CPPC_HIGHEST_PERF(val);
++	} else {
++		ret = cppc_get_highest_perf(cpu, &val);
++		if (ret)
++			goto out;
++	}
++
++	WRITE_ONCE(*highest_perf, (u32)val);
++out:
++	return ret;
++}
++EXPORT_SYMBOL_GPL(amd_get_highest_perf);
++
++/**
++ * amd_detect_prefcore: Detect if CPUs in the system support preferred cores
++ * @detected: Output variable for the result of the detection.
++ *
++ * Determine whether CPUs in the system support preferred cores. On systems
++ * that support preferred cores, different highest perf values will be found
++ * on different cores. On other systems, the highest perf value will be the
++ * same on all cores.
++ *
++ * The result of the detection will be stored in the 'detected' parameter.
++ *
++ * Return: 0 for success, negative error code otherwise
++ */
++int amd_detect_prefcore(bool *detected)
++{
++	int cpu, count = 0;
++	u64 highest_perf[2] = {0};
++
++	if (WARN_ON(!detected))
++		return -EINVAL;
++
++	switch (amd_pref_core_detected) {
++	case AMD_PREF_CORE_SUPPORTED:
++		*detected = true;
++		return 0;
++	case AMD_PREF_CORE_UNSUPPORTED:
++		*detected = false;
++		return 0;
++	default:
++		break;
++	}
++
++	for_each_present_cpu(cpu) {
++		u32 tmp;
++		int ret;
++
++		ret = amd_get_highest_perf(cpu, &tmp);
++		if (ret)
++			return ret;
++
++		if (!count || (count == 1 && tmp != highest_perf[0]))
++			highest_perf[count++] = tmp;
++
++		if (count == 2)
++			break;
++	}
++
++	*detected = (count == 2);
++	boost_numerator = highest_perf[0];
++
++	amd_pref_core_detected = *detected ? AMD_PREF_CORE_SUPPORTED :
++					     AMD_PREF_CORE_UNSUPPORTED;
++
++	pr_debug("AMD CPPC preferred core is %ssupported (highest perf: 0x%llx)\n",
++		 *detected ? "" : "un", highest_perf[0]);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(amd_detect_prefcore);
++
++/**
++ * amd_get_boost_ratio_numerator: Get the numerator to use for boost ratio calculation
++ * @cpu: CPU to get numerator for.
++ * @numerator: Output variable for numerator.
++ *
++ * Determine the numerator to use for calculating the boost ratio on
++ * a CPU. On systems that support preferred cores, this will be a hardcoded
++ * value. On other systems this will the highest performance register value.
++ *
++ * Return: 0 for success, negative error code otherwise.
++ */
++int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator)
++{
++	bool prefcore;
++	int ret;
++
++	ret = amd_detect_prefcore(&prefcore);
++	if (ret)
++		return ret;
++
++	/* without preferred cores, return the highest perf register value */
++	if (!prefcore) {
++		*numerator = boost_numerator;
++		return 0;
++	}
++
++	/*
++	 * For AMD CPUs with Family ID 19H and Model ID range 0x70 to 0x7f,
++	 * the highest performance level is set to 196.
++	 * https://bugzilla.kernel.org/show_bug.cgi?id=218759
++	 */
++	if (cpu_feature_enabled(X86_FEATURE_ZEN4)) {
++		switch (boot_cpu_data.x86_model) {
++		case 0x70 ... 0x7f:
++			*numerator = CPPC_HIGHEST_PERF_PERFORMANCE;
++			return 0;
++		default:
++			break;
++		}
++	}
++	*numerator = CPPC_HIGHEST_PERF_PREFCORE;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(amd_get_boost_ratio_numerator);
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 1e0fe5f8ab84e..015971adadfc7 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -1190,22 +1190,6 @@ unsigned long amd_get_dr_addr_mask(unsigned int dr)
+ }
+ EXPORT_SYMBOL_GPL(amd_get_dr_addr_mask);
+ 
+-u32 amd_get_highest_perf(void)
+-{
+-	struct cpuinfo_x86 *c = &boot_cpu_data;
+-
+-	if (c->x86 == 0x17 && ((c->x86_model >= 0x30 && c->x86_model < 0x40) ||
+-			       (c->x86_model >= 0x70 && c->x86_model < 0x80)))
+-		return 166;
+-
+-	if (c->x86 == 0x19 && ((c->x86_model >= 0x20 && c->x86_model < 0x30) ||
+-			       (c->x86_model >= 0x40 && c->x86_model < 0x70)))
+-		return 166;
+-
+-	return 255;
+-}
+-EXPORT_SYMBOL_GPL(amd_get_highest_perf);
+-
+ static void zenbleed_check_cpu(void *unused)
+ {
+ 	struct cpuinfo_x86 *c = &cpu_data(smp_processor_id());
+diff --git a/drivers/cpufreq/acpi-cpufreq.c b/drivers/cpufreq/acpi-cpufreq.c
+index a8ca625a98b89..0f04feb6cafaf 100644
+--- a/drivers/cpufreq/acpi-cpufreq.c
++++ b/drivers/cpufreq/acpi-cpufreq.c
+@@ -642,10 +642,16 @@ static u64 get_max_boost_ratio(unsigned int cpu)
+ 		return 0;
+ 	}
+ 
+-	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD)
+-		highest_perf = amd_get_highest_perf();
+-	else
++	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
++		ret = amd_get_boost_ratio_numerator(cpu, &highest_perf);
++		if (ret) {
++			pr_debug("CPU%d: Unable to get boost ratio numerator (%d)\n",
++				 cpu, ret);
++			return 0;
++		}
++	} else {
+ 		highest_perf = perf_caps.highest_perf;
++	}
+ 
+ 	nominal_perf = perf_caps.nominal_perf;
+ 
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 68c616b572f22..65a80ad9e747c 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -52,8 +52,6 @@
+ #define AMD_PSTATE_TRANSITION_LATENCY	20000
+ #define AMD_PSTATE_TRANSITION_DELAY	1000
+ #define AMD_PSTATE_FAST_CPPC_TRANSITION_DELAY 600
+-#define CPPC_HIGHEST_PERF_PERFORMANCE	196
+-#define CPPC_HIGHEST_PERF_DEFAULT	166
+ 
+ #define AMD_CPPC_EPP_PERFORMANCE		0x00
+ #define AMD_CPPC_EPP_BALANCE_PERFORMANCE	0x80
+@@ -372,43 +370,17 @@ static inline int amd_pstate_enable(bool enable)
+ 	return static_call(amd_pstate_enable)(enable);
+ }
+ 
+-static u32 amd_pstate_highest_perf_set(struct amd_cpudata *cpudata)
+-{
+-	struct cpuinfo_x86 *c = &cpu_data(0);
+-
+-	/*
+-	 * For AMD CPUs with Family ID 19H and Model ID range 0x70 to 0x7f,
+-	 * the highest performance level is set to 196.
+-	 * https://bugzilla.kernel.org/show_bug.cgi?id=218759
+-	 */
+-	if (c->x86 == 0x19 && (c->x86_model >= 0x70 && c->x86_model <= 0x7f))
+-		return CPPC_HIGHEST_PERF_PERFORMANCE;
+-
+-	return CPPC_HIGHEST_PERF_DEFAULT;
+-}
+-
+ static int pstate_init_perf(struct amd_cpudata *cpudata)
+ {
+ 	u64 cap1;
+-	u32 highest_perf;
+ 
+ 	int ret = rdmsrl_safe_on_cpu(cpudata->cpu, MSR_AMD_CPPC_CAP1,
+ 				     &cap1);
+ 	if (ret)
+ 		return ret;
+ 
+-	/* For platforms that do not support the preferred core feature, the
+-	 * highest_pef may be configured with 166 or 255, to avoid max frequency
+-	 * calculated wrongly. we take the AMD_CPPC_HIGHEST_PERF(cap1) value as
+-	 * the default max perf.
+-	 */
+-	if (cpudata->hw_prefcore)
+-		highest_perf = amd_pstate_highest_perf_set(cpudata);
+-	else
+-		highest_perf = AMD_CPPC_HIGHEST_PERF(cap1);
+-
+-	WRITE_ONCE(cpudata->highest_perf, highest_perf);
+-	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
++	WRITE_ONCE(cpudata->highest_perf, AMD_CPPC_HIGHEST_PERF(cap1));
++	WRITE_ONCE(cpudata->max_limit_perf, AMD_CPPC_HIGHEST_PERF(cap1));
+ 	WRITE_ONCE(cpudata->nominal_perf, AMD_CPPC_NOMINAL_PERF(cap1));
+ 	WRITE_ONCE(cpudata->lowest_nonlinear_perf, AMD_CPPC_LOWNONLIN_PERF(cap1));
+ 	WRITE_ONCE(cpudata->lowest_perf, AMD_CPPC_LOWEST_PERF(cap1));
+@@ -426,12 +398,7 @@ static int cppc_init_perf(struct amd_cpudata *cpudata)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (cpudata->hw_prefcore)
+-		highest_perf = amd_pstate_highest_perf_set(cpudata);
+-	else
+-		highest_perf = cppc_perf.highest_perf;
+-
+-	WRITE_ONCE(cpudata->highest_perf, highest_perf);
++	WRITE_ONCE(cpudata->highest_perf, cppc_perf.highest_perf);
+ 	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
+ 	WRITE_ONCE(cpudata->nominal_perf, cppc_perf.nominal_perf);
+ 	WRITE_ONCE(cpudata->lowest_nonlinear_perf,
+@@ -803,66 +770,22 @@ static void amd_pstste_sched_prefcore_workfn(struct work_struct *work)
+ }
+ static DECLARE_WORK(sched_prefcore_work, amd_pstste_sched_prefcore_workfn);
+ 
+-/*
+- * Get the highest performance register value.
+- * @cpu: CPU from which to get highest performance.
+- * @highest_perf: Return address.
+- *
+- * Return: 0 for success, -EIO otherwise.
+- */
+-static int amd_pstate_get_highest_perf(int cpu, u32 *highest_perf)
+-{
+-	int ret;
+-
+-	if (cpu_feature_enabled(X86_FEATURE_CPPC)) {
+-		u64 cap1;
+-
+-		ret = rdmsrl_safe_on_cpu(cpu, MSR_AMD_CPPC_CAP1, &cap1);
+-		if (ret)
+-			return ret;
+-		WRITE_ONCE(*highest_perf, AMD_CPPC_HIGHEST_PERF(cap1));
+-	} else {
+-		u64 cppc_highest_perf;
+-
+-		ret = cppc_get_highest_perf(cpu, &cppc_highest_perf);
+-		if (ret)
+-			return ret;
+-		WRITE_ONCE(*highest_perf, cppc_highest_perf);
+-	}
+-
+-	return (ret);
+-}
+-
+ #define CPPC_MAX_PERF	U8_MAX
+ 
+ static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
+ {
+-	int ret, prio;
+-	u32 highest_perf;
+-
+-	ret = amd_pstate_get_highest_perf(cpudata->cpu, &highest_perf);
+-	if (ret)
++	/* user disabled or not detected */
++	if (!amd_pstate_prefcore)
+ 		return;
+ 
+ 	cpudata->hw_prefcore = true;
+-	/* check if CPPC preferred core feature is enabled*/
+-	if (highest_perf < CPPC_MAX_PERF)
+-		prio = (int)highest_perf;
+-	else {
+-		pr_debug("AMD CPPC preferred core is unsupported!\n");
+-		cpudata->hw_prefcore = false;
+-		return;
+-	}
+-
+-	if (!amd_pstate_prefcore)
+-		return;
+ 
+ 	/*
+ 	 * The priorities can be set regardless of whether or not
+ 	 * sched_set_itmt_support(true) has been called and it is valid to
+ 	 * update them at any time after it has been called.
+ 	 */
+-	sched_set_itmt_core_prio(prio, cpudata->cpu);
++	sched_set_itmt_core_prio((int)READ_ONCE(cpudata->highest_perf), cpudata->cpu);
+ 
+ 	schedule_work(&sched_prefcore_work);
+ }
+@@ -875,17 +798,17 @@ static void amd_pstate_update_limits(unsigned int cpu)
+ 	int ret;
+ 	bool highest_perf_changed = false;
+ 
+-	mutex_lock(&amd_pstate_driver_lock);
+-	if ((!amd_pstate_prefcore) || (!cpudata->hw_prefcore))
+-		goto free_cpufreq_put;
++	if (!amd_pstate_prefcore)
++		return;
+ 
+-	ret = amd_pstate_get_highest_perf(cpu, &cur_high);
++	mutex_lock(&amd_pstate_driver_lock);
++	ret = amd_get_highest_perf(cpu, &cur_high);
+ 	if (ret)
+ 		goto free_cpufreq_put;
+ 
+ 	prev_high = READ_ONCE(cpudata->prefcore_ranking);
+-	if (prev_high != cur_high) {
+-		highest_perf_changed = true;
++	highest_perf_changed = (prev_high != cur_high);
++	if (highest_perf_changed) {
+ 		WRITE_ONCE(cpudata->prefcore_ranking, cur_high);
+ 
+ 		if (cur_high < CPPC_MAX_PERF)
+@@ -949,8 +872,8 @@ static u32 amd_pstate_get_transition_latency(unsigned int cpu)
+ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
+ {
+ 	int ret;
+-	u32 min_freq;
+-	u32 highest_perf, max_freq;
++	u32 min_freq, max_freq;
++	u64 numerator;
+ 	u32 nominal_perf, nominal_freq;
+ 	u32 lowest_nonlinear_perf, lowest_nonlinear_freq;
+ 	u32 boost_ratio, lowest_nonlinear_ratio;
+@@ -972,8 +895,10 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
+ 
+ 	nominal_perf = READ_ONCE(cpudata->nominal_perf);
+ 
+-	highest_perf = READ_ONCE(cpudata->highest_perf);
+-	boost_ratio = div_u64(highest_perf << SCHED_CAPACITY_SHIFT, nominal_perf);
++	ret = amd_get_boost_ratio_numerator(cpudata->cpu, &numerator);
++	if (ret)
++		return ret;
++	boost_ratio = div_u64(numerator << SCHED_CAPACITY_SHIFT, nominal_perf);
+ 	max_freq = (nominal_freq * boost_ratio >> SCHED_CAPACITY_SHIFT) * 1000;
+ 
+ 	lowest_nonlinear_perf = READ_ONCE(cpudata->lowest_nonlinear_perf);
+@@ -1028,12 +953,12 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+ 
+ 	cpudata->cpu = policy->cpu;
+ 
+-	amd_pstate_init_prefcore(cpudata);
+-
+ 	ret = amd_pstate_init_perf(cpudata);
+ 	if (ret)
+ 		goto free_cpudata1;
+ 
++	amd_pstate_init_prefcore(cpudata);
++
+ 	ret = amd_pstate_init_freq(cpudata);
+ 	if (ret)
+ 		goto free_cpudata1;
+@@ -1187,12 +1112,7 @@ static ssize_t show_amd_pstate_prefcore_ranking(struct cpufreq_policy *policy,
+ static ssize_t show_amd_pstate_hw_prefcore(struct cpufreq_policy *policy,
+ 					   char *buf)
+ {
+-	bool hw_prefcore;
+-	struct amd_cpudata *cpudata = policy->driver_data;
+-
+-	hw_prefcore = READ_ONCE(cpudata->hw_prefcore);
+-
+-	return sysfs_emit(buf, "%s\n", str_enabled_disabled(hw_prefcore));
++	return sysfs_emit(buf, "%s\n", str_enabled_disabled(amd_pstate_prefcore));
+ }
+ 
+ static ssize_t show_energy_performance_available_preferences(
+@@ -1483,12 +1403,12 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 	cpudata->cpu = policy->cpu;
+ 	cpudata->epp_policy = 0;
+ 
+-	amd_pstate_init_prefcore(cpudata);
+-
+ 	ret = amd_pstate_init_perf(cpudata);
+ 	if (ret)
+ 		goto free_cpudata1;
+ 
++	amd_pstate_init_prefcore(cpudata);
++
+ 	ret = amd_pstate_init_freq(cpudata);
+ 	if (ret)
+ 		goto free_cpudata1;
+@@ -1933,6 +1853,12 @@ static int __init amd_pstate_init(void)
+ 		static_call_update(amd_pstate_update_perf, cppc_update_perf);
+ 	}
+ 
++	if (amd_pstate_prefcore) {
++		ret = amd_detect_prefcore(&amd_pstate_prefcore);
++		if (ret)
++			return ret;
++	}
++
+ 	/* enable amd pstate feature */
+ 	ret = amd_pstate_enable(true);
+ 	if (ret) {
+diff --git a/include/acpi/cppc_acpi.h b/include/acpi/cppc_acpi.h
+index 930b6afba6f4d..1d79320a23490 100644
+--- a/include/acpi/cppc_acpi.h
++++ b/include/acpi/cppc_acpi.h
+@@ -136,6 +136,16 @@ struct cppc_cpudata {
+ 	cpumask_var_t shared_cpu_map;
+ };
+ 
++#ifdef CONFIG_CPU_SUP_AMD
++extern int amd_detect_prefcore(bool *detected);
++extern int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf);
++extern int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator);
++#else /* !CONFIG_CPU_SUP_AMD */
++static inline int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf) { return -ENODEV; }
++static inline int amd_detect_prefcore(bool *detected) { return -ENODEV; }
++static inline int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator) { return -ENODEV; }
++#endif /* !CONFIG_CPU_SUP_AMD */
++
+ #ifdef CONFIG_ACPI_CPPC_LIB
+ extern int cppc_get_desired_perf(int cpunum, u64 *desired_perf);
+ extern int cppc_get_nominal_perf(int cpunum, u64 *nominal_perf);
+-- 
+2.46.0
+
