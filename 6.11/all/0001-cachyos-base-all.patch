@@ -1,18 +1,52 @@
-From 89404bebea127570b279beb4ed0a30ace5403370 Mon Sep 17 00:00:00 2001
+From 73761e1cdf8d8e5f8470c1309e5ddb8559199152 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sun, 1 Sep 2024 10:38:28 +0200
+Date: Sat, 7 Sep 2024 11:38:33 +0200
 Subject: [PATCH 01/11] amd-pstate
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- arch/x86/include/asm/processor.h |   3 -
- arch/x86/kernel/acpi/cppc.c      | 159 ++++++++++++++++++++++++++++++-
- arch/x86/kernel/cpu/amd.c        |  16 ----
- drivers/cpufreq/acpi-cpufreq.c   |  12 ++-
- drivers/cpufreq/amd-pstate.c     | 143 +++++++--------------------
- include/acpi/cppc_acpi.h         |  10 ++
- 6 files changed, 208 insertions(+), 135 deletions(-)
+ Documentation/admin-guide/pm/amd-pstate.rst |  15 +-
+ arch/x86/include/asm/processor.h            |   3 -
+ arch/x86/kernel/acpi/cppc.c                 | 172 ++++++++++++++++++--
+ arch/x86/kernel/cpu/amd.c                   |  16 --
+ drivers/cpufreq/acpi-cpufreq.c              |  12 +-
+ drivers/cpufreq/amd-pstate.c                | 139 ++++------------
+ include/acpi/cppc_acpi.h                    |  41 +++--
+ 7 files changed, 247 insertions(+), 151 deletions(-)
 
+diff --git a/Documentation/admin-guide/pm/amd-pstate.rst b/Documentation/admin-guide/pm/amd-pstate.rst
+index d0324d44f548..210a808b74ec 100644
+--- a/Documentation/admin-guide/pm/amd-pstate.rst
++++ b/Documentation/admin-guide/pm/amd-pstate.rst
+@@ -251,7 +251,9 @@ performance supported in `AMD CPPC Performance Capability <perf_cap_>`_).
+ In some ASICs, the highest CPPC performance is not the one in the ``_CPC``
+ table, so we need to expose it to sysfs. If boost is not active, but
+ still supported, this maximum frequency will be larger than the one in
+-``cpuinfo``.
++``cpuinfo``. On systems that support preferred core, the driver will have
++different values for some cores than others and this will reflect the values
++advertised by the platform at bootup.
+ This attribute is read-only.
+ 
+ ``amd_pstate_lowest_nonlinear_freq``
+@@ -262,6 +264,17 @@ lowest non-linear performance in `AMD CPPC Performance Capability
+ <perf_cap_>`_.)
+ This attribute is read-only.
+ 
++``amd_pstate_hw_prefcore``
++
++Whether the platform supports the preferred core feature and it has been
++enabled. This attribute is read-only.
++
++``amd_pstate_prefcore_ranking``
++
++The performance ranking of the core. This number doesn't have any unit, but
++larger numbers are preferred at the time of reading. This can change at
++runtime based on platform conditions. This attribute is read-only.
++
+ ``energy_performance_available_preferences``
+ 
+ A list of all the supported EPP preferences that could be used for
 diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
 index a75a07f4931f..775acbdea1a9 100644
 --- a/arch/x86/include/asm/processor.h
@@ -35,7 +69,7 @@ index a75a07f4931f..775acbdea1a9 100644
  static inline void amd_check_microcode(void)		{ }
  #endif
 diff --git a/arch/x86/kernel/acpi/cppc.c b/arch/x86/kernel/acpi/cppc.c
-index ff8f25faca3d..44b13a4e2874 100644
+index ff8f25faca3d..956984054bf3 100644
 --- a/arch/x86/kernel/acpi/cppc.c
 +++ b/arch/x86/kernel/acpi/cppc.c
 @@ -9,6 +9,17 @@
@@ -56,7 +90,14 @@ index ff8f25faca3d..44b13a4e2874 100644
  /* Refer to drivers/acpi/cppc_acpi.c for the description of functions */
  
  bool cpc_supported_by_cpu(void)
-@@ -75,15 +86,17 @@ static void amd_set_max_freq_ratio(void)
+@@ -69,31 +80,30 @@ int cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val)
+ static void amd_set_max_freq_ratio(void)
+ {
+ 	struct cppc_perf_caps perf_caps;
+-	u64 highest_perf, nominal_perf;
++	u64 numerator, nominal_perf;
+ 	u64 perf_ratio;
+ 	int rc;
  
  	rc = cppc_get_perf_caps(0, &perf_caps);
  	if (rc) {
@@ -66,9 +107,11 @@ index ff8f25faca3d..44b13a4e2874 100644
  	}
  
 -	highest_perf = amd_get_highest_perf();
-+	rc = amd_get_boost_ratio_numerator(0, &highest_perf);
-+	if (rc)
-+		pr_warn("Could not retrieve highest performance\n");
++	rc = amd_get_boost_ratio_numerator(0, &numerator);
++	if (rc) {
++		pr_warn("Could not retrieve highest performance (%d)\n", rc);
++		return;
++	}
  	nominal_perf = perf_caps.nominal_perf;
  
 -	if (!highest_perf || !nominal_perf) {
@@ -78,16 +121,18 @@ index ff8f25faca3d..44b13a4e2874 100644
  		return;
  	}
  
-@@ -91,7 +104,7 @@ static void amd_set_max_freq_ratio(void)
+-	perf_ratio = div_u64(highest_perf * SCHED_CAPACITY_SCALE, nominal_perf);
  	/* midpoint between max_boost and max_P */
- 	perf_ratio = (perf_ratio + SCHED_CAPACITY_SCALE) >> 1;
- 	if (!perf_ratio) {
+-	perf_ratio = (perf_ratio + SCHED_CAPACITY_SCALE) >> 1;
+-	if (!perf_ratio) {
 -		pr_debug("Non-zero highest/nominal perf values led to a 0 ratio\n");
-+		pr_warn("Non-zero highest/nominal perf values led to a 0 ratio\n");
- 		return;
- 	}
+-		return;
+-	}
++	perf_ratio = (div_u64(numerator * SCHED_CAPACITY_SCALE, nominal_perf) + SCHED_CAPACITY_SCALE) >> 1;
  
-@@ -116,3 +129,139 @@ void init_freq_invariance_cppc(void)
+ 	freq_invariance_set_perf_ratio(perf_ratio, false);
+ }
+@@ -116,3 +126,143 @@ void init_freq_invariance_cppc(void)
  	init_done = true;
  	mutex_unlock(&freq_invariance_lock);
  }
@@ -191,6 +236,10 @@ index ff8f25faca3d..44b13a4e2874 100644
 + * a CPU. On systems that support preferred cores, this will be a hardcoded
 + * value. On other systems this will the highest performance register value.
 + *
++ * If booting the system with amd-pstate enabled but preferred cores disabled then
++ * the correct boost numerator will be returned to match hardware capabilities
++ * even if the preferred cores scheduling hints are not enabled.
++ *
 + * Return: 0 for success, negative error code otherwise.
 + */
 +int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator)
@@ -279,7 +328,7 @@ index a8ca625a98b8..0f04feb6cafa 100644
  	nominal_perf = perf_caps.nominal_perf;
  
 diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
-index 89bda7a2bb8d..93cac81e1cbe 100644
+index 89bda7a2bb8d..893dd20f5518 100644
 --- a/drivers/cpufreq/amd-pstate.c
 +++ b/drivers/cpufreq/amd-pstate.c
 @@ -52,8 +52,6 @@
@@ -337,7 +386,13 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  	WRITE_ONCE(cpudata->nominal_perf, AMD_CPPC_NOMINAL_PERF(cap1));
  	WRITE_ONCE(cpudata->lowest_nonlinear_perf, AMD_CPPC_LOWNONLIN_PERF(cap1));
  	WRITE_ONCE(cpudata->lowest_perf, AMD_CPPC_LOWEST_PERF(cap1));
-@@ -426,12 +398,7 @@ static int cppc_init_perf(struct amd_cpudata *cpudata)
+@@ -420,19 +392,13 @@ static int pstate_init_perf(struct amd_cpudata *cpudata)
+ static int cppc_init_perf(struct amd_cpudata *cpudata)
+ {
+ 	struct cppc_perf_caps cppc_perf;
+-	u32 highest_perf;
+ 
+ 	int ret = cppc_get_perf_caps(cpudata->cpu, &cppc_perf);
  	if (ret)
  		return ret;
  
@@ -347,11 +402,13 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
 -		highest_perf = cppc_perf.highest_perf;
 -
 -	WRITE_ONCE(cpudata->highest_perf, highest_perf);
+-	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
 +	WRITE_ONCE(cpudata->highest_perf, cppc_perf.highest_perf);
- 	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
++	WRITE_ONCE(cpudata->max_limit_perf, cppc_perf.highest_perf);
  	WRITE_ONCE(cpudata->nominal_perf, cppc_perf.nominal_perf);
  	WRITE_ONCE(cpudata->lowest_nonlinear_perf,
-@@ -554,12 +521,15 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
+ 		   cppc_perf.lowest_nonlinear_perf);
+@@ -554,12 +520,15 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
  	}
  
  	if (value == prev)
@@ -368,7 +425,7 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  }
  
  static int amd_pstate_verify(struct cpufreq_policy_data *policy)
-@@ -803,66 +773,22 @@ static void amd_pstste_sched_prefcore_workfn(struct work_struct *work)
+@@ -803,66 +772,22 @@ static void amd_pstste_sched_prefcore_workfn(struct work_struct *work)
  }
  static DECLARE_WORK(sched_prefcore_work, amd_pstste_sched_prefcore_workfn);
  
@@ -438,7 +495,7 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  
  	schedule_work(&sched_prefcore_work);
  }
-@@ -875,17 +801,17 @@ static void amd_pstate_update_limits(unsigned int cpu)
+@@ -875,17 +800,17 @@ static void amd_pstate_update_limits(unsigned int cpu)
  	int ret;
  	bool highest_perf_changed = false;
  
@@ -462,7 +519,7 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  		WRITE_ONCE(cpudata->prefcore_ranking, cur_high);
  
  		if (cur_high < CPPC_MAX_PERF)
-@@ -949,8 +875,8 @@ static u32 amd_pstate_get_transition_latency(unsigned int cpu)
+@@ -949,8 +874,8 @@ static u32 amd_pstate_get_transition_latency(unsigned int cpu)
  static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
  {
  	int ret;
@@ -473,7 +530,7 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  	u32 nominal_perf, nominal_freq;
  	u32 lowest_nonlinear_perf, lowest_nonlinear_freq;
  	u32 boost_ratio, lowest_nonlinear_ratio;
-@@ -972,8 +898,10 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
+@@ -972,8 +897,10 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
  
  	nominal_perf = READ_ONCE(cpudata->nominal_perf);
  
@@ -486,7 +543,7 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  	max_freq = (nominal_freq * boost_ratio >> SCHED_CAPACITY_SHIFT) * 1000;
  
  	lowest_nonlinear_perf = READ_ONCE(cpudata->lowest_nonlinear_perf);
-@@ -1028,12 +956,12 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+@@ -1028,12 +955,12 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
  
  	cpudata->cpu = policy->cpu;
  
@@ -501,21 +558,7 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  	ret = amd_pstate_init_freq(cpudata);
  	if (ret)
  		goto free_cpudata1;
-@@ -1187,12 +1115,7 @@ static ssize_t show_amd_pstate_prefcore_ranking(struct cpufreq_policy *policy,
- static ssize_t show_amd_pstate_hw_prefcore(struct cpufreq_policy *policy,
- 					   char *buf)
- {
--	bool hw_prefcore;
--	struct amd_cpudata *cpudata = policy->driver_data;
--
--	hw_prefcore = READ_ONCE(cpudata->hw_prefcore);
--
--	return sysfs_emit(buf, "%s\n", str_enabled_disabled(hw_prefcore));
-+	return sysfs_emit(buf, "%s\n", str_enabled_disabled(amd_pstate_prefcore));
- }
- 
- static ssize_t show_energy_performance_available_preferences(
-@@ -1483,12 +1406,12 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+@@ -1483,12 +1410,12 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
  	cpudata->cpu = policy->cpu;
  	cpudata->epp_policy = 0;
  
@@ -530,7 +573,7 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  	ret = amd_pstate_init_freq(cpudata);
  	if (ret)
  		goto free_cpudata1;
-@@ -1841,10 +1764,8 @@ static bool amd_cppc_supported(void)
+@@ -1841,10 +1768,8 @@ static bool amd_cppc_supported(void)
  	 * the code is added for debugging purposes.
  	 */
  	if (!cpu_feature_enabled(X86_FEATURE_CPPC)) {
@@ -543,7 +586,7 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  			if ((c->x86_model > 0x10 && c->x86_model < 0x1F) ||
  					(c->x86_model > 0x40 && c->x86_model < 0xaf))
  				warn = true;
-@@ -1933,6 +1854,12 @@ static int __init amd_pstate_init(void)
+@@ -1933,6 +1858,12 @@ static int __init amd_pstate_init(void)
  		static_call_update(amd_pstate_update_perf, cppc_update_perf);
  	}
  
@@ -557,30 +600,104 @@ index 89bda7a2bb8d..93cac81e1cbe 100644
  	ret = amd_pstate_enable(true);
  	if (ret) {
 diff --git a/include/acpi/cppc_acpi.h b/include/acpi/cppc_acpi.h
-index 930b6afba6f4..1d79320a2349 100644
+index 930b6afba6f4..482e0587a041 100644
 --- a/include/acpi/cppc_acpi.h
 +++ b/include/acpi/cppc_acpi.h
-@@ -136,6 +136,16 @@ struct cppc_cpudata {
- 	cpumask_var_t shared_cpu_map;
- };
- 
-+#ifdef CONFIG_CPU_SUP_AMD
-+extern int amd_detect_prefcore(bool *detected);
+@@ -159,34 +159,37 @@ extern int cppc_get_epp_perf(int cpunum, u64 *epp_perf);
+ extern int cppc_set_epp_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls, bool enable);
+ extern int cppc_get_auto_sel_caps(int cpunum, struct cppc_perf_caps *perf_caps);
+ extern int cppc_set_auto_sel(int cpu, bool enable);
 +extern int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf);
 +extern int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator);
-+#else /* !CONFIG_CPU_SUP_AMD */
-+static inline int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf) { return -ENODEV; }
-+static inline int amd_detect_prefcore(bool *detected) { return -ENODEV; }
-+static inline int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator) { return -ENODEV; }
-+#endif /* !CONFIG_CPU_SUP_AMD */
-+
- #ifdef CONFIG_ACPI_CPPC_LIB
- extern int cppc_get_desired_perf(int cpunum, u64 *desired_perf);
- extern int cppc_get_nominal_perf(int cpunum, u64 *nominal_perf);
++extern int amd_detect_prefcore(bool *detected);
+ #else /* !CONFIG_ACPI_CPPC_LIB */
+ static inline int cppc_get_desired_perf(int cpunum, u64 *desired_perf)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_get_nominal_perf(int cpunum, u64 *nominal_perf)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_get_highest_perf(int cpunum, u64 *highest_perf)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_get_perf_ctrs(int cpu, struct cppc_perf_fb_ctrs *perf_fb_ctrs)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_set_enable(int cpu, bool enable)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_get_perf_caps(int cpu, struct cppc_perf_caps *caps)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline bool cppc_perf_ctrs_in_pcc(void)
+ {
+@@ -210,27 +213,39 @@ static inline bool cpc_ffh_supported(void)
+ }
+ static inline int cpc_read_ffh(int cpunum, struct cpc_reg *reg, u64 *val)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_set_epp_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls, bool enable)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_get_epp_perf(int cpunum, u64 *epp_perf)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_set_auto_sel(int cpu, bool enable)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
+ }
+ static inline int cppc_get_auto_sel_caps(int cpunum, struct cppc_perf_caps *perf_caps)
+ {
+-	return -ENOTSUPP;
++	return -EOPNOTSUPP;
++}
++static inline int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf)
++{
++	return -ENODEV;
++}
++static inline int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator)
++{
++	return -EOPNOTSUPP;
++}
++static inline int amd_detect_prefcore(bool *detected)
++{
++	return -ENODEV;
+ }
+ #endif /* !CONFIG_ACPI_CPPC_LIB */
+ 
 -- 
 2.46.0
 
-From c03b9d435583136f64f0b91d4ac79f27d0e176cd Mon Sep 17 00:00:00 2001
+From bd1b3b9f726cc72fba475c14b00abd3edb89bfa6 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 1 Sep 2024 10:38:38 +0200
 Subject: [PATCH 02/11] bbr3
@@ -3966,7 +4083,7 @@ index 4d40615dc8fc..f27941201ef2 100644
 -- 
 2.46.0
 
-From cfadd59d3bf4eb2ba75e1b778510b13bd2299f1f Mon Sep 17 00:00:00 2001
+From 3e5745c6ee0038e4c888d08d93da04bc2ca22f1c Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 1 Sep 2024 10:38:49 +0200
 Subject: [PATCH 03/11] block
@@ -4451,9 +4568,9 @@ index acdc28756d9d..8b214233a061 100644
 -- 
 2.46.0
 
-From 0dbaf3e34fbdd41800ee182694dc6b4a16bd5021 Mon Sep 17 00:00:00 2001
+From d9bee35b5daf6b172d1b53a6c6198a9881e1935f Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sun, 1 Sep 2024 10:38:57 +0200
+Date: Sat, 7 Sep 2024 11:38:49 +0200
 Subject: [PATCH 04/11] cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -4517,8 +4634,8 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  mm/vmpressure.c                               |    4 +
  mm/vmscan.c                                   |  142 +
  scripts/Makefile.package                      |    3 +-
- scripts/package/PKGBUILD                      |   39 +-
- 60 files changed, 6100 insertions(+), 110 deletions(-)
+ scripts/package/PKGBUILD                      |   52 +-
+ 60 files changed, 6113 insertions(+), 110 deletions(-)
  create mode 100644 drivers/i2c/busses/i2c-nct6775.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.h
@@ -11754,7 +11871,7 @@ index 4a80584ec771..11d53f240a2b 100644
  		KBUILD_MAKEFLAGS="$(MAKEFLAGS)" \
  		KBUILD_REVISION="$(shell $(srctree)/scripts/build-version)" \
 diff --git a/scripts/package/PKGBUILD b/scripts/package/PKGBUILD
-index 663ce300dd06..839cd5e634d2 100644
+index 663ce300dd06..f83493838cf9 100644
 --- a/scripts/package/PKGBUILD
 +++ b/scripts/package/PKGBUILD
 @@ -3,10 +3,13 @@
@@ -11767,7 +11884,7 @@ index 663ce300dd06..839cd5e634d2 100644
 -fi
 +pkgname=("${pkgbase}")
 +
-+_extrapackages=${PACMAN_EXTRAPACKAGES-headers api-headers}
++_extrapackages=${PACMAN_EXTRAPACKAGES-headers api-headers debug}
 +for pkg in $_extrapackages; do
 +	pkgname+=("${pkgbase}-${pkg}")
 +done
@@ -11830,7 +11947,7 @@ index 663ce300dd06..839cd5e634d2 100644
  	cp System.map "${builddir}/System.map"
  	cp .config "${builddir}/.config"
  
-@@ -94,8 +106,7 @@ _package-api-headers() {
+@@ -94,12 +106,24 @@ _package-api-headers() {
  	provides=(linux-api-headers)
  	conflicts=(linux-api-headers)
  
@@ -11840,22 +11957,41 @@ index 663ce300dd06..839cd5e634d2 100644
  
  	${MAKE} headers_install INSTALL_HDR_PATH="${pkgdir}/usr"
  }
+ 
++_package-debug(){
++	pkgdesc="Non-stripped vmlinux file for the ${pkgdesc} kernel"
++
++	local debugdir="${pkgdir}/usr/src/debug/${pkgbase}"
++	local builddir="${pkgdir}/usr/${MODLIB}/build"
++
++	_prologue
++
++	install -Dt "${debugdir}" -m644 vmlinux
++	mkdir -p "${builddir}"
++	ln -sr "${debugdir}/vmlinux" "${builddir}/vmlinux"
++}
++
+ for _p in "${pkgname[@]}"; do
+ 	eval "package_$_p() {
+ 		$(declare -f "_package${_p#$pkgbase}")
 -- 
 2.46.0
 
-From 8ece8492ab552375f939b01887f695b4c8bd7d39 Mon Sep 17 00:00:00 2001
+From 3dcefbc7d1e5938853df1295fdf7acfd06397303 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Sun, 1 Sep 2024 10:39:07 +0200
+Date: Sat, 7 Sep 2024 11:38:58 +0200
 Subject: [PATCH 05/11] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- arch/Kconfig                         |   4 +-
- arch/x86/include/asm/apic.h          |   8 --
- arch/x86/kernel/amd_nb.c             |   4 +
- arch/x86/kernel/apic/apic_flat_64.c  | 119 ++-------------------------
- drivers/powercap/intel_rapl_common.c |   1 +
- 5 files changed, 14 insertions(+), 122 deletions(-)
+ arch/Kconfig                                  |   4 +-
+ arch/x86/include/asm/apic.h                   |   8 --
+ arch/x86/kernel/amd_nb.c                      |   4 +
+ arch/x86/kernel/apic/apic_flat_64.c           | 119 ++----------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c       |   3 +
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |   2 +-
+ drivers/powercap/intel_rapl_common.c          |   1 +
+ 7 files changed, 18 insertions(+), 123 deletions(-)
 
 diff --git a/arch/Kconfig b/arch/Kconfig
 index 975dd22a2dbd..de69b8f5b5be 100644
@@ -12084,6 +12220,33 @@ index f37ad3392fec..e0308d8c4e6c 100644
 -apic_drivers(apic_physflat, apic_flat);
 +struct apic *apic __ro_after_init = &apic_physflat;
 +EXPORT_SYMBOL_GPL(apic);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index aad2027e5c7c..0e617dff8765 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -348,6 +348,9 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
+ 		return -EINVAL;
+ 	}
+ 
++	/* always clear VRAM */
++	flags |= AMDGPU_GEM_CREATE_VRAM_CLEARED;
++
+ 	/* create a gem object to contain this object in */
+ 	if (args->in.domains & (AMDGPU_GEM_DOMAIN_GDS |
+ 	    AMDGPU_GEM_DOMAIN_GWS | AMDGPU_GEM_DOMAIN_OA)) {
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 68357fb6b551..b8d1530645ab 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -10536,7 +10536,7 @@ static bool should_reset_plane(struct drm_atomic_state *state,
+ 	 * TODO: We can likely skip bandwidth validation if the only thing that
+ 	 * changed about the plane was it'z z-ordering.
+ 	 */
+-	if (new_crtc_state->zpos_changed)
++	if (old_plane_state->normalized_zpos != new_plane_state->normalized_zpos)
+ 		return true;
+ 
+ 	if (drm_atomic_crtc_needs_modeset(new_crtc_state))
 diff --git a/drivers/powercap/intel_rapl_common.c b/drivers/powercap/intel_rapl_common.c
 index 3cffa6c79538..8b7a5a31e8c1 100644
 --- a/drivers/powercap/intel_rapl_common.c
@@ -12099,7 +12262,7 @@ index 3cffa6c79538..8b7a5a31e8c1 100644
 -- 
 2.46.0
 
-From ce9f099c5a2244989b1cb027580ead7a80d4fa55 Mon Sep 17 00:00:00 2001
+From 4206a28ac3b7bfe1070904ecd19e8e34f6a219c6 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 1 Sep 2024 10:39:19 +0200
 Subject: [PATCH 06/11] intel-pstate
@@ -12583,7 +12746,7 @@ index 7d92f16a430a..86ad1fed71f1 100644
 -- 
 2.46.0
 
-From f9f37e11d53bf4044bb8bf7b8a74e19090fc9bda Mon Sep 17 00:00:00 2001
+From 1a3fb7f6bb4539f2bd7fd74e0ee224b3121d9759 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 1 Sep 2024 10:39:28 +0200
 Subject: [PATCH 07/11] ksm
@@ -13025,7 +13188,7 @@ index 01071182763e..7394bad8178e 100644
 -- 
 2.46.0
 
-From 374d5a89939e019d2d3abd22f683486c82230791 Mon Sep 17 00:00:00 2001
+From 1f3595f6ea340ccc08f05d4ef95c84aa17260ce2 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 1 Sep 2024 10:39:38 +0200
 Subject: [PATCH 08/11] ntsync
@@ -16114,7 +16277,7 @@ index 000000000000..5fa2c9a0768c
 -- 
 2.46.0
 
-From 99b646a36247a68818da737fd76441bdfe531213 Mon Sep 17 00:00:00 2001
+From 00738211bf66de39c8ce6efae8e66b0ffd741193 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 1 Sep 2024 10:39:50 +0200
 Subject: [PATCH 09/11] perf-per-core
@@ -17022,7 +17185,7 @@ index 9a6069e7133c..23722aa21e2f 100644
 -- 
 2.46.0
 
-From ca5746bedb2da2feb67f1cfed4e80ace86b3c240 Mon Sep 17 00:00:00 2001
+From 366b7acab85750bf70d946138d160c62fd8b6968 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 1 Sep 2024 10:40:01 +0200
 Subject: [PATCH 10/11] t2
@@ -27437,7 +27600,7 @@ index 4427572b2477..b60c99d61882 100755
 -- 
 2.46.0
 
-From dec2bed6cdefc145bc1bc816f59c2bb833070742 Mon Sep 17 00:00:00 2001
+From 3016997fe7a30476a232efb26ee20678a33a65a0 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
 Date: Sun, 1 Sep 2024 10:40:12 +0200
 Subject: [PATCH 11/11] zstd
