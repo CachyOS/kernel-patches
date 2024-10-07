@@ -1,0 +1,444 @@
+From 853e0fd7d1030f4206023bb5408b1ce4f90efe19 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 7 Oct 2024 11:51:39 +0200
+Subject: [PATCH 1/8] amd-pstate
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ arch/x86/include/asm/cpufeatures.h |  1 +
+ arch/x86/include/asm/processor.h   | 13 +++++++
+ arch/x86/kernel/acpi/cppc.c        | 30 +++++++++++++++
+ arch/x86/kernel/cpu/amd.c          | 29 ++++++++++++++
+ arch/x86/kernel/cpu/scattered.c    |  1 +
+ drivers/cpufreq/amd-pstate.c       | 61 +++++++++++++++---------------
+ drivers/cpufreq/amd-pstate.h       |  4 +-
+ drivers/cpufreq/cpufreq.c          |  6 ++-
+ include/linux/cpufreq.h            |  6 +++
+ 9 files changed, 117 insertions(+), 34 deletions(-)
+
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index dd4682857c12..cea1ed82aeb4 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -473,6 +473,7 @@
+ #define X86_FEATURE_CLEAR_BHB_HW	(21*32+ 3) /* BHI_DIS_S HW control enabled */
+ #define X86_FEATURE_CLEAR_BHB_LOOP_ON_VMEXIT (21*32+ 4) /* Clear branch history at vmexit using SW loop */
+ #define X86_FEATURE_FAST_CPPC		(21*32 + 5) /* AMD Fast CPPC */
++#define X86_FEATURE_HETERO_CORE_TOPOLOGY	(21*32 + 6) /* Heterogeneous Core Topology */
+ 
+ /*
+  * BUG word(s)
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 4a686f0e5dbf..d81a6efa81bb 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -691,6 +691,14 @@ static inline u32 per_cpu_l2c_id(unsigned int cpu)
+ 	return per_cpu(cpu_info.topo.l2c_id, cpu);
+ }
+ 
++/* defined by CPUID_Fn80000026_EBX BIT [31:28] */
++enum amd_core_type {
++	CPU_CORE_TYPE_NO_HETERO_SUP = -1,
++	CPU_CORE_TYPE_PERFORMANCE = 0,
++	CPU_CORE_TYPE_EFFICIENCY = 1,
++	CPU_CORE_TYPE_UNDEFINED = 2,
++};
++
+ #ifdef CONFIG_CPU_SUP_AMD
+ /*
+  * Issue a DIV 0/1 insn to clear any division data from previous DIV
+@@ -703,9 +711,14 @@ static __always_inline void amd_clear_divider(void)
+ }
+ 
+ extern void amd_check_microcode(void);
++extern enum amd_core_type amd_get_core_type(void);
+ #else
+ static inline void amd_clear_divider(void)		{ }
+ static inline void amd_check_microcode(void)		{ }
++static inline enum amd_core_type amd_get_core_type(void)
++{
++	return CPU_CORE_TYPE_NO_HETERO_SUP;
++}
+ #endif
+ 
+ extern unsigned long arch_align_stack(unsigned long sp);
+diff --git a/arch/x86/kernel/acpi/cppc.c b/arch/x86/kernel/acpi/cppc.c
+index 956984054bf3..ca289e6ec82c 100644
+--- a/arch/x86/kernel/acpi/cppc.c
++++ b/arch/x86/kernel/acpi/cppc.c
+@@ -217,6 +217,12 @@ int amd_detect_prefcore(bool *detected)
+ }
+ EXPORT_SYMBOL_GPL(amd_detect_prefcore);
+ 
++static void amd_do_get_core_type(void *data)
++{
++	enum amd_core_type *core_type = data;
++	*core_type = amd_get_core_type();
++}
++
+ /**
+  * amd_get_boost_ratio_numerator: Get the numerator to use for boost ratio calculation
+  * @cpu: CPU to get numerator for.
+@@ -234,7 +240,9 @@ EXPORT_SYMBOL_GPL(amd_detect_prefcore);
+  */
+ int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator)
+ {
++	enum amd_core_type core_type;
+ 	bool prefcore;
++	u32 tmp;
+ 	int ret;
+ 
+ 	ret = amd_detect_prefcore(&prefcore);
+@@ -261,6 +269,28 @@ int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator)
+ 			break;
+ 		}
+ 	}
++
++	/* detect if running on heterogeneous design */
++	smp_call_function_single(cpu, amd_do_get_core_type, &core_type, 1);
++	switch (core_type) {
++	case CPU_CORE_TYPE_NO_HETERO_SUP:
++		break;
++	case CPU_CORE_TYPE_PERFORMANCE:
++		/* use the max scale for performance cores */
++		*numerator = CPPC_HIGHEST_PERF_PERFORMANCE;
++		return 0;
++	case CPU_CORE_TYPE_EFFICIENCY:
++		/* use the highest perf value for efficiency cores */
++		ret = amd_get_highest_perf(cpu, &tmp);
++		if (ret)
++			return ret;
++		*numerator = tmp;
++		return 0;
++	default:
++		pr_warn("WARNING: Undefined core type %d found\n", core_type);
++		break;
++	}
++
+ 	*numerator = CPPC_HIGHEST_PERF_PREFCORE;
+ 
+ 	return 0;
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 015971adadfc..8ad5f1385f0e 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -1204,3 +1204,32 @@ void amd_check_microcode(void)
+ 
+ 	on_each_cpu(zenbleed_check_cpu, NULL, 1);
+ }
++
++/**
++ * amd_get_core_type - Heterogeneous core type identification
++ *
++ * Returns the CPU type [31:28] (i.e., performance or efficient) of
++ * a CPU in the processor.
++ *
++ * If the processor has no core type support, returns
++ * CPU_CORE_TYPE_NO_HETERO_SUP.
++ */
++enum amd_core_type amd_get_core_type(void)
++{
++	struct {
++		u32  num_processors             :16,
++		     power_efficiency_ranking   :8,
++		     native_model_id            :4,
++		     core_type                  :4;
++	} props;
++
++	if (!cpu_feature_enabled(X86_FEATURE_HETERO_CORE_TOPOLOGY))
++		return CPU_CORE_TYPE_NO_HETERO_SUP;
++
++	cpuid_leaf_reg(0x80000026, CPUID_EBX, &props);
++	if (props.core_type >= CPU_CORE_TYPE_UNDEFINED)
++		return CPU_CORE_TYPE_UNDEFINED;
++
++	return props.core_type;
++}
++EXPORT_SYMBOL_GPL(amd_get_core_type);
+diff --git a/arch/x86/kernel/cpu/scattered.c b/arch/x86/kernel/cpu/scattered.c
+index c84c30188fdf..3bba55323163 100644
+--- a/arch/x86/kernel/cpu/scattered.c
++++ b/arch/x86/kernel/cpu/scattered.c
+@@ -52,6 +52,7 @@ static const struct cpuid_bit cpuid_bits[] = {
+ 	{ X86_FEATURE_PERFMON_V2,	CPUID_EAX,  0, 0x80000022, 0 },
+ 	{ X86_FEATURE_AMD_LBR_V2,	CPUID_EAX,  1, 0x80000022, 0 },
+ 	{ X86_FEATURE_AMD_LBR_PMC_FREEZE,	CPUID_EAX,  2, 0x80000022, 0 },
++	{ X86_FEATURE_HETERO_CORE_TOPOLOGY,	CPUID_EAX,  30, 0x80000026, 0 },
+ 	{ 0, 0, 0, 0, 0 }
+ };
+ 
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 15e201d5e911..75709ba7550b 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -233,7 +233,7 @@ static int amd_pstate_get_energy_pref_index(struct amd_cpudata *cpudata)
+ 	return index;
+ }
+ 
+-static void pstate_update_perf(struct amd_cpudata *cpudata, u32 min_perf,
++static void msr_update_perf(struct amd_cpudata *cpudata, u32 min_perf,
+ 			       u32 des_perf, u32 max_perf, bool fast_switch)
+ {
+ 	if (fast_switch)
+@@ -243,7 +243,7 @@ static void pstate_update_perf(struct amd_cpudata *cpudata, u32 min_perf,
+ 			      READ_ONCE(cpudata->cppc_req_cached));
+ }
+ 
+-DEFINE_STATIC_CALL(amd_pstate_update_perf, pstate_update_perf);
++DEFINE_STATIC_CALL(amd_pstate_update_perf, msr_update_perf);
+ 
+ static inline void amd_pstate_update_perf(struct amd_cpudata *cpudata,
+ 					  u32 min_perf, u32 des_perf,
+@@ -306,7 +306,7 @@ static int amd_pstate_set_energy_pref_index(struct amd_cpudata *cpudata,
+ 	return ret;
+ }
+ 
+-static inline int pstate_enable(bool enable)
++static inline int msr_enable(bool enable)
+ {
+ 	int ret, cpu;
+ 	unsigned long logical_proc_id_mask = 0;
+@@ -332,7 +332,7 @@ static inline int pstate_enable(bool enable)
+ 	return 0;
+ }
+ 
+-static int cppc_enable(bool enable)
++static int shmem_enable(bool enable)
+ {
+ 	int cpu, ret = 0;
+ 	struct cppc_perf_ctrls perf_ctrls;
+@@ -359,14 +359,14 @@ static int cppc_enable(bool enable)
+ 	return ret;
+ }
+ 
+-DEFINE_STATIC_CALL(amd_pstate_enable, pstate_enable);
++DEFINE_STATIC_CALL(amd_pstate_enable, msr_enable);
+ 
+ static inline int amd_pstate_enable(bool enable)
+ {
+ 	return static_call(amd_pstate_enable)(enable);
+ }
+ 
+-static int pstate_init_perf(struct amd_cpudata *cpudata)
++static int msr_init_perf(struct amd_cpudata *cpudata)
+ {
+ 	u64 cap1;
+ 
+@@ -385,7 +385,7 @@ static int pstate_init_perf(struct amd_cpudata *cpudata)
+ 	return 0;
+ }
+ 
+-static int cppc_init_perf(struct amd_cpudata *cpudata)
++static int shmem_init_perf(struct amd_cpudata *cpudata)
+ {
+ 	struct cppc_perf_caps cppc_perf;
+ 
+@@ -420,14 +420,14 @@ static int cppc_init_perf(struct amd_cpudata *cpudata)
+ 	return ret;
+ }
+ 
+-DEFINE_STATIC_CALL(amd_pstate_init_perf, pstate_init_perf);
++DEFINE_STATIC_CALL(amd_pstate_init_perf, msr_init_perf);
+ 
+ static inline int amd_pstate_init_perf(struct amd_cpudata *cpudata)
+ {
+ 	return static_call(amd_pstate_init_perf)(cpudata);
+ }
+ 
+-static void cppc_update_perf(struct amd_cpudata *cpudata,
++static void shmem_update_perf(struct amd_cpudata *cpudata,
+ 			     u32 min_perf, u32 des_perf,
+ 			     u32 max_perf, bool fast_switch)
+ {
+@@ -696,7 +696,7 @@ static int amd_pstate_cpu_boost_update(struct cpufreq_policy *policy, bool on)
+ 	policy->max = policy->cpuinfo.max_freq;
+ 
+ 	if (cppc_state == AMD_PSTATE_PASSIVE) {
+-		ret = freq_qos_update_request(&cpudata->req[1], policy->cpuinfo.max_freq);
++		ret = freq_qos_update_request(&cpudata->max_freq_req, policy->cpuinfo.max_freq);
+ 		if (ret < 0)
+ 			pr_debug("Failed to update freq constraint: CPU%d\n", cpudata->cpu);
+ 	}
+@@ -963,17 +963,17 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+ 
+ 	ret = amd_pstate_init_perf(cpudata);
+ 	if (ret)
+-		goto free_cpudata1;
++		goto free_cpudata;
+ 
+ 	amd_pstate_init_prefcore(cpudata);
+ 
+ 	ret = amd_pstate_init_freq(cpudata);
+ 	if (ret)
+-		goto free_cpudata1;
++		goto free_cpudata;
+ 
+ 	ret = amd_pstate_init_boost_support(cpudata);
+ 	if (ret)
+-		goto free_cpudata1;
++		goto free_cpudata;
+ 
+ 	min_freq = READ_ONCE(cpudata->min_freq);
+ 	max_freq = READ_ONCE(cpudata->max_freq);
+@@ -995,18 +995,11 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+ 	if (cpu_feature_enabled(X86_FEATURE_CPPC))
+ 		policy->fast_switch_possible = true;
+ 
+-	ret = freq_qos_add_request(&policy->constraints, &cpudata->req[0],
+-				   FREQ_QOS_MIN, policy->cpuinfo.min_freq);
+-	if (ret < 0) {
+-		dev_err(dev, "Failed to add min-freq constraint (%d)\n", ret);
+-		goto free_cpudata1;
+-	}
+-
+-	ret = freq_qos_add_request(&policy->constraints, &cpudata->req[1],
++	ret = freq_qos_add_request(&policy->constraints, &cpudata->max_freq_req,
+ 				   FREQ_QOS_MAX, policy->cpuinfo.max_freq);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Failed to add max-freq constraint (%d)\n", ret);
+-		goto free_cpudata2;
++		goto free_cpudata;
+ 	}
+ 
+ 	cpudata->max_limit_freq = max_freq;
+@@ -1019,9 +1012,7 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+ 
+ 	return 0;
+ 
+-free_cpudata2:
+-	freq_qos_remove_request(&cpudata->req[0]);
+-free_cpudata1:
++free_cpudata:
+ 	kfree(cpudata);
+ 	return ret;
+ }
+@@ -1030,8 +1021,7 @@ static void amd_pstate_cpu_exit(struct cpufreq_policy *policy)
+ {
+ 	struct amd_cpudata *cpudata = policy->driver_data;
+ 
+-	freq_qos_remove_request(&cpudata->req[1]);
+-	freq_qos_remove_request(&cpudata->req[0]);
++	freq_qos_remove_request(&cpudata->max_freq_req);
+ 	policy->fast_switch_possible = false;
+ 	kfree(cpudata);
+ }
+@@ -1706,6 +1696,13 @@ static int amd_pstate_epp_resume(struct cpufreq_policy *policy)
+ 	return 0;
+ }
+ 
++static int amd_pstate_get_init_min_freq(struct cpufreq_policy *policy)
++{
++	struct amd_cpudata *cpudata = policy->driver_data;
++
++	return READ_ONCE(cpudata->lowest_nonlinear_freq);
++}
++
+ static struct cpufreq_driver amd_pstate_driver = {
+ 	.flags		= CPUFREQ_CONST_LOOPS | CPUFREQ_NEED_UPDATE_LIMITS,
+ 	.verify		= amd_pstate_verify,
+@@ -1719,6 +1716,7 @@ static struct cpufreq_driver amd_pstate_driver = {
+ 	.update_limits	= amd_pstate_update_limits,
+ 	.name		= "amd-pstate",
+ 	.attr		= amd_pstate_attr,
++	.get_init_min_freq = amd_pstate_get_init_min_freq,
+ };
+ 
+ static struct cpufreq_driver amd_pstate_epp_driver = {
+@@ -1735,6 +1733,7 @@ static struct cpufreq_driver amd_pstate_epp_driver = {
+ 	.set_boost	= amd_pstate_set_boost,
+ 	.name		= "amd-pstate-epp",
+ 	.attr		= amd_pstate_epp_attr,
++	.get_init_min_freq = amd_pstate_get_init_min_freq,
+ };
+ 
+ static int __init amd_pstate_set_driver(int mode_idx)
+@@ -1756,7 +1755,7 @@ static int __init amd_pstate_set_driver(int mode_idx)
+ 	return -EINVAL;
+ }
+ 
+-/**
++/*
+  * CPPC function is not supported for family ID 17H with model_ID ranging from 0x10 to 0x2F.
+  * show the debug message that helps to check if the CPU has CPPC support for loading issue.
+  */
+@@ -1879,9 +1878,9 @@ static int __init amd_pstate_init(void)
+ 			current_pstate_driver->adjust_perf = amd_pstate_adjust_perf;
+ 	} else {
+ 		pr_debug("AMD CPPC shared memory based functionality is supported\n");
+-		static_call_update(amd_pstate_enable, cppc_enable);
+-		static_call_update(amd_pstate_init_perf, cppc_init_perf);
+-		static_call_update(amd_pstate_update_perf, cppc_update_perf);
++		static_call_update(amd_pstate_enable, shmem_enable);
++		static_call_update(amd_pstate_init_perf, shmem_init_perf);
++		static_call_update(amd_pstate_update_perf, shmem_update_perf);
+ 	}
+ 
+ 	if (amd_pstate_prefcore) {
+diff --git a/drivers/cpufreq/amd-pstate.h b/drivers/cpufreq/amd-pstate.h
+index cd573bc6b6db..643e2a71827d 100644
+--- a/drivers/cpufreq/amd-pstate.h
++++ b/drivers/cpufreq/amd-pstate.h
+@@ -28,7 +28,7 @@ struct amd_aperf_mperf {
+ /**
+  * struct amd_cpudata - private CPU data for AMD P-State
+  * @cpu: CPU number
+- * @req: constraint request to apply
++ * @max_freq_req: maximum frequency constraint request to apply
+  * @cppc_req_cached: cached performance request hints
+  * @highest_perf: the maximum performance an individual processor may reach,
+  *		  assuming ideal conditions
+@@ -68,7 +68,7 @@ struct amd_aperf_mperf {
+ struct amd_cpudata {
+ 	int	cpu;
+ 
+-	struct	freq_qos_request req[2];
++	struct	freq_qos_request max_freq_req;
+ 	u64	cppc_req_cached;
+ 
+ 	u32	highest_perf;
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index f98c9438760c..2923068cf5f4 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1361,6 +1361,7 @@ static int cpufreq_online(unsigned int cpu)
+ 	bool new_policy;
+ 	unsigned long flags;
+ 	unsigned int j;
++	u32 init_min_freq = FREQ_QOS_MIN_DEFAULT_VALUE;
+ 	int ret;
+ 
+ 	pr_debug("%s: bringing CPU%u online\n", __func__, cpu);
+@@ -1445,9 +1446,12 @@ static int cpufreq_online(unsigned int cpu)
+ 			goto out_destroy_policy;
+ 		}
+ 
++		if (cpufreq_driver->get_init_min_freq)
++			init_min_freq = cpufreq_driver->get_init_min_freq(policy);
++
+ 		ret = freq_qos_add_request(&policy->constraints,
+ 					   policy->min_freq_req, FREQ_QOS_MIN,
+-					   FREQ_QOS_MIN_DEFAULT_VALUE);
++					   init_min_freq);
+ 		if (ret < 0) {
+ 			/*
+ 			 * So we don't call freq_qos_remove_request() for an
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 7fe0981a7e46..8a2e1fece90c 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -414,6 +414,12 @@ struct cpufreq_driver {
+ 	 * policy is properly initialized, but before the governor is started.
+ 	 */
+ 	void		(*register_em)(struct cpufreq_policy *policy);
++
++	/*
++	 * Set by drivers that want to initialize the policy->min_freq_req with
++	 * a value different from the default value (0) in cpufreq core.
++	 */
++	int		(*get_init_min_freq)(struct cpufreq_policy *policy);
+ };
+ 
+ /* flags */
+-- 
+2.47.0.rc0
+
