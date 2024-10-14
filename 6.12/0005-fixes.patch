@@ -1,7 +1,7 @@
-From 2faa202575d7a733f0d84ead9c6096310c371be2 Mon Sep 17 00:00:00 2001
+From aa9eed21906c876c1ac1b878acb08345019e7514 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 7 Oct 2024 11:53:30 +0200
-Subject: [PATCH 4/8] fixes
+Date: Mon, 14 Oct 2024 14:03:37 +0200
+Subject: [PATCH 5/9] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
@@ -30,7 +30,10 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  .../gpu/drm/amd/pm/swsmu/smu14/smu_v14_0.c    | 33 +++++++++----
  .../drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c  |  3 +-
  drivers/net/wireless/realtek/rtw89/pci.c      | 48 ++++++++++++++++---
- 25 files changed, 220 insertions(+), 116 deletions(-)
+ kernel/sched/core.c                           | 20 ++++++--
+ kernel/sched/sched.h                          |  1 +
+ kernel/sched/stats.h                          | 10 ++++
+ 28 files changed, 248 insertions(+), 119 deletions(-)
 
 diff --git a/arch/Kconfig b/arch/Kconfig
 index 8af374ea1adc..70d231265c39 100644
@@ -1124,92 +1127,124 @@ index 02afeb3acce4..5aef7fa37878 100644
  
  	resource_len = pci_resource_len(pdev, bar_id);
  	rtwpci->mmap = pci_iomap(pdev, bar_id, resource_len);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index aeb595514461..9dd091ad5a60 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2009,12 +2009,19 @@ unsigned long get_wchan(struct task_struct *p)
+ 
+ void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+ {
++	bool wakee_not_migrated = (flags & ENQUEUE_WAKEUP) && !(flags & ENQUEUE_MIGRATED);
++
+ 	if (!(flags & ENQUEUE_NOCLOCK))
+ 		update_rq_clock(rq);
+ 
+ 	if (!(flags & ENQUEUE_RESTORE)) {
+ 		sched_info_enqueue(rq, p);
+-		psi_enqueue(p, (flags & ENQUEUE_WAKEUP) && !(flags & ENQUEUE_MIGRATED));
++
++		/* Notify PSI that the task was migrated in a delayed state before wakeup. */
++		if ((p->migration_flags & DELAYED_MIGRATED) && !task_on_rq_migrating(p)) {
++			wakee_not_migrated = false;
++			p->migration_flags &= ~DELAYED_MIGRATED;
++		}
+ 	}
+ 
+ 	p->sched_class->enqueue_task(rq, p, flags);
+@@ -2023,6 +2030,8 @@ void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+ 	 * ->sched_delayed.
+ 	 */
+ 	uclamp_rq_inc(rq, p);
++	if (!(flags & ENQUEUE_RESTORE))
++		psi_enqueue(p, wakee_not_migrated);
+ 
+ 	if (sched_core_enabled(rq))
+ 		sched_core_enqueue(rq, p);
+@@ -2042,6 +2051,9 @@ inline bool dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+ 	if (!(flags & DEQUEUE_SAVE)) {
+ 		sched_info_dequeue(rq, p);
+ 		psi_dequeue(p, flags & DEQUEUE_SLEEP);
++
++		if (p->se.sched_delayed && task_on_rq_migrating(p))
++			p->migration_flags |= DELAYED_MIGRATED;
+ 	}
+ 
+ 	/*
+@@ -3737,7 +3749,7 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
+ 	if (task_on_rq_queued(p)) {
+ 		update_rq_clock(rq);
+ 		if (p->se.sched_delayed)
+-			enqueue_task(rq, p, ENQUEUE_NOCLOCK | ENQUEUE_DELAYED);
++			enqueue_task(rq, p, ENQUEUE_NOCLOCK | ENQUEUE_WAKEUP | ENQUEUE_DELAYED);
+ 		if (!task_on_cpu(rq, p)) {
+ 			/*
+ 			 * When on_rq && !on_cpu the task is preempted, see if
+@@ -6544,6 +6556,7 @@ static void __sched notrace __schedule(int sched_mode)
+ 	 * as a preemption by schedule_debug() and RCU.
+ 	 */
+ 	bool preempt = sched_mode > SM_NONE;
++	bool block = false;
+ 	unsigned long *switch_count;
+ 	unsigned long prev_state;
+ 	struct rq_flags rf;
+@@ -6629,6 +6642,7 @@ static void __sched notrace __schedule(int sched_mode)
+ 			 * After this, schedule() must not care about p->state any more.
+ 			 */
+ 			block_task(rq, prev, flags);
++			block = true;
+ 		}
+ 		switch_count = &prev->nvcsw;
+ 	}
+@@ -6674,7 +6688,7 @@ static void __sched notrace __schedule(int sched_mode)
+ 
+ 		migrate_disable_switch(rq, prev);
+ 		psi_account_irqtime(rq, prev, next);
+-		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
++		psi_sched_switch(prev, next, block);
+ 
+ 		trace_sched_switch(preempt, prev, next, prev_state);
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index c9e5ef0af192..808bfaded2af 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1326,6 +1326,7 @@ static inline int cpu_of(struct rq *rq)
+ }
+ 
+ #define MDF_PUSH		0x01
++#define DELAYED_MIGRATED	0x02 /* Task was migrated when in DELAYED_DEQUEUE state */
+ 
+ static inline bool is_migration_disabled(struct task_struct *p)
+ {
+diff --git a/kernel/sched/stats.h b/kernel/sched/stats.h
+index 237780aa3c53..06a2c6d3ec1e 100644
+--- a/kernel/sched/stats.h
++++ b/kernel/sched/stats.h
+@@ -129,6 +129,13 @@ static inline void psi_enqueue(struct task_struct *p, bool wakeup)
+ 	if (static_branch_likely(&psi_disabled))
+ 		return;
+ 
++	/*
++	 * Delayed task is not ready to run yet!
++	 * Wait for a requeue before accounting.
++	 */
++	if (p->se.sched_delayed)
++		return;
++
+ 	if (p->in_memstall)
+ 		set |= TSK_MEMSTALL_RUNNING;
+ 
+@@ -148,6 +155,9 @@ static inline void psi_dequeue(struct task_struct *p, bool sleep)
+ 	if (static_branch_likely(&psi_disabled))
+ 		return;
+ 
++	/* Delayed task can only be dequeued for migration. */
++	WARN_ON_ONCE(p->se.sched_delayed && sleep);
++
+ 	/*
+ 	 * A voluntary sleep is a dequeue followed by a task switch. To
+ 	 * avoid walking all ancestors twice, psi_task_switch() handles
 -- 
 2.47.0.rc0
 
-From 3b0fe361443383351212d1503d4b3dcf32fd1ce8 Mon Sep 17 00:00:00 2001
-From: Javier Martinez Canillas <javierm@redhat.com>
-Date: Thu, 19 May 2022 14:40:07 +0200
-Subject: [PATCH] drivers/firmware: skip simpledrm if nvidia-drm.modeset=1 is
- set
-
-The Nvidia proprietary driver has some bugs that leads to issues if used
-with the simpledrm driver. The most noticeable is that does not register
-an emulated fbdev device.
-
-It just relies on a fbdev to be registered by another driver, that could
-be that could be attached to the framebuffer console. On UEFI machines,
-this is the efifb driver.
-
-This means that disabling the efifb driver will cause virtual consoles to
-not be present in the system when using the Nvidia driver. Legacy BIOS is
-not affected just because fbcon is not used there, but instead vgacon.
-
-Unless a VGA mode is specified using the vga= kernel command line option,
-in that case the vesafb driver is used instead and its fbdev attached to
-the fbcon.
-
-This is a problem because with CONFIG_SYSFB_SIMPLEFB=y, the sysfb platform
-code attempts to register a "simple-framebuffer" platform device (that is
-matched against simpledrm) and only registers either an "efi-framebuffer"
-or "vesa-framebuffer" if this fails to be registered due the video modes
-not being compatible.
-
-The Nvidia driver relying on another driver to register the fbdev is quite
-fragile, since it can't really assume those will stick around. For example
-there are patches posted to remove the EFI and VESA platform devices once
-a real DRM or fbdev driver probes.
-
-But in any case, moving to a simpledrm + emulated fbdev only breaks this
-assumption and causes users to not have VT if the Nvidia driver is used.
-
-So to prevent this, let's add a workaround and make the sysfb to skip the
-"simple-framebuffer" registration when nvidia-drm.modeset=1 option is set.
-
-This is quite horrible, but honestly I can't think of any other approach.
-
-For this to work, the CONFIG_FB_EFI and CONFIG_FB_VESA config options must
-be enabled besides CONFIG_DRM_SIMPLEDRM.
-
-Signed-off-by: Javier Martinez Canillas <javierm@redhat.com>
-Cherry-picked-for: https://bugs.archlinux.org/task/73720
----
- drivers/firmware/sysfb.c | 18 +++++++++++++++++-
- 1 file changed, 17 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/firmware/sysfb.c b/drivers/firmware/sysfb.c
-index a3df782fa687b0..940d8f51434176 100644
---- a/drivers/firmware/sysfb.c
-+++ b/drivers/firmware/sysfb.c
-@@ -35,6 +35,22 @@
- #include <linux/screen_info.h>
- #include <linux/sysfb.h>
- 
-+static int skip_simpledrm;
-+
-+static int __init simpledrm_disable(char *opt)
-+{
-+	if (!opt)
-+                return -EINVAL;
-+
-+	get_option(&opt, &skip_simpledrm);
-+
-+	if (skip_simpledrm)
-+		pr_info("The simpledrm driver will not be probed\n");
-+
-+	return 0;
-+}
-+early_param("nvidia-drm.modeset", simpledrm_disable);
-+
- static struct platform_device *pd;
- static DEFINE_MUTEX(disable_lock);
- static bool disabled;
-@@ -145,7 +161,7 @@ static __init int sysfb_init(void)
- 
- 	/* try to create a simple-framebuffer device */
- 	compatible = sysfb_parse_mode(si, &mode);
--	if (compatible) {
-+	if (compatible && !skip_simpledrm) {
- 		pd = sysfb_create_simplefb(si, &mode, parent);
- 		if (!IS_ERR(pd))
- 			goto put_device;
