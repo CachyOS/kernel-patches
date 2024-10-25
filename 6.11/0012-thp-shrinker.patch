@@ -1,29 +1,27 @@
-From e6b7bcc3665414747dd2976d41a8b8f4f052dd77 Mon Sep 17 00:00:00 2001
+From 9c5f8134d6095a520bca8870f2477115b595ca07 Mon Sep 17 00:00:00 2001
 From: Eric Naim <dnaim@cachyos.org>
 Date: Tue, 22 Oct 2024 22:53:44 +0800
-Subject: [PATCH 13/14] thp-shrinker
+Subject: [PATCH 12/13] thp-shrinker
 
-Signed-off-by: Eric Naim <dnaim@cachyos.org>
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- Documentation/admin-guide/mm/transhuge.rst    |  16 +++
+ Documentation/admin-guide/mm/transhuge.rst    |  16 ++
  include/linux/huge_mm.h                       |   4 +-
  include/linux/khugepaged.h                    |   1 +
  include/linux/page-flags.h                    |  13 +-
  include/linux/rmap.h                          |   7 +-
  include/linux/vm_event_item.h                 |   1 +
- mm/huge_memory.c                              | 124 ++++++++++++++++--
+ mm/huge_memory.c                              | 143 ++++++++++++++++--
  mm/khugepaged.c                               |   3 +-
- mm/memcontrol.c                               |   3 +-
- mm/migrate.c                                  |  75 +++++++++--
+ mm/migrate.c                                  |  75 +++++++--
  mm/migrate_device.c                           |   4 +-
- mm/page_alloc.c                               |   5 +-
  mm/rmap.c                                     |   5 +-
  mm/vmscan.c                                   |   3 +-
  mm/vmstat.c                                   |   1 +
- .../selftests/mm/split_huge_page_test.c       |  71 ++++++++++
- tools/testing/selftests/mm/vm_util.c          |  22 ++++
+ .../selftests/mm/split_huge_page_test.c       |  71 +++++++++
+ tools/testing/selftests/mm/vm_util.c          |  22 +++
  tools/testing/selftests/mm/vm_util.h          |   1 +
- 18 files changed, 323 insertions(+), 36 deletions(-)
+ 16 files changed, 334 insertions(+), 36 deletions(-)
 
 diff --git a/Documentation/admin-guide/mm/transhuge.rst b/Documentation/admin-guide/mm/transhuge.rst
 index 058485daf186..02ae7bc9efbd 100644
@@ -164,7 +162,7 @@ index 747943bc8cc2..d35e588e0ece 100644
  		THP_SCAN_EXCEED_NONE_PTE,
  		THP_SCAN_EXCEED_SWAP_PTE,
 diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index 4d2839fcf688..3292411ad8ed 100644
+index 4d2839fcf688..eb2e5c305547 100644
 --- a/mm/huge_memory.c
 +++ b/mm/huge_memory.c
 @@ -77,6 +77,7 @@ static unsigned long deferred_split_count(struct shrinker *shrink,
@@ -360,6 +358,17 @@ index 4d2839fcf688..3292411ad8ed 100644
  static unsigned long deferred_split_scan(struct shrinker *shrink,
  		struct shrink_control *sc)
  {
+@@ -3369,8 +3442,8 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
+ 	struct deferred_split *ds_queue = &pgdata->deferred_split_queue;
+ 	unsigned long flags;
+ 	LIST_HEAD(list);
+-	struct folio *folio, *next;
+-	int split = 0;
++	struct folio *folio, *next, *prev = NULL;
++	int split = 0, removed = 0;
+ 
+ #ifdef CONFIG_MEMCG
+ 	if (sc->memcg)
 @@ -3385,6 +3458,9 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
  			list_move(&folio->_deferred_list, &list);
  		} else {
@@ -370,7 +379,7 @@ index 4d2839fcf688..3292411ad8ed 100644
  			list_del_init(&folio->_deferred_list);
  			ds_queue->split_queue_len--;
  		}
-@@ -3394,13 +3470,35 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
+@@ -3394,20 +3470,55 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
  	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
  
  	list_for_each_entry_safe(folio, next, &list, _deferred_list) {
@@ -394,6 +403,7 @@ index 4d2839fcf688..3292411ad8ed 100644
 +		}
  		folio_unlock(folio);
  next:
+-		folio_put(folio);
 +		/*
 +		 * split_folio() removes folio from list on success.
 +		 * Only add back to the queue if folio is partially mapped.
@@ -403,11 +413,31 @@ index 4d2839fcf688..3292411ad8ed 100644
 +		 */
 +		if (!did_split && !folio_test_partially_mapped(folio)) {
 +			list_del_init(&folio->_deferred_list);
-+			ds_queue->split_queue_len--;
++			removed++;
++		} else {
++			/*
++			 * That unlocked list_del_init() above would be unsafe,
++			 * unless its folio is separated from any earlier folios
++			 * left on the list (which may be concurrently unqueued)
++			 * by one safe folio with refcount still raised.
++			 */
++			swap(folio, prev);
 +		}
- 		folio_put(folio);
++		if (folio)
++			folio_put(folio);
  	}
  
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+ 	list_splice_tail(&list, &ds_queue->split_queue);
++	ds_queue->split_queue_len -= removed;
+ 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
+ 
++	if (prev)
++		folio_put(prev);
++
+ 	/*
+ 	 * Stop shrinker if we didn't split any page, but the queue is empty.
+ 	 * This can happen if pages were freed under us.
 diff --git a/mm/khugepaged.c b/mm/khugepaged.c
 index 4cba91ecf74b..ee490f1e7de2 100644
 --- a/mm/khugepaged.c
@@ -429,20 +459,6 @@ index 4cba91ecf74b..ee490f1e7de2 100644
  	spin_unlock(pmd_ptl);
  
  	folio = NULL;
-diff --git a/mm/memcontrol.c b/mm/memcontrol.c
-index d563fb515766..c5078e86ac55 100644
---- a/mm/memcontrol.c
-+++ b/mm/memcontrol.c
-@@ -4606,7 +4606,8 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
- 	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
- 	VM_BUG_ON_FOLIO(folio_order(folio) > 1 &&
- 			!folio_test_hugetlb(folio) &&
--			!list_empty(&folio->_deferred_list), folio);
-+			!list_empty(&folio->_deferred_list) &&
-+			folio_test_partially_mapped(folio), folio);
- 
- 	/*
- 	 * Nobody should be changing or seriously looking at
 diff --git a/mm/migrate.c b/mm/migrate.c
 index 368ab3878fa6..d3a66f1a621b 100644
 --- a/mm/migrate.c
@@ -610,22 +626,6 @@ index 6d66dc1c6ffa..8f875636b35b 100644
  		folio_unlock(src);
  
  		if (is_zone_device_page(page))
-diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index f8b4dae35fc3..6040ed48da3e 100644
---- a/mm/page_alloc.c
-+++ b/mm/page_alloc.c
-@@ -962,8 +962,9 @@ static int free_tail_page_prepare(struct page *head_page, struct page *page)
- 		break;
- 	case 2:
- 		/* the second tail page: deferred_list overlaps ->mapping */
--		if (unlikely(!list_empty(&folio->_deferred_list))) {
--			bad_page(page, "on deferred list");
-+		if (unlikely(!list_empty(&folio->_deferred_list) &&
-+		    folio_test_partially_mapped(folio))) {
-+			bad_page(page, "partially mapped folio on deferred list");
- 			goto out;
- 		}
- 		break;
 diff --git a/mm/rmap.c b/mm/rmap.c
 index 2490e727e2dc..77b5185058b4 100644
 --- a/mm/rmap.c
@@ -810,5 +810,5 @@ index 9007c420d52c..2eaed8209925 100644
  bool check_huge_file(void *addr, int nr_hpages, uint64_t hpage_size);
  bool check_huge_shmem(void *addr, int nr_hpages, uint64_t hpage_size);
 -- 
-2.47.0
+2.47.0.rc0
 
