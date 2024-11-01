@@ -1,0 +1,428 @@
+From 89fb634d80e9bcaf6820b78f7d9a4942c7cc120e Mon Sep 17 00:00:00 2001
+From: Eric Naim <dnaim@cachyos.org>
+Date: Sat, 2 Nov 2024 00:04:23 +0800
+Subject: [PATCH] openssl-provider
+
+Signed-off-by: Eric Naim <dnaim@cachyos.org>
+---
+ MAINTAINERS          |   1 +
+ certs/Makefile       |   2 +-
+ certs/extract-cert.c | 138 +++++++++++++++++++++++--------------------
+ scripts/sign-file.c  | 134 +++++++++++++++++++++--------------------
+ scripts/ssl-common.h |  32 ++++++++++
+ 5 files changed, 178 insertions(+), 129 deletions(-)
+ create mode 100644 scripts/ssl-common.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index ae4c0cec5073..294d2ce29b73 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -4784,6 +4784,7 @@ S:	Maintained
+ F:	Documentation/admin-guide/module-signing.rst
+ F:	certs/
+ F:	scripts/sign-file.c
++F:	scripts/ssl-common.h
+ F:	tools/certs/
+ 
+ CFAG12864B LCD DRIVER
+diff --git a/certs/Makefile b/certs/Makefile
+index 799ad7b9e68a..67e1f2707c2f 100644
+--- a/certs/Makefile
++++ b/certs/Makefile
+@@ -84,5 +84,5 @@ targets += x509_revocation_list
+ 
+ hostprogs := extract-cert
+ 
+-HOSTCFLAGS_extract-cert.o = $(shell $(HOSTPKG_CONFIG) --cflags libcrypto 2> /dev/null)
++HOSTCFLAGS_extract-cert.o = $(shell $(HOSTPKG_CONFIG) --cflags libcrypto 2> /dev/null) -I$(srctree)/scripts
+ HOSTLDLIBS_extract-cert = $(shell $(HOSTPKG_CONFIG) --libs libcrypto 2> /dev/null || echo -lcrypto)
+diff --git a/certs/extract-cert.c b/certs/extract-cert.c
+index 70e9ec89d87d..7d6d468ed612 100644
+--- a/certs/extract-cert.c
++++ b/certs/extract-cert.c
+@@ -21,14 +21,17 @@
+ #include <openssl/bio.h>
+ #include <openssl/pem.h>
+ #include <openssl/err.h>
+-#include <openssl/engine.h>
+-
+-/*
+- * OpenSSL 3.0 deprecates the OpenSSL's ENGINE API.
+- *
+- * Remove this if/when that API is no longer used
+- */
+-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++#if OPENSSL_VERSION_MAJOR >= 3
++# define USE_PKCS11_PROVIDER
++# include <openssl/provider.h>
++# include <openssl/store.h>
++#else
++# if !defined(OPENSSL_NO_ENGINE) && !defined(OPENSSL_NO_DEPRECATED_3_0)
++#  define USE_PKCS11_ENGINE
++#  include <openssl/engine.h>
++# endif
++#endif
++#include "ssl-common.h"
+ 
+ #define PKEY_ID_PKCS7 2
+ 
+@@ -40,41 +43,6 @@ void format(void)
+ 	exit(2);
+ }
+ 
+-static void display_openssl_errors(int l)
+-{
+-	const char *file;
+-	char buf[120];
+-	int e, line;
+-
+-	if (ERR_peek_error() == 0)
+-		return;
+-	fprintf(stderr, "At main.c:%d:\n", l);
+-
+-	while ((e = ERR_get_error_line(&file, &line))) {
+-		ERR_error_string(e, buf);
+-		fprintf(stderr, "- SSL %s: %s:%d\n", buf, file, line);
+-	}
+-}
+-
+-static void drain_openssl_errors(void)
+-{
+-	const char *file;
+-	int line;
+-
+-	if (ERR_peek_error() == 0)
+-		return;
+-	while (ERR_get_error_line(&file, &line)) {}
+-}
+-
+-#define ERR(cond, fmt, ...)				\
+-	do {						\
+-		bool __cond = (cond);			\
+-		display_openssl_errors(__LINE__);	\
+-		if (__cond) {				\
+-			err(1, fmt, ## __VA_ARGS__);	\
+-		}					\
+-	} while(0)
+-
+ static const char *key_pass;
+ static BIO *wb;
+ static char *cert_dst;
+@@ -94,6 +62,66 @@ static void write_cert(X509 *x509)
+ 		fprintf(stderr, "Extracted cert: %s\n", buf);
+ }
+ 
++static X509 *load_cert_pkcs11(const char *cert_src)
++{
++	X509 *cert = NULL;
++#ifdef USE_PKCS11_PROVIDER
++	OSSL_STORE_CTX *store;
++
++	if (!OSSL_PROVIDER_try_load(NULL, "pkcs11", true))
++		ERR(1, "OSSL_PROVIDER_try_load(pkcs11)");
++	if (!OSSL_PROVIDER_try_load(NULL, "default", true))
++		ERR(1, "OSSL_PROVIDER_try_load(default)");
++
++	store = OSSL_STORE_open(cert_src, NULL, NULL, NULL, NULL);
++	ERR(!store, "OSSL_STORE_open");
++
++	while (!OSSL_STORE_eof(store)) {
++		OSSL_STORE_INFO *info = OSSL_STORE_load(store);
++
++		if (!info) {
++			drain_openssl_errors(__LINE__, 0);
++			continue;
++		}
++		if (OSSL_STORE_INFO_get_type(info) == OSSL_STORE_INFO_CERT) {
++			cert = OSSL_STORE_INFO_get1_CERT(info);
++			ERR(!cert, "OSSL_STORE_INFO_get1_CERT");
++		}
++		OSSL_STORE_INFO_free(info);
++		if (cert)
++			break;
++	}
++	OSSL_STORE_close(store);
++#elif defined(USE_PKCS11_ENGINE)
++		ENGINE *e;
++		struct {
++			const char *cert_id;
++			X509 *cert;
++		} parms;
++
++		parms.cert_id = cert_src;
++		parms.cert = NULL;
++
++		ENGINE_load_builtin_engines();
++		drain_openssl_errors(__LINE__, 1);
++		e = ENGINE_by_id("pkcs11");
++		ERR(!e, "Load PKCS#11 ENGINE");
++		if (ENGINE_init(e))
++			drain_openssl_errors(__LINE__, 1);
++		else
++			ERR(1, "ENGINE_init");
++		if (key_pass)
++			ERR(!ENGINE_ctrl_cmd_string(e, "PIN", key_pass, 0), "Set PKCS#11 PIN");
++		ENGINE_ctrl_cmd(e, "LOAD_CERT_CTRL", 0, &parms, NULL, 1);
++		ERR(!parms.cert, "Get X.509 from PKCS#11");
++		cert = parms.cert;
++#else
++		fprintf(stderr, "no pkcs11 engine/provider available\n");
++		exit(1);
++#endif
++	return cert;
++}
++
+ int main(int argc, char **argv)
+ {
+ 	char *cert_src;
+@@ -122,28 +150,10 @@ int main(int argc, char **argv)
+ 		fclose(f);
+ 		exit(0);
+ 	} else if (!strncmp(cert_src, "pkcs11:", 7)) {
+-		ENGINE *e;
+-		struct {
+-			const char *cert_id;
+-			X509 *cert;
+-		} parms;
+-
+-		parms.cert_id = cert_src;
+-		parms.cert = NULL;
++		X509 *cert = load_cert_pkcs11(cert_src);
+ 
+-		ENGINE_load_builtin_engines();
+-		drain_openssl_errors();
+-		e = ENGINE_by_id("pkcs11");
+-		ERR(!e, "Load PKCS#11 ENGINE");
+-		if (ENGINE_init(e))
+-			drain_openssl_errors();
+-		else
+-			ERR(1, "ENGINE_init");
+-		if (key_pass)
+-			ERR(!ENGINE_ctrl_cmd_string(e, "PIN", key_pass, 0), "Set PKCS#11 PIN");
+-		ENGINE_ctrl_cmd(e, "LOAD_CERT_CTRL", 0, &parms, NULL, 1);
+-		ERR(!parms.cert, "Get X.509 from PKCS#11");
+-		write_cert(parms.cert);
++		ERR(!cert, "load_cert_pkcs11 failed");
++		write_cert(cert);
+ 	} else {
+ 		BIO *b;
+ 		X509 *x509;
+diff --git a/scripts/sign-file.c b/scripts/sign-file.c
+index 3edb156ae52c..ba413dc69a20 100644
+--- a/scripts/sign-file.c
++++ b/scripts/sign-file.c
+@@ -27,14 +27,17 @@
+ #include <openssl/evp.h>
+ #include <openssl/pem.h>
+ #include <openssl/err.h>
+-#include <openssl/engine.h>
+-
+-/*
+- * OpenSSL 3.0 deprecates the OpenSSL's ENGINE API.
+- *
+- * Remove this if/when that API is no longer used
+- */
+-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++#if OPENSSL_VERSION_MAJOR >= 3
++# define USE_PKCS11_PROVIDER
++# include <openssl/provider.h>
++# include <openssl/store.h>
++#else
++# if !defined(OPENSSL_NO_ENGINE) && !defined(OPENSSL_NO_DEPRECATED_3_0)
++#  define USE_PKCS11_ENGINE
++#  include <openssl/engine.h>
++# endif
++#endif
++#include "ssl-common.h"
+ 
+ /*
+  * Use CMS if we have openssl-1.0.0 or newer available - otherwise we have to
+@@ -83,41 +86,6 @@ void format(void)
+ 	exit(2);
+ }
+ 
+-static void display_openssl_errors(int l)
+-{
+-	const char *file;
+-	char buf[120];
+-	int e, line;
+-
+-	if (ERR_peek_error() == 0)
+-		return;
+-	fprintf(stderr, "At main.c:%d:\n", l);
+-
+-	while ((e = ERR_get_error_line(&file, &line))) {
+-		ERR_error_string(e, buf);
+-		fprintf(stderr, "- SSL %s: %s:%d\n", buf, file, line);
+-	}
+-}
+-
+-static void drain_openssl_errors(void)
+-{
+-	const char *file;
+-	int line;
+-
+-	if (ERR_peek_error() == 0)
+-		return;
+-	while (ERR_get_error_line(&file, &line)) {}
+-}
+-
+-#define ERR(cond, fmt, ...)				\
+-	do {						\
+-		bool __cond = (cond);			\
+-		display_openssl_errors(__LINE__);	\
+-		if (__cond) {				\
+-			errx(1, fmt, ## __VA_ARGS__);	\
+-		}					\
+-	} while(0)
+-
+ static const char *key_pass;
+ 
+ static int pem_pw_cb(char *buf, int len, int w, void *v)
+@@ -139,28 +107,66 @@ static int pem_pw_cb(char *buf, int len, int w, void *v)
+ 	return pwlen;
+ }
+ 
+-static EVP_PKEY *read_private_key(const char *private_key_name)
++static EVP_PKEY *read_private_key_pkcs11(const char *private_key_name)
+ {
+-	EVP_PKEY *private_key;
++	EVP_PKEY *private_key = NULL;
++#ifdef USE_PKCS11_PROVIDER
++	OSSL_STORE_CTX *store;
+ 
++	if (!OSSL_PROVIDER_try_load(NULL, "pkcs11", true))
++		ERR(1, "OSSL_PROVIDER_try_load(pkcs11)");
++	if (!OSSL_PROVIDER_try_load(NULL, "default", true))
++		ERR(1, "OSSL_PROVIDER_try_load(default)");
++
++	store = OSSL_STORE_open(private_key_name, NULL, NULL, NULL, NULL);
++	ERR(!store, "OSSL_STORE_open");
++
++	while (!OSSL_STORE_eof(store)) {
++		OSSL_STORE_INFO *info = OSSL_STORE_load(store);
++
++		if (!info) {
++			drain_openssl_errors(__LINE__, 0);
++			continue;
++		}
++		if (OSSL_STORE_INFO_get_type(info) == OSSL_STORE_INFO_PKEY) {
++			private_key = OSSL_STORE_INFO_get1_PKEY(info);
++			ERR(!private_key, "OSSL_STORE_INFO_get1_PKEY");
++		}
++		OSSL_STORE_INFO_free(info);
++		if (private_key)
++			break;
++	}
++	OSSL_STORE_close(store);
++#elif defined(USE_PKCS11_ENGINE)
++	ENGINE *e;
++
++	ENGINE_load_builtin_engines();
++	drain_openssl_errors(__LINE__, 1);
++	e = ENGINE_by_id("pkcs11");
++	ERR(!e, "Load PKCS#11 ENGINE");
++	if (ENGINE_init(e))
++		drain_openssl_errors(__LINE__, 1);
++	else
++		ERR(1, "ENGINE_init");
++	if (key_pass)
++		ERR(!ENGINE_ctrl_cmd_string(e, "PIN", key_pass, 0),
++				"Set PKCS#11 PIN");
++	private_key = ENGINE_load_private_key(e, private_key_name,
++			NULL, NULL);
++	ERR(!private_key, "%s", private_key_name);
++#else
++	fprintf(stderr, "no pkcs11 engine/provider available\n");
++	exit(1);
++#endif
++	return private_key;
++}
++
++static EVP_PKEY *read_private_key(const char *private_key_name)
++{
+ 	if (!strncmp(private_key_name, "pkcs11:", 7)) {
+-		ENGINE *e;
+-
+-		ENGINE_load_builtin_engines();
+-		drain_openssl_errors();
+-		e = ENGINE_by_id("pkcs11");
+-		ERR(!e, "Load PKCS#11 ENGINE");
+-		if (ENGINE_init(e))
+-			drain_openssl_errors();
+-		else
+-			ERR(1, "ENGINE_init");
+-		if (key_pass)
+-			ERR(!ENGINE_ctrl_cmd_string(e, "PIN", key_pass, 0),
+-			    "Set PKCS#11 PIN");
+-		private_key = ENGINE_load_private_key(e, private_key_name,
+-						      NULL, NULL);
+-		ERR(!private_key, "%s", private_key_name);
++		return read_private_key_pkcs11(private_key_name);
+ 	} else {
++		EVP_PKEY *private_key;
+ 		BIO *b;
+ 
+ 		b = BIO_new_file(private_key_name, "rb");
+@@ -169,9 +175,9 @@ static EVP_PKEY *read_private_key(const char *private_key_name)
+ 						      NULL);
+ 		ERR(!private_key, "%s", private_key_name);
+ 		BIO_free(b);
+-	}
+ 
+-	return private_key;
++		return private_key;
++	}
+ }
+ 
+ static X509 *read_x509(const char *x509_name)
+@@ -306,7 +312,7 @@ int main(int argc, char **argv)
+ 
+ 		/* Digest the module data. */
+ 		OpenSSL_add_all_digests();
+-		display_openssl_errors(__LINE__);
++		drain_openssl_errors(__LINE__, 0);
+ 		digest_algo = EVP_get_digestbyname(hash_algo);
+ 		ERR(!digest_algo, "EVP_get_digestbyname");
+ 
+diff --git a/scripts/ssl-common.h b/scripts/ssl-common.h
+new file mode 100644
+index 000000000000..2db0e181143c
+--- /dev/null
++++ b/scripts/ssl-common.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: LGPL-2.1+ */
++/*
++ * SSL helper functions shared by sign-file and extract-cert.
++ */
++
++static void drain_openssl_errors(int l, int silent)
++{
++	const char *file;
++	char buf[120];
++	int e, line;
++
++	if (ERR_peek_error() == 0)
++		return;
++	if (!silent)
++		fprintf(stderr, "At main.c:%d:\n", l);
++
++	while ((e = ERR_peek_error_line(&file, &line))) {
++		ERR_error_string(e, buf);
++		if (!silent)
++			fprintf(stderr, "- SSL %s: %s:%d\n", buf, file, line);
++		ERR_get_error();
++	}
++}
++
++#define ERR(cond, fmt, ...)				\
++	do {						\
++		bool __cond = (cond);			\
++		drain_openssl_errors(__LINE__, 0);	\
++		if (__cond) {				\
++			errx(1, fmt, ## __VA_ARGS__);	\
++		}					\
++	} while (0)
+-- 
+2.47.0
+
