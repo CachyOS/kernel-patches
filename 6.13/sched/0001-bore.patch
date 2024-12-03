@@ -1,22 +1,22 @@
-From 09bda9a3d80069a6ba4434cc02087b4afb844605 Mon Sep 17 00:00:00 2001
+From d5c314f1e6df3cba78c3d75d0b8f5e75a728a401 Mon Sep 17 00:00:00 2001
 From: Eric Naim <dnaim@cachyos.org>
-Date: Mon, 2 Dec 2024 16:33:34 +0800
+Date: Tue, 3 Dec 2024 21:29:12 +0800
 Subject: [PATCH] bore
 
 Signed-off-by: Eric Naim <dnaim@cachyos.org>
 ---
  include/linux/sched.h      |  17 ++
- include/linux/sched/bore.h |  39 ++++
+ include/linux/sched/bore.h |  41 ++++
  init/Kconfig               |  17 ++
  kernel/Kconfig.hz          |  17 ++
  kernel/fork.c              |   5 +
  kernel/sched/Makefile      |   1 +
- kernel/sched/bore.c        | 400 +++++++++++++++++++++++++++++++++++++
- kernel/sched/core.c        |   7 +
- kernel/sched/debug.c       |  61 +++++-
- kernel/sched/fair.c        |  72 ++++++-
+ kernel/sched/bore.c        | 443 +++++++++++++++++++++++++++++++++++++
+ kernel/sched/core.c        |   6 +
+ kernel/sched/debug.c       |  61 ++++-
+ kernel/sched/fair.c        |  72 +++++-
  kernel/sched/sched.h       |   9 +
- 11 files changed, 640 insertions(+), 5 deletions(-)
+ 11 files changed, 684 insertions(+), 5 deletions(-)
  create mode 100644 include/linux/sched/bore.h
  create mode 100644 kernel/sched/bore.c
 
@@ -57,17 +57,17 @@ index d380bffee2ef..aacd3fffb238 100644
  
 diff --git a/include/linux/sched/bore.h b/include/linux/sched/bore.h
 new file mode 100644
-index 000000000000..4078fddf4e90
+index 000000000000..d42c9c50c904
 --- /dev/null
 +++ b/include/linux/sched/bore.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,41 @@
 +
 +#include <linux/sched.h>
 +#include <linux/sched/cputime.h>
 +
 +#ifndef _LINUX_SCHED_BORE_H
 +#define _LINUX_SCHED_BORE_H
-+#define SCHED_BORE_VERSION "5.8.1"
++#define SCHED_BORE_VERSION "5.8.2"
 +
 +#ifdef CONFIG_SCHED_BORE
 +extern u8   __read_mostly sched_bore;
@@ -75,6 +75,7 @@ index 000000000000..4078fddf4e90
 +extern u8   __read_mostly sched_burst_smoothness_long;
 +extern u8   __read_mostly sched_burst_smoothness_short;
 +extern u8   __read_mostly sched_burst_fork_atavistic;
++extern u8   __read_mostly sched_burst_clone_limit_rcu;
 +extern u8   __read_mostly sched_burst_parity_threshold;
 +extern u8   __read_mostly sched_burst_penalty_offset;
 +extern uint __read_mostly sched_burst_penalty_scale;
@@ -95,6 +96,7 @@ index 000000000000..4078fddf4e90
 +	struct task_struct *p, struct task_struct *parent, u64 clone_flags);
 +
 +extern void init_task_bore(struct task_struct *p);
++extern void sched_bore_init(void);
 +
 +extern void reweight_entity(
 +	struct cfs_rq *cfs_rq, struct sched_entity *se, unsigned long weight);
@@ -189,15 +191,20 @@ index 976092b7bd45..293aad675444 100644
 +obj-y += bore.o
 diff --git a/kernel/sched/bore.c b/kernel/sched/bore.c
 new file mode 100644
-index 000000000000..794cb2bb3a01
+index 000000000000..496d373dee2f
 --- /dev/null
 +++ b/kernel/sched/bore.c
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,443 @@
 +/*
 + *  Burst-Oriented Response Enhancer (BORE) CPU Scheduler
 + *  Copyright (C) 2021-2024 Masahito Suzuki <firelzrd@gmail.com>
 + */
 +#include <linux/cpuset.h>
++#include <linux/cpumask.h>
++#include <linux/rculist.h>
++#include <linux/rcupdate.h>
++#include <linux/semaphore.h>
++#include <linux/sched/task.h>
 +#include <linux/sched/bore.h>
 +#include "sched.h"
 +
@@ -207,6 +214,7 @@ index 000000000000..794cb2bb3a01
 +u8   __read_mostly sched_burst_smoothness_long  = 1;
 +u8   __read_mostly sched_burst_smoothness_short = 0;
 +u8   __read_mostly sched_burst_fork_atavistic   = 2;
++u8   __read_mostly sched_burst_clone_limit_rcu  = 2;
 +u8   __read_mostly sched_burst_parity_threshold = 2;
 +u8   __read_mostly sched_burst_penalty_offset   = 24;
 +uint __read_mostly sched_burst_penalty_scale    = 1280;
@@ -217,6 +225,9 @@ index 000000000000..794cb2bb3a01
 +static int __maybe_unused sixty_four     = 64;
 +static int __maybe_unused maxval_u8      = 255;
 +static int __maybe_unused maxval_12_bits = 4095;
++
++static uint     __read_mostly init_ncpus;
++static rwlock_t __read_mostly *lock_limiter;
 +
 +#define MAX_BURST_PENALTY (39U <<2)
 +
@@ -392,7 +403,7 @@ index 000000000000..794cb2bb3a01
 +	list_for_each_entry_rcu(child, &p->children, sibling) {
 +		dec = child;
 +		while ((dcnt = count_child_tasks(dec)) == 1)
-+			dec = list_first_entry(&dec->children, struct task_struct, sibling);
++			dec = list_first_or_null_rcu(&dec->children, struct task_struct, sibling);
 +		
 +		if (!dcnt || !depth) {
 +			if (!task_is_bore_eligible(dec)) continue;
@@ -455,9 +466,16 @@ index 000000000000..794cb2bb3a01
 +	struct task_struct *p, struct task_struct *parent, u64 clone_flags) {
 +	u64 now;
 +	u8 penalty;
++	bool limit_rcu;
++	uint limiter_idx;
 +
 +	if (!task_is_bore_eligible(p)) return;
 +
++	limit_rcu = sched_burst_clone_limit_rcu;
++	if (limit_rcu) {
++		limiter_idx = p->pid % (init_ncpus >> limit_rcu);
++		write_lock_irq(&lock_limiter[limiter_idx]);
++	}
 +	rcu_read_lock();
 +	now = jiffies_to_nsecs(jiffies);
 +	if (clone_flags & CLONE_THREAD) {
@@ -470,6 +488,8 @@ index 000000000000..794cb2bb3a01
 +			inherit_burst_direct(parent, now);
 +	}
 +	rcu_read_unlock();
++	if (limit_rcu)
++		write_unlock_irq(&lock_limiter[limiter_idx]);
 +
 +	struct sched_entity *se = &p->se;
 +	revolve_burst_penalty(se);
@@ -487,6 +507,22 @@ index 000000000000..794cb2bb3a01
 +	p->se.burst_score = 0;
 +	memset(&p->se.child_burst, 0, sizeof(struct sched_burst_cache));
 +	memset(&p->se.group_burst, 0, sizeof(struct sched_burst_cache));
++}
++
++static void __init sched_bore_init_lock_limiters(void) {
++	uint nr_limiters;
++	init_ncpus = nr_cpu_ids;
++	nr_limiters = max(1, nr_cpu_ids / 2);
++	lock_limiter = (rwlock_t*)kmalloc(
++		nr_limiters * sizeof(rwlock_t), GFP_NOWAIT);
++	for (int i = 0; i < nr_limiters; i++)
++		rwlock_init(&lock_limiter[i]);
++}
++
++void __init sched_bore_init(void) {
++	printk(KERN_INFO "BORE (Burst-Oriented Response Enhancer) CPU Scheduler modification %s by Masahito Suzuki", SCHED_BORE_VERSION);
++	sched_bore_init_lock_limiters();
++    init_task_bore(&init_task);
 +}
 +
 +#ifdef CONFIG_SYSCTL
@@ -530,6 +566,15 @@ index 000000000000..794cb2bb3a01
 +	{
 +		.procname	= "sched_burst_fork_atavistic",
 +		.data		= &sched_burst_fork_atavistic,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler = proc_dou8vec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_THREE,
++	},
++	{
++		.procname	= "sched_burst_clone_limit_rcu",
++		.data		= &sched_burst_clone_limit_rcu,
 +		.maxlen		= sizeof(u8),
 +		.mode		= 0644,
 +		.proc_handler = proc_dou8vec_minmax,
@@ -594,7 +639,7 @@ index 000000000000..794cb2bb3a01
 +#endif // CONFIG_SYSCTL
 +#endif // CONFIG_SCHED_BORE
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 95e40895a519..1e134d64bcd9 100644
+index 95e40895a519..2aefe00ca9db 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -97,6 +97,8 @@
@@ -606,13 +651,12 @@ index 95e40895a519..1e134d64bcd9 100644
  EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpu);
  EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpumask);
  
-@@ -8481,6 +8483,11 @@ void __init sched_init(void)
+@@ -8481,6 +8483,10 @@ void __init sched_init(void)
  	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
  #endif
  
 +#ifdef CONFIG_SCHED_BORE
-+	printk(KERN_INFO "BORE (Burst-Oriented Response Enhancer) CPU Scheduler modification %s by Masahito Suzuki", SCHED_BORE_VERSION);
-+	init_task_bore(&init_task);
++	sched_bore_init();
 +#endif // CONFIG_SCHED_BORE
 +
  	wait_bit_init();
