@@ -1,7 +1,7 @@
-From a439277c4230522e4cb7d320e524fb09c60ead98 Mon Sep 17 00:00:00 2001
+From d5457aadc3cf13e70807fcd568468bf5ee6ce310 Mon Sep 17 00:00:00 2001
 From: Eric Naim <dnaim@cachyos.org>
-Date: Fri, 6 Dec 2024 12:22:57 +0800
-Subject: [PATCH] bore-cachy-5.7
+Date: Thu, 12 Dec 2024 16:30:54 +0800
+Subject: [PATCH] bore-cachy
 
 Signed-off-by: Eric Naim <dnaim@cachyos.org>
 ---
@@ -11,12 +11,12 @@ Signed-off-by: Eric Naim <dnaim@cachyos.org>
  kernel/Kconfig.hz          |  17 ++
  kernel/fork.c              |   5 +
  kernel/sched/Makefile      |   1 +
- kernel/sched/bore.c        | 407 +++++++++++++++++++++++++++++++++++++
+ kernel/sched/bore.c        | 423 +++++++++++++++++++++++++++++++++++++
  kernel/sched/core.c        |   6 +
  kernel/sched/debug.c       |  61 +++++-
  kernel/sched/fair.c        |  88 ++++++--
  kernel/sched/sched.h       |   9 +
- 11 files changed, 650 insertions(+), 18 deletions(-)
+ 11 files changed, 666 insertions(+), 18 deletions(-)
  create mode 100644 include/linux/sched/bore.h
  create mode 100644 kernel/sched/bore.c
 
@@ -57,7 +57,7 @@ index bb343136ddd0..c86185f87e7b 100644
  
 diff --git a/include/linux/sched/bore.h b/include/linux/sched/bore.h
 new file mode 100644
-index 000000000000..f54f238ded13
+index 000000000000..4f3d3cbefe3c
 --- /dev/null
 +++ b/include/linux/sched/bore.h
 @@ -0,0 +1,40 @@
@@ -67,7 +67,7 @@ index 000000000000..f54f238ded13
 +
 +#ifndef _LINUX_SCHED_BORE_H
 +#define _LINUX_SCHED_BORE_H
-+#define SCHED_BORE_VERSION "5.7.10"
++#define SCHED_BORE_VERSION "5.7.13"
 +
 +#ifdef CONFIG_SCHED_BORE
 +extern u8   __read_mostly sched_bore;
@@ -190,10 +190,10 @@ index 976092b7bd45..293aad675444 100644
 +obj-y += bore.o
 diff --git a/kernel/sched/bore.c b/kernel/sched/bore.c
 new file mode 100644
-index 000000000000..e4a02de9db44
+index 000000000000..da1edca15414
 --- /dev/null
 +++ b/kernel/sched/bore.c
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,423 @@
 +/*
 + *  Burst-Oriented Response Enhancer (BORE) CPU Scheduler
 + *  Copyright (C) 2021-2024 Masahito Suzuki <firelzrd@gmail.com>
@@ -317,7 +317,7 @@ index 000000000000..e4a02de9db44
 +}
 +
 +static inline bool task_is_bore_eligible(struct task_struct *p)
-+{return p->sched_class == &fair_sched_class;}
++{return p && p->sched_class == &fair_sched_class && !p->exit_state;}
 +
 +static void reset_task_weights_bore(void) {
 +	struct task_struct *task;
@@ -380,8 +380,13 @@ index 000000000000..e4a02de9db44
 +	update_burst_cache(&p->se.child_burst, p, cnt, sum, now);
 +}
 +
-+static inline u8 inherit_burst_direct(struct task_struct *p, u64 now) {
++static inline u8 inherit_burst_direct(
++	struct task_struct *p, u64 now, u64 clone_flags) {
 +	struct task_struct *parent = p;
++
++	if (clone_flags & CLONE_PARENT)
++		parent = parent->real_parent;
++
 +	if (burst_cache_expired(&parent->se.child_burst, now))
 +		update_child_burst_direct(parent, now);
 +
@@ -418,13 +423,23 @@ index 000000000000..e4a02de9db44
 +	*asum += sum;
 +}
 +
-+static inline u8 inherit_burst_topological(struct task_struct *p, u64 now) {
++static inline u8 inherit_burst_topological(
++	struct task_struct *p, u64 now, u64 clone_flags) {
 +	struct task_struct *anc = p;
 +	u32 cnt = 0, sum = 0;
++	u32 base_child_cnt = 0;
++
++	if (clone_flags & CLONE_PARENT) {
++		anc = anc->real_parent;
++		base_child_cnt = 1;
++	}
 +
 +	for (struct task_struct *next;
-+		 anc != (next = anc->real_parent) && count_children_max2(anc) <= 1;
-+		 anc = next) {}
++		 anc != (next = anc->real_parent) &&
++		 	count_children_max2(anc) <= base_child_cnt;) {
++		anc = next;
++		base_child_cnt = 1;
++	}
 +
 +	if (burst_cache_expired(&anc->se.child_burst, now))
 +		update_child_burst_topological(
@@ -447,7 +462,7 @@ index 000000000000..e4a02de9db44
 +}
 +
 +static inline u8 inherit_burst_tg(struct task_struct *p, u64 now) {
-+	struct task_struct *parent = p->group_leader;
++	struct task_struct *parent = rcu_dereference(p->group_leader);
 +	if (burst_cache_expired(&parent->se.group_burst, now))
 +		update_tg_burst(parent, now);
 +
@@ -461,18 +476,19 @@ index 000000000000..e4a02de9db44
 +
 +	if (!task_is_bore_eligible(p)) return;
 +
-+	read_lock(&tasklist_lock);
-+	now = jiffies_to_nsecs(jiffies);
 +	if (clone_flags & CLONE_THREAD) {
++		rcu_read_lock();
++		now = jiffies_to_nsecs(jiffies);
 +		penalty = inherit_burst_tg(parent, now);
++		rcu_read_unlock();
 +	} else {
-+		if (clone_flags & CLONE_PARENT)
-+			parent = parent->real_parent;
++		read_lock(&tasklist_lock);
++		now = jiffies_to_nsecs(jiffies);
 +		penalty = likely(sched_burst_fork_atavistic) ?
-+			inherit_burst_topological(parent, now):
-+			inherit_burst_direct(parent, now);
++			inherit_burst_topological(parent, now, clone_flags):
++			inherit_burst_direct(parent, now, clone_flags);
++		read_unlock(&tasklist_lock);
 +	}
-+	read_unlock(&tasklist_lock);
 +
 +	struct sched_entity *se = &p->se;
 +	revolve_burst_penalty(se);
@@ -602,7 +618,7 @@ index 000000000000..e4a02de9db44
 +#endif // CONFIG_SYSCTL
 +#endif // CONFIG_SCHED_BORE
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index a1c353a62c56..4dc0c98c1afd 100644
+index 76b27b2a9c56..7371dff0c158 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -97,6 +97,8 @@
@@ -614,7 +630,7 @@ index a1c353a62c56..4dc0c98c1afd 100644
  EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpu);
  EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpumask);
  
-@@ -8380,6 +8382,10 @@ void __init sched_init(void)
+@@ -8377,6 +8379,10 @@ void __init sched_init(void)
  	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
  #endif
  
@@ -998,3 +1014,4 @@ index c5d6012794de..ce3804c6fa5c 100644
  extern int sysctl_resched_latency_warn_ms;
 -- 
 2.47.1
+
