@@ -1,0 +1,309 @@
+From 1afadae08378d2b3ecddd4d4bc008e1168cc13f7 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 14 Apr 2025 17:05:59 +0200
+Subject: [PATCH 3/6] async-shutdown
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ drivers/base/base.h           |   8 +-
+ drivers/base/core.c           | 182 ++++++++++++++++++++++++++++------
+ drivers/nvme/host/pci.c       |   1 +
+ include/linux/device/driver.h |   2 +
+ 4 files changed, 161 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/base/base.h b/drivers/base/base.h
+index 0042e4774b0c..6e32605a335f 100644
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -10,6 +10,7 @@
+  * shared outside of the drivers/base/ directory.
+  *
+  */
++#include <linux/async.h>
+ #include <linux/notifier.h>
+ 
+ /**
+@@ -97,11 +98,14 @@ struct driver_private {
+  *	the device; typically because it depends on another driver getting
+  *	probed first.
+  * @async_driver - pointer to device driver awaiting probe via async_probe
++ * @shutdown_after - used during device shutdown to ensure correct shutdown
++ *	ordering.
+  * @device - pointer back to the struct device that this structure is
+  * associated with.
+  * @dead - This device is currently either in the process of or has been
+  *	removed from the system. Any asynchronous events scheduled for this
+  *	device should exit without taking any action.
++ * @async_shutdown_queued - indicates async shutdown is enqueued for this device
+  *
+  * Nothing outside of the driver core should ever touch these fields.
+  */
+@@ -114,8 +118,10 @@ struct device_private {
+ 	struct list_head deferred_probe;
+ 	const struct device_driver *async_driver;
+ 	char *deferred_probe_reason;
++	async_cookie_t shutdown_after;
+ 	struct device *device;
+-	u8 dead:1;
++	u8 dead:1,
++	   async_shutdown_queued:1;
+ };
+ #define to_device_private_parent(obj)	\
+ 	container_of(obj, struct device_private, knode_parent)
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index d2f9d3a59d6b..8a8bb406b60b 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <linux/acpi.h>
++#include <linux/async.h>
+ #include <linux/blkdev.h>
+ #include <linux/cleanup.h>
+ #include <linux/cpufreq.h>
+@@ -4760,18 +4761,156 @@ int device_change_owner(struct device *dev, kuid_t kuid, kgid_t kgid)
+ }
+ EXPORT_SYMBOL_GPL(device_change_owner);
+ 
++static ASYNC_DOMAIN(sd_domain);
++
++static void shutdown_one_device(struct device *dev)
++{
++	/* hold lock to avoid race with probe/release */
++	if (dev->parent && dev->bus && dev->bus->need_parent_lock)
++		device_lock(dev->parent);
++	device_lock(dev);
++
++	/* Don't allow any more runtime suspends */
++	pm_runtime_get_noresume(dev);
++	pm_runtime_barrier(dev);
++
++	if (dev->class && dev->class->shutdown_pre) {
++		if (initcall_debug)
++			dev_info(dev, "shutdown_pre\n");
++		dev->class->shutdown_pre(dev);
++	}
++	if (dev->bus && dev->bus->shutdown) {
++		if (initcall_debug)
++			dev_info(dev, "shutdown\n");
++		dev->bus->shutdown(dev);
++	} else if (dev->driver && dev->driver->shutdown) {
++		if (initcall_debug)
++			dev_info(dev, "shutdown\n");
++		dev->driver->shutdown(dev);
++	}
++
++	device_unlock(dev);
++	if (dev->parent && dev->bus && dev->bus->need_parent_lock)
++		device_unlock(dev->parent);
++
++	put_device(dev);
++	if (dev->parent)
++		put_device(dev->parent);
++}
++
++static bool device_wants_async_shutdown(struct device *dev)
++{
++	if (dev->driver && dev->driver->async_shutdown_enable)
++		return true;
++
++	return false;
++}
++
++/**
++ * shutdown_one_device_async
++ * @data: the pointer to the struct device to be shutdown
++ * @cookie: not used
++ *
++ * Shuts down one device, after waiting for device's last child or consumer to
++ * be shutdown.
++ *
++ * shutdown_after is set to the shutdown cookie of the last child or consumer
++ * of this device (if any).
++ */
++static void shutdown_one_device_async(void *data, async_cookie_t cookie)
++{
++	struct device_private *p = data;
++
++	if (p->shutdown_after)
++		async_synchronize_cookie_domain(p->shutdown_after, &sd_domain);
++
++	shutdown_one_device(p->device);
++}
++
++static void queue_device_async_shutdown(struct device *dev)
++{
++	struct device_link *link;
++	struct device *parent;
++	async_cookie_t cookie;
++	int idx;
++
++	parent = get_device(dev->parent);
++	get_device(dev);
++
++	/*
++	 * Add one to this device's cookie so that when shutdown_after is passed
++	 * to async_synchronize_cookie_domain(), it will wait until *after*
++	 * shutdown_one_device_async() is finished running for this device.
++	 */
++	cookie = async_schedule_domain(shutdown_one_device_async, dev->p,
++				       &sd_domain) + 1;
++
++	/*
++	 * Set async_shutdown_queued to avoid overwriting a parent's
++	 * shutdown_after while the parent is shutting down. This can happen if
++	 * a parent or supplier is not ordered in the devices_kset list before a
++	 * child or consumer, which is not expected.
++	 */
++	dev->p->async_shutdown_queued = 1;
++
++	/* Ensure any parent & suppliers wait for this device to shut down */
++	if (parent) {
++		if (!parent->p->async_shutdown_queued)
++			parent->p->shutdown_after = cookie;
++		put_device(parent);
++	}
++
++	idx = device_links_read_lock();
++	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node,
++				device_links_read_lock_held()) {
++		/*
++		 * sync_state_only devlink consumers aren't dependent on
++		 * suppliers
++		 */
++		if (!device_link_flag_is_sync_state_only(link->flags) &&
++		    !link->supplier->p->async_shutdown_queued)
++			link->supplier->p->shutdown_after = cookie;
++	}
++	device_links_read_unlock(idx);
++	put_device(dev);
++}
++
+ /**
+  * device_shutdown - call ->shutdown() on each device to shutdown.
+  */
+ void device_shutdown(void)
+ {
+-	struct device *dev, *parent;
++	struct device *dev, *parent, *tmp;
++	LIST_HEAD(async_list);
++	bool wait_for_async;
+ 
+ 	wait_for_device_probe();
+ 	device_block_probing();
+ 
+ 	cpufreq_suspend();
+ 
++	/*
++	 * Find devices which can shut down asynchronously, and move them from
++	 * the devices list onto the async list in reverse order.
++	 */
++	spin_lock(&devices_kset->list_lock);
++	list_for_each_entry_safe(dev, tmp, &devices_kset->list, kobj.entry) {
++		if (device_wants_async_shutdown(dev)) {
++			get_device(dev->parent);
++			get_device(dev);
++			list_move(&dev->kobj.entry, &async_list);
++		}
++	}
++	spin_unlock(&devices_kset->list_lock);
++
++	/*
++	 * Dispatch asynchronous shutdowns first so they don't have to wait
++	 * behind any synchronous shutdowns.
++	 */
++	wait_for_async = !list_empty(&async_list);
++	list_for_each_entry_safe(dev, tmp, &async_list, kobj.entry)
++		queue_device_async_shutdown(dev);
++
+ 	spin_lock(&devices_kset->list_lock);
+ 	/*
+ 	 * Walk the devices list backward, shutting down each in turn.
+@@ -4796,40 +4935,21 @@ void device_shutdown(void)
+ 		list_del_init(&dev->kobj.entry);
+ 		spin_unlock(&devices_kset->list_lock);
+ 
+-		/* hold lock to avoid race with probe/release */
+-		if (parent)
+-			device_lock(parent);
+-		device_lock(dev);
+-
+-		/* Don't allow any more runtime suspends */
+-		pm_runtime_get_noresume(dev);
+-		pm_runtime_barrier(dev);
+-
+-		if (dev->class && dev->class->shutdown_pre) {
+-			if (initcall_debug)
+-				dev_info(dev, "shutdown_pre\n");
+-			dev->class->shutdown_pre(dev);
+-		}
+-		if (dev->bus && dev->bus->shutdown) {
+-			if (initcall_debug)
+-				dev_info(dev, "shutdown\n");
+-			dev->bus->shutdown(dev);
+-		} else if (dev->driver && dev->driver->shutdown) {
+-			if (initcall_debug)
+-				dev_info(dev, "shutdown\n");
+-			dev->driver->shutdown(dev);
+-		}
+-
+-		device_unlock(dev);
+-		if (parent)
+-			device_unlock(parent);
+-
+-		put_device(dev);
+-		put_device(parent);
++		/*
++		 * Dispatch an async shutdown if this device has a child or
++		 * consumer that is async. Otherwise, shut down synchronously.
++		 */
++		if (dev->p->shutdown_after)
++			queue_device_async_shutdown(dev);
++		else
++			shutdown_one_device(dev);
+ 
+ 		spin_lock(&devices_kset->list_lock);
+ 	}
+ 	spin_unlock(&devices_kset->list_lock);
++
++	if (wait_for_async)
++		async_synchronize_full_domain(&sd_domain);
+ }
+ 
+ /*
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index b178d52eac1b..c0b99bed1329 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -3785,6 +3785,7 @@ static struct pci_driver nvme_driver = {
+ 	.shutdown	= nvme_shutdown,
+ 	.driver		= {
+ 		.probe_type	= PROBE_PREFER_ASYNCHRONOUS,
++		.async_shutdown_enable	= true,
+ #ifdef CONFIG_PM_SLEEP
+ 		.pm		= &nvme_dev_pm_ops,
+ #endif
+diff --git a/include/linux/device/driver.h b/include/linux/device/driver.h
+index cd8e0f0a634b..c63bc0050c84 100644
+--- a/include/linux/device/driver.h
++++ b/include/linux/device/driver.h
+@@ -56,6 +56,7 @@ enum probe_type {
+  * @mod_name:	Used for built-in modules.
+  * @suppress_bind_attrs: Disables bind/unbind via sysfs.
+  * @probe_type:	Type of the probe (synchronous or asynchronous) to use.
++ * @async_shutdown_enable: Enables devices to be shutdown asynchronously.
+  * @of_match_table: The open firmware table.
+  * @acpi_match_table: The ACPI match table.
+  * @probe:	Called to query the existence of a specific device,
+@@ -102,6 +103,7 @@ struct device_driver {
+ 
+ 	bool suppress_bind_attrs;	/* disables bind/unbind via sysfs */
+ 	enum probe_type probe_type;
++	bool async_shutdown_enable;
+ 
+ 	const struct of_device_id	*of_match_table;
+ 	const struct acpi_device_id	*acpi_match_table;
+-- 
+2.48.0.rc1
+

@@ -1,0 +1,230 @@
+From 1e8ff649f1b9ede85a836f7f7a4bdf1004cbd27c Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Mon, 14 Apr 2025 17:05:04 +0200
+Subject: [PATCH 1/6] amd-pstate
+
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ drivers/cpufreq/amd-pstate.c   | 32 +++++++------------
+ include/linux/sched/topology.h |  6 ++++
+ kernel/sched/debug.c           |  4 +++
+ kernel/sched/fair.c            |  5 +--
+ kernel/sched/topology.c        | 58 ++++++++++++++++++++++++++++++++++
+ 5 files changed, 82 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+index 6789eed1bb5b..01214c150051 100644
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -791,19 +791,9 @@ static void amd_perf_ctl_reset(unsigned int cpu)
+ 	wrmsrl_on_cpu(cpu, MSR_AMD_PERF_CTL, 0);
+ }
+ 
+-/*
+- * Set amd-pstate preferred core enable can't be done directly from cpufreq callbacks
+- * due to locking, so queue the work for later.
+- */
+-static void amd_pstste_sched_prefcore_workfn(struct work_struct *work)
+-{
+-	sched_set_itmt_support();
+-}
+-static DECLARE_WORK(sched_prefcore_work, amd_pstste_sched_prefcore_workfn);
+-
+ #define CPPC_MAX_PERF	U8_MAX
+ 
+-static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
++static void amd_pstate_init_asym_prio(struct amd_cpudata *cpudata)
+ {
+ 	/* user disabled or not detected */
+ 	if (!amd_pstate_prefcore)
+@@ -811,14 +801,8 @@ static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
+ 
+ 	cpudata->hw_prefcore = true;
+ 
+-	/*
+-	 * The priorities can be set regardless of whether or not
+-	 * sched_set_itmt_support(true) has been called and it is valid to
+-	 * update them at any time after it has been called.
+-	 */
++	/* The priorities must be initialized before ITMT support can be toggled on. */
+ 	sched_set_itmt_core_prio((int)READ_ONCE(cpudata->prefcore_ranking), cpudata->cpu);
+-
+-	schedule_work(&sched_prefcore_work);
+ }
+ 
+ static void amd_pstate_update_limits(unsigned int cpu)
+@@ -844,8 +828,10 @@ static void amd_pstate_update_limits(unsigned int cpu)
+ 	if (highest_perf_changed) {
+ 		WRITE_ONCE(cpudata->prefcore_ranking, cur_high);
+ 
+-		if (cur_high < CPPC_MAX_PERF)
++		if (cur_high < CPPC_MAX_PERF) {
+ 			sched_set_itmt_core_prio((int)cur_high, cpu);
++			sched_update_asym_prefer_cpu(cpu, prev_high, cur_high);
++		}
+ 	}
+ }
+ 
+@@ -971,7 +957,7 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
+ 	if (ret)
+ 		goto free_cpudata1;
+ 
+-	amd_pstate_init_prefcore(cpudata);
++	amd_pstate_init_asym_prio(cpudata);
+ 
+ 	ret = amd_pstate_init_freq(cpudata);
+ 	if (ret)
+@@ -1447,7 +1433,7 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 	if (ret)
+ 		goto free_cpudata1;
+ 
+-	amd_pstate_init_prefcore(cpudata);
++	amd_pstate_init_asym_prio(cpudata);
+ 
+ 	ret = amd_pstate_init_freq(cpudata);
+ 	if (ret)
+@@ -1777,6 +1763,10 @@ static int __init amd_pstate_init(void)
+ 		}
+ 	}
+ 
++	/* Enable ITMT support once all CPUs have initialized their asym priorities. */
++	if (amd_pstate_prefcore)
++		sched_set_itmt_support();
++
+ 	return ret;
+ 
+ global_attr_free:
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index 7b4301b7235f..198bb5cc1774 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -195,6 +195,8 @@ struct sched_domain_topology_level {
+ };
+ 
+ extern void __init set_sched_topology(struct sched_domain_topology_level *tl);
++extern void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio);
++
+ 
+ # define SD_INIT_NAME(type)		.name = #type
+ 
+@@ -223,6 +225,10 @@ static inline bool cpus_share_resources(int this_cpu, int that_cpu)
+ 	return true;
+ }
+ 
++static inline void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio)
++{
++}
++
+ #endif	/* !CONFIG_SMP */
+ 
+ #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 56ae54e0ce6a..557246880a7e 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -588,6 +588,10 @@ static void register_sd(struct sched_domain *sd, struct dentry *parent)
+ 	debugfs_create_file("flags", 0444, parent, &sd->flags, &sd_flags_fops);
+ 	debugfs_create_file("groups_flags", 0444, parent, &sd->groups->flags, &sd_flags_fops);
+ 	debugfs_create_u32("level", 0444, parent, (u32 *)&sd->level);
++
++	if (sd->flags & SD_ASYM_PACKING)
++		debugfs_create_u32("group_asym_prefer_cpu", 0444, parent,
++				   (u32 *)&sd->groups->asym_prefer_cpu);
+ }
+ 
+ void update_sched_domain_debugfs(void)
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index e43993a4e580..90f6dc424a89 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -10258,7 +10258,7 @@ sched_group_asym(struct lb_env *env, struct sg_lb_stats *sgs, struct sched_group
+ 	    (sgs->group_weight - sgs->idle_cpus != 1))
+ 		return false;
+ 
+-	return sched_asym(env->sd, env->dst_cpu, group->asym_prefer_cpu);
++	return sched_asym(env->sd, env->dst_cpu, READ_ONCE(group->asym_prefer_cpu));
+ }
+ 
+ /* One group has more than one SMT CPU while the other group does not */
+@@ -10495,7 +10495,8 @@ static bool update_sd_pick_busiest(struct lb_env *env,
+ 
+ 	case group_asym_packing:
+ 		/* Prefer to move from lowest priority CPU's work */
+-		return sched_asym_prefer(sds->busiest->asym_prefer_cpu, sg->asym_prefer_cpu);
++		return sched_asym_prefer(READ_ONCE(sds->busiest->asym_prefer_cpu),
++					 READ_ONCE(sg->asym_prefer_cpu));
+ 
+ 	case group_misfit_task:
+ 		/*
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index f1ebc60d967f..8426de317835 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1333,6 +1333,64 @@ static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
+ 	update_group_capacity(sd, cpu);
+ }
+ 
++#ifdef CONFIG_SMP
++
++/* Update the "asym_prefer_cpu" when arch_asym_cpu_priority() changes. */
++void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio)
++{
++	int asym_prefer_cpu = cpu;
++	struct sched_domain *sd;
++
++	guard(rcu)();
++
++	for_each_domain(cpu, sd) {
++		struct sched_group *sg;
++		int group_cpu;
++
++		if (!(sd->flags & SD_ASYM_PACKING))
++			continue;
++
++		/*
++		 * Groups of overlapping domain are replicated per NUMA
++		 * node and will require updating "asym_prefer_cpu" on
++		 * each local copy.
++		 *
++		 * If you are hitting this warning, consider moving
++		 * "sg->asym_prefer_cpu" to "sg->sgc->asym_prefer_cpu"
++		 * which is shared by all the overlapping groups.
++		 */
++		WARN_ON_ONCE(sd->flags & SD_OVERLAP);
++
++		sg = sd->groups;
++		if (cpu != sg->asym_prefer_cpu) {
++			/*
++			 * Since the parent is a superset of the current group,
++			 * if the cpu is not the "asym_prefer_cpu" at the
++			 * current level, it cannot be the preferred CPU at a
++			 * higher levels either.
++			 */
++			if (!sched_asym_prefer(cpu, sg->asym_prefer_cpu))
++				return;
++
++			WRITE_ONCE(sg->asym_prefer_cpu, cpu);
++			continue;
++		}
++
++		/* Ranking has improved; CPU is still the preferred one. */
++		if (new_prio >= old_prio)
++			continue;
++
++		for_each_cpu(group_cpu, sched_group_span(sg)) {
++			if (sched_asym_prefer(group_cpu, asym_prefer_cpu))
++				asym_prefer_cpu = group_cpu;
++		}
++
++		WRITE_ONCE(sg->asym_prefer_cpu, asym_prefer_cpu);
++	}
++}
++
++#endif /* CONFIG_SMP */
++
+ /*
+  * Set of available CPUs grouped by their corresponding capacities
+  * Each list entry contains a CPU mask reflecting CPUs that share the same
+-- 
+2.48.0.rc1
+
