@@ -1,43 +1,52 @@
-From 8e25c43b4f65d6249ffcdd8631af68e32aabe985 Mon Sep 17 00:00:00 2001
+From 3b8f567b28354b7b6167f7bd7d958944e70f3cf5 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Fri, 7 Mar 2025 19:27:38 +0100
+Date: Sun, 20 Apr 2025 15:46:56 +0200
 Subject: [PATCH 03/12] bbr3
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- include/linux/tcp.h                |    4 +-
+ include/linux/tcp.h                |    6 +-
  include/net/inet_connection_sock.h |    4 +-
  include/net/tcp.h                  |   72 +-
  include/uapi/linux/inet_diag.h     |   23 +
  include/uapi/linux/rtnetlink.h     |    4 +-
  include/uapi/linux/tcp.h           |    1 +
  net/ipv4/Kconfig                   |   21 +-
- net/ipv4/bpf_tcp_ca.c              |    9 +-
+ net/ipv4/bpf_tcp_ca.c              |    4 +-
  net/ipv4/tcp.c                     |    3 +
- net/ipv4/tcp_bbr.c                 | 2230 +++++++++++++++++++++-------
+ net/ipv4/tcp_bbr.c                 | 2231 +++++++++++++++++++++-------
  net/ipv4/tcp_cong.c                |    1 +
  net/ipv4/tcp_input.c               |   40 +-
  net/ipv4/tcp_minisocks.c           |    2 +
  net/ipv4/tcp_output.c              |   48 +-
  net/ipv4/tcp_rate.c                |   30 +-
  net/ipv4/tcp_timer.c               |    1 +
- 16 files changed, 1940 insertions(+), 553 deletions(-)
+ 16 files changed, 1937 insertions(+), 554 deletions(-)
 
 diff --git a/include/linux/tcp.h b/include/linux/tcp.h
-index f88daaa76d83..b0f79a5888a2 100644
+index f88daaa76d83..e569fd1ed7e8 100644
 --- a/include/linux/tcp.h
 +++ b/include/linux/tcp.h
-@@ -368,7 +368,9 @@ struct tcp_sock {
- 	u8	compressed_ack;
- 	u8	dup_ack_counter:2,
- 		tlp_retrans:1,	/* TLP is a retransmission */
--		unused:5;
-+		fast_ack_mode:2, /* which fast ack mode ? */
-+		tlp_orig_data_app_limited:1, /* app-limited before TLP rtx? */
-+		unused:2;
- 	u8	thin_lto    : 1,/* Use linear timeouts for thin streams */
- 		fastopen_connect:1, /* FASTOPEN_CONNECT sockopt */
- 		fastopen_no_cookie:1, /* Allow send/recv SYN+data without a cookie */
+@@ -243,7 +243,8 @@ struct tcp_sock {
+ 	/* OOO segments go in this rbtree. Socket lock must be held. */
+ 	struct rb_root	out_of_order_queue;
+ 	u32	snd_ssthresh;	/* Slow start size threshold		*/
+-	u8	recvmsg_inq : 1;/* Indicate # of bytes in queue upon recvmsg */
++	u32	recvmsg_inq : 1,/* Indicate # of bytes in queue upon recvmsg */
++		fast_ack_mode:1;/* ack ASAP if >1 rcv_mss received? */
+ 	__cacheline_group_end(tcp_sock_read_rx);
+ 
+ 	/* TX read-write hotpath cache lines */
+@@ -300,7 +301,8 @@ struct tcp_sock {
+  */
+ 	struct tcp_options_received rx_opt;
+ 	u8	nonagle     : 4,/* Disable Nagle algorithm?             */
+-		rate_app_limited:1;  /* rate_{delivered,interval_us} limited? */
++		rate_app_limited:1,  /* rate_{delivered,interval_us} limited? */
++		tlp_orig_data_app_limited:1; /* app-limited before TLP rtx? */
+ 	__cacheline_group_end(tcp_sock_write_txrx);
+ 
+ 	/* RX read-write hotpath cache lines */
 diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
 index c7f42844c79a..170250145598 100644
 --- a/include/net/inet_connection_sock.h
@@ -280,14 +289,14 @@ index db7254d52d93..38de18d921ea 100644
  struct rta_session {
  	__u8	proto;
 diff --git a/include/uapi/linux/tcp.h b/include/uapi/linux/tcp.h
-index dbf896f3146c..4702cd2f1ffc 100644
+index dbf896f3146c..92b6d6472951 100644
 --- a/include/uapi/linux/tcp.h
 +++ b/include/uapi/linux/tcp.h
 @@ -178,6 +178,7 @@ enum tcp_fastopen_client_fail {
  #define TCPI_OPT_ECN_SEEN	16 /* we received at least one packet with ECT */
  #define TCPI_OPT_SYN_DATA	32 /* SYN-ACK acked data in SYN sent or rcvd */
  #define TCPI_OPT_USEC_TS	64 /* usec timestamps */
-+#define TCPI_OPT_ECN_LOW	128 /* Low-latency ECN configured at init */
++#define TCPI_OPT_ECN_LOW	128 /* Low-latency ECN enabled at conn init */
  
  /*
   * Sender's congestion state indicating normal or abnormal situations
@@ -324,10 +333,10 @@ index 6d2c97f8e9ef..ddc116ef22cb 100644
  choice
  	prompt "Default TCP congestion control"
 diff --git a/net/ipv4/bpf_tcp_ca.c b/net/ipv4/bpf_tcp_ca.c
-index 554804774628..2279e6e7bc9c 100644
+index 554804774628..fb6ab6ca8440 100644
 --- a/net/ipv4/bpf_tcp_ca.c
 +++ b/net/ipv4/bpf_tcp_ca.c
-@@ -280,11 +280,15 @@ static void bpf_tcp_ca_pkts_acked(struct sock *sk, const struct ack_sample *samp
+@@ -280,7 +280,7 @@ static void bpf_tcp_ca_pkts_acked(struct sock *sk, const struct ack_sample *samp
  {
  }
  
@@ -336,21 +345,12 @@ index 554804774628..2279e6e7bc9c 100644
  {
  	return 0;
  }
- 
-+static void bpf_tcp_ca_skb_marked_lost(struct sock *sk, const struct sk_buff *skb)
-+{
-+}
-+
- static void bpf_tcp_ca_cong_control(struct sock *sk, u32 ack, int flag,
- 				    const struct rate_sample *rs)
- {
-@@ -315,7 +319,8 @@ static struct tcp_congestion_ops __bpf_ops_tcp_congestion_ops = {
+@@ -315,7 +315,7 @@ static struct tcp_congestion_ops __bpf_ops_tcp_congestion_ops = {
  	.cwnd_event = bpf_tcp_ca_cwnd_event,
  	.in_ack_event = bpf_tcp_ca_in_ack_event,
  	.pkts_acked = bpf_tcp_ca_pkts_acked,
 -	.min_tso_segs = bpf_tcp_ca_min_tso_segs,
 +	.tso_segs = bpf_tcp_ca_tso_segs,
-+	.skb_marked_lost = bpf_tcp_ca_skb_marked_lost,
  	.cong_control = bpf_tcp_ca_cong_control,
  	.undo_cwnd = bpf_tcp_ca_undo_cwnd,
  	.sndbuf_expand = bpf_tcp_ca_sndbuf_expand,
@@ -376,7 +376,7 @@ index d74281eca14f..61aa756120ad 100644
  		info->tcpi_options |= TCPI_OPT_SYN_DATA;
  	if (tp->tcp_usec_ts)
 diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
-index 760941e55153..a180fa648d5e 100644
+index 760941e55153..516a5daac694 100644
 --- a/net/ipv4/tcp_bbr.c
 +++ b/net/ipv4/tcp_bbr.c
 @@ -1,18 +1,19 @@
@@ -592,7 +592,7 @@ index 760941e55153..a180fa648d5e 100644
 +	BBR_BW_PROBE_UP		= 0,  /* push up inflight to probe for bw/vol */
 +	BBR_BW_PROBE_DOWN	= 1,  /* drain excess inflight from the queue */
 +	BBR_BW_PROBE_CRUISE	= 2,  /* use pipe, w/ headroom in queue/pipe */
-+	BBR_BW_PROBE_REFILL	= 3,  /* v2: refill the pipe again to 100% */
++	BBR_BW_PROBE_REFILL	= 3,  /* refill the pipe again to 100% */
  };
 -/* Randomize the starting gain cycling phase over N phases: */
 -static const u32 bbr_cycle_rand = 7;
@@ -812,16 +812,17 @@ index 760941e55153..a180fa648d5e 100644
  static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
-@@ -279,7 +456,7 @@ static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
+@@ -279,7 +456,8 @@ static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
  	bw = (u64)tcp_snd_cwnd(tp) * BW_UNIT;
  	do_div(bw, rtt_us);
  	WRITE_ONCE(sk->sk_pacing_rate,
 -		   bbr_bw_to_pacing_rate(sk, bw, bbr_high_gain));
-+		   bbr_bw_to_pacing_rate(sk, bw, bbr_param(sk, startup_pacing_gain)));
++		   bbr_bw_to_pacing_rate(sk, bw,
++					 bbr_param(sk, startup_pacing_gain)));
  }
  
  /* Pace using current bw estimate and a gain factor. */
-@@ -295,26 +472,48 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
+@@ -295,26 +473,48 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
  		WRITE_ONCE(sk->sk_pacing_rate, rate);
  }
  
@@ -883,7 +884,7 @@ index 760941e55153..a180fa648d5e 100644
  }
  
  /* Save "last known good" cwnd so we can restore it after losses or PROBE_RTT */
-@@ -334,7 +533,9 @@ __bpf_kfunc static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
+@@ -334,7 +534,9 @@ __bpf_kfunc static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
  	struct tcp_sock *tp = tcp_sk(sk);
  	struct bbr *bbr = inet_csk_ca(sk);
  
@@ -894,7 +895,7 @@ index 760941e55153..a180fa648d5e 100644
  		bbr->idle_restart = 1;
  		bbr->ack_epoch_mstamp = tp->tcp_mstamp;
  		bbr->ack_epoch_acked = 0;
-@@ -345,6 +546,16 @@ __bpf_kfunc static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
+@@ -345,6 +547,16 @@ __bpf_kfunc static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
  			bbr_set_pacing_rate(sk, bbr_bw(sk), BBR_UNIT);
  		else if (bbr->mode == BBR_PROBE_RTT)
  			bbr_check_probe_rtt_done(sk);
@@ -911,7 +912,7 @@ index 760941e55153..a180fa648d5e 100644
  	}
  }
  
-@@ -367,10 +578,10 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
+@@ -367,10 +579,10 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
  	 * default. This should only happen when the connection is not using TCP
  	 * timestamps and has retransmitted all of the SYN/SYNACK/data packets
  	 * ACKed so far. In this case, an RTO can cut cwnd to 1, in which
@@ -924,7 +925,7 @@ index 760941e55153..a180fa648d5e 100644
  
  	w = (u64)bw * bbr->min_rtt_us;
  
-@@ -387,23 +598,23 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
+@@ -387,23 +599,23 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
   *   - one skb in sending host Qdisc,
   *   - one skb in sending host TSO/GSO engine
   *   - one skb being received by receiver host LRO/GRO/delayed-ACK engine
@@ -956,7 +957,7 @@ index 760941e55153..a180fa648d5e 100644
  		cwnd += 2;
  
  	return cwnd;
-@@ -458,10 +669,10 @@ static u32 bbr_ack_aggregation_cwnd(struct sock *sk)
+@@ -458,10 +670,10 @@ static u32 bbr_ack_aggregation_cwnd(struct sock *sk)
  {
  	u32 max_aggr_cwnd, aggr_cwnd = 0;
  
@@ -969,7 +970,7 @@ index 760941e55153..a180fa648d5e 100644
  			     >> BBR_SCALE;
  		aggr_cwnd = min(aggr_cwnd, max_aggr_cwnd);
  	}
-@@ -469,66 +680,27 @@ static u32 bbr_ack_aggregation_cwnd(struct sock *sk)
+@@ -469,66 +681,27 @@ static u32 bbr_ack_aggregation_cwnd(struct sock *sk)
  	return aggr_cwnd;
  }
  
@@ -1043,7 +1044,7 @@ index 760941e55153..a180fa648d5e 100644
  	target_cwnd = bbr_bdp(sk, bw, gain);
  
  	/* Increment the cwnd to account for excess ACKed data that seems
-@@ -537,74 +709,26 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
+@@ -537,74 +710,26 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
  	target_cwnd += bbr_ack_aggregation_cwnd(sk);
  	target_cwnd = bbr_quantization_budget(sk, target_cwnd);
  
@@ -1135,7 +1136,7 @@ index 760941e55153..a180fa648d5e 100644
  }
  
  static void bbr_reset_startup_mode(struct sock *sk)
-@@ -614,191 +738,49 @@ static void bbr_reset_startup_mode(struct sock *sk)
+@@ -614,191 +739,49 @@ static void bbr_reset_startup_mode(struct sock *sk)
  	bbr->mode = BBR_STARTUP;
  }
  
@@ -1352,7 +1353,7 @@ index 760941e55153..a180fa648d5e 100644
  }
  
  /* Estimates the windowed max degree of ack aggregation.
-@@ -812,7 +794,7 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
+@@ -812,7 +795,7 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
   *
   * Max extra_acked is clamped by cwnd and bw * bbr_extra_acked_max_us (100 ms).
   * Max filter is an approximate sliding window of 5-10 (packet timed) round
@@ -1361,7 +1362,7 @@ index 760941e55153..a180fa648d5e 100644
   */
  static void bbr_update_ack_aggregation(struct sock *sk,
  				       const struct rate_sample *rs)
-@@ -820,15 +802,19 @@ static void bbr_update_ack_aggregation(struct sock *sk,
+@@ -820,15 +803,19 @@ static void bbr_update_ack_aggregation(struct sock *sk,
  	u32 epoch_us, expected_acked, extra_acked;
  	struct bbr *bbr = inet_csk_ca(sk);
  	struct tcp_sock *tp = tcp_sk(sk);
@@ -1383,7 +1384,7 @@ index 760941e55153..a180fa648d5e 100644
  			bbr->extra_acked_win_rtts = 0;
  			bbr->extra_acked_win_idx = bbr->extra_acked_win_idx ?
  						   0 : 1;
-@@ -862,49 +848,6 @@ static void bbr_update_ack_aggregation(struct sock *sk,
+@@ -862,49 +849,6 @@ static void bbr_update_ack_aggregation(struct sock *sk,
  		bbr->extra_acked[bbr->extra_acked_win_idx] = extra_acked;
  }
  
@@ -1433,7 +1434,7 @@ index 760941e55153..a180fa648d5e 100644
  static void bbr_check_probe_rtt_done(struct sock *sk)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
-@@ -914,9 +857,9 @@ static void bbr_check_probe_rtt_done(struct sock *sk)
+@@ -914,9 +858,9 @@ static void bbr_check_probe_rtt_done(struct sock *sk)
  	      after(tcp_jiffies32, bbr->probe_rtt_done_stamp)))
  		return;
  
@@ -1445,7 +1446,7 @@ index 760941e55153..a180fa648d5e 100644
  }
  
  /* The goal of PROBE_RTT mode is to have BBR flows cooperatively and
-@@ -942,23 +885,35 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
+@@ -942,23 +886,35 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
  {
  	struct tcp_sock *tp = tcp_sk(sk);
  	struct bbr *bbr = inet_csk_ca(sk);
@@ -1490,7 +1491,7 @@ index 760941e55153..a180fa648d5e 100644
  	}
  
  	if (bbr->mode == BBR_PROBE_RTT) {
-@@ -967,9 +922,9 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
+@@ -967,9 +923,9 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
  			(tp->delivered + tcp_packets_in_flight(tp)) ? : 1;
  		/* Maintain min packets in flight for max(200 ms, 1 round). */
  		if (!bbr->probe_rtt_done_stamp &&
@@ -1502,7 +1503,7 @@ index 760941e55153..a180fa648d5e 100644
  			bbr->probe_rtt_round_done = 0;
  			bbr->next_rtt_delivered = tp->delivered;
  		} else if (bbr->probe_rtt_done_stamp) {
-@@ -990,18 +945,20 @@ static void bbr_update_gains(struct sock *sk)
+@@ -990,18 +946,20 @@ static void bbr_update_gains(struct sock *sk)
  
  	switch (bbr->mode) {
  	case BBR_STARTUP:
@@ -1531,7 +1532,7 @@ index 760941e55153..a180fa648d5e 100644
  		break;
  	case BBR_PROBE_RTT:
  		bbr->pacing_gain = BBR_UNIT;
-@@ -1013,144 +970,1387 @@ static void bbr_update_gains(struct sock *sk)
+@@ -1013,144 +971,1387 @@ static void bbr_update_gains(struct sock *sk)
  	}
  }
  
@@ -1555,9 +1556,9 @@ index 760941e55153..a180fa648d5e 100644
  {
  	struct bbr *bbr = inet_csk_ca(sk);
 -	u32 bw;
--
--	bbr_update_model(sk, rs);
  
+-	bbr_update_model(sk, rs);
+-
 -	bw = bbr_bw(sk);
 -	bbr_set_pacing_rate(sk, bw, bbr->pacing_gain);
 -	bbr_set_cwnd(sk, rs, rs->acked_sacked, bw, bbr->cwnd_gain);
@@ -1691,7 +1692,7 @@ index 760941e55153..a180fa648d5e 100644
 +
 +	/* See if we should use ECN sender logic for this connection. */
 +	if (!bbr->ecn_eligible && bbr_can_use_ecn(sk) &&
-+	    bbr_param(sk, ecn_factor) &&
++	    !!bbr_param(sk, ecn_factor) &&
 +	    (bbr->min_rtt_us <= bbr_ecn_max_rtt_us ||
 +	     !bbr_ecn_max_rtt_us))
 +		bbr->ecn_eligible = 1;
@@ -1744,9 +1745,9 @@ index 760941e55153..a180fa648d5e 100644
 +
 +/* Each round trip of BBR_BW_PROBE_UP, double volume of probing data. */
 +static void bbr_raise_inflight_hi_slope(struct sock *sk)
-+{
+ {
 +	struct tcp_sock *tp = tcp_sk(sk);
-+	struct bbr *bbr = inet_csk_ca(sk);
+ 	struct bbr *bbr = inet_csk_ca(sk);
 +	u32 growth_this_round, cnt;
 +
 +	/* Calculate "slope": packets S/Acked per inflight_hi increment. */
@@ -1783,15 +1784,15 @@ index 760941e55153..a180fa648d5e 100644
 +
 +/* Does loss/ECN rate for this sample say inflight is "too high"?
 + * This is used by both the bbr_check_loss_too_high_in_startup() function,
-+ * which can be used in either v1 or v2, and the PROBE_UP phase of v2, which
-+ * uses it to notice when loss/ECN rates suggest inflight is too high.
++ * and in PROBE_UP.
 + */
 +static bool bbr_is_inflight_too_high(const struct sock *sk,
 +				      const struct rate_sample *rs)
 +{
 +	const struct bbr *bbr = inet_csk_ca(sk);
 +	u32 loss_thresh, ecn_thresh;
-+
+ 
+-	bbr->full_bw = 0;   /* spurious slow-down; reset full pipe detection */
 +	if (rs->lost > 0 && rs->tx_in_flight) {
 +		loss_thresh = (u64)rs->tx_in_flight * bbr_param(sk, loss_thresh) >>
 +				BBR_SCALE;
@@ -1801,7 +1802,7 @@ index 760941e55153..a180fa648d5e 100644
 +	}
 +
 +	if (rs->delivered_ce > 0 && rs->delivered > 0 &&
-+	    bbr->ecn_eligible && bbr_param(sk, ecn_thresh)) {
++	    bbr->ecn_eligible && !!bbr_param(sk, ecn_thresh)) {
 +		ecn_thresh = (u64)rs->delivered * bbr_param(sk, ecn_thresh) >>
 +				BBR_SCALE;
 +		if (rs->delivered_ce > ecn_thresh) {
@@ -1999,7 +2000,7 @@ index 760941e55153..a180fa648d5e 100644
 +		return;
 +
 +	/* ECN response. */
-+	if (bbr->ecn_in_round && bbr_param(sk, ecn_factor)) {
++	if (bbr->ecn_in_round && !!bbr_param(sk, ecn_factor)) {
 +		bbr_init_lower_bounds(sk, false);
 +		bbr_ecn_lower_bounds(sk, &ecn_inflight_lo);
 +	}
@@ -2091,15 +2092,14 @@ index 760941e55153..a180fa648d5e 100644
 + */
 +static void bbr_update_congestion_signals(
 +	struct sock *sk, const struct rate_sample *rs, struct bbr_context *ctx)
- {
- 	struct bbr *bbr = inet_csk_ca(sk);
++{
++	struct bbr *bbr = inet_csk_ca(sk);
 +	u64 bw;
 +
 +	if (rs->interval_us <= 0 || !rs->acked_sacked)
 +		return; /* Not a valid observation */
 +	bw = ctx->sample_bw;
- 
--	bbr->full_bw = 0;   /* spurious slow-down; reset full pipe detection */
++
 +	if (!rs->is_app_limited || bw >= bbr_max_bw(sk))
 +		bbr_take_max_bw_sample(sk, bw);
 +
@@ -2651,7 +2651,8 @@ index 760941e55153..a180fa648d5e 100644
 +	return false;
 +}
 +
-+__bpf_kfunc static void bbr_main(struct sock *sk, u32 ack, int flag, const struct rate_sample *rs)
++__bpf_kfunc static void bbr_main(struct sock *sk, u32 ack, int flag,
++				 const struct rate_sample *rs)
 +{
 +	struct tcp_sock *tp = tcp_sk(sk);
 +	struct bbr *bbr = inet_csk_ca(sk);
@@ -2993,7 +2994,7 @@ index 760941e55153..a180fa648d5e 100644
  	.get_info	= bbr_get_info,
  	.set_state	= bbr_set_state,
  };
-@@ -1159,10 +2359,11 @@ BTF_KFUNCS_START(tcp_bbr_check_kfunc_ids)
+@@ -1159,10 +2360,11 @@ BTF_KFUNCS_START(tcp_bbr_check_kfunc_ids)
  BTF_ID_FLAGS(func, bbr_init)
  BTF_ID_FLAGS(func, bbr_main)
  BTF_ID_FLAGS(func, bbr_sndbuf_expand)
@@ -3006,7 +3007,7 @@ index 760941e55153..a180fa648d5e 100644
  BTF_ID_FLAGS(func, bbr_set_state)
  BTF_KFUNCS_END(tcp_bbr_check_kfunc_ids)
  
-@@ -1195,5 +2396,12 @@ MODULE_AUTHOR("Van Jacobson <vanj@google.com>");
+@@ -1195,5 +2397,12 @@ MODULE_AUTHOR("Van Jacobson <vanj@google.com>");
  MODULE_AUTHOR("Neal Cardwell <ncardwell@google.com>");
  MODULE_AUTHOR("Yuchung Cheng <ycheng@google.com>");
  MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
@@ -3382,5 +3383,5 @@ index b412ed88ccd9..d70f8b742b21 100644
  	event = icsk->icsk_pending;
  
 -- 
-2.48.0.rc1
+2.49.0.391.g4bbb303af6
 
