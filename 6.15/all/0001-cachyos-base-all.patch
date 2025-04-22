@@ -1,59 +1,109 @@
-From 1e8ff649f1b9ede85a836f7f7a4bdf1004cbd27c Mon Sep 17 00:00:00 2001
+From f55a5e74dad189a3897d080cb5c4ac4231fda7ab Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 14 Apr 2025 17:05:04 +0200
+Date: Tue, 22 Apr 2025 16:37:35 +0200
 Subject: [PATCH 1/6] amd-pstate
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
- drivers/cpufreq/amd-pstate.c   | 32 +++++++------------
- include/linux/sched/topology.h |  6 ++++
- kernel/sched/debug.c           |  4 +++
- kernel/sched/fair.c            |  5 +--
- kernel/sched/topology.c        | 58 ++++++++++++++++++++++++++++++++++
- 5 files changed, 82 insertions(+), 23 deletions(-)
+ drivers/cpufreq/amd-pstate.c   | 91 ++++++++++++++++++++++++----------
+ drivers/cpufreq/amd-pstate.h   |  2 +
+ include/linux/sched/topology.h |  6 +++
+ kernel/sched/debug.c           |  4 ++
+ kernel/sched/fair.c            |  5 +-
+ kernel/sched/topology.c        | 58 ++++++++++++++++++++++
+ 6 files changed, 138 insertions(+), 28 deletions(-)
 
 diff --git a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
-index 6789eed1bb5b..01214c150051 100644
+index b961f3a3b580..4e3fa183817c 100644
 --- a/drivers/cpufreq/amd-pstate.c
 +++ b/drivers/cpufreq/amd-pstate.c
-@@ -791,19 +791,9 @@ static void amd_perf_ctl_reset(unsigned int cpu)
- 	wrmsrl_on_cpu(cpu, MSR_AMD_PERF_CTL, 0);
- }
- 
--/*
-- * Set amd-pstate preferred core enable can't be done directly from cpufreq callbacks
-- * due to locking, so queue the work for later.
-- */
--static void amd_pstste_sched_prefcore_workfn(struct work_struct *work)
--{
--	sched_set_itmt_support();
--}
--static DECLARE_WORK(sched_prefcore_work, amd_pstste_sched_prefcore_workfn);
--
- #define CPPC_MAX_PERF	U8_MAX
- 
--static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
-+static void amd_pstate_init_asym_prio(struct amd_cpudata *cpudata)
+@@ -389,7 +389,8 @@ static inline int amd_pstate_cppc_enable(struct cpufreq_policy *policy)
+ static int msr_init_perf(struct amd_cpudata *cpudata)
  {
- 	/* user disabled or not detected */
- 	if (!amd_pstate_prefcore)
-@@ -811,14 +801,8 @@ static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
+ 	union perf_cached perf = READ_ONCE(cpudata->perf);
+-	u64 cap1, numerator;
++	u64 cap1, numerator, cppc_req;
++	u8 min_perf;
  
- 	cpudata->hw_prefcore = true;
+ 	int ret = rdmsrl_safe_on_cpu(cpudata->cpu, MSR_AMD_CPPC_CAP1,
+ 				     &cap1);
+@@ -400,6 +401,22 @@ static int msr_init_perf(struct amd_cpudata *cpudata)
+ 	if (ret)
+ 		return ret;
  
--	/*
--	 * The priorities can be set regardless of whether or not
--	 * sched_set_itmt_support(true) has been called and it is valid to
--	 * update them at any time after it has been called.
--	 */
-+	/* The priorities must be initialized before ITMT support can be toggled on. */
- 	sched_set_itmt_core_prio((int)READ_ONCE(cpudata->prefcore_ranking), cpudata->cpu);
++	ret = rdmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, &cppc_req);
++	if (ret)
++		return ret;
++
++	WRITE_ONCE(cpudata->cppc_req_cached, cppc_req);
++	min_perf = FIELD_GET(AMD_CPPC_MIN_PERF_MASK, cppc_req);
++
++	/*
++	 * Clear out the min_perf part to check if the rest of the MSR is 0, if yes, this is an
++	 * indication that the min_perf value is the one specified through the BIOS option
++	 */
++	cppc_req &= ~(AMD_CPPC_MIN_PERF_MASK);
++
++	if (!cppc_req && min_perf)
++		perf.bios_min_perf = min_perf;
++
+ 	perf.highest_perf = numerator;
+ 	perf.max_limit_perf = numerator;
+ 	perf.min_limit_perf = FIELD_GET(AMD_CPPC_LOWEST_PERF_MASK, cap1);
+@@ -554,6 +571,10 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u8 min_perf,
+ 	if (!policy)
+ 		return;
+ 
++	/* limit the max perf when core performance boost feature is disabled */
++	if (!cpudata->boost_supported)
++		max_perf = min_t(u8, perf.nominal_perf, max_perf);
++
+ 	des_perf = clamp_t(u8, des_perf, min_perf, max_perf);
+ 
+ 	policy->cur = perf_to_freq(perf, cpudata->nominal_freq, des_perf);
+@@ -563,10 +584,6 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u8 min_perf,
+ 		des_perf = 0;
+ 	}
+ 
+-	/* limit the max perf when core performance boost feature is disabled */
+-	if (!cpudata->boost_supported)
+-		max_perf = min_t(u8, perf.nominal_perf, max_perf);
 -
--	schedule_work(&sched_prefcore_work);
- }
+ 	if (trace_amd_pstate_perf_enabled() && amd_pstate_sample(cpudata)) {
+ 		trace_amd_pstate_perf(min_perf, des_perf, max_perf, cpudata->freq,
+ 			cpudata->cur.mperf, cpudata->cur.aperf, cpudata->cur.tsc,
+@@ -580,20 +597,26 @@ static int amd_pstate_verify(struct cpufreq_policy_data *policy_data)
+ {
+ 	/*
+ 	 * Initialize lower frequency limit (i.e.policy->min) with
+-	 * lowest_nonlinear_frequency which is the most energy efficient
+-	 * frequency. Override the initial value set by cpufreq core and
+-	 * amd-pstate qos_requests.
++	 * lowest_nonlinear_frequency or the min frequency (if) specified in BIOS,
++	 * Override the initial value set by cpufreq core and amd-pstate qos_requests.
+ 	 */
+ 	if (policy_data->min == FREQ_QOS_MIN_DEFAULT_VALUE) {
+ 		struct cpufreq_policy *policy __free(put_cpufreq_policy) =
+ 					      cpufreq_cpu_get(policy_data->cpu);
+ 		struct amd_cpudata *cpudata;
++		union perf_cached perf;
  
- static void amd_pstate_update_limits(unsigned int cpu)
-@@ -844,8 +828,10 @@ static void amd_pstate_update_limits(unsigned int cpu)
+ 		if (!policy)
+ 			return -EINVAL;
+ 
+ 		cpudata = policy->driver_data;
+-		policy_data->min = cpudata->lowest_nonlinear_freq;
++		perf = READ_ONCE(cpudata->perf);
++
++		if (perf.bios_min_perf)
++			policy_data->min = perf_to_freq(perf, cpudata->nominal_freq,
++							perf.bios_min_perf);
++		else
++			policy_data->min = cpudata->lowest_nonlinear_freq;
+ 	}
+ 
+ 	cpufreq_verify_within_cpu_limits(policy_data);
+@@ -831,8 +854,10 @@ static void amd_pstate_update_limits(unsigned int cpu)
  	if (highest_perf_changed) {
  		WRITE_ONCE(cpudata->prefcore_ranking, cur_high);
  
@@ -65,35 +115,131 @@ index 6789eed1bb5b..01214c150051 100644
  	}
  }
  
-@@ -971,7 +957,7 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
- 	if (ret)
- 		goto free_cpudata1;
+@@ -1025,6 +1050,9 @@ static void amd_pstate_cpu_exit(struct cpufreq_policy *policy)
+ {
+ 	struct amd_cpudata *cpudata = policy->driver_data;
  
--	amd_pstate_init_prefcore(cpudata);
-+	amd_pstate_init_asym_prio(cpudata);
++	/* Reset CPPC_REQ MSR to the BIOS value */
++	amd_pstate_update_perf(policy, cpudata->perf.bios_min_perf, 0U, 0U, 0U, false);
++
+ 	freq_qos_remove_request(&cpudata->req[1]);
+ 	freq_qos_remove_request(&cpudata->req[0]);
+ 	policy->fast_switch_possible = false;
+@@ -1419,7 +1447,6 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 	struct amd_cpudata *cpudata;
+ 	union perf_cached perf;
+ 	struct device *dev;
+-	u64 value;
+ 	int ret;
  
- 	ret = amd_pstate_init_freq(cpudata);
- 	if (ret)
-@@ -1447,7 +1433,7 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
- 	if (ret)
- 		goto free_cpudata1;
- 
--	amd_pstate_init_prefcore(cpudata);
-+	amd_pstate_init_asym_prio(cpudata);
- 
- 	ret = amd_pstate_init_freq(cpudata);
- 	if (ret)
-@@ -1777,6 +1763,10 @@ static int __init amd_pstate_init(void)
- 		}
+ 	/*
+@@ -1484,12 +1511,6 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
+ 		cpudata->epp_default = AMD_CPPC_EPP_BALANCE_PERFORMANCE;
  	}
  
-+	/* Enable ITMT support once all CPUs have initialized their asym priorities. */
-+	if (amd_pstate_prefcore)
-+		sched_set_itmt_support();
-+
- 	return ret;
+-	if (cpu_feature_enabled(X86_FEATURE_CPPC)) {
+-		ret = rdmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, &value);
+-		if (ret)
+-			return ret;
+-		WRITE_ONCE(cpudata->cppc_req_cached, value);
+-	}
+ 	ret = amd_pstate_set_epp(policy, cpudata->epp_default);
+ 	if (ret)
+ 		return ret;
+@@ -1509,6 +1530,9 @@ static void amd_pstate_epp_cpu_exit(struct cpufreq_policy *policy)
+ 	struct amd_cpudata *cpudata = policy->driver_data;
  
- global_attr_free:
+ 	if (cpudata) {
++		/* Reset CPPC_REQ MSR to the BIOS value */
++		amd_pstate_update_perf(policy, cpudata->perf.bios_min_perf, 0U, 0U, 0U, false);
++
+ 		kfree(cpudata);
+ 		policy->driver_data = NULL;
+ 	}
+@@ -1559,22 +1583,34 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
+ 	return 0;
+ }
+ 
+-static int amd_pstate_epp_cpu_online(struct cpufreq_policy *policy)
++static int amd_pstate_cpu_online(struct cpufreq_policy *policy)
+ {
+-	pr_debug("AMD CPU Core %d going online\n", policy->cpu);
+-
+ 	return amd_pstate_cppc_enable(policy);
+ }
+ 
+-static int amd_pstate_epp_cpu_offline(struct cpufreq_policy *policy)
++static int amd_pstate_cpu_offline(struct cpufreq_policy *policy)
+ {
+-	return 0;
++	struct amd_cpudata *cpudata = policy->driver_data;
++
++	/*
++	 * Reset CPPC_REQ MSR to the BIOS value, this will allow us to retain the BIOS specified
++	 * min_perf value across kexec reboots. If this CPU is just onlined normally after this, the
++	 * limits, epp and desired perf will get reset to the cached values in cpudata struct
++	 */
++	return amd_pstate_update_perf(policy, cpudata->perf.bios_min_perf, 0U, 0U, 0U, false);
+ }
+ 
+-static int amd_pstate_epp_suspend(struct cpufreq_policy *policy)
++static int amd_pstate_suspend(struct cpufreq_policy *policy)
+ {
+ 	struct amd_cpudata *cpudata = policy->driver_data;
+ 
++	/*
++	 * Reset CPPC_REQ MSR to the BIOS value, this will allow us to retain the BIOS specified
++	 * min_perf value across kexec reboots. If this CPU is just resumed back without kexec,
++	 * the limits, epp and desired perf will get reset to the cached values in cpudata struct
++	 */
++	amd_pstate_update_perf(policy, cpudata->perf.bios_min_perf, 0U, 0U, 0U, false);
++
+ 	/* invalidate to ensure it's rewritten during resume */
+ 	cpudata->cppc_req_cached = 0;
+ 
+@@ -1609,6 +1645,9 @@ static struct cpufreq_driver amd_pstate_driver = {
+ 	.fast_switch    = amd_pstate_fast_switch,
+ 	.init		= amd_pstate_cpu_init,
+ 	.exit		= amd_pstate_cpu_exit,
++	.online		= amd_pstate_cpu_online,
++	.offline	= amd_pstate_cpu_offline,
++	.suspend	= amd_pstate_suspend,
+ 	.set_boost	= amd_pstate_set_boost,
+ 	.update_limits	= amd_pstate_update_limits,
+ 	.name		= "amd-pstate",
+@@ -1621,9 +1660,9 @@ static struct cpufreq_driver amd_pstate_epp_driver = {
+ 	.setpolicy	= amd_pstate_epp_set_policy,
+ 	.init		= amd_pstate_epp_cpu_init,
+ 	.exit		= amd_pstate_epp_cpu_exit,
+-	.offline	= amd_pstate_epp_cpu_offline,
+-	.online		= amd_pstate_epp_cpu_online,
+-	.suspend	= amd_pstate_epp_suspend,
++	.offline	= amd_pstate_cpu_offline,
++	.online		= amd_pstate_cpu_online,
++	.suspend	= amd_pstate_suspend,
+ 	.resume		= amd_pstate_epp_resume,
+ 	.update_limits	= amd_pstate_update_limits,
+ 	.set_boost	= amd_pstate_set_boost,
+diff --git a/drivers/cpufreq/amd-pstate.h b/drivers/cpufreq/amd-pstate.h
+index fbe1c08d3f06..2f7ae364d331 100644
+--- a/drivers/cpufreq/amd-pstate.h
++++ b/drivers/cpufreq/amd-pstate.h
+@@ -30,6 +30,7 @@
+  * @lowest_perf: the absolute lowest performance level of the processor
+  * @min_limit_perf: Cached value of the performance corresponding to policy->min
+  * @max_limit_perf: Cached value of the performance corresponding to policy->max
++ * @bios_min_perf: Cached perf value corresponding to the "Requested CPU Min Frequency" BIOS option
+  */
+ union perf_cached {
+ 	struct {
+@@ -39,6 +40,7 @@ union perf_cached {
+ 		u8	lowest_perf;
+ 		u8	min_limit_perf;
+ 		u8	max_limit_perf;
++		u8	bios_min_perf;
+ 	};
+ 	u64	val;
+ };
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
 index 7b4301b7235f..198bb5cc1774 100644
 --- a/include/linux/sched/topology.h
@@ -226,11 +372,11 @@ index f1ebc60d967f..8426de317835 100644
   * Set of available CPUs grouped by their corresponding capacities
   * Each list entry contains a CPU mask reflecting CPUs that share the same
 -- 
-2.48.0.rc1
+2.49.0.391.g4bbb303af6
 
-From 1ae075a8e878f9b31d7feb993d6037562722c21a Mon Sep 17 00:00:00 2001
+From 61334ab485c75463839cc5cee9556e2f76452a83 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 14 Apr 2025 17:05:24 +0200
+Date: Tue, 22 Apr 2025 16:37:53 +0200
 Subject: [PATCH 2/6] asus
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -6615,11 +6761,11 @@ index 783e2a336861..78261ea49995 100644
  					   u32 *retval)
  {
 -- 
-2.48.0.rc1
+2.49.0.391.g4bbb303af6
 
-From 1afadae08378d2b3ecddd4d4bc008e1168cc13f7 Mon Sep 17 00:00:00 2001
+From 9018db9aabf31fc35c9c8cd57fa3ede99360732f Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 14 Apr 2025 17:05:59 +0200
+Date: Tue, 22 Apr 2025 16:38:05 +0200
 Subject: [PATCH 3/6] async-shutdown
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -6924,11 +7070,11 @@ index cd8e0f0a634b..c63bc0050c84 100644
  	const struct of_device_id	*of_match_table;
  	const struct acpi_device_id	*acpi_match_table;
 -- 
-2.48.0.rc1
+2.49.0.391.g4bbb303af6
 
-From da48778d480a447e07a60e8a4df095cfa05c4260 Mon Sep 17 00:00:00 2001
+From cdcae9c1abcda2c9a9df3e61bc93fda60fbbac11 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 14 Apr 2025 17:06:10 +0200
+Date: Tue, 22 Apr 2025 16:38:15 +0200
 Subject: [PATCH 4/6] bbr3
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
@@ -10323,15 +10469,16 @@ index e4c616bbd727..e4a7a25d667d 100644
  	event = icsk->icsk_pending;
  
 -- 
-2.48.0.rc1
+2.49.0.391.g4bbb303af6
 
-From 663a165ed49acab28cea80992e24476f1f0e58ac Mon Sep 17 00:00:00 2001
+From 3901bc7aeb5e773b9947105b2039e7ff1529d911 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 14 Apr 2025 17:06:20 +0200
+Date: Tue, 22 Apr 2025 16:38:51 +0200
 Subject: [PATCH 5/6] cachy
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
+ .../ABI/testing/sysfs-driver-intel-xe-hwmon   |   24 +
  .../admin-guide/kernel-parameters.txt         |   12 +
  Documentation/admin-guide/sysctl/vm.rst       |   72 +
  Makefile                                      |    8 +
@@ -10356,6 +10503,11 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  .../amd/display/amdgpu_dm/amdgpu_dm_plane.c   |    6 +-
  drivers/gpu/drm/amd/pm/amdgpu_pm.c            |    3 +
  drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c     |   14 +-
+ drivers/gpu/drm/xe/regs/xe_pcode_regs.h       |    3 +
+ drivers/gpu/drm/xe/xe_device_types.h          |    2 +
+ drivers/gpu/drm/xe/xe_hwmon.c                 |  125 +-
+ drivers/gpu/drm/xe/xe_pci.c                   |    4 +
+ drivers/gpu/drm/xe/xe_pcode_api.h             |    3 +
  drivers/hid/amd-sfh-hid/amd_sfh_client.c      |    2 +
  drivers/hid/amd-sfh-hid/amd_sfh_pcie.c        |    4 +
  drivers/hid/amd-sfh-hid/amd_sfh_pcie.h        |    1 +
@@ -10401,7 +10553,7 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  mm/vmpressure.c                               |    4 +
  mm/vmscan.c                                   |  148 +-
  net/ipv4/inet_connection_sock.c               |    2 +-
- 69 files changed, 7667 insertions(+), 50 deletions(-)
+ 75 files changed, 7827 insertions(+), 51 deletions(-)
  create mode 100644 block/adios.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.h
@@ -10411,6 +10563,38 @@ Signed-off-by: Peter Jung <admin@ptr1337.dev>
  create mode 100644 drivers/scsi/vhba/Makefile
  create mode 100644 drivers/scsi/vhba/vhba.c
 
+diff --git a/Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon b/Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon
+index 9bce281314df..adbb9bce15a5 100644
+--- a/Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon
++++ b/Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon
+@@ -124,3 +124,27 @@ Contact:	intel-xe@lists.freedesktop.org
+ Description:	RO. VRAM temperature in millidegree Celsius.
+ 
+ 		Only supported for particular Intel Xe graphics platforms.
++
++What:		/sys/bus/pci/drivers/xe/.../hwmon/hwmon<i>/fan1_input
++Date:		March 2025
++KernelVersion:	6.14
++Contact:	intel-xe@lists.freedesktop.org
++Description:	RO. Fan 1 speed in RPM.
++
++		Only supported for particular Intel Xe graphics platforms.
++
++What:		/sys/bus/pci/drivers/xe/.../hwmon/hwmon<i>/fan2_input
++Date:		March 2025
++KernelVersion:	6.14
++Contact:	intel-xe@lists.freedesktop.org
++Description:	RO. Fan 2 speed in RPM.
++
++		Only supported for particular Intel Xe graphics platforms.
++
++What:		/sys/bus/pci/drivers/xe/.../hwmon/hwmon<i>/fan3_input
++Date:		March 2025
++KernelVersion:	6.14
++Contact:	intel-xe@lists.freedesktop.org
++Description:	RO. Fan 3 speed in RPM.
++
++		Only supported for particular Intel Xe graphics platforms.
 diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
 index d9fd26b95b34..7ccf69a73991 100644
 --- a/Documentation/admin-guide/kernel-parameters.txt
@@ -10539,10 +10723,10 @@ index 8290177b4f75..f2e601171a3e 100644
  unprivileged_userfaultfd
  ========================
 diff --git a/Makefile b/Makefile
-index c91afd55099e..892059197182 100644
+index 3dcad2319662..18adf49a5342 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -858,11 +858,19 @@ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
+@@ -857,11 +857,19 @@ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
  ifdef CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE
  KBUILD_CFLAGS += -O2
  KBUILD_RUSTFLAGS += -Copt-level=2
@@ -12243,7 +12427,7 @@ index 2c5c228408bf..918e2bebfe78 100644
  	  This driver adds a CPUFreq driver which utilizes a fine grain
  	  processor performance frequency control range instead of legacy
 diff --git a/drivers/cpufreq/intel_pstate.c b/drivers/cpufreq/intel_pstate.c
-index 4aad79d26c64..8c01b83fa443 100644
+index f41ed0b9e610..f49ecc3f5b50 100644
 --- a/drivers/cpufreq/intel_pstate.c
 +++ b/drivers/cpufreq/intel_pstate.c
 @@ -3825,6 +3825,8 @@ static int __init intel_pstate_setup(char *str)
@@ -12256,7 +12440,7 @@ index 4aad79d26c64..8c01b83fa443 100644
  		default_driver = &intel_pstate;
  	else if (!strcmp(str, "passive"))
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
-index 2c04ae133848..4123859444ab 100644
+index ef6e78224fdf..2a4e123ec1d2 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
 @@ -161,6 +161,7 @@ struct amdgpu_watchdog_timer {
@@ -12268,7 +12452,7 @@ index 2c04ae133848..4123859444ab 100644
  extern int amdgpu_gart_size;
  extern int amdgpu_gtt_size;
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
-index 26bf896f1444..8cbf1d6e7ce0 100644
+index 24ee4710f807..f72a848a606a 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
 @@ -143,6 +143,7 @@ enum AMDGPU_DEBUG_MASK {
@@ -12444,6 +12628,303 @@ index 46cce1d2aaf3..e3adb7aea969 100644
  		dev_err(smu->adev->dev,
  			"New power limit (%d) is out of range [%d,%d]\n",
  			limit, smu->min_power_limit, smu->max_power_limit);
+diff --git a/drivers/gpu/drm/xe/regs/xe_pcode_regs.h b/drivers/gpu/drm/xe/regs/xe_pcode_regs.h
+index 8846eb9ce2a4..c7d5d782e3f9 100644
+--- a/drivers/gpu/drm/xe/regs/xe_pcode_regs.h
++++ b/drivers/gpu/drm/xe/regs/xe_pcode_regs.h
+@@ -21,6 +21,9 @@
+ #define BMG_PACKAGE_POWER_SKU			XE_REG(0x138098)
+ #define BMG_PACKAGE_POWER_SKU_UNIT		XE_REG(0x1380dc)
+ #define BMG_PACKAGE_ENERGY_STATUS		XE_REG(0x138120)
++#define BMG_FAN_1_SPEED				XE_REG(0x138140)
++#define BMG_FAN_2_SPEED				XE_REG(0x138170)
++#define BMG_FAN_3_SPEED				XE_REG(0x1381a0)
+ #define BMG_VRAM_TEMPERATURE			XE_REG(0x1382c0)
+ #define BMG_PACKAGE_TEMPERATURE			XE_REG(0x138434)
+ #define BMG_PACKAGE_RAPL_LIMIT			XE_REG(0x138440)
+diff --git a/drivers/gpu/drm/xe/xe_device_types.h b/drivers/gpu/drm/xe/xe_device_types.h
+index 9f8667ebba85..20239d6a2e98 100644
+--- a/drivers/gpu/drm/xe/xe_device_types.h
++++ b/drivers/gpu/drm/xe/xe_device_types.h
+@@ -314,6 +314,8 @@ struct xe_device {
+ 		u8 has_atomic_enable_pte_bit:1;
+ 		/** @info.has_device_atomics_on_smem: Supports device atomics on SMEM */
+ 		u8 has_device_atomics_on_smem:1;
++		/** @info.has_fan_control: Device supports fan control */
++		u8 has_fan_control:1;
+ 		/** @info.has_flat_ccs: Whether flat CCS metadata is used */
+ 		u8 has_flat_ccs:1;
+ 		/** @info.has_heci_cscfi: device has heci cscfi */
+diff --git a/drivers/gpu/drm/xe/xe_hwmon.c b/drivers/gpu/drm/xe/xe_hwmon.c
+index 48d80ffdf7bb..eb293aec36a0 100644
+--- a/drivers/gpu/drm/xe/xe_hwmon.c
++++ b/drivers/gpu/drm/xe/xe_hwmon.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/hwmon-sysfs.h>
+ #include <linux/hwmon.h>
++#include <linux/jiffies.h>
+ #include <linux/types.h>
+ #include <linux/units.h>
+ 
+@@ -27,6 +28,7 @@ enum xe_hwmon_reg {
+ 	REG_PKG_POWER_SKU_UNIT,
+ 	REG_GT_PERF_STATUS,
+ 	REG_PKG_ENERGY_STATUS,
++	REG_FAN_SPEED,
+ };
+ 
+ enum xe_hwmon_reg_operation {
+@@ -42,6 +44,13 @@ enum xe_hwmon_channel {
+ 	CHANNEL_MAX,
+ };
+ 
++enum xe_fan_channel {
++	FAN_1,
++	FAN_2,
++	FAN_3,
++	FAN_MAX,
++};
++
+ /*
+  * SF_* - scale factors for particular quantities according to hwmon spec.
+  */
+@@ -61,6 +70,16 @@ struct xe_hwmon_energy_info {
+ 	long accum_energy;
+ };
+ 
++/**
++ * struct xe_hwmon_fan_info - to cache previous fan reading
++ */
++struct xe_hwmon_fan_info {
++	/** @reg_val_prev: previous fan reg val */
++	u32 reg_val_prev;
++	/** @time_prev: previous timestamp */
++	u64 time_prev;
++};
++
+ /**
+  * struct xe_hwmon - xe hwmon data structure
+  */
+@@ -79,6 +98,8 @@ struct xe_hwmon {
+ 	int scl_shift_time;
+ 	/** @ei: Energy info for energyN_input */
+ 	struct xe_hwmon_energy_info ei[CHANNEL_MAX];
++	/** @fi: Fan info for fanN_input */
++	struct xe_hwmon_fan_info fi[FAN_MAX];
+ };
+ 
+ static struct xe_reg xe_hwmon_get_reg(struct xe_hwmon *hwmon, enum xe_hwmon_reg hwmon_reg,
+@@ -144,6 +165,14 @@ static struct xe_reg xe_hwmon_get_reg(struct xe_hwmon *hwmon, enum xe_hwmon_reg
+ 			return PCU_CR_PACKAGE_ENERGY_STATUS;
+ 		}
+ 		break;
++	case REG_FAN_SPEED:
++		if (channel == FAN_1)
++			return BMG_FAN_1_SPEED;
++		else if (channel == FAN_2)
++			return BMG_FAN_2_SPEED;
++		else if (channel == FAN_3)
++			return BMG_FAN_3_SPEED;
++		break;
+ 	default:
+ 		drm_warn(&xe->drm, "Unknown xe hwmon reg id: %d\n", hwmon_reg);
+ 		break;
+@@ -454,6 +483,7 @@ static const struct hwmon_channel_info * const hwmon_info[] = {
+ 	HWMON_CHANNEL_INFO(curr, HWMON_C_LABEL, HWMON_C_CRIT | HWMON_C_LABEL),
+ 	HWMON_CHANNEL_INFO(in, HWMON_I_INPUT | HWMON_I_LABEL, HWMON_I_INPUT | HWMON_I_LABEL),
+ 	HWMON_CHANNEL_INFO(energy, HWMON_E_INPUT | HWMON_E_LABEL, HWMON_E_INPUT | HWMON_E_LABEL),
++	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT, HWMON_F_INPUT),
+ 	NULL
+ };
+ 
+@@ -480,6 +510,19 @@ static int xe_hwmon_pcode_write_i1(const struct xe_hwmon *hwmon, u32 uval)
+ 			      (uval & POWER_SETUP_I1_DATA_MASK));
+ }
+ 
++static int xe_hwmon_pcode_read_fan_control(const struct xe_hwmon *hwmon, u32 subcmd, u32 *uval)
++{
++	struct xe_tile *root_tile = xe_device_get_root_tile(hwmon->xe);
++
++	/* Platforms that don't return correct value */
++	if (hwmon->xe->info.platform == XE_DG2 && subcmd == FSC_READ_NUM_FANS) {
++		*uval = 2;
++		return 0;
++	}
++
++	return xe_pcode_read(root_tile, PCODE_MBOX(FAN_SPEED_CONTROL, subcmd, 0), uval, NULL);
++}
++
+ static int xe_hwmon_power_curr_crit_read(struct xe_hwmon *hwmon, int channel,
+ 					 long *value, u32 scale_factor)
+ {
+@@ -705,6 +748,75 @@ xe_hwmon_energy_read(struct xe_hwmon *hwmon, u32 attr, int channel, long *val)
+ 	}
+ }
+ 
++static umode_t
++xe_hwmon_fan_is_visible(struct xe_hwmon *hwmon, u32 attr, int channel)
++{
++	u32 uval;
++
++	if (!hwmon->xe->info.has_fan_control)
++		return 0;
++
++	switch (attr) {
++	case hwmon_fan_input:
++		if (xe_hwmon_pcode_read_fan_control(hwmon, FSC_READ_NUM_FANS, &uval))
++			return 0;
++
++		return channel < uval ? 0444 : 0;
++	default:
++		return 0;
++	}
++}
++
++static int
++xe_hwmon_fan_input_read(struct xe_hwmon *hwmon, int channel, long *val)
++{
++	struct xe_mmio *mmio = xe_root_tile_mmio(hwmon->xe);
++	struct xe_hwmon_fan_info *fi = &hwmon->fi[channel];
++	u64 rotations, time_now, time;
++	u32 reg_val;
++	int ret = 0;
++
++	mutex_lock(&hwmon->hwmon_lock);
++
++	reg_val = xe_mmio_read32(mmio, xe_hwmon_get_reg(hwmon, REG_FAN_SPEED, channel));
++	time_now = get_jiffies_64();
++
++	/*
++	 * HW register value is accumulated count of pulses from PWM fan with the scale
++	 * of 2 pulses per rotation.
++	 */
++	rotations = (reg_val - fi->reg_val_prev) / 2;
++
++	time = jiffies_delta_to_msecs(time_now - fi->time_prev);
++	if (unlikely(!time)) {
++		ret = -EAGAIN;
++		goto unlock;
++	}
++
++	/*
++	 * Calculate fan speed in RPM by time averaging two subsequent readings in minutes.
++	 * RPM = number of rotations * msecs per minute / time in msecs
++	 */
++	*val = DIV_ROUND_UP_ULL(rotations * (MSEC_PER_SEC * 60), time);
++
++	fi->reg_val_prev = reg_val;
++	fi->time_prev = time_now;
++unlock:
++	mutex_unlock(&hwmon->hwmon_lock);
++	return ret;
++}
++
++static int
++xe_hwmon_fan_read(struct xe_hwmon *hwmon, u32 attr, int channel, long *val)
++{
++	switch (attr) {
++	case hwmon_fan_input:
++		return xe_hwmon_fan_input_read(hwmon, channel, val);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static umode_t
+ xe_hwmon_is_visible(const void *drvdata, enum hwmon_sensor_types type,
+ 		    u32 attr, int channel)
+@@ -730,6 +842,9 @@ xe_hwmon_is_visible(const void *drvdata, enum hwmon_sensor_types type,
+ 	case hwmon_energy:
+ 		ret = xe_hwmon_energy_is_visible(hwmon, attr, channel);
+ 		break;
++	case hwmon_fan:
++		ret = xe_hwmon_fan_is_visible(hwmon, attr, channel);
++		break;
+ 	default:
+ 		ret = 0;
+ 		break;
+@@ -765,6 +880,9 @@ xe_hwmon_read(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+ 	case hwmon_energy:
+ 		ret = xe_hwmon_energy_read(hwmon, attr, channel, val);
+ 		break;
++	case hwmon_fan:
++		ret = xe_hwmon_fan_read(hwmon, attr, channel, val);
++		break;
+ 	default:
+ 		ret = -EOPNOTSUPP;
+ 		break;
+@@ -842,7 +960,7 @@ static void
+ xe_hwmon_get_preregistration_info(struct xe_hwmon *hwmon)
+ {
+ 	struct xe_mmio *mmio = xe_root_tile_mmio(hwmon->xe);
+-	long energy;
++	long energy, fan_speed;
+ 	u64 val_sku_unit = 0;
+ 	int channel;
+ 	struct xe_reg pkg_power_sku_unit;
+@@ -866,6 +984,11 @@ xe_hwmon_get_preregistration_info(struct xe_hwmon *hwmon)
+ 	for (channel = 0; channel < CHANNEL_MAX; channel++)
+ 		if (xe_hwmon_is_visible(hwmon, hwmon_energy, hwmon_energy_input, channel))
+ 			xe_hwmon_energy_get(hwmon, channel, &energy);
++
++	/* Initialize 'struct xe_hwmon_fan_info' with initial fan register reading. */
++	for (channel = 0; channel < FAN_MAX; channel++)
++		if (xe_hwmon_is_visible(hwmon, hwmon_fan, hwmon_fan_input, channel))
++			xe_hwmon_fan_input_read(hwmon, channel, &fan_speed);
+ }
+ 
+ static void xe_hwmon_mutex_destroy(void *arg)
+diff --git a/drivers/gpu/drm/xe/xe_pci.c b/drivers/gpu/drm/xe/xe_pci.c
+index 818f023166d5..88138a3fcf50 100644
+--- a/drivers/gpu/drm/xe/xe_pci.c
++++ b/drivers/gpu/drm/xe/xe_pci.c
+@@ -62,6 +62,7 @@ struct xe_device_desc {
+ 	u8 is_dgfx:1;
+ 
+ 	u8 has_display:1;
++	u8 has_fan_control:1;
+ 	u8 has_heci_gscfi:1;
+ 	u8 has_heci_cscfi:1;
+ 	u8 has_llc:1;
+@@ -302,6 +303,7 @@ static const struct xe_device_desc dg2_desc = {
+ 
+ 	DG2_FEATURES,
+ 	.has_display = true,
++	.has_fan_control = true,
+ };
+ 
+ static const __maybe_unused struct xe_device_desc pvc_desc = {
+@@ -336,6 +338,7 @@ static const struct xe_device_desc bmg_desc = {
+ 	PLATFORM(BATTLEMAGE),
+ 	.dma_mask_size = 46,
+ 	.has_display = true,
++	.has_fan_control = true,
+ 	.has_heci_cscfi = 1,
+ };
+ 
+@@ -575,6 +578,7 @@ static int xe_info_init_early(struct xe_device *xe,
+ 
+ 	xe->info.dma_mask_size = desc->dma_mask_size;
+ 	xe->info.is_dgfx = desc->is_dgfx;
++	xe->info.has_fan_control = desc->has_fan_control;
+ 	xe->info.has_heci_gscfi = desc->has_heci_gscfi;
+ 	xe->info.has_heci_cscfi = desc->has_heci_cscfi;
+ 	xe->info.has_llc = desc->has_llc;
+diff --git a/drivers/gpu/drm/xe/xe_pcode_api.h b/drivers/gpu/drm/xe/xe_pcode_api.h
+index 2bae9afdbd35..e622ae17f08d 100644
+--- a/drivers/gpu/drm/xe/xe_pcode_api.h
++++ b/drivers/gpu/drm/xe/xe_pcode_api.h
+@@ -49,6 +49,9 @@
+ /* Domain IDs (param2) */
+ #define     PCODE_MBOX_DOMAIN_HBM		0x2
+ 
++#define   FAN_SPEED_CONTROL			0x7D
++#define     FSC_READ_NUM_FANS			0x4
++
+ #define PCODE_SCRATCH(x)		XE_REG(0x138320 + ((x) * 4))
+ /* PCODE_SCRATCH0 */
+ #define   AUXINFO_REG_OFFSET		REG_GENMASK(17, 15)
 diff --git a/drivers/hid/amd-sfh-hid/amd_sfh_client.c b/drivers/hid/amd-sfh-hid/amd_sfh_client.c
 index 3438d392920f..867019955b10 100644
 --- a/drivers/hid/amd-sfh-hid/amd_sfh_client.c
@@ -18362,7 +18843,7 @@ index 000000000000..878a3be0ba2b
 +module_exit(vhba_exit);
 +
 diff --git a/include/linux/mm.h b/include/linux/mm.h
-index b7f13f087954..2a91564862f9 100644
+index bf55206935c4..d25cb2c98b93 100644
 --- a/include/linux/mm.h
 +++ b/include/linux/mm.h
 @@ -193,6 +193,14 @@ static inline void __mm_zero_struct_page(struct page *page)
@@ -18436,7 +18917,7 @@ index 965a19809c7e..3d442267a256 100644
  void finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
  long wait_woken(struct wait_queue_entry *wq_entry, unsigned mode, long timeout);
 diff --git a/init/Kconfig b/init/Kconfig
-index dd2ea3b9a799..e3f35e6b08e4 100644
+index 63f5974b9fa6..25fef1bc41b3 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
 @@ -165,6 +165,10 @@ config THREAD_INFO_IN_TASK
@@ -18867,7 +19348,7 @@ index e113f713b493..5fc1934a3095 100644
  
  #
 diff --git a/mm/compaction.c b/mm/compaction.c
-index 139f00c0308a..5d84bf05a30a 100644
+index ca71fd3c3181..2070b1e5106f 100644
 --- a/mm/compaction.c
 +++ b/mm/compaction.c
 @@ -1923,7 +1923,11 @@ static int sysctl_compact_unevictable_allowed __read_mostly = CONFIG_COMPACT_UNE
@@ -18899,10 +19380,10 @@ index 2a47682d1ab7..f828c2e0086c 100644
  	(1<<TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG);
  
 diff --git a/mm/mm_init.c b/mm/mm_init.c
-index 84f14fa12d0d..d8dc681fd7b1 100644
+index 9659689b8ace..0f884bca873e 100644
 --- a/mm/mm_init.c
 +++ b/mm/mm_init.c
-@@ -2732,6 +2732,7 @@ static void __init mem_init_print_info(void)
+@@ -2733,6 +2733,7 @@ static void __init mem_init_print_info(void)
  		, K(totalhigh_pages())
  #endif
  		);
@@ -18939,7 +19420,7 @@ index c81624bc3969..f19314209557 100644
  EXPORT_SYMBOL_GPL(dirty_writeback_interval);
  
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index fd6b865cb1ab..89e2ac5b57e2 100644
+index 5669baf2a6fe..15712bc235d1 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
 @@ -274,7 +274,11 @@ const char * const migratetype_names[MIGRATE_TYPES] = {
@@ -18994,7 +19475,7 @@ index bd5183dfd879..3a410f53a07c 100644
  
  /*
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index b620d74b0f66..55dc01c0d87b 100644
+index 3783e45bfc92..4f991a6ae689 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -148,6 +148,15 @@ struct scan_control {
@@ -19239,19 +19720,18 @@ index dd5cf8914a28..b216088a6abd 100644
  		release_sock(sk);
  		if (reqsk_queue_empty(&icsk->icsk_accept_queue))
 -- 
-2.48.0.rc1
+2.49.0.391.g4bbb303af6
 
-From a044b047e7ca4403118014af47d81e9dff528986 Mon Sep 17 00:00:00 2001
+From 8742368de92877d18d1a55b942fec8bc2d8fb467 Mon Sep 17 00:00:00 2001
 From: Peter Jung <admin@ptr1337.dev>
-Date: Mon, 14 Apr 2025 17:06:36 +0200
+Date: Tue, 22 Apr 2025 16:40:00 +0200
 Subject: [PATCH 6/6] fixes
 
 Signed-off-by: Peter Jung <admin@ptr1337.dev>
 ---
  arch/Kconfig             | 4 ++--
- drivers/nvme/host/core.c | 2 +-
  scripts/package/PKGBUILD | 5 +++++
- 3 files changed, 8 insertions(+), 3 deletions(-)
+ 2 files changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/arch/Kconfig b/arch/Kconfig
 index b0adb665041f..eea830cc90a7 100644
@@ -19275,19 +19755,6 @@ index b0adb665041f..eea830cc90a7 100644
  	depends on HAVE_ARCH_MMAP_RND_COMPAT_BITS
  	help
  	  This value can be used to select the number of bits to use to
-diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
-index b502ac07483b..eb6ea8acb3cc 100644
---- a/drivers/nvme/host/core.c
-+++ b/drivers/nvme/host/core.c
-@@ -4300,7 +4300,7 @@ static void nvme_scan_work(struct work_struct *work)
- 	if (test_bit(NVME_AER_NOTICE_NS_CHANGED, &ctrl->events))
- 		nvme_queue_scan(ctrl);
- #ifdef CONFIG_NVME_MULTIPATH
--	else
-+	else if (ctrl->ana_log_buf)
- 		/* Re-read the ANA log page to not miss updates */
- 		queue_work(nvme_wq, &ctrl->ana_work);
- #endif
 diff --git a/scripts/package/PKGBUILD b/scripts/package/PKGBUILD
 index 452374d63c24..08f80d7c5df0 100644
 --- a/scripts/package/PKGBUILD
@@ -19305,5 +19772,5 @@ index 452374d63c24..08f80d7c5df0 100644
  	mkdir -p "${builddir}"
  	cp System.map "${builddir}/System.map"
 -- 
-2.48.0.rc1
+2.49.0.391.g4bbb303af6
 
