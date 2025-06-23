@@ -1,0 +1,329 @@
+From 7cbe5a287388164cbc66d29ee7e9f426b2f5dd11 Mon Sep 17 00:00:00 2001
+From: Eric Naim <dnaim@cachyos.org>
+Date: Mon, 23 Jun 2025 15:17:48 +0700
+Subject: [PATCH 8/8] s5-power
+
+Signed-off-by: Eric Naim <dnaim@cachyos.org>
+---
+ drivers/base/power/main.c                  |  7 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  4 +
+ drivers/pci/pci-driver.c                   | 94 ++++++++++++++--------
+ drivers/scsi/mesh.c                        |  1 +
+ drivers/scsi/stex.c                        |  1 +
+ drivers/usb/host/sl811-hcd.c               |  1 +
+ include/linux/pm.h                         |  3 +
+ include/trace/events/power.h               |  3 +-
+ kernel/reboot.c                            |  6 ++
+ 9 files changed, 86 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
+index eebe699fdf4f..0215b20c5e2c 100644
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -85,6 +85,8 @@ static const char *pm_verb(int event)
+ 		return "restore";
+ 	case PM_EVENT_RECOVER:
+ 		return "recover";
++	case PM_EVENT_POWEROFF:
++		return "poweroff";
+ 	default:
+ 		return "(unknown PM event)";
+ 	}
+@@ -355,6 +357,7 @@ static pm_callback_t pm_op(const struct dev_pm_ops *ops, pm_message_t state)
+ 	case PM_EVENT_FREEZE:
+ 	case PM_EVENT_QUIESCE:
+ 		return ops->freeze;
++	case PM_EVENT_POWEROFF:
+ 	case PM_EVENT_HIBERNATE:
+ 		return ops->poweroff;
+ 	case PM_EVENT_THAW:
+@@ -389,6 +392,7 @@ static pm_callback_t pm_late_early_op(const struct dev_pm_ops *ops,
+ 	case PM_EVENT_FREEZE:
+ 	case PM_EVENT_QUIESCE:
+ 		return ops->freeze_late;
++	case PM_EVENT_POWEROFF:
+ 	case PM_EVENT_HIBERNATE:
+ 		return ops->poweroff_late;
+ 	case PM_EVENT_THAW:
+@@ -423,6 +427,7 @@ static pm_callback_t pm_noirq_op(const struct dev_pm_ops *ops, pm_message_t stat
+ 	case PM_EVENT_FREEZE:
+ 	case PM_EVENT_QUIESCE:
+ 		return ops->freeze_noirq;
++	case PM_EVENT_POWEROFF:
+ 	case PM_EVENT_HIBERNATE:
+ 		return ops->poweroff_noirq;
+ 	case PM_EVENT_THAW:
+@@ -1296,6 +1301,8 @@ static pm_message_t resume_event(pm_message_t sleep_state)
+ 		return PMSG_RECOVER;
+ 	case PM_EVENT_HIBERNATE:
+ 		return PMSG_RESTORE;
++	case PM_EVENT_POWEROFF:
++		return PMSG_ON;
+ 	}
+ 	return PMSG_ON;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 78f8755996f0..36a3b1270c86 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4961,6 +4961,10 @@ static int amdgpu_device_evict_resources(struct amdgpu_device *adev)
+ 	if (!adev->in_s4 && (adev->flags & AMD_IS_APU))
+ 		return 0;
+ 
++	/* No need to evict when going to S5 through S4 callbacks */
++	if (system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF)
++		return 0;
++
+ 	ret = amdgpu_ttm_evict_resources(adev, TTM_PL_VRAM);
+ 	if (ret)
+ 		DRM_WARN("evicting device resources failed\n");
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index 67db34fd10ee..b78b98133e7d 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -758,6 +758,56 @@ static void pci_pm_complete(struct device *dev)
+ 
+ #endif /* !CONFIG_PM_SLEEP */
+ 
++#if defined(CONFIG_SUSPEND) || defined(CONFIG_HIBERNATE_CALLBACKS)
++/**
++ * pci_pm_set_prepare_bus_pm
++ * @pci_dev: pci device
++ *
++ * Prepare the device to go into a low power state by saving state
++ * and configure bus PM policy.
++ *
++ * Return: TRUE for bus PM will be used
++ *         FALSE for bus PM will be skipped
++ */
++static bool pci_pm_set_prepare_bus_pm(struct pci_dev *pci_dev)
++{
++	if (!pci_dev->state_saved) {
++		pci_save_state(pci_dev);
++
++		/*
++		 * If the device is a bridge with a child in D0 below it,
++		 * it needs to stay in D0, so check skip_bus_pm to avoid
++		 * putting it into a low-power state in that case.
++		 */
++		if (!pci_dev->skip_bus_pm && pci_power_manageable(pci_dev))
++			pci_prepare_to_sleep(pci_dev);
++	}
++
++	pci_dbg(pci_dev, "PCI PM: Sleep power state: %s\n",
++		pci_power_name(pci_dev->current_state));
++
++	if (pci_dev->current_state == PCI_D0) {
++		pci_dev->skip_bus_pm = true;
++		/*
++		 * Per PCI PM r1.2, table 6-1, a bridge must be in D0 if any
++		 * downstream device is in D0, so avoid changing the power state
++		 * of the parent bridge by setting the skip_bus_pm flag for it.
++		 */
++		if (pci_dev->bus->self)
++			pci_dev->bus->self->skip_bus_pm = true;
++	}
++
++	if (pci_dev->skip_bus_pm && pm_suspend_no_platform()) {
++		pci_dbg(pci_dev, "PCI PM: Skipped\n");
++		return FALSE;
++	}
++
++	pci_pm_set_unknown_state(pci_dev);
++
++	return TRUE;
++}
++#endif /* CONFIG_SUSPEND || CONFIG_HIBERNATE_CALLBACKS */
++
+ #ifdef CONFIG_SUSPEND
+ static void pcie_pme_root_status_cleanup(struct pci_dev *pci_dev)
+ {
+@@ -877,38 +927,8 @@ static int pci_pm_suspend_noirq(struct device *dev)
+ 		}
+ 	}
+ 
+-	if (!pci_dev->state_saved) {
+-		pci_save_state(pci_dev);
+-
+-		/*
+-		 * If the device is a bridge with a child in D0 below it,
+-		 * it needs to stay in D0, so check skip_bus_pm to avoid
+-		 * putting it into a low-power state in that case.
+-		 */
+-		if (!pci_dev->skip_bus_pm && pci_power_manageable(pci_dev))
+-			pci_prepare_to_sleep(pci_dev);
+-	}
+-
+-	pci_dbg(pci_dev, "PCI PM: Suspend power state: %s\n",
+-		pci_power_name(pci_dev->current_state));
+-
+-	if (pci_dev->current_state == PCI_D0) {
+-		pci_dev->skip_bus_pm = true;
+-		/*
+-		 * Per PCI PM r1.2, table 6-1, a bridge must be in D0 if any
+-		 * downstream device is in D0, so avoid changing the power state
+-		 * of the parent bridge by setting the skip_bus_pm flag for it.
+-		 */
+-		if (pci_dev->bus->self)
+-			pci_dev->bus->self->skip_bus_pm = true;
+-	}
+-
+-	if (pci_dev->skip_bus_pm && pm_suspend_no_platform()) {
+-		pci_dbg(pci_dev, "PCI PM: Skipped\n");
++	if (!pci_pm_set_prepare_bus_pm(pci_dev))
+ 		goto Fixup;
+-	}
+-
+-	pci_pm_set_unknown_state(pci_dev);
+ 
+ 	/*
+ 	 * Some BIOSes from ASUS have a bug: If a USB EHCI host controller's
+@@ -1135,6 +1155,8 @@ static int pci_pm_poweroff(struct device *dev)
+ 	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+ 
++	pci_dev->skip_bus_pm = false;
++
+ 	if (pci_has_legacy_pm_support(pci_dev))
+ 		return pci_legacy_suspend(dev, PMSG_HIBERNATE);
+ 
+@@ -1198,8 +1220,8 @@ static int pci_pm_poweroff_noirq(struct device *dev)
+ 			return error;
+ 	}
+ 
+-	if (!pci_dev->state_saved && !pci_has_subordinate(pci_dev))
+-		pci_prepare_to_sleep(pci_dev);
++	if (!pci_pm_set_prepare_bus_pm(pci_dev))
++		goto Fixup;
+ 
+ 	/*
+ 	 * The reason for doing this here is the same as for the analogous code
+@@ -1208,6 +1230,7 @@ static int pci_pm_poweroff_noirq(struct device *dev)
+ 	if (pci_dev->class == PCI_CLASS_SERIAL_USB_EHCI)
+ 		pci_write_config_word(pci_dev, PCI_COMMAND, 0);
+ 
++Fixup:
+ 	pci_fixup_device(pci_fixup_suspend_late, pci_dev);
+ 
+ 	return 0;
+@@ -1217,10 +1240,15 @@ static int pci_pm_restore_noirq(struct device *dev)
+ {
+ 	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
++	pci_power_t prev_state = pci_dev->current_state;
++	bool skip_bus_pm = pci_dev->skip_bus_pm;
+ 
+ 	pci_pm_default_resume_early(pci_dev);
+ 	pci_fixup_device(pci_fixup_resume_early, pci_dev);
+ 
++	if (!skip_bus_pm && prev_state == PCI_D3cold)
++		pci_pm_bridge_power_up_actions(pci_dev);
++
+ 	if (pci_has_legacy_pm_support(pci_dev))
+ 		return 0;
+ 
+diff --git a/drivers/scsi/mesh.c b/drivers/scsi/mesh.c
+index 1c15cac41d80..768b85eecc8f 100644
+--- a/drivers/scsi/mesh.c
++++ b/drivers/scsi/mesh.c
+@@ -1762,6 +1762,7 @@ static int mesh_suspend(struct macio_dev *mdev, pm_message_t mesg)
+ 	case PM_EVENT_SUSPEND:
+ 	case PM_EVENT_HIBERNATE:
+ 	case PM_EVENT_FREEZE:
++	case PM_EVENT_POWEROFF:
+ 		break;
+ 	default:
+ 		return 0;
+diff --git a/drivers/scsi/stex.c b/drivers/scsi/stex.c
+index 63ed7f9aaa93..ee9372e1f7f0 100644
+--- a/drivers/scsi/stex.c
++++ b/drivers/scsi/stex.c
+@@ -1965,6 +1965,7 @@ static int stex_choice_sleep_mic(struct st_hba *hba, pm_message_t state)
+ 	case PM_EVENT_SUSPEND:
+ 		return ST_S3;
+ 	case PM_EVENT_HIBERNATE:
++	case PM_EVENT_POWEROFF:
+ 		hba->msi_lock = 0;
+ 		return ST_S4;
+ 	default:
+diff --git a/drivers/usb/host/sl811-hcd.c b/drivers/usb/host/sl811-hcd.c
+index ea3cab99c5d4..5d6dba681e50 100644
+--- a/drivers/usb/host/sl811-hcd.c
++++ b/drivers/usb/host/sl811-hcd.c
+@@ -1748,6 +1748,7 @@ sl811h_suspend(struct platform_device *dev, pm_message_t state)
+ 		break;
+ 	case PM_EVENT_SUSPEND:
+ 	case PM_EVENT_HIBERNATE:
++	case PM_EVENT_POWEROFF:
+ 	case PM_EVENT_PRETHAW:		/* explicitly discard hw state */
+ 		port_power(sl811, 0);
+ 		break;
+diff --git a/include/linux/pm.h b/include/linux/pm.h
+index f0bd8fbae4f2..cb66f47631a7 100644
+--- a/include/linux/pm.h
++++ b/include/linux/pm.h
+@@ -506,6 +506,7 @@ const struct dev_pm_ops name = { \
+  * RECOVER	Creation of a hibernation image or restoration of the main
+  *		memory contents from a hibernation image has failed, call
+  *		->thaw() and ->complete() for all devices.
++ * POWEROFF	System will poweroff, call ->poweroff() for all devices.
+  *
+  * The following PM_EVENT_ messages are defined for internal use by
+  * kernel subsystems.  They are never issued by the PM core.
+@@ -536,6 +537,7 @@ const struct dev_pm_ops name = { \
+ #define PM_EVENT_USER		0x0100
+ #define PM_EVENT_REMOTE		0x0200
+ #define PM_EVENT_AUTO		0x0400
++#define PM_EVENT_POWEROFF	0x0800
+ 
+ #define PM_EVENT_SLEEP		(PM_EVENT_SUSPEND | PM_EVENT_HIBERNATE)
+ #define PM_EVENT_USER_SUSPEND	(PM_EVENT_USER | PM_EVENT_SUSPEND)
+@@ -550,6 +552,7 @@ const struct dev_pm_ops name = { \
+ #define PMSG_QUIESCE	((struct pm_message){ .event = PM_EVENT_QUIESCE, })
+ #define PMSG_SUSPEND	((struct pm_message){ .event = PM_EVENT_SUSPEND, })
+ #define PMSG_HIBERNATE	((struct pm_message){ .event = PM_EVENT_HIBERNATE, })
++#define PMSG_POWEROFF	((struct pm_message){ .event = PM_EVENT_POWEROFF, })
+ #define PMSG_RESUME	((struct pm_message){ .event = PM_EVENT_RESUME, })
+ #define PMSG_THAW	((struct pm_message){ .event = PM_EVENT_THAW, })
+ #define PMSG_RESTORE	((struct pm_message){ .event = PM_EVENT_RESTORE, })
+diff --git a/include/trace/events/power.h b/include/trace/events/power.h
+index 6c631eec23e3..8fa70f239737 100644
+--- a/include/trace/events/power.h
++++ b/include/trace/events/power.h
+@@ -199,7 +199,8 @@ TRACE_EVENT(pstate_sample,
+ 		{ PM_EVENT_HIBERNATE, "hibernate" }, \
+ 		{ PM_EVENT_THAW, "thaw" }, \
+ 		{ PM_EVENT_RESTORE, "restore" }, \
+-		{ PM_EVENT_RECOVER, "recover" })
++		{ PM_EVENT_RECOVER, "recover" }, \
++		{ PM_EVENT_POWEROFF, "poweroff" })
+ 
+ DEFINE_EVENT(cpu, cpu_frequency,
+ 
+diff --git a/kernel/reboot.c b/kernel/reboot.c
+index ec087827c85c..c8835f8e5f27 100644
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -13,6 +13,7 @@
+ #include <linux/kexec.h>
+ #include <linux/kmod.h>
+ #include <linux/kmsg_dump.h>
++#include <linux/pm.h>
+ #include <linux/reboot.h>
+ #include <linux/suspend.h>
+ #include <linux/syscalls.h>
+@@ -305,6 +306,11 @@ static void kernel_shutdown_prepare(enum system_states state)
+ 		(state == SYSTEM_HALT) ? SYS_HALT : SYS_POWER_OFF, NULL);
+ 	system_state = state;
+ 	usermodehelper_disable();
++#ifdef CONFIG_HIBERNATE_CALLBACKS
++	if (!dpm_suspend_start(PMSG_POWEROFF) && !dpm_suspend_end(PMSG_POWEROFF))
++		return;
++	pr_emerg("Failed to power off devices, using shutdown instead.\n");
++#endif
+ 	device_shutdown();
+ }
+ /**
+-- 
+2.50.0
+
