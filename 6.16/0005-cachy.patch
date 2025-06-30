@@ -1,6 +1,6 @@
-From d0224684c8ca5fd5ab3a3505ac72d574a4fdf6df Mon Sep 17 00:00:00 2001
+From 390118e39ef977186d9feb058b9dc76be3b39da2 Mon Sep 17 00:00:00 2001
 From: Eric Naim <dnaim@cachyos.org>
-Date: Mon, 23 Jun 2025 15:17:46 +0700
+Date: Mon, 30 Jun 2025 11:43:02 +0700
 Subject: [PATCH 5/8] cachy
 
 Signed-off-by: Eric Naim <dnaim@cachyos.org>
@@ -16,7 +16,7 @@ Signed-off-by: Eric Naim <dnaim@cachyos.org>
  arch/x86/pci/common.c                         |    7 +-
  block/Kconfig.iosched                         |   14 +
  block/Makefile                                |    8 +
- block/adios.c                                 | 1382 +++++++
+ block/adios.c                                 | 1368 +++++++
  block/elevator.c                              |   13 +-
  drivers/Makefile                              |   13 +-
  drivers/ata/ahci.c                            |   23 +-
@@ -78,7 +78,7 @@ Signed-off-by: Eric Naim <dnaim@cachyos.org>
  scripts/Makefile.thinlto                      |   38 +
  scripts/Makefile.vmlinux_a                    |   83 +
  scripts/mod/modpost.c                         |   15 +-
- 73 files changed, 7859 insertions(+), 73 deletions(-)
+ 73 files changed, 7845 insertions(+), 73 deletions(-)
  create mode 100644 block/adios.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.h
@@ -238,7 +238,7 @@ index 9bef46151d53..0ee649d4808b 100644
  unprivileged_userfaultfd
  ========================
 diff --git a/Makefile b/Makefile
-index f884dfe10246..c6ec32c1d962 100644
+index 1c9ea229809f..f4309cfc47e0 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -862,11 +862,19 @@ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
@@ -542,10 +542,10 @@ index c65f4da93702..105b12fd86b8 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 000000000000..2034f3ce63c4
+index 000000000000..9f9a64d0acfc
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1382 @@
+@@ -0,0 +1,1368 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -570,7 +570,7 @@ index 000000000000..2034f3ce63c4
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.0.0"
++#define ADIOS_VERSION "2.1.1"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -655,6 +655,7 @@ index 000000000000..2034f3ce63c4
 +};
 +
 +#define ADIOS_BQ_PAGES 2
++#define ADIOS_MAX_INSERTS_PER_LOCK 16
 +
 +// Adios scheduler data
 +struct adios_data {
@@ -675,7 +676,7 @@ index 000000000000..2034f3ce63c4
 +	u32 async_depth;
 +	u8  bq_refill_below_ratio;
 +
-+	u8 bq_page;
++	bool bq_page;
 +	bool more_bq_ready;
 +	struct list_head batch_queue[ADIOS_BQ_PAGES][ADIOS_OPTYPES];
 +	u32 batch_count[ADIOS_BQ_PAGES][ADIOS_OPTYPES];
@@ -1196,8 +1197,6 @@ index 000000000000..2034f3ce63c4
 +		return;
 +	}
 +
-+	guard(spinlock_irqsave)(&ad->lock);
-+
 +	if (blk_mq_sched_try_insert_merge(q, rq, free))
 +		return;
 +
@@ -1214,14 +1213,24 @@ index 000000000000..2034f3ce63c4
 +static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 +				   struct list_head *list,
 +				   blk_insert_t insert_flags) {
++	struct request_queue *q = hctx->queue;
++	struct adios_data *ad = q->elevator->elevator_data;
 +	struct request *rq;
++	bool stop = false;
 +	LIST_HEAD(free);
 +
-+	while (!list_empty(list)) {
-+		rq = list_first_entry(list, struct request, queuelist);
-+		list_del_init(&rq->queuelist);
-+		insert_request(hctx, rq, insert_flags, &free);
-+	}
++	do {
++	scoped_guard(spinlock_irqsave, &ad->lock)
++		for (int i = 0; i < ADIOS_MAX_INSERTS_PER_LOCK; i++) {
++			if (list_empty(list)) {
++				stop = true;
++				break;
++			}
++			rq = list_first_entry(list, struct request, queuelist);
++			list_del_init(&rq->queuelist);
++			insert_request(hctx, rq, insert_flags, &free);
++		}
++	} while (!stop);
 +
 +	blk_mq_free_requests(&free);
 +}
@@ -1251,100 +1260,74 @@ index 000000000000..2034f3ce63c4
 +	return list_first_entry(&dl_group->rqs, struct adios_rq_data, dl_node);
 +}
 +
-+// Select the next request to dispatch from the deadline-sorted red-black tree
-+static struct request *next_request(struct adios_data *ad) {
-+	struct adios_rq_data *rd;
-+	bool dl_idx, bias_idx, reduce_bias;
-+
-+	if (!ad->dl_queued)
-+		return NULL;
-+
-+	dl_idx = ad->dl_queued >> 1;
-+	rd = get_dl_first_rd(ad, dl_idx);
-+
-+	bias_idx = ad->dl_bias < 0;
-+	reduce_bias = (bias_idx == dl_idx);
-+
-+	if (ad->dl_queued == 0x3) {
-+		struct adios_rq_data *trd[2];
-+		trd[0] = get_dl_first_rd(ad, 0);
-+		trd[1] = rd;
-+
-+		rd = trd[bias_idx];
-+
-+		reduce_bias =
-+			(trd[bias_idx]->deadline > trd[((u8)bias_idx + 1) % 2]->deadline);
-+	}
-+
-+	if (reduce_bias) {
-+		s64 sign = ((int)bias_idx << 1) - 1;
-+		if (unlikely(!rd->pred_lat))
-+			ad->dl_bias = sign;
-+		else {
-+			ad->dl_bias += sign * (s64)((rd->pred_lat *
-+				adios_prio_to_weight[ad->dl_prio[bias_idx] + 20]) >> 10);
-+		}
-+	}
-+
-+	return rd->rq;
-+}
-+
-+// Reset the batch queue counts for a given page
-+static void reset_batch_counts(struct adios_data *ad, u8 page) {
-+	memset(&ad->batch_count[page], 0, sizeof(ad->batch_count[page]));
-+}
-+
-+// Initialize all batch queues
-+static void init_batch_queues(struct adios_data *ad) {
-+	for (u8 page = 0; page < ADIOS_BQ_PAGES; page++) {
-+		reset_batch_counts(ad, page);
-+
-+		for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
-+			INIT_LIST_HEAD(&ad->batch_queue[page][optype]);
-+	}
-+}
-+
 +// Fill the batch queues with requests from the deadline-sorted red-black tree
 +static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
-+	u32 count = 0;
++	struct adios_rq_data *rd;
++	struct request *rq;
 +	u32 optype_count[ADIOS_OPTYPES] = {0};
-+	u8 page = (ad->bq_page + 1) % ADIOS_BQ_PAGES;
++	u32 count = 0;
++	u8 optype;
++	bool page = !ad->bq_page, dl_idx, bias_idx, reduce_bias;
 +
-+	reset_batch_counts(ad, page);
++	// Reset batch queue counts for the back page
++	memset(&ad->batch_count[page], 0, sizeof(ad->batch_count[page]));
 +
 +	scoped_guard(spinlock_irqsave, &ad->lock)
 +		while (true) {
-+			struct request *rq = next_request(ad);
-+			if (!rq)
++
++			// Check if there are any requests queued in the deadline tree
++			if (!ad->dl_queued)
 +				break;
 +
-+			struct adios_rq_data *rd = get_rq_data(rq);
-+			u8 optype = adios_optype(rq);
-+			current_lat += rd->pred_lat;
++			dl_idx = ad->dl_queued >> 1;
++			// Get the first request from the deadline-sorted tree
++			rd = get_dl_first_rd(ad, dl_idx);
++			bias_idx = ad->dl_bias < 0;
++
++			// If read and write requests are queued, choose one based on bias
++			if (ad->dl_queued == 0x3) {
++				struct adios_rq_data *trd[2] = {get_dl_first_rd(ad, 0), rd};
++				rd = trd[bias_idx];
++
++				reduce_bias = (trd[bias_idx]->deadline > trd[!bias_idx]->deadline);
++			} else
++				reduce_bias = (bias_idx == dl_idx);
++			
++			rq = rd->rq;
++			optype = adios_optype(rq);
 +
 +			// Check batch size and total predicted latency
-+			if (count && (!ad->latency_model[optype].base || 
-+				ad->batch_count[page][optype] >= ad->batch_limit[optype] ||
-+				current_lat > ad->global_latency_window)) {
++			if (count && (!ad->latency_model[optype].base ||
++					ad->batch_count[page][optype] >= ad->batch_limit[optype] ||
++					(current_lat + rd->pred_lat) > ad->global_latency_window))
 +				break;
++
++			if (reduce_bias) {
++				s64 sign = ((int)bias_idx << 1) - 1;
++				if (unlikely(!rd->pred_lat))
++					ad->dl_bias = sign;
++				else
++					// Adjust the bias based on the predicted latency
++					ad->dl_bias += sign * (s64)((rd->pred_lat *
++						adios_prio_to_weight[ad->dl_prio[bias_idx] + 20]) >> 10);
 +			}
 +
 +			remove_request(ad, rq);
 +
 +			// Add request to the corresponding batch queue
 +			list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
-+			ad->batch_count[page][optype]++;
 +			atomic64_add(rd->pred_lat, &ad->total_pred_lat);
++			current_lat += rd->pred_lat;
++			ad->batch_count[page][optype]++;
 +			optype_count[optype]++;
 +			count++;
 +		}
 +
 +	if (count) {
 +		ad->more_bq_ready = true;
-+		for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++) {
++		for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
 +			if (ad->batch_actual_max_size[optype] < optype_count[optype])
 +				ad->batch_actual_max_size[optype] = optype_count[optype];
-+		}
 +		if (ad->batch_actual_max_total < count)
 +			ad->batch_actual_max_total = count;
 +	}
@@ -1354,7 +1337,7 @@ index 000000000000..2034f3ce63c4
 +// Flip to the next batch queue page
 +static void flip_bq_page(struct adios_data *ad) {
 +	ad->more_bq_ready = false;
-+	ad->bq_page = (ad->bq_page + 1) % ADIOS_BQ_PAGES;
++	ad->bq_page = !ad->bq_page;
 +}
 +
 +// Dispatch a request from the batch queues
@@ -1366,16 +1349,16 @@ index 000000000000..2034f3ce63c4
 +
 +	tpl = atomic64_read(&ad->total_pred_lat);
 +
-+	if (!ad->more_bq_ready && (!tpl ||
-+			tpl < div_u64(ad->global_latency_window * ad->bq_refill_below_ratio, 100)))
++	if (!ad->more_bq_ready && (!tpl || tpl < div_u64(
++			ad->global_latency_window * ad->bq_refill_below_ratio, 100)))
 +		fill_batch_queues(ad, tpl);
 +
 +again:
 +	// Check if there are any requests in the batch queues
 +	for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
 +		if (!list_empty(&ad->batch_queue[ad->bq_page][i])) {
-+			rq = list_first_entry(&ad->batch_queue[ad->bq_page][i],
-+									struct request, queuelist);
++			rq = list_first_entry(
++				&ad->batch_queue[ad->bq_page][i], struct request, queuelist);
 +			list_del_init(&rq->queuelist);
 +			return rq;
 +		}
@@ -1554,7 +1537,10 @@ index 000000000000..2034f3ce63c4
 +		ad->batch_limit[cpu] = default_batch_limit[cpu];
 +	}
 +	timer_setup(&ad->update_timer, update_timer_callback, 0);
-+	init_batch_queues(ad);
++	
++	for (u8 page = 0; page < ADIOS_BQ_PAGES; page++)
++		for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
++			INIT_LIST_HEAD(&ad->batch_queue[page][optype]);
 +
 +	spin_lock_init(&ad->lock);
 +	spin_lock_init(&ad->pq_lock);
@@ -1992,7 +1978,7 @@ index b5749cf67044..5beba9f57254 100644
  obj-$(CONFIG_MTD)		+= mtd/
  obj-$(CONFIG_SPI)		+= spi/
 diff --git a/drivers/ata/ahci.c b/drivers/ata/ahci.c
-index e5e5c2e81d09..62ac9452d8f4 100644
+index aa93b0ecbbc6..ba65e1b56fd6 100644
 --- a/drivers/ata/ahci.c
 +++ b/drivers/ata/ahci.c
 @@ -1656,7 +1656,7 @@ static irqreturn_t ahci_thunderx_irq_handler(int irq, void *dev_instance)
@@ -2136,7 +2122,7 @@ index abd3b6564373..46937e6fa78d 100644
 +
  endmenu
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-index bc4cd11bfc79..745f04cb0a3b 100644
+index 0b8ac9edc070..1a7b7b645ed0 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 @@ -4637,7 +4637,7 @@ static int amdgpu_dm_mode_config_init(struct amdgpu_device *adev)
@@ -2429,10 +2415,10 @@ index b5cbb57ee5f6..a0f7fa1518c6 100644
  }
  
 diff --git a/drivers/md/dm-crypt.c b/drivers/md/dm-crypt.c
-index 9dfdb63220d7..91aeee72a15e 100644
+index 17157c4216a5..70c63fd059d6 100644
 --- a/drivers/md/dm-crypt.c
 +++ b/drivers/md/dm-crypt.c
-@@ -3284,6 +3284,11 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+@@ -3287,6 +3287,11 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
  			goto bad;
  	}
  
