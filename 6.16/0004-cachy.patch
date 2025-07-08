@@ -1,7 +1,7 @@
-From 390118e39ef977186d9feb058b9dc76be3b39da2 Mon Sep 17 00:00:00 2001
+From d6895ee14b0ffe88bc0d3d638b25d1d29f95f169 Mon Sep 17 00:00:00 2001
 From: Eric Naim <dnaim@cachyos.org>
-Date: Mon, 30 Jun 2025 11:43:02 +0700
-Subject: [PATCH 5/8] cachy
+Date: Tue, 8 Jul 2025 18:20:55 +0700
+Subject: [PATCH 4/8] cachy
 
 Signed-off-by: Eric Naim <dnaim@cachyos.org>
 ---
@@ -16,7 +16,7 @@ Signed-off-by: Eric Naim <dnaim@cachyos.org>
  arch/x86/pci/common.c                         |    7 +-
  block/Kconfig.iosched                         |   14 +
  block/Makefile                                |    8 +
- block/adios.c                                 | 1368 +++++++
+ block/adios.c                                 | 1448 +++++++
  block/elevator.c                              |   13 +-
  drivers/Makefile                              |   13 +-
  drivers/ata/ahci.c                            |   23 +-
@@ -78,7 +78,7 @@ Signed-off-by: Eric Naim <dnaim@cachyos.org>
  scripts/Makefile.thinlto                      |   38 +
  scripts/Makefile.vmlinux_a                    |   83 +
  scripts/mod/modpost.c                         |   15 +-
- 73 files changed, 7845 insertions(+), 73 deletions(-)
+ 73 files changed, 7925 insertions(+), 73 deletions(-)
  create mode 100644 block/adios.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.c
  create mode 100644 drivers/media/v4l2-core/v4l2loopback.h
@@ -238,7 +238,7 @@ index 9bef46151d53..0ee649d4808b 100644
  unprivileged_userfaultfd
  ========================
 diff --git a/Makefile b/Makefile
-index 1c9ea229809f..f4309cfc47e0 100644
+index 7eea2a41c905..39fbbf94176a 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -862,11 +862,19 @@ KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
@@ -542,10 +542,10 @@ index c65f4da93702..105b12fd86b8 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 000000000000..9f9a64d0acfc
+index 000000000000..1a2bb6460123
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1368 @@
+@@ -0,0 +1,1448 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -564,13 +564,14 @@ index 000000000000..9f9a64d0acfc
 +#include <linux/slab.h>
 +#include <linux/timekeeping.h>
 +#include <linux/percpu.h>
++#include <linux/string.h>
 +
 +#include "elevator.h"
 +#include "blk.h"
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.1.1"
++#define ADIOS_VERSION "2.2.5"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -630,7 +631,7 @@ index 000000000000..9f9a64d0acfc
 +};
 +
 +// New structure to hold per-cpu buckets, improving data locality and code clarity.
-+struct per_cpu_lm_buckets {
++struct lm_buckets {
 +	struct latency_bucket_small small_bucket[LM_LAT_BUCKET_COUNT];
 +	struct latency_bucket_large large_bucket[LM_LAT_BUCKET_COUNT];
 +};
@@ -647,7 +648,7 @@ index 000000000000..9f9a64d0acfc
 +	u64 last_update_jiffies;
 +
 +	// Per-CPU buckets to avoid lock contention on the completion path
-+	struct per_cpu_lm_buckets __percpu *pcpu_buckets;
++	struct lm_buckets __percpu *pcpu_buckets;
 +
 +	u32 lm_shrink_at_kreqs;
 +	u32 lm_shrink_at_gbytes;
@@ -682,7 +683,7 @@ index 000000000000..9f9a64d0acfc
 +	u32 batch_count[ADIOS_BQ_PAGES][ADIOS_OPTYPES];
 +	spinlock_t bq_lock;
 +
-+	struct per_cpu_lm_buckets *aggr_buckets;
++	struct lm_buckets *aggr_buckets;
 +
 +	struct latency_model latency_model[ADIOS_OPTYPES];
 +	struct timer_list update_timer;
@@ -865,6 +866,15 @@ index 000000000000..9f9a64d0acfc
 +	return true;
 +}
 +
++static void reset_buckets(struct lm_buckets *buckets)
++{ memset(buckets, 0, sizeof(*buckets)); }
++
++static void lm_reset_pcpu_buckets(struct latency_model *model) {
++	int cpu;
++	for_each_possible_cpu(cpu)
++		reset_buckets(per_cpu_ptr(model->pcpu_buckets, cpu));
++}
++
 +// Update the latency model parameters and statistics
 +static void latency_model_update(
 +		struct adios_data *ad, struct latency_model *model) {
@@ -872,14 +882,14 @@ index 000000000000..9f9a64d0acfc
 +	u32 small_count, large_count;
 +	bool time_elapsed;
 +	bool small_processed = false, large_processed = false;
-+	struct per_cpu_lm_buckets *aggr = ad->aggr_buckets;
++	struct lm_buckets *aggr = ad->aggr_buckets;
 +	struct latency_bucket_small *asb;
 +	struct latency_bucket_large *alb;
-+	struct per_cpu_lm_buckets *pcpu_b;
++	struct lm_buckets *pcpu_b;
 +	unsigned long flags;
 +	int cpu;
 +
-+	memset(aggr, 0, sizeof(*aggr));
++	reset_buckets(ad->aggr_buckets);
 +
 +	write_seqlock_irqsave(&model->lock, flags);
 +
@@ -901,7 +911,7 @@ index 000000000000..9f9a64d0acfc
 +			}
 +		}
 +		// Reset per-cpu buckets after aggregating
-+		memset(pcpu_b, 0, sizeof(*pcpu_b));
++		reset_buckets(pcpu_b);
 +	}
 +
 +	// Whether enough time has elapsed since the last update
@@ -958,9 +968,10 @@ index 000000000000..9f9a64d0acfc
 +static void latency_model_input(struct adios_data *ad,
 +		struct latency_model *model, u32 block_size, u64 latency, u64 pred_lat) {
 +	u8 bucket_index;
-+	struct per_cpu_lm_buckets *buckets;
++	struct lm_buckets *buckets;
++	int cpu = get_cpu();
 +
-+	buckets = this_cpu_ptr(model->pcpu_buckets);
++	buckets = per_cpu_ptr(model->pcpu_buckets, cpu);
 +
 +	if (block_size <= LM_BLOCK_SIZE_THRESHOLD) {
 +		// Handle small requests
@@ -972,14 +983,18 @@ index 000000000000..9f9a64d0acfc
 +		buckets->small_bucket[bucket_index].count++;
 +		buckets->small_bucket[bucket_index].sum_latency += latency;
 +
++		put_cpu();
++
 +		if (unlikely(!model->base)) {
 +			latency_model_update(ad, model);
 +			return;
 +		}
 +	} else {
 +		// Handle large requests
-+		if (!model->base || !pred_lat)
++		if (!model->base || !pred_lat) {
++			put_cpu();
 +			return;
++		}
 +
 +		bucket_index = lm_input_bucket_index(latency, pred_lat);
 +
@@ -989,6 +1004,8 @@ index 000000000000..9f9a64d0acfc
 +		buckets->large_bucket[bucket_index].count++;
 +		buckets->large_bucket[bucket_index].sum_latency += latency;
 +		buckets->large_bucket[bucket_index].sum_block_size += block_size;
++
++		put_cpu();
 +	}
 +}
 +
@@ -1473,7 +1490,7 @@ index 000000000000..9f9a64d0acfc
 +	struct adios_data *ad;
 +	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
-+	int cpu = 0;
++	u8 optype = 0;
 +
 +	eq = elevator_alloc(q, e);
 +	if (!eq)
@@ -1520,11 +1537,11 @@ index 000000000000..9f9a64d0acfc
 +		goto destroy_dl_group_pool;
 +	}
 +
-+	for (cpu = 0; cpu < ADIOS_OPTYPES; cpu++) {
-+		struct latency_model *model = &ad->latency_model[cpu];
++	for (optype = 0; optype < ADIOS_OPTYPES; optype++) {
++		struct latency_model *model = &ad->latency_model[optype];
 +		seqlock_init(&model->lock);
 +
-+		model->pcpu_buckets = alloc_percpu(struct per_cpu_lm_buckets);
++		model->pcpu_buckets = alloc_percpu(struct lm_buckets);
 +		if (!model->pcpu_buckets)
 +			goto free_buckets;
 +
@@ -1533,8 +1550,8 @@ index 000000000000..9f9a64d0acfc
 +		model->lm_shrink_at_gbytes = default_lm_shrink_at_gbytes;
 +		model->lm_shrink_resist    = default_lm_shrink_resist;
 +
-+		ad->latency_target[cpu] = default_latency_target[cpu];
-+		ad->batch_limit[cpu] = default_batch_limit[cpu];
++		ad->latency_target[optype] = default_latency_target[optype];
++		ad->batch_limit[optype] = default_batch_limit[optype];
 +	}
 +	timer_setup(&ad->update_timer, update_timer_callback, 0);
 +	
@@ -1557,8 +1574,8 @@ index 000000000000..9f9a64d0acfc
 +
 +free_buckets:
 +	pr_err("adios: Failed to allocate per-cpu buckets\n");
-+	while (--cpu >= 0) {
-+		struct latency_model *prev_model = &ad->latency_model[cpu];
++	while (--optype >= 0) {
++		struct latency_model *prev_model = &ad->latency_model[optype];
 +		free_percpu(prev_model->pcpu_buckets);
 +	}
 +	kfree(ad->aggr_buckets);
@@ -1598,56 +1615,89 @@ index 000000000000..9f9a64d0acfc
 +	kfree(ad);
 +}
 +
-+// Define sysfs attributes for read operation latency model
-+#define SYSFS_OPTYPE_DECL(name, optype)					\
-+static ssize_t adios_lat_model_##name##_show(				\
-+		struct elevator_queue *e, char *page) {				\
-+	struct adios_data *ad = e->elevator_data;				\
-+	struct latency_model *model = &ad->latency_model[optype];		\
-+	ssize_t len = 0;						\
-+	u64 base, slope;						\
-+	unsigned int seq;						\
++static void load_latency_model(struct latency_model *model, u64 base, u64 slope)
++{
++	write_seqlock_bh(&model->lock);
++	model->last_update_jiffies = jiffies;
++
++	// Initialize base and its statistics as a single sample.
++	model->base = base;
++	model->small_sum_delay = base;
++	model->small_count = 1;
++
++	// Initialize slope and its statistics as a single sample.
++	model->slope = slope;
++	model->large_sum_delay = slope;
++	model->large_sum_bsize = 1024; /* Corresponds to 1 KiB */
++
++	lm_reset_pcpu_buckets(model);
++
++	write_sequnlock_bh(&model->lock);
++}
++
++// Define sysfs attributes for operation types
++#define SYSFS_OPTYPE_DECL(name, optype) \
++static ssize_t adios_lat_model_##name##_show( \
++		struct elevator_queue *e, char *page) { \
++	struct adios_data *ad = e->elevator_data; \
++	struct latency_model *model = &ad->latency_model[optype]; \
++	ssize_t len = 0; \
++	u64 base, slope; \
++	unsigned int seq; \
 +	do { \
 +		seq = read_seqbegin(&model->lock); \
 +		base = model->base; \
 +		slope = model->slope; \
 +	} while (read_seqretry(&model->lock, seq)); \
-+	len += sprintf(page,       "base : %llu ns\n", base);	\
-+	len += sprintf(page + len, "slope: %llu ns/KiB\n", slope);\
-+	return len;							\
-+}									\
-+static ssize_t adios_lat_target_##name##_store(				\
-+		struct elevator_queue *e, const char *page, size_t count) {	\
-+	struct adios_data *ad = e->elevator_data;				\
-+	unsigned long nsec;						\
-+	int ret;							\
-+	ret = kstrtoul(page, 10, &nsec);					\
-+	if (ret)							\
-+		return ret;						\
-+	ad->latency_model[optype].base = 0ULL;				\
-+	ad->latency_target[optype] = nsec;				\
-+	return count;							\
-+}									\
-+static ssize_t adios_lat_target_##name##_show(				\
-+		struct elevator_queue *e, char *page) {				\
-+	struct adios_data *ad = e->elevator_data;				\
-+	return sprintf(page, "%llu\n", ad->latency_target[optype]);	\
-+}									\
-+static ssize_t adios_batch_limit_##name##_store(			\
-+		struct elevator_queue *e, const char *page, size_t count) {	\
-+	unsigned long max_batch;					\
-+	int ret;							\
-+	ret = kstrtoul(page, 10, &max_batch);				\
-+	if (ret || max_batch == 0)					\
-+		return -EINVAL;						\
-+	struct adios_data *ad = e->elevator_data;				\
-+	ad->batch_limit[optype] = max_batch;				\
-+	return count;							\
-+}									\
-+static ssize_t adios_batch_limit_##name##_show(				\
-+		struct elevator_queue *e, char *page) {				\
-+	struct adios_data *ad = e->elevator_data;				\
-+	return sprintf(page, "%u\n", ad->batch_limit[optype]);		\
++	len += sprintf(page,       "base : %llu ns\n", base); \
++	len += sprintf(page + len, "slope: %llu ns/KiB\n", slope); \
++	return len; \
++} \
++static ssize_t adios_lat_model_##name##_store( \
++		struct elevator_queue *e, const char *page, size_t count) { \
++	struct adios_data *ad = e->elevator_data; \
++	struct latency_model *model = &ad->latency_model[optype]; \
++	u64 base, slope; \
++	int ret; \
++	ret = sscanf(page, "%llu %llu", &base, &slope); \
++	if (ret != 2) \
++		return -EINVAL; \
++	load_latency_model(model, base, slope); \
++	reset_buckets(ad->aggr_buckets); \
++	return count; \
++} \
++static ssize_t adios_lat_target_##name##_store( \
++		struct elevator_queue *e, const char *page, size_t count) { \
++	struct adios_data *ad = e->elevator_data; \
++	unsigned long nsec; \
++	int ret; \
++	ret = kstrtoul(page, 10, &nsec); \
++	if (ret) \
++		return ret; \
++	ad->latency_model[optype].base = 0ULL; \
++	ad->latency_target[optype] = nsec; \
++	return count; \
++} \
++static ssize_t adios_lat_target_##name##_show( \
++		struct elevator_queue *e, char *page) { \
++	struct adios_data *ad = e->elevator_data; \
++	return sprintf(page, "%llu\n", ad->latency_target[optype]); \
++} \
++static ssize_t adios_batch_limit_##name##_store( \
++		struct elevator_queue *e, const char *page, size_t count) { \
++	unsigned long max_batch; \
++	int ret; \
++	ret = kstrtoul(page, 10, &max_batch); \
++	if (ret || max_batch == 0) \
++		return -EINVAL; \
++	struct adios_data *ad = e->elevator_data; \
++	ad->batch_limit[optype] = max_batch; \
++	return count; \
++} \
++static ssize_t adios_batch_limit_##name##_show( \
++		struct elevator_queue *e, char *page) { \
++	struct adios_data *ad = e->elevator_data; \
++	return sprintf(page, "%u\n", ad->batch_limit[optype]); \
 +}
 +
 +SYSFS_OPTYPE_DECL(read, ADIOS_READ);
@@ -1760,28 +1810,58 @@ index 000000000000..9f9a64d0acfc
 +	return count;
 +}
 +
-+// Reset the latency model parameters
++// Reset the latency model parameters or load them from user input
 +static ssize_t adios_reset_lat_model_store(
-+		struct elevator_queue *e, const char *page, size_t count) {
++		struct elevator_queue *e, const char *page, size_t count)
++{
 +	struct adios_data *ad = e->elevator_data;
-+	unsigned long val;
++	struct latency_model *model;
 +	int ret;
 +
-+	ret = kstrtoul(page, 10, &val);
-+	if (ret || val != 1)
-+		return -EINVAL;
++	/*
++	 * Differentiate between two modes based on input format:
++	 * 1. "1": Fully reset the model (backward compatibility).
++	 * 2. "R_base R_slope W_base W_slope D_base D_slope": Load values.
++	 */
++	if (!strchr(page, ' ')) {
++		// Mode 1: Full reset.
++		unsigned long val;
 +
-+	for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
-+		struct latency_model *model = &ad->latency_model[i];
-+		write_seqlock_bh(&model->lock);
-+		model->base = 0ULL;
-+		model->slope = 0ULL;
-+		model->small_sum_delay = 0ULL;
-+		model->small_count = 0ULL;
-+		model->large_sum_delay = 0ULL;
-+		model->large_sum_bsize = 0ULL;
-+		write_sequnlock_bh(&model->lock);
++		ret = kstrtoul(page, 10, &val);
++		if (ret || val != 1)
++			return -EINVAL;
++
++		for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
++			model = &ad->latency_model[i];
++			write_seqlock_bh(&model->lock);
++			model->last_update_jiffies = jiffies;
++			model->base = 0ULL;
++			model->slope = 0ULL;
++			model->small_sum_delay = 0ULL;
++			model->small_count = 0ULL;
++			model->large_sum_delay = 0ULL;
++			model->large_sum_bsize = 0ULL;
++			lm_reset_pcpu_buckets(model);
++			write_sequnlock_bh(&model->lock);
++		}
++	} else {
++		// Mode 2: Load initial values for all latency models.
++		u64 params[3][2]; /* 0:base, 1:slope for R, W, D */
++
++		ret = sscanf(page, "%llu %llu %llu %llu %llu %llu",
++			&params[ADIOS_READ   ][0], &params[ADIOS_READ   ][1],
++			&params[ADIOS_WRITE  ][0], &params[ADIOS_WRITE  ][1],
++			&params[ADIOS_DISCARD][0], &params[ADIOS_DISCARD][1]);
++
++		if (ret != 6)
++			return -EINVAL;
++
++		for (u8 i = ADIOS_READ; i <= ADIOS_DISCARD; i++) {
++			model = &ad->latency_model[i];
++			load_latency_model(model, params[i][0], params[i][1]);
++		}
 +	}
++	reset_buckets(ad->aggr_buckets);
 +
 +	return count;
 +}
@@ -1846,9 +1926,9 @@ index 000000000000..9f9a64d0acfc
 +	AD_ATTR_RW(batch_limit_write),
 +	AD_ATTR_RW(batch_limit_discard),
 +
-+	AD_ATTR_RO(lat_model_read),
-+	AD_ATTR_RO(lat_model_write),
-+	AD_ATTR_RO(lat_model_discard),
++	AD_ATTR_RW(lat_model_read),
++	AD_ATTR_RW(lat_model_write),
++	AD_ATTR_RW(lat_model_discard),
 +
 +	AD_ATTR_RW(lat_target_read),
 +	AD_ATTR_RW(lat_target_write),
@@ -2122,10 +2202,10 @@ index abd3b6564373..46937e6fa78d 100644
 +
  endmenu
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-index 0b8ac9edc070..1a7b7b645ed0 100644
+index f58fa5da7fe5..3a39877bd790 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-@@ -4637,7 +4637,7 @@ static int amdgpu_dm_mode_config_init(struct amdgpu_device *adev)
+@@ -4639,7 +4639,7 @@ static int amdgpu_dm_mode_config_init(struct amdgpu_device *adev)
  		return r;
  	}
  
@@ -8205,7 +8285,7 @@ index 965a19809c7e..3d442267a256 100644
  void finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
  long wait_woken(struct wait_queue_entry *wq_entry, unsigned mode, long timeout);
 diff --git a/init/Kconfig b/init/Kconfig
-index af4c2f085455..fbb8b8f81326 100644
+index 666783eb50ab..a290a75b3921 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
 @@ -167,6 +167,10 @@ config THREAD_INFO_IN_TASK
