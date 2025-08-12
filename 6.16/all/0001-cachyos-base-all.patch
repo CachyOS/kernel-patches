@@ -21675,6 +21675,374 @@ index cea8a7e9d6d3..cd904f281489 100644
 -- 
 2.50.1
 
+From bd6ba7cfd2d262ed3b0c7188a8b68ebe457fbc24 Mon Sep 17 00:00:00 2001
+From: Xaver Hugl <xaver.hugl@kde.org>
+Date: Fri, 1 Aug 2025 15:10:53 +0200
+Subject: [PATCH] drm: don't run atomic_async_check for disabled planes
+
+It's entirely valid and correct for compositors to include disabled
+planes in the atomic commit, and doing that should not prevent async
+flips from working. To fix that, this commit moves the plane check
+to after all the properties of the object have been set, and skips
+the async checks if the plane was and still is not visible.
+
+Fixes: fd40a63c drm/atomic (Let drivers decide which planes to async flip)
+Closes: https://gitlab.freedesktop.org/drm/amd/-/issues/4263
+
+Signed-off-by: Xaver Hugl <xaver.hugl@kde.org>
+---
+ drivers/gpu/drm/drm_atomic_uapi.c | 51 +++++++++++++++++++++----------
+ 1 file changed, 35 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_atomic_uapi.c b/drivers/gpu/drm/drm_atomic_uapi.c
+index c2726af6698e..2ae41a522e92 100644
+--- a/drivers/gpu/drm/drm_atomic_uapi.c
++++ b/drivers/gpu/drm/drm_atomic_uapi.c
+@@ -1068,7 +1068,6 @@ int drm_atomic_set_property(struct drm_atomic_state *state,
+ 		struct drm_plane *plane = obj_to_plane(obj);
+ 		struct drm_plane_state *plane_state;
+ 		struct drm_mode_config *config = &plane->dev->mode_config;
+-		const struct drm_plane_helper_funcs *plane_funcs = plane->helper_private;
+ 
+ 		plane_state = drm_atomic_get_plane_state(state, plane);
+ 		if (IS_ERR(plane_state)) {
+@@ -1084,21 +1083,8 @@ int drm_atomic_set_property(struct drm_atomic_state *state,
+ 				ret = drm_atomic_plane_get_property(plane, plane_state,
+ 								    prop, &old_val);
+ 				ret = drm_atomic_check_prop_changes(ret, old_val, prop_value, prop);
+-			}
+-
+-			/* ask the driver if this non-primary plane is supported */
+-			if (plane->type != DRM_PLANE_TYPE_PRIMARY) {
+-				ret = -EINVAL;
+-
+-				if (plane_funcs && plane_funcs->atomic_async_check)
+-					ret = plane_funcs->atomic_async_check(plane, state, true);
+-
+-				if (ret) {
+-					drm_dbg_atomic(prop->dev,
+-						       "[PLANE:%d:%s] does not support async flips\n",
+-						       obj->id, plane->name);
+-					break;
+-				}
++				if (ret)
++				    break;
+ 			}
+ 		}
+ 
+@@ -1394,6 +1380,10 @@ int drm_mode_atomic_ioctl(struct drm_device *dev,
+ 	int ret = 0;
+ 	unsigned int i, j, num_fences;
+ 	bool async_flip = false;
++	struct drm_plane *plane;
++	struct drm_plane_state *old_plane_state = NULL;
++	struct drm_plane_state *new_plane_state = NULL;
++	u64 fb_id = 0;
+ 
+ 	/* disallow for drivers not supporting atomic: */
+ 	if (!drm_core_check_feature(dev, DRIVER_ATOMIC))
+@@ -1521,6 +1511,35 @@ int drm_mode_atomic_ioctl(struct drm_device *dev,
+ 			copied_props++;
+ 		}
+ 
++		if (async_flip && obj->type == DRM_MODE_OBJECT_PLANE &&
++		    obj_to_plane(obj)->type != DRM_PLANE_TYPE_PRIMARY) {
++			/* need to ask the driver if this plane is supported */
++			plane = obj_to_plane(obj);
++			old_plane_state = drm_atomic_get_old_plane_state(state, plane);
++			new_plane_state = drm_atomic_get_new_plane_state(state, plane);
++			ret = drm_atomic_plane_get_property(plane, new_plane_state,
++							    dev->mode_config.prop_fb_id,
++							    &fb_id);
++			if (ret)
++				break;
++			/*
++			 * Only do the check if the plane was or is enabled.
++			 * Note that the new state doesn't have "visible" set yet,
++			 * so this uses fb_id instead.
++			 */
++			if (old_plane_state->visible || fb_id)
++				ret = -EINVAL;
++			if (ret && plane->helper_private &&
++			    plane->helper_private->atomic_async_check) {
++				ret = plane->helper_private->atomic_async_check(plane, state, true);
++			}
++			if (ret) {
++				drm_dbg_atomic(dev, "[PLANE:%d:%s] does not support async flips\n",
++						obj->id, plane->name);
++				break;
++			}
++		}
++
+ 		drm_mode_object_put(obj);
+ 	}
+ 
+-- 
+2.50.1
+
+From 6bd11a920ab4432a9b8d9c1044d07c3bab529a72 Mon Sep 17 00:00:00 2001
+From: Peter Jung <admin@ptr1337.dev>
+Date: Tue, 5 Aug 2025 17:46:56 +0200
+Subject: [PATCH] wifi: ath12k: update channel list in worker when wait flag is
+ set
+
+With previous patch [1], ath12k_reg_update_chan_list() will be called
+during reg_process_self_managed_hint().
+
+reg_process_self_managed_hint() will hold rtnl_lock all the time.
+But ath12k_reg_update_chan_list() may increase the occupation time of
+rtnl_lock, because when wait flag is set, wait_for_completion_timeout()
+will be called during 11d/hw scan.
+
+Should minimize the occupation time of rtnl_lock as much as possible
+to avoid interfering with rest of the system. So move the update channel
+list operation to a new worker, so that wait_for_completion_timeout()
+won't be called with the rtnl_lock held.
+
+Tested-on: WCN7850 hw2.0 PCI WLAN.HMT.1.0.c5-00481-QCAHMTSWPL_V1.0_V2.0_SILICONZ-3
+
+Fixes: f335295aa29c ("wifi: ath12k: avoid deadlock during regulatory update in ath12k_regd_update()") #[1]
+Signed-off-by: Kang Yang <kang.yang@oss.qualcomm.com>
+Reviewed-by: Aditya Kumar Singh <aditya.kumar.singh@oss.qualcomm.com>
+Link: https://patch.msgid.link/20250605082528.701-1-kang.yang@oss.qualcomm.com
+Signed-off-by: Jeff Johnson <jeff.johnson@oss.qualcomm.com>
+Signed-off-by: Peter Jung <admin@ptr1337.dev>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  1 +
+ drivers/net/wireless/ath/ath12k/core.h |  4 +-
+ drivers/net/wireless/ath/ath12k/mac.c  | 13 ++++
+ drivers/net/wireless/ath/ath12k/reg.c  | 85 ++++++++++++++++++--------
+ drivers/net/wireless/ath/ath12k/reg.h  |  1 +
+ drivers/net/wireless/ath/ath12k/wmi.h  |  1 +
+ 6 files changed, 78 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index 89ae80934b30..cd58ab9c2322 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1409,6 +1409,7 @@ void ath12k_core_halt(struct ath12k *ar)
+ 	ath12k_mac_peer_cleanup_all(ar);
+ 	cancel_delayed_work_sync(&ar->scan.timeout);
+ 	cancel_work_sync(&ar->regd_update_work);
++	cancel_work_sync(&ar->regd_channel_update_work);
+ 	cancel_work_sync(&ab->rfkill_work);
+ 	cancel_work_sync(&ab->update_11d_work);
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 7bcd9c70309f..289998585fcb 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -719,7 +719,7 @@ struct ath12k {
+ 
+ 	/* protects the radio specific data like debug stats, ppdu_stats_info stats,
+ 	 * vdev_stop_status info, scan data, ath12k_sta info, ath12k_link_vif info,
+-	 * channel context data, survey info, test mode data.
++	 * channel context data, survey info, test mode data, regd_channel_update_queue.
+ 	 */
+ 	spinlock_t data_lock;
+ 
+@@ -778,6 +778,8 @@ struct ath12k {
+ 	struct completion bss_survey_done;
+ 
+ 	struct work_struct regd_update_work;
++	struct work_struct regd_channel_update_work;
++	struct list_head regd_channel_update_queue;
+ 
+ 	struct wiphy_work wmi_mgmt_tx_work;
+ 	struct sk_buff_head wmi_mgmt_tx_queue;
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 59ec422992d3..86089ddcc691 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8286,6 +8286,7 @@ static void ath12k_mac_stop(struct ath12k *ar)
+ {
+ 	struct ath12k_hw *ah = ar->ah;
+ 	struct htt_ppdu_stats_info *ppdu_stats, *tmp;
++	struct ath12k_wmi_scan_chan_list_arg *arg;
+ 	int ret;
+ 
+ 	lockdep_assert_held(&ah->hw_mutex);
+@@ -8300,6 +8301,7 @@ static void ath12k_mac_stop(struct ath12k *ar)
+ 
+ 	cancel_delayed_work_sync(&ar->scan.timeout);
+ 	wiphy_work_cancel(ath12k_ar_to_hw(ar)->wiphy, &ar->scan.vdev_clean_wk);
++	cancel_work_sync(&ar->regd_channel_update_work);
+ 	cancel_work_sync(&ar->regd_update_work);
+ 	cancel_work_sync(&ar->ab->rfkill_work);
+ 	cancel_work_sync(&ar->ab->update_11d_work);
+@@ -8307,10 +8309,18 @@ static void ath12k_mac_stop(struct ath12k *ar)
+ 	complete(&ar->completed_11d_scan);
+ 
+ 	spin_lock_bh(&ar->data_lock);
++
+ 	list_for_each_entry_safe(ppdu_stats, tmp, &ar->ppdu_stats_info, list) {
+ 		list_del(&ppdu_stats->list);
+ 		kfree(ppdu_stats);
+ 	}
++
++	while ((arg = list_first_entry_or_null(&ar->regd_channel_update_queue,
++					       struct ath12k_wmi_scan_chan_list_arg,
++					       list))) {
++		list_del(&arg->list);
++		kfree(arg);
++	}
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+ 	rcu_assign_pointer(ar->ab->pdevs_active[ar->pdev_idx], NULL);
+@@ -12204,6 +12214,7 @@ static void ath12k_mac_hw_unregister(struct ath12k_hw *ah)
+ 	int i;
+ 
+ 	for_each_ar(ah, ar, i) {
++		cancel_work_sync(&ar->regd_channel_update_work);
+ 		cancel_work_sync(&ar->regd_update_work);
+ 		ath12k_debugfs_unregister(ar);
+ 		ath12k_fw_stats_reset(ar);
+@@ -12564,6 +12575,8 @@ static void ath12k_mac_setup(struct ath12k *ar)
+ 
+ 	INIT_DELAYED_WORK(&ar->scan.timeout, ath12k_scan_timeout_work);
+ 	wiphy_work_init(&ar->scan.vdev_clean_wk, ath12k_scan_vdev_clean_work);
++	INIT_WORK(&ar->regd_channel_update_work, ath12k_regd_update_chan_list_work);
++	INIT_LIST_HEAD(&ar->regd_channel_update_queue);
+ 	INIT_WORK(&ar->regd_update_work, ath12k_regd_update_work);
+ 
+ 	wiphy_work_init(&ar->wmi_mgmt_tx_work, ath12k_mgmt_over_wmi_tx_work);
+diff --git a/drivers/net/wireless/ath/ath12k/reg.c b/drivers/net/wireless/ath/ath12k/reg.c
+index 2598b39d5d7e..0fc7f209956d 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -137,32 +137,7 @@ int ath12k_reg_update_chan_list(struct ath12k *ar, bool wait)
+ 	struct ath12k_wmi_channel_arg *ch;
+ 	enum nl80211_band band;
+ 	int num_channels = 0;
+-	int i, ret, left;
+-
+-	if (wait && ar->state_11d == ATH12K_11D_RUNNING) {
+-		left = wait_for_completion_timeout(&ar->completed_11d_scan,
+-						   ATH12K_SCAN_TIMEOUT_HZ);
+-		if (!left) {
+-			ath12k_dbg(ar->ab, ATH12K_DBG_REG,
+-				   "failed to receive 11d scan complete: timed out\n");
+-			ar->state_11d = ATH12K_11D_IDLE;
+-		}
+-		ath12k_dbg(ar->ab, ATH12K_DBG_REG,
+-			   "reg 11d scan wait left time %d\n", left);
+-	}
+-
+-	if (wait &&
+-	    (ar->scan.state == ATH12K_SCAN_STARTING ||
+-	    ar->scan.state == ATH12K_SCAN_RUNNING)) {
+-		left = wait_for_completion_timeout(&ar->scan.completed,
+-						   ATH12K_SCAN_TIMEOUT_HZ);
+-		if (!left)
+-			ath12k_dbg(ar->ab, ATH12K_DBG_REG,
+-				   "failed to receive hw scan complete: timed out\n");
+-
+-		ath12k_dbg(ar->ab, ATH12K_DBG_REG,
+-			   "reg hw scan wait left time %d\n", left);
+-	}
++	int i, ret = 0;
+ 
+ 	if (ar->ah->state == ATH12K_HW_STATE_RESTARTING)
+ 		return 0;
+@@ -244,6 +219,16 @@ int ath12k_reg_update_chan_list(struct ath12k *ar, bool wait)
+ 		}
+ 	}
+ 
++	if (wait) {
++		spin_lock_bh(&ar->data_lock);
++		list_add_tail(&arg->list, &ar->regd_channel_update_queue);
++		spin_unlock_bh(&ar->data_lock);
++
++		queue_work(ar->ab->workqueue, &ar->regd_channel_update_work);
++
++		return 0;
++	}
++
+ 	ret = ath12k_wmi_send_scan_chan_list_cmd(ar, arg);
+ 	kfree(arg);
+ 
+@@ -764,6 +749,54 @@ ath12k_reg_build_regd(struct ath12k_base *ab,
+ 	return new_regd;
+ }
+ 
++void ath12k_regd_update_chan_list_work(struct work_struct *work)
++{
++	struct ath12k *ar = container_of(work, struct ath12k,
++					 regd_channel_update_work);
++	struct ath12k_wmi_scan_chan_list_arg *arg;
++	struct list_head local_update_list;
++	int left;
++
++	INIT_LIST_HEAD(&local_update_list);
++
++	spin_lock_bh(&ar->data_lock);
++	list_splice_tail_init(&ar->regd_channel_update_queue, &local_update_list);
++	spin_unlock_bh(&ar->data_lock);
++
++	while ((arg = list_first_entry_or_null(&local_update_list,
++					       struct ath12k_wmi_scan_chan_list_arg,
++					       list))) {
++		if (ar->state_11d != ATH12K_11D_IDLE) {
++			left = wait_for_completion_timeout(&ar->completed_11d_scan,
++							   ATH12K_SCAN_TIMEOUT_HZ);
++			if (!left) {
++				ath12k_dbg(ar->ab, ATH12K_DBG_REG,
++					   "failed to receive 11d scan complete: timed out\n");
++				ar->state_11d = ATH12K_11D_IDLE;
++			}
++
++			ath12k_dbg(ar->ab, ATH12K_DBG_REG,
++				   "reg 11d scan wait left time %d\n", left);
++		}
++
++		if ((ar->scan.state == ATH12K_SCAN_STARTING ||
++		     ar->scan.state == ATH12K_SCAN_RUNNING)) {
++			left = wait_for_completion_timeout(&ar->scan.completed,
++							   ATH12K_SCAN_TIMEOUT_HZ);
++			if (!left)
++				ath12k_dbg(ar->ab, ATH12K_DBG_REG,
++					   "failed to receive hw scan complete: timed out\n");
++
++			ath12k_dbg(ar->ab, ATH12K_DBG_REG,
++				   "reg hw scan wait left time %d\n", left);
++		}
++
++		ath12k_wmi_send_scan_chan_list_cmd(ar, arg);
++		list_del(&arg->list);
++		kfree(arg);
++	}
++}
++
+ void ath12k_regd_update_work(struct work_struct *work)
+ {
+ 	struct ath12k *ar = container_of(work, struct ath12k,
+diff --git a/drivers/net/wireless/ath/ath12k/reg.h b/drivers/net/wireless/ath/ath12k/reg.h
+index 8af8e9ba462e..0aeba06182c5 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.h
++++ b/drivers/net/wireless/ath/ath12k/reg.h
+@@ -113,6 +113,7 @@ int ath12k_reg_handle_chan_list(struct ath12k_base *ab,
+ 				struct ath12k_reg_info *reg_info,
+ 				enum wmi_vdev_type vdev_type,
+ 				enum ieee80211_ap_reg_power power_type);
++void ath12k_regd_update_chan_list_work(struct work_struct *work);
+ enum wmi_reg_6g_ap_type
+ ath12k_reg_ap_pwr_convert(enum ieee80211_ap_reg_power power_type);
+ enum ath12k_reg_status ath12k_reg_validate_reg_info(struct ath12k_base *ab,
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.h b/drivers/net/wireless/ath/ath12k/wmi.h
+index c640ffa180c8..117150220b99 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -3948,6 +3948,7 @@ struct wmi_stop_scan_cmd {
+ } __packed;
+ 
+ struct ath12k_wmi_scan_chan_list_arg {
++	struct list_head list;
+ 	u32 pdev_id;
+ 	u16 nallchans;
+ 	struct ath12k_wmi_channel_arg channel[];
+-- 
+2.50.1
+
 From 0fc382f7d5a69dcfabaa0d7a24b1bc1dd7af1d40 Mon Sep 17 00:00:00 2001
 From: Eric Naim <dnaim@cachyos.org>
 Date: Mon, 28 Jul 2025 11:50:38 +0700
