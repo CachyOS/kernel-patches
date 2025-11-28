@@ -1,6 +1,6 @@
-From 041a36018f2780381cb323354096ded5c4b558d8 Mon Sep 17 00:00:00 2001
+From d2d662e72062b1623ff362af1d21f6502ecbfe79 Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Tue, 11 Nov 2025 22:52:08 +0100
+Date: Fri, 28 Nov 2025 16:46:22 +0100
 Subject: [PATCH] bore-cachy
 
 Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
@@ -15,10 +15,10 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  kernel/sched/bore.c        | 387 +++++++++++++++++++++++++++++++++++++
  kernel/sched/core.c        |  12 ++
  kernel/sched/debug.c       |  61 +++++-
- kernel/sched/fair.c        | 192 +++++++++++++-----
+ kernel/sched/fair.c        | 128 +++++++++---
  kernel/sched/features.h    |   3 +
  kernel/sched/sched.h       |   9 +
- 13 files changed, 737 insertions(+), 49 deletions(-)
+ 13 files changed, 695 insertions(+), 27 deletions(-)
  create mode 100644 include/linux/sched/bore.h
  create mode 100644 kernel/sched/bore.c
 
@@ -71,7 +71,7 @@ index 0d1d70ade..2a0aba074 100644
  #ifdef CONFIG_SCHED_CORE
 diff --git a/include/linux/sched/bore.h b/include/linux/sched/bore.h
 new file mode 100644
-index 000000000..9c2423724
+index 000000000..79dd72b9a
 --- /dev/null
 +++ b/include/linux/sched/bore.h
 @@ -0,0 +1,39 @@
@@ -87,7 +87,7 @@ index 000000000..9c2423724
 +#define SCHED_BORE_AUTHOR   "Masahito Suzuki"
 +#define SCHED_BORE_PROGNAME "BORE CPU Scheduler modification"
 +
-+#define SCHED_BORE_VERSION  "6.5.10"
++#define SCHED_BORE_VERSION  "6.5.9"
 +
 +extern u8   __read_mostly sched_bore;
 +extern u8   __read_mostly sched_burst_inherit_type;
@@ -772,7 +772,7 @@ index 9815f9a0c..88bafe9f9 100644
  	P(se.avg.runnable_sum);
  	P(se.avg.util_sum);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 22a578a70..ccc6a9ff9 100644
+index 22a578a70..c21e7bf76 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -55,6 +55,10 @@
@@ -909,15 +909,6 @@ index 22a578a70..ccc6a9ff9 100644
 +#endif /* CONFIG_SCHED_BORE */
  #endif
  #endif
- 
-@@ -1060,7 +1086,7 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
- #include "pelt.h"
- #ifdef CONFIG_SMP
- 
--static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu);
-+static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu, int sync);
- static unsigned long task_h_load(struct task_struct *p);
- static unsigned long capacity_of(int cpu);
  
 @@ -1261,6 +1287,9 @@ static void update_curr(struct cfs_rq *cfs_rq)
  	if (entity_is_task(curr)) {
@@ -1069,110 +1060,7 @@ index 22a578a70..ccc6a9ff9 100644
  	if (dequeue_entities(rq, &p->se, flags) < 0)
  		return false;
  
-@@ -7700,6 +7764,24 @@ static inline int __select_idle_cpu(int cpu, struct task_struct *p)
- DEFINE_STATIC_KEY_FALSE(sched_smt_present);
- EXPORT_SYMBOL_GPL(sched_smt_present);
- 
-+/*
-+ * Return true if all the CPUs in the SMT core where @cpu belongs are idle,
-+ * false otherwise.
-+ */
-+static bool is_idle_core(int cpu)
-+{
-+	int sibling;
-+
-+	if (!sched_smt_active())
-+		return (available_idle_cpu(cpu) || sched_idle_cpu(cpu));
-+
-+	for_each_cpu(sibling, cpu_smt_mask(cpu))
-+		if (!available_idle_cpu(sibling) && !sched_idle_cpu(sibling))
-+			return false;
-+
-+	return true;
-+}
-+
- static inline void set_idle_cores(int cpu, int val)
- {
- 	struct sched_domain_shared *sds;
-@@ -7968,13 +8050,26 @@ static inline bool asym_fits_cpu(unsigned long util,
- /*
-  * Try and locate an idle core/thread in the LLC cache domain.
-  */
--static int select_idle_sibling(struct task_struct *p, int prev, int target)
-+static int select_idle_sibling(struct task_struct *p, int prev, int target, int sync)
- {
- 	bool has_idle_core = false;
- 	struct sched_domain *sd;
- 	unsigned long task_util, util_min, util_max;
- 	int i, recent_used_cpu, prev_aff = -1;
- 
-+	/* Check a recently used CPU as a potential idle candidate: */
-+	recent_used_cpu = p->recent_used_cpu;
-+	p->recent_used_cpu = prev;
-+	if (recent_used_cpu != prev &&
-+	    recent_used_cpu != target &&
-+	    cpus_share_cache(recent_used_cpu, target) &&
-+	    is_idle_core(recent_used_cpu) &&
-+	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr)) {
-+		return recent_used_cpu;
-+	} else {
-+		recent_used_cpu = -1;
-+	}
-+
- 	/*
- 	 * On asymmetric system, update task utilization because we will check
- 	 * that the task fits with CPU's capacity.
-@@ -7991,7 +8086,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
- 	 */
- 	lockdep_assert_irqs_disabled();
- 
--	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
-+	if (sync && is_idle_core(target) &&
- 	    asym_fits_cpu(task_util, util_min, util_max, target))
- 		return target;
- 
-@@ -8025,24 +8120,6 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
- 		return prev;
- 	}
- 
--	/* Check a recently used CPU as a potential idle candidate: */
--	recent_used_cpu = p->recent_used_cpu;
--	p->recent_used_cpu = prev;
--	if (recent_used_cpu != prev &&
--	    recent_used_cpu != target &&
--	    cpus_share_cache(recent_used_cpu, target) &&
--	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
--	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
--	    asym_fits_cpu(task_util, util_min, util_max, recent_used_cpu)) {
--
--		if (!static_branch_unlikely(&sched_cluster_active) ||
--		    cpus_share_resources(recent_used_cpu, target))
--			return recent_used_cpu;
--
--	} else {
--		recent_used_cpu = -1;
--	}
--
- 	/*
- 	 * For asymmetric CPU capacity systems, our domain of interest is
- 	 * sd_asym_cpucapacity rather than sd_llc.
-@@ -8776,7 +8853,14 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
- 		new_cpu = sched_balance_find_dst_cpu(sd, p, cpu, prev_cpu, sd_flag);
- 	} else if (wake_flags & WF_TTWU) { /* XXX always ? */
- 		/* Fast path */
--		new_cpu = select_idle_sibling(p, prev_cpu, new_cpu);
-+		/*
-+		 * If the previous CPU is an idle core, retain the same for
-+		 * cache locality. Otherwise, search for an idle sibling.
-+		 */
-+		if (is_idle_core(prev_cpu))
-+			new_cpu = prev_cpu;
-+		else
-+			new_cpu = select_idle_sibling(p, prev_cpu, new_cpu, sync);
- 	}
- 	rcu_read_unlock();
- 
-@@ -9147,16 +9231,25 @@ static void yield_task_fair(struct rq *rq)
+@@ -9147,16 +9211,25 @@ static void yield_task_fair(struct rq *rq)
  	/*
  	 * Are we the only task in the tree?
  	 */
@@ -1198,7 +1086,7 @@ index 22a578a70..ccc6a9ff9 100644
  	/*
  	 * Tell update_rq_clock() that we've just updated,
  	 * so we don't do microscopic update in schedule()
-@@ -13348,6 +13441,9 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
+@@ -13348,6 +13421,9 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
  	SCHED_WARN_ON(p->se.sched_delayed);
  
  	attach_task_cfs_rq(p);
@@ -1252,5 +1140,5 @@ index f7f056b3a..71f0d1cea 100644
  #ifdef CONFIG_SCHED_DEBUG
  extern int sysctl_resched_latency_warn_ms;
 -- 
-2.51.2
+2.52.0
 
