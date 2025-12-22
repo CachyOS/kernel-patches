@@ -1,0 +1,366 @@
+From 1b44c7a65a6ccea7ce90961b106b55ebd4c6c2f1 Mon Sep 17 00:00:00 2001
+From: Eric Naim <dnaim@cachyos.org>
+Date: Mon, 22 Dec 2025 10:14:28 +0800
+Subject: [PATCH 7/7] vmscape
+
+Signed-off-by: Eric Naim <dnaim@cachyos.org>
+---
+ Documentation/admin-guide/hw-vuln/vmscape.rst |  8 +++
+ .../admin-guide/kernel-parameters.txt         |  4 +-
+ arch/x86/Kconfig                              |  1 +
+ arch/x86/entry/entry_64.S                     | 13 +++-
+ arch/x86/include/asm/cpufeatures.h            |  2 +-
+ arch/x86/include/asm/entry-common.h           |  9 ++-
+ arch/x86/include/asm/nospec-branch.h          | 11 +++-
+ arch/x86/kernel/cpu/bugs.c                    | 65 +++++++++++++++----
+ arch/x86/kvm/x86.c                            |  4 +-
+ arch/x86/net/bpf_jit_comp.c                   |  2 +
+ 10 files changed, 90 insertions(+), 29 deletions(-)
+
+diff --git a/Documentation/admin-guide/hw-vuln/vmscape.rst b/Documentation/admin-guide/hw-vuln/vmscape.rst
+index d9b9a2b6c114..580f288ae8bf 100644
+--- a/Documentation/admin-guide/hw-vuln/vmscape.rst
++++ b/Documentation/admin-guide/hw-vuln/vmscape.rst
+@@ -86,6 +86,10 @@ The possible values in this file are:
+    run a potentially malicious guest and issues an IBPB before the first
+    exit to userspace after VM-exit.
+ 
++ * 'Mitigation: Clear BHB before exit to userspace':
++
++   As above, conditional BHB clearing mitigation is enabled.
++
+  * 'Mitigation: IBPB on VMEXIT':
+ 
+    IBPB is issued on every VM-exit. This occurs when other mitigations like
+@@ -108,3 +112,7 @@ The mitigation can be controlled via the ``vmscape=`` command line parameter:
+ 
+    Force vulnerability detection and mitigation even on processors that are
+    not known to be affected.
++
++ * ``vmscape=on``:
++
++   Choose the mitigation based on the VMSCAPE variant the CPU is affected by.
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index b0105d1cf605..d6122f4b2f76 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -8241,9 +8241,11 @@ Kernel parameters
+ 
+ 			off		- disable the mitigation
+ 			ibpb		- use Indirect Branch Prediction Barrier
+-					  (IBPB) mitigation (default)
++					  (IBPB) mitigation
+ 			force		- force vulnerability detection even on
+ 					  unaffected processors
++			on		- (default) selects IBPB or BHB clear
++					  mitigation based on CPU
+ 
+ 	vsyscall=	[X86-64,EARLY]
+ 			Controls the behavior of vsyscalls (i.e. calls to
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 80527299f859..e03e35a2a6ce 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -2710,6 +2710,7 @@ config MITIGATION_TSA
+ config MITIGATION_VMSCAPE
+ 	bool "Mitigate VMSCAPE"
+ 	depends on KVM
++	depends on HAVE_STATIC_CALL
+ 	default y
+ 	help
+ 	  Enable mitigation for VMSCAPE attacks. VMSCAPE is a hardware security
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index f9983a1907bf..6d93602dd309 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -1529,12 +1529,19 @@ SYM_CODE_END(rewind_stack_and_make_dead)
+  * refactored in the future if needed. The .skips are for safety, to ensure
+  * that all RETs are in the second half of a cacheline to mitigate Indirect
+  * Target Selection, rather than taking the slowpath via its_return_thunk.
++ *
++ * Note, callers should use a speculation barrier like LFENCE immediately after
++ * a call to this function to ensure BHB is cleared before indirect branches.
+  */
+ SYM_FUNC_START(clear_bhb_loop)
+ 	ANNOTATE_NOENDBR
+ 	push	%rbp
+ 	mov	%rsp, %rbp
+-	movl	$5, %ecx
++
++	/* loop count differs based on BHI_CTRL, see Intel's BHI guidance */
++	ALTERNATIVE "movl $5,  %ecx; movl $5, %edx",	\
++		    "movl $12, %ecx; movl $7, %edx", X86_FEATURE_BHI_CTRL
++
+ 	ANNOTATE_INTRA_FUNCTION_CALL
+ 	call	1f
+ 	jmp	5f
+@@ -1555,7 +1562,7 @@ SYM_FUNC_START(clear_bhb_loop)
+ 	 * but some Clang versions (e.g. 18) don't like this.
+ 	 */
+ 	.skip 32 - 18, 0xcc
+-2:	movl	$5, %eax
++2:	movl	%edx, %eax
+ 3:	jmp	4f
+ 	nop
+ 4:	sub	$1, %eax
+@@ -1563,7 +1570,7 @@ SYM_FUNC_START(clear_bhb_loop)
+ 	sub	$1, %ecx
+ 	jnz	1b
+ .Lret2:	RET
+-5:	lfence
++5:
+ 	pop	%rbp
+ 	RET
+ SYM_FUNC_END(clear_bhb_loop)
+diff --git a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+index c3b53beb1300..aa39430476d6 100644
+--- a/arch/x86/include/asm/cpufeatures.h
++++ b/arch/x86/include/asm/cpufeatures.h
+@@ -501,7 +501,7 @@
+ #define X86_FEATURE_TSA_SQ_NO		(21*32+11) /* AMD CPU not vulnerable to TSA-SQ */
+ #define X86_FEATURE_TSA_L1_NO		(21*32+12) /* AMD CPU not vulnerable to TSA-L1 */
+ #define X86_FEATURE_CLEAR_CPU_BUF_VM	(21*32+13) /* Clear CPU buffers using VERW before VMRUN */
+-#define X86_FEATURE_IBPB_EXIT_TO_USER	(21*32+14) /* Use IBPB on exit-to-userspace, see VMSCAPE bug */
++/* Free */
+ #define X86_FEATURE_ABMC		(21*32+15) /* Assignable Bandwidth Monitoring Counters */
+ #define X86_FEATURE_MSR_IMM		(21*32+16) /* MSR immediate form instructions */
+ #define X86_FEATURE_SGX_EUPDATESVN	(21*32+17) /* Support for ENCLS[EUPDATESVN] instruction */
+diff --git a/arch/x86/include/asm/entry-common.h b/arch/x86/include/asm/entry-common.h
+index ce3eb6d5fdf9..783e7cb50cae 100644
+--- a/arch/x86/include/asm/entry-common.h
++++ b/arch/x86/include/asm/entry-common.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/randomize_kstack.h>
+ #include <linux/user-return-notifier.h>
++#include <linux/static_call_types.h>
+ 
+ #include <asm/nospec-branch.h>
+ #include <asm/io_bitmap.h>
+@@ -94,11 +95,9 @@ static inline void arch_exit_to_user_mode_prepare(struct pt_regs *regs,
+ 	 */
+ 	choose_random_kstack_offset(rdtsc());
+ 
+-	/* Avoid unnecessary reads of 'x86_ibpb_exit_to_user' */
+-	if (cpu_feature_enabled(X86_FEATURE_IBPB_EXIT_TO_USER) &&
+-	    this_cpu_read(x86_ibpb_exit_to_user)) {
+-		indirect_branch_prediction_barrier();
+-		this_cpu_write(x86_ibpb_exit_to_user, false);
++	if (unlikely(this_cpu_read(x86_predictor_flush_exit_to_user))) {
++		static_call_cond(vmscape_predictor_flush)();
++		this_cpu_write(x86_predictor_flush_exit_to_user, false);
+ 	}
+ }
+ #define arch_exit_to_user_mode_prepare arch_exit_to_user_mode_prepare
+diff --git a/arch/x86/include/asm/nospec-branch.h b/arch/x86/include/asm/nospec-branch.h
+index 4f4b5e8a1574..80efdb6645ba 100644
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -331,11 +331,11 @@
+ 
+ #ifdef CONFIG_X86_64
+ .macro CLEAR_BRANCH_HISTORY
+-	ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_LOOP
++	ALTERNATIVE "", "call clear_bhb_loop; lfence", X86_FEATURE_CLEAR_BHB_LOOP
+ .endm
+ 
+ .macro CLEAR_BRANCH_HISTORY_VMEXIT
+-	ALTERNATIVE "", "call clear_bhb_loop", X86_FEATURE_CLEAR_BHB_VMEXIT
++	ALTERNATIVE "", "call clear_bhb_loop; lfence", X86_FEATURE_CLEAR_BHB_VMEXIT
+ .endm
+ #else
+ #define CLEAR_BRANCH_HISTORY
+@@ -390,6 +390,8 @@ extern void write_ibpb(void);
+ 
+ #ifdef CONFIG_X86_64
+ extern void clear_bhb_loop(void);
++#else
++static inline void clear_bhb_loop(void) {}
+ #endif
+ 
+ extern void (*x86_return_thunk)(void);
+@@ -533,7 +535,7 @@ void alternative_msr_write(unsigned int msr, u64 val, unsigned int feature)
+ 		: "memory");
+ }
+ 
+-DECLARE_PER_CPU(bool, x86_ibpb_exit_to_user);
++DECLARE_PER_CPU(bool, x86_predictor_flush_exit_to_user);
+ 
+ static inline void indirect_branch_prediction_barrier(void)
+ {
+@@ -542,6 +544,9 @@ static inline void indirect_branch_prediction_barrier(void)
+ 			    :: "rax", "rcx", "rdx", "memory");
+ }
+ 
++#include <linux/static_call_types.h>
++DECLARE_STATIC_CALL(vmscape_predictor_flush, write_ibpb);
++
+ /* The Intel SPEC CTRL MSR base value cache */
+ extern u64 x86_spec_ctrl_base;
+ DECLARE_PER_CPU(u64, x86_spec_ctrl_current);
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index d0a2847a4bb0..2818bfcb9f9f 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -62,12 +62,11 @@ DEFINE_PER_CPU(u64, x86_spec_ctrl_current);
+ EXPORT_PER_CPU_SYMBOL_GPL(x86_spec_ctrl_current);
+ 
+ /*
+- * Set when the CPU has run a potentially malicious guest. An IBPB will
+- * be needed to before running userspace. That IBPB will flush the branch
+- * predictor content.
++ * Set when the CPU has run a potentially malicious guest. Indicates that a
++ * branch predictor flush is needed before running userspace.
+  */
+-DEFINE_PER_CPU(bool, x86_ibpb_exit_to_user);
+-EXPORT_PER_CPU_SYMBOL_GPL(x86_ibpb_exit_to_user);
++DEFINE_PER_CPU(bool, x86_predictor_flush_exit_to_user);
++EXPORT_PER_CPU_SYMBOL_GPL(x86_predictor_flush_exit_to_user);
+ 
+ u64 x86_pred_cmd __ro_after_init = PRED_CMD_IBPB;
+ 
+@@ -230,6 +229,9 @@ static void x86_amd_ssb_disable(void)
+ 		wrmsrq(MSR_AMD64_LS_CFG, msrval);
+ }
+ 
++DEFINE_STATIC_CALL_NULL(vmscape_predictor_flush, write_ibpb);
++EXPORT_STATIC_CALL_GPL(vmscape_predictor_flush);
++
+ #undef pr_fmt
+ #define pr_fmt(fmt)	"MDS: " fmt
+ 
+@@ -3049,15 +3051,19 @@ static void __init srso_apply_mitigation(void)
+ enum vmscape_mitigations {
+ 	VMSCAPE_MITIGATION_NONE,
+ 	VMSCAPE_MITIGATION_AUTO,
++	VMSCAPE_MITIGATION_ON,
+ 	VMSCAPE_MITIGATION_IBPB_EXIT_TO_USER,
+ 	VMSCAPE_MITIGATION_IBPB_ON_VMEXIT,
++	VMSCAPE_MITIGATION_BHB_CLEAR_EXIT_TO_USER,
+ };
+ 
+ static const char * const vmscape_strings[] = {
+-	[VMSCAPE_MITIGATION_NONE]		= "Vulnerable",
++	[VMSCAPE_MITIGATION_NONE]			= "Vulnerable",
+ 	/* [VMSCAPE_MITIGATION_AUTO] */
+-	[VMSCAPE_MITIGATION_IBPB_EXIT_TO_USER]	= "Mitigation: IBPB before exit to userspace",
+-	[VMSCAPE_MITIGATION_IBPB_ON_VMEXIT]	= "Mitigation: IBPB on VMEXIT",
++	/* [VMSCAPE_MITIGATION_ON] */
++	[VMSCAPE_MITIGATION_IBPB_EXIT_TO_USER]		= "Mitigation: IBPB before exit to userspace",
++	[VMSCAPE_MITIGATION_IBPB_ON_VMEXIT]		= "Mitigation: IBPB on VMEXIT",
++	[VMSCAPE_MITIGATION_BHB_CLEAR_EXIT_TO_USER]	= "Mitigation: Clear BHB before exit to userspace",
+ };
+ 
+ static enum vmscape_mitigations vmscape_mitigation __ro_after_init =
+@@ -3074,7 +3080,9 @@ static int __init vmscape_parse_cmdline(char *str)
+ 		vmscape_mitigation = VMSCAPE_MITIGATION_IBPB_EXIT_TO_USER;
+ 	} else if (!strcmp(str, "force")) {
+ 		setup_force_cpu_bug(X86_BUG_VMSCAPE);
+-		vmscape_mitigation = VMSCAPE_MITIGATION_AUTO;
++		vmscape_mitigation = VMSCAPE_MITIGATION_ON;
++	} else if (!strcmp(str, "on")) {
++		vmscape_mitigation = VMSCAPE_MITIGATION_ON;
+ 	} else {
+ 		pr_err("Ignoring unknown vmscape=%s option.\n", str);
+ 	}
+@@ -3085,17 +3093,42 @@ early_param("vmscape", vmscape_parse_cmdline);
+ 
+ static void __init vmscape_select_mitigation(void)
+ {
+-	if (!boot_cpu_has_bug(X86_BUG_VMSCAPE) ||
+-	    !boot_cpu_has(X86_FEATURE_IBPB)) {
++	if (!boot_cpu_has_bug(X86_BUG_VMSCAPE)) {
+ 		vmscape_mitigation = VMSCAPE_MITIGATION_NONE;
+ 		return;
+ 	}
+ 
+-	if (vmscape_mitigation == VMSCAPE_MITIGATION_AUTO) {
+-		if (should_mitigate_vuln(X86_BUG_VMSCAPE))
++	if ((vmscape_mitigation == VMSCAPE_MITIGATION_AUTO) &&
++	    !should_mitigate_vuln(X86_BUG_VMSCAPE))
++		vmscape_mitigation = VMSCAPE_MITIGATION_NONE;
++
++	switch (vmscape_mitigation) {
++	case VMSCAPE_MITIGATION_NONE:
++		break;
++
++	case VMSCAPE_MITIGATION_IBPB_EXIT_TO_USER:
++		if (!boot_cpu_has(X86_FEATURE_IBPB))
++			vmscape_mitigation = VMSCAPE_MITIGATION_NONE;
++		break;
++
++	case VMSCAPE_MITIGATION_AUTO:
++	case VMSCAPE_MITIGATION_ON:
++		/*
++		 * CPUs with BHI_CTRL(ADL and newer) can avoid the IBPB and use BHB
++		 * clear sequence. These CPUs are only vulnerable to the BHI variant
++		 * of the VMSCAPE attack and does not require an IBPB flush. In
++		 * 32-bit mode BHB clear sequence is not supported.
++		 */
++		if (boot_cpu_has(X86_FEATURE_BHI_CTRL) && IS_ENABLED(CONFIG_X86_64))
++			vmscape_mitigation = VMSCAPE_MITIGATION_BHB_CLEAR_EXIT_TO_USER;
++		else if (boot_cpu_has(X86_FEATURE_IBPB))
+ 			vmscape_mitigation = VMSCAPE_MITIGATION_IBPB_EXIT_TO_USER;
+ 		else
+ 			vmscape_mitigation = VMSCAPE_MITIGATION_NONE;
++		break;
++
++	default:
++		break;
+ 	}
+ }
+ 
+@@ -3114,7 +3147,9 @@ static void __init vmscape_update_mitigation(void)
+ static void __init vmscape_apply_mitigation(void)
+ {
+ 	if (vmscape_mitigation == VMSCAPE_MITIGATION_IBPB_EXIT_TO_USER)
+-		setup_force_cpu_cap(X86_FEATURE_IBPB_EXIT_TO_USER);
++		static_call_update(vmscape_predictor_flush, write_ibpb);
++	else if (vmscape_mitigation == VMSCAPE_MITIGATION_BHB_CLEAR_EXIT_TO_USER)
++		static_call_update(vmscape_predictor_flush, clear_bhb_loop);
+ }
+ 
+ #undef pr_fmt
+@@ -3203,9 +3238,11 @@ void cpu_bugs_smt_update(void)
+ 	switch (vmscape_mitigation) {
+ 	case VMSCAPE_MITIGATION_NONE:
+ 	case VMSCAPE_MITIGATION_AUTO:
++	case VMSCAPE_MITIGATION_ON:
+ 		break;
+ 	case VMSCAPE_MITIGATION_IBPB_ON_VMEXIT:
+ 	case VMSCAPE_MITIGATION_IBPB_EXIT_TO_USER:
++	case VMSCAPE_MITIGATION_BHB_CLEAR_EXIT_TO_USER:
+ 		/*
+ 		 * Hypervisors can be attacked across-threads, warn for SMT when
+ 		 * STIBP is not already enabled system-wide.
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index ff8812f3a129..21d10b504119 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11424,8 +11424,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	 * set for the CPU that actually ran the guest, and not the CPU that it
+ 	 * may migrate to.
+ 	 */
+-	if (cpu_feature_enabled(X86_FEATURE_IBPB_EXIT_TO_USER))
+-		this_cpu_write(x86_ibpb_exit_to_user, true);
++	if (static_call_query(vmscape_predictor_flush))
++		this_cpu_write(x86_predictor_flush_exit_to_user, true);
+ 
+ 	/*
+ 	 * Consume any pending interrupts, including the possible source of
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index b0bac2a66eff..c31508be0d72 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -1620,6 +1620,8 @@ static int emit_spectre_bhb_barrier(u8 **pprog, u8 *ip,
+ 
+ 		if (emit_call(&prog, func, ip))
+ 			return -EINVAL;
++		/* Don't speculate past this until BHB is cleared */
++		EMIT_LFENCE();
+ 		EMIT1(0x59); /* pop rcx */
+ 		EMIT1(0x58); /* pop rax */
+ 	}
+-- 
+2.52.0
+
