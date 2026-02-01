@@ -1,0 +1,368 @@
+From 95ffea92592cceb81dda316445102db322a9a636 Mon Sep 17 00:00:00 2001
+From: Masahito S <firelzrd@gmail.com>
+Date: Sun, 1 Feb 2026 16:40:09 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v1.0
+
+---
+ include/linux/sched/topology.h |   7 ++
+ init/Kconfig                   |  13 +++
+ kernel/sched/fair.c            |  10 ++
+ kernel/sched/idle.c            |   6 +
+ kernel/sched/poc_selector.c    | 202 +++++++++++++++++++++++++++++++++
+ kernel/sched/sched.h           |  11 ++
+ kernel/sched/topology.c        |   8 ++
+ 7 files changed, 257 insertions(+)
+ create mode 100644 kernel/sched/poc_selector.c
+
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index bbcfdf12aa..be765ac586 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -68,6 +68,13 @@ struct sched_domain_shared {
+ 	atomic_t	nr_busy_cpus;
+ 	int		has_idle_cores;
+ 	int		nr_idle_scan;
++#ifdef CONFIG_SCHED_POC_SELECTOR
++	/* POC Selector: per-LLC atomic64 idle masks (cake inspired) */
++	atomic64_t	poc_idle_cpus;		/* logical CPU idle mask (u64) */
++	atomic64_t	poc_idle_cores;		/* physical core idle mask (u64) */
++	int			poc_cpu_base;		/* smallest CPU ID in this LLC */
++	bool		poc_fast_eligible;	/* true when LLC CPU ID range < 64 */
++#endif
+ };
+ 
+ struct sched_domain {
+diff --git a/init/Kconfig b/init/Kconfig
+index cab3ad28ca..991fe7f8a4 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1435,6 +1435,19 @@ config SCHED_AUTOGROUP
+ 	  desktop applications.  Task group autogeneration is currently based
+ 	  upon task session.
+ 
++config SCHED_POC_SELECTOR
++	bool "Piece-Of-Cake Fast Idle CPU Selector"
++	depends on SMP
++	default y
++	help
++	  Idle CPU selector using cached bitmasks inspired by the scx_cake BPF
++	  scheduler. Reduces select_idle_cpu overhead by using bitmap scanning.
++
++	  This optimization does not affect scheduler fairness - it only
++	  speeds up the process of finding an idle CPU for task wakeup.
++
++	  If unsure, say Y.
++
+ config RELAY
+ 	bool "Kernel->user space relay support (formerly relayfs)"
+ 	select IRQ_WORK
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 967ca52fb2..bd42481632 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7680,6 +7680,9 @@ static inline int select_idle_smt(struct task_struct *p, struct sched_domain *sd
+ 
+ #endif /* !CONFIG_SCHED_SMT */
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++#include "poc_selector.c"
++#endif
+ /*
+  * Scan the LLC domain for idle CPUs; this is dynamically regulated by
+  * comparing the average scan cost (tracked in sd->avg_scan_cost) against the
+@@ -7691,6 +7694,13 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 	int i, cpu, idle_cpu = -1, nr = INT_MAX;
+ 	struct sched_domain_shared *sd_share;
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++	/* Try fast path POC Selector first (SMT-aware 2-phase search) */
++	cpu = select_idle_cpu_poc(p, sd, has_idle_core, target);
++	if (cpu >= 0)
++		return cpu;
++#endif
++
+ 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+ 
+ 	if (sched_feat(SIS_UTIL)) {
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index c39b089d4f..8a8a13bd6c 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -275,6 +275,9 @@ static void do_idle(void)
+ 	__current_set_polling();
+ 	tick_nohz_idle_enter();
+ 
++	/* POC Selector: mark CPU as idle */
++	set_cpu_idle_state(cpu, 1);
++
+ 	while (!need_resched()) {
+ 
+ 		/*
+@@ -332,6 +335,9 @@ static void do_idle(void)
+ 		arch_cpu_idle_exit();
+ 	}
+ 
++	/* POC Selector: mark CPU as busy */
++	set_cpu_idle_state(cpu, 0);
++
+ 	/*
+ 	 * Since we fell out of the loop above, we know TIF_NEED_RESCHED must
+ 	 * be set, propagate it into PREEMPT_NEED_RESCHED.
+diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
+new file mode 100644
+index 0000000000..17fcb9649e
+--- /dev/null
++++ b/kernel/sched/poc_selector.c
+@@ -0,0 +1,202 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Piece-Of-Cake (POC) CPU Selector
++ *
++ * Fast idle CPU selector inspired by RitzDaCat's scx_cake scheduler
++ * "Piece of Cake" - making idle CPU search a piece of cake!
++ *
++ * Uses per-LLC atomic64_t bitmasks for O(1) idle CPU lookup.
++ * When the fast path is not eligible (LLC > 64 CPUs or affinity
++ * restrictions), returns -1 to let CFS standard select_idle_cpu handle it.
++ *
++ * Copyright (C) 2026 Masahito Suzuki
++ */
++
++#ifdef CONFIG_SCHED_POC_SELECTOR
++
++#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
++#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
++
++#define SCHED_POC_SELECTOR_VERSION  "1.0"
++
++/*
++ * Runtime control: sched_poc_selector
++ * - 1 (default): POC Selector enabled
++ * - 0: POC Selector disabled, fallback to standard select_idle_cpu
++ */
++unsigned int __read_mostly sched_poc_selector = 1;
++
++/*
++ * is_idle_core_poc - Check if all SMT siblings of a CPU are idle
++ * @cpu: CPU number to check
++ * @sd_share: sched_domain_shared containing poc_idle_cpus
++ *
++ * Returns: true if ALL SMT siblings are idle, false otherwise
++ *
++ * Reads the atomic64 idle CPU mask to determine if the entire
++ * physical core (all SMT siblings) is idle.
++ */
++static bool is_idle_core_poc(int cpu, struct sched_domain_shared *sd_share)
++{
++	u64 cpus = (u64)atomic64_read(&sd_share->poc_idle_cpus);
++	int base = sd_share->poc_cpu_base;
++	int sibling;
++
++	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
++		int bit = sibling - base;
++
++		if ((unsigned int)bit >= 64 || !(cpus & (1ULL << bit)))
++			return false;
++	}
++	return true;
++}
++
++/*
++ * set_cpu_idle_state - Update per-LLC idle masks when CPU goes idle/busy
++ * @cpu: CPU number
++ * @state: 0=busy, 1=idle
++ *
++ * Updates the per-LLC atomic64 idle CPU and core masks using lock-free
++ * atomic64_or/atomic64_andnot operations.  Each CPU only modifies its
++ * own bit, so no additional locking is required.
++ *
++ * CPUs outside the 64-bit range (bit >= 64) are silently skipped;
++ * the fast path will not be used for those LLCs anyway.
++ */
++void set_cpu_idle_state(int cpu, int state)
++{
++	struct rq *rq = cpu_rq(cpu);
++	struct sched_domain_shared *sd_share;
++
++	atomic_set(&rq->poc_idle_state, state);
++
++	scoped_guard(rcu) {
++		sd_share = rcu_dereference(per_cpu(sd_llc_shared, cpu));
++		if (!sd_share)
++			break;
++
++		int bit = cpu - sd_share->poc_cpu_base;
++
++		if ((unsigned int)bit >= 64)
++			break;
++
++		/* Update logical CPU idle mask */
++		if (state > 0)
++			atomic64_or(1ULL << bit, &sd_share->poc_idle_cpus);
++		else
++			atomic64_andnot(1ULL << bit, &sd_share->poc_idle_cpus);
++
++		/*
++		 * Ensure the CPU mask update is visible before
++		 * reading it back in is_idle_core_poc().
++		 *
++		 * On x86, the preceding LOCK'd atomic64_or/andnot
++		 * already provides full ordering, so this compiles
++		 * to a mere compiler barrier (~0 cyc).  On ARM64
++		 * it emits dmb ish.
++		 */
++		smp_mb__after_atomic();
++
++		/* Update physical core idle mask */
++		int core = cpumask_first(cpu_smt_mask(cpu));
++		int core_bit = core - sd_share->poc_cpu_base;
++
++		if ((unsigned int)core_bit < 64) {
++			if (is_idle_core_poc(cpu, sd_share))
++				atomic64_or(1ULL << core_bit, &sd_share->poc_idle_cores);
++			else
++				atomic64_andnot(1ULL << core_bit, &sd_share->poc_idle_cores);
++		}
++	}
++}
++
++/*
++ * select_idle_cpu_poc - Fast idle CPU selector (cake-inspired atomic64 path)
++ * @p: task to be placed
++ * @sd: scheduling domain
++ * @has_idle_core: true if there are idle physical cores
++ * @target: preferred target CPU
++ *
++ * Returns: idle CPU number if found, -1 otherwise
++ *
++ * Three-level fast path using per-LLC atomic64_t masks:
++ *
++ *   Level 0: Saturation check -- mask == 0 means no idle CPUs     (~5 cyc)
++ *   Level 1: Target sticky    -- reuse target if still idle       (~8 cyc)
++ *   Level 2: TZCNT search     -- find first idle core or CPU      (~12 cyc)
++ *
++ * Returns -1 (falls through to CFS standard select_idle_cpu) when:
++ *   - Runtime disabled (sched_poc_selector == 0)
++ *   - LLC has > 64 CPUs (poc_fast_eligible == false)
++ *   - Task has affinity restrictions
++ *   - No idle CPUs available
++ */
++static int select_idle_cpu_poc(struct task_struct *p,
++				struct sched_domain *sd,
++				bool has_idle_core,
++				int target)
++{
++	struct sched_domain_shared *sd_share;
++	int base;
++	u64 mask;
++
++	if (!sched_poc_selector)
++		return -1;
++
++	/* Affinity-restricted tasks fall through to CFS standard path */
++	if (unlikely(p->nr_cpus_allowed < sd->span_weight))
++		return -1;
++
++	sd_share = rcu_dereference(per_cpu(sd_llc_shared, target));
++	if (!sd_share || !sd_share->poc_fast_eligible)
++		return -1;
++
++	base = sd_share->poc_cpu_base;
++	mask = (u64)atomic64_read(&sd_share->poc_idle_cpus);
++
++	/* Level 0: Saturation check */
++	if (!mask)
++		return -1;
++
++	/* Level 1: Target sticky -- maximize cache locality */
++	int tgt_bit = target - base;
++
++	if ((unsigned int)tgt_bit < 64 && (mask & (1ULL << tgt_bit)))
++		return target;
++
++	/* Level 2: TZCNT idle core/CPU search */
++	if (has_idle_core) {
++		u64 cores = (u64)atomic64_read(&sd_share->poc_idle_cores);
++
++		if (cores)
++			return __builtin_ctzll(cores) + base;
++	}
++
++	return __builtin_ctzll(mask) + base;
++}
++
++#ifdef CONFIG_SYSCTL
++static struct ctl_table sched_poc_sysctls[] = {
++	{
++		.procname	= "sched_poc_selector",
++		.data		= &sched_poc_selector,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++};
++
++static int __init sched_poc_sysctl_init(void)
++{
++	printk(KERN_INFO "%s %s by %s\n", SCHED_POC_SELECTOR_PROGNAME,
++		SCHED_POC_SELECTOR_VERSION, SCHED_POC_SELECTOR_AUTHOR);
++
++	register_sysctl_init("kernel", sched_poc_sysctls);
++	return 0;
++}
++late_initcall(sched_poc_sysctl_init);
++
++#endif /* CONFIG_SYSCTL */
++#endif /* CONFIG_SCHED_POC_SELECTOR */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index adfb6e3409..4cbfed34e3 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1144,6 +1144,11 @@ struct rq {
+ #define UCLAMP_FLAG_IDLE 0x01
+ #endif
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++	/* POC Selector: CPU idle state for bitmap updates */
++	atomic_t		poc_idle_state;  /* 0=busy, 1=idle */
++#endif
++
+ 	struct cfs_rq		cfs;
+ 	struct rt_rq		rt;
+ 	struct dl_rq		dl;
+@@ -3134,6 +3139,12 @@ extern void nohz_run_idle_balance(int cpu);
+ static inline void nohz_run_idle_balance(int cpu) { }
+ #endif
+ 
++#ifdef CONFIG_SCHED_POC_SELECTOR
++extern void set_cpu_idle_state(int cpu, int state);
++#else
++static inline void set_cpu_idle_state(int cpu, int state) { }
++#endif
++
+ #include "stats.h"
+ 
+ #if defined(CONFIG_SCHED_CORE) && defined(CONFIG_SCHEDSTATS)
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 444bdfdab7..fd153acdf4 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1717,6 +1717,14 @@ sd_init(struct sched_domain_topology_level *tl,
+ 		sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
+ 		atomic_inc(&sd->shared->ref);
+ 		atomic_set(&sd->shared->nr_busy_cpus, sd_weight);
++
++#ifdef CONFIG_SCHED_POC_SELECTOR
++		sd->shared->poc_cpu_base = sd_id;
++		sd->shared->poc_fast_eligible =
++			(cpumask_last(sd_span) - sd_id) < 64;
++		atomic64_set(&sd->shared->poc_idle_cpus, 0);
++		atomic64_set(&sd->shared->poc_idle_cores, 0);
++#endif
+ 	}
+ 
+ 	sd->private = sdd;
+-- 
+2.34.1
