@@ -1,33 +1,35 @@
-From 95ffea92592cceb81dda316445102db322a9a636 Mon Sep 17 00:00:00 2001
+From 97380f6319fd8aa1576f5587e666d7fabb723c30 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 1 Feb 2026 16:40:09 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v1.0
+Date: Mon, 2 Feb 2026 21:15:49 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v1.1
 
 ---
- include/linux/sched/topology.h |   7 ++
- init/Kconfig                   |  13 +++
+ include/linux/sched/topology.h |   9 ++
+ init/Kconfig                   |  13 ++
  kernel/sched/fair.c            |  10 ++
  kernel/sched/idle.c            |   6 +
- kernel/sched/poc_selector.c    | 202 +++++++++++++++++++++++++++++++++
+ kernel/sched/poc_selector.c    | 267 +++++++++++++++++++++++++++++++++
  kernel/sched/sched.h           |  11 ++
- kernel/sched/topology.c        |   8 ++
- 7 files changed, 257 insertions(+)
+ kernel/sched/topology.c        |  19 +++
+ 7 files changed, 335 insertions(+)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
-index bbcfdf12aa..be765ac586 100644
+index bbcfdf12aa..cc60e07ea5 100644
 --- a/include/linux/sched/topology.h
 +++ b/include/linux/sched/topology.h
-@@ -68,6 +68,13 @@ struct sched_domain_shared {
+@@ -68,6 +68,15 @@ struct sched_domain_shared {
  	atomic_t	nr_busy_cpus;
  	int		has_idle_cores;
  	int		nr_idle_scan;
 +#ifdef CONFIG_SCHED_POC_SELECTOR
++#define POC_MASK_WORDS_MAX	2	/* up to 128 CPUs per LLC */
 +	/* POC Selector: per-LLC atomic64 idle masks (cake inspired) */
-+	atomic64_t	poc_idle_cpus;		/* logical CPU idle mask (u64) */
-+	atomic64_t	poc_idle_cores;		/* physical core idle mask (u64) */
++	atomic64_t	poc_idle_cpus[POC_MASK_WORDS_MAX];	/* logical CPU idle mask  */
++	atomic64_t	poc_idle_cores[POC_MASK_WORDS_MAX];	/* physical core idle mask */
 +	int			poc_cpu_base;		/* smallest CPU ID in this LLC */
-+	bool		poc_fast_eligible;	/* true when LLC CPU ID range < 64 */
++	int			poc_nr_words;		/* number of active 64-bit words */
++	bool		poc_fast_eligible;	/* true when LLC CPU range fits */
 +#endif
  };
  
@@ -110,10 +112,10 @@ index c39b089d4f..8a8a13bd6c 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..17fcb9649e
+index 0000000000..16f7ddc349
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,267 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Piece-Of-Cake (POC) CPU Selector
@@ -121,9 +123,14 @@ index 0000000000..17fcb9649e
 + * Fast idle CPU selector inspired by RitzDaCat's scx_cake scheduler
 + * "Piece of Cake" - making idle CPU search a piece of cake!
 + *
-+ * Uses per-LLC atomic64_t bitmasks for O(1) idle CPU lookup.
-+ * When the fast path is not eligible (LLC > 64 CPUs or affinity
-+ * restrictions), returns -1 to let CFS standard select_idle_cpu handle it.
++ * Uses per-LLC atomic64_t bitmask arrays for O(1) idle CPU lookup.
++ * Supports up to POC_MASK_WORDS_MAX * 64 CPUs per LLC (default 256).
++ * Each word count variant is macro-expanded and dispatched via switch
++ * on poc_nr_words, so the compiler fully unrolls each variant.
++ *
++ * When the fast path is not eligible (LLC exceeds the supported range
++ * or affinity restrictions apply), returns -1 to let CFS standard
++ * select_idle_cpu handle it.
 + *
 + * Copyright (C) 2026 Masahito Suzuki
 + */
@@ -133,7 +140,7 @@ index 0000000000..17fcb9649e
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "1.0"
++#define SCHED_POC_SELECTOR_VERSION  "1.1"
 +
 +/*
 + * Runtime control: sched_poc_selector
@@ -149,19 +156,26 @@ index 0000000000..17fcb9649e
 + *
 + * Returns: true if ALL SMT siblings are idle, false otherwise
 + *
-+ * Reads the atomic64 idle CPU mask to determine if the entire
-+ * physical core (all SMT siblings) is idle.
++ * Indexes into the correct word of the poc_idle_cpus[] array
++ * for each sibling.
 + */
 +static bool is_idle_core_poc(int cpu, struct sched_domain_shared *sd_share)
 +{
-+	u64 cpus = (u64)atomic64_read(&sd_share->poc_idle_cpus);
 +	int base = sd_share->poc_cpu_base;
++	int nr_words = sd_share->poc_nr_words;
 +	int sibling;
 +
 +	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
-+		int bit = sibling - base;
++		int bit  = sibling - base;
++		int word = bit >> 6;
++		int pos  = bit & 63;
 +
-+		if ((unsigned int)bit >= 64 || !(cpus & (1ULL << bit)))
++		if ((unsigned int)word >= nr_words)
++			return false;
++
++		u64 cpus = (u64)atomic64_read(&sd_share->poc_idle_cpus[word]);
++
++		if (!(cpus & (1ULL << pos)))
 +			return false;
 +	}
 +	return true;
@@ -174,9 +188,9 @@ index 0000000000..17fcb9649e
 + *
 + * Updates the per-LLC atomic64 idle CPU and core masks using lock-free
 + * atomic64_or/atomic64_andnot operations.  Each CPU only modifies its
-+ * own bit, so no additional locking is required.
++ * own bit within a single word, so no additional locking is required.
 + *
-+ * CPUs outside the 64-bit range (bit >= 64) are silently skipped;
++ * CPUs outside the supported range are silently skipped;
 + * the fast path will not be used for those LLCs anyway.
 + */
 +void set_cpu_idle_state(int cpu, int state)
@@ -191,16 +205,18 @@ index 0000000000..17fcb9649e
 +		if (!sd_share)
 +			break;
 +
-+		int bit = cpu - sd_share->poc_cpu_base;
++		int bit  = cpu - sd_share->poc_cpu_base;
++		int word = bit >> 6;
++		int pos  = bit & 63;
 +
-+		if ((unsigned int)bit >= 64)
++		if ((unsigned int)word >= sd_share->poc_nr_words)
 +			break;
 +
 +		/* Update logical CPU idle mask */
 +		if (state > 0)
-+			atomic64_or(1ULL << bit, &sd_share->poc_idle_cpus);
++			atomic64_or(1ULL << pos, &sd_share->poc_idle_cpus[word]);
 +		else
-+			atomic64_andnot(1ULL << bit, &sd_share->poc_idle_cpus);
++			atomic64_andnot(1ULL << pos, &sd_share->poc_idle_cpus[word]);
 +
 +		/*
 +		 * Ensure the CPU mask update is visible before
@@ -214,17 +230,86 @@ index 0000000000..17fcb9649e
 +		smp_mb__after_atomic();
 +
 +		/* Update physical core idle mask */
-+		int core = cpumask_first(cpu_smt_mask(cpu));
++		int core     = cpumask_first(cpu_smt_mask(cpu));
 +		int core_bit = core - sd_share->poc_cpu_base;
++		int core_w   = core_bit >> 6;
++		int core_pos = core_bit & 63;
 +
-+		if ((unsigned int)core_bit < 64) {
++		if ((unsigned int)core_w < sd_share->poc_nr_words) {
 +			if (is_idle_core_poc(cpu, sd_share))
-+				atomic64_or(1ULL << core_bit, &sd_share->poc_idle_cores);
++				atomic64_or(1ULL << core_pos,
++					    &sd_share->poc_idle_cores[core_w]);
 +			else
-+				atomic64_andnot(1ULL << core_bit, &sd_share->poc_idle_cores);
++				atomic64_andnot(1ULL << core_pos,
++						&sd_share->poc_idle_cores[core_w]);
 +		}
 +	}
 +}
++
++/*
++ * DEFINE_SELECT_IDLE_CPU_POC - Generate an N-word variant of the fast path
++ *
++ * Each variant is fully unrollable by the compiler because N is a
++ * compile-time literal.
++ *
++ * Three-level fast path using per-LLC atomic64_t mask arrays:
++ *
++ *   Level 0: Saturation check -- OR all words; 0 means no idle CPUs
++ *   Level 1: Target sticky    -- reuse target if still idle
++ *   Level 2: TZCNT search     -- find first idle core or CPU
++ */
++#define DEFINE_SELECT_IDLE_CPU_POC(N)							\
++static int select_idle_cpu_poc_##N(bool has_idle_core,			\
++				   int target,									\
++				   struct sched_domain_shared *sd_share)		\
++{																\
++	int base = sd_share->poc_cpu_base;							\
++	u64 any = 0;												\
++	int i;														\
++																\
++	/* Level 0: Saturation check */								\
++	for (i = 0; i < (N); i++)									\
++		any |= (u64)atomic64_read(&sd_share->poc_idle_cpus[i]);	\
++	if (!any)													\
++		return -1;												\
++																\
++	/* Level 1: Target sticky -- maximize cache locality */		\
++	{															\
++		int tgt_bit = target - base;							\
++		int w   = tgt_bit >> 6;									\
++		int pos = tgt_bit & 63;									\
++																\
++		if ((unsigned int)w < (N)) {							\
++			u64 m = (u64)atomic64_read(							\
++					&sd_share->poc_idle_cpus[w]);				\
++			if (m & (1ULL << pos))								\
++				return target;									\
++		}														\
++	}															\
++																\
++	/* Level 2: TZCNT idle core/CPU search */					\
++	if (has_idle_core) {										\
++		for (i = 0; i < (N); i++) {								\
++			u64 cores = (u64)atomic64_read(						\
++					&sd_share->poc_idle_cores[i]);				\
++			if (cores)											\
++				return __builtin_ctzll(cores)					\
++					+ (i << 6) + base;							\
++		}														\
++	}															\
++																\
++	for (i = 0; i < (N); i++) {									\
++		u64 cpus = (u64)atomic64_read(							\
++				&sd_share->poc_idle_cpus[i]);					\
++		if (cpus)												\
++			return __builtin_ctzll(cpus) + (i << 6) + base;		\
++	}															\
++																\
++	return -1;													\
++}
++
++DEFINE_SELECT_IDLE_CPU_POC(1)
++DEFINE_SELECT_IDLE_CPU_POC(2)
 +
 +/*
 + * select_idle_cpu_poc - Fast idle CPU selector (cake-inspired atomic64 path)
@@ -235,15 +320,12 @@ index 0000000000..17fcb9649e
 + *
 + * Returns: idle CPU number if found, -1 otherwise
 + *
-+ * Three-level fast path using per-LLC atomic64_t masks:
-+ *
-+ *   Level 0: Saturation check -- mask == 0 means no idle CPUs     (~5 cyc)
-+ *   Level 1: Target sticky    -- reuse target if still idle       (~8 cyc)
-+ *   Level 2: TZCNT search     -- find first idle core or CPU      (~12 cyc)
++ * Guard checks are performed here; the actual N-word search is
++ * dispatched via switch on poc_nr_words to a fully-unrolled variant.
 + *
 + * Returns -1 (falls through to CFS standard select_idle_cpu) when:
 + *   - Runtime disabled (sched_poc_selector == 0)
-+ *   - LLC has > 64 CPUs (poc_fast_eligible == false)
++ *   - LLC exceeds POC_MASK_WORDS_MAX * 64 CPUs
 + *   - Task has affinity restrictions
 + *   - No idle CPUs available
 + */
@@ -253,8 +335,7 @@ index 0000000000..17fcb9649e
 +				int target)
 +{
 +	struct sched_domain_shared *sd_share;
-+	int base;
-+	u64 mask;
++	int nr_words;
 +
 +	if (!sched_poc_selector)
 +		return -1;
@@ -267,28 +348,14 @@ index 0000000000..17fcb9649e
 +	if (!sd_share || !sd_share->poc_fast_eligible)
 +		return -1;
 +
-+	base = sd_share->poc_cpu_base;
-+	mask = (u64)atomic64_read(&sd_share->poc_idle_cpus);
++	nr_words = sd_share->poc_nr_words;
 +
-+	/* Level 0: Saturation check */
-+	if (!mask)
-+		return -1;
-+
-+	/* Level 1: Target sticky -- maximize cache locality */
-+	int tgt_bit = target - base;
-+
-+	if ((unsigned int)tgt_bit < 64 && (mask & (1ULL << tgt_bit)))
-+		return target;
-+
-+	/* Level 2: TZCNT idle core/CPU search */
-+	if (has_idle_core) {
-+		u64 cores = (u64)atomic64_read(&sd_share->poc_idle_cores);
-+
-+		if (cores)
-+			return __builtin_ctzll(cores) + base;
++	switch (nr_words) {
++	case 1: return select_idle_cpu_poc_1(has_idle_core, target, sd_share);
++	case 2: return select_idle_cpu_poc_2(has_idle_core, target, sd_share);
 +	}
 +
-+	return __builtin_ctzll(mask) + base;
++	return -1;
 +}
 +
 +#ifdef CONFIG_SYSCTL
@@ -346,23 +413,35 @@ index adfb6e3409..4cbfed34e3 100644
  
  #if defined(CONFIG_SCHED_CORE) && defined(CONFIG_SCHEDSTATS)
 diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
-index 444bdfdab7..fd153acdf4 100644
+index 444bdfdab7..4fdd4ff5b7 100644
 --- a/kernel/sched/topology.c
 +++ b/kernel/sched/topology.c
-@@ -1717,6 +1717,14 @@ sd_init(struct sched_domain_topology_level *tl,
+@@ -1717,6 +1717,25 @@ sd_init(struct sched_domain_topology_level *tl,
  		sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
  		atomic_inc(&sd->shared->ref);
  		atomic_set(&sd->shared->nr_busy_cpus, sd_weight);
 +
 +#ifdef CONFIG_SCHED_POC_SELECTOR
++		int range = cpumask_last(sd_span) - sd_id + 1;
++		int nr_words = DIV_ROUND_UP(range, 64);
++		int i;
++
 +		sd->shared->poc_cpu_base = sd_id;
-+		sd->shared->poc_fast_eligible =
-+			(cpumask_last(sd_span) - sd_id) < 64;
-+		atomic64_set(&sd->shared->poc_idle_cpus, 0);
-+		atomic64_set(&sd->shared->poc_idle_cores, 0);
++		if (nr_words <= POC_MASK_WORDS_MAX) {
++			sd->shared->poc_nr_words = nr_words;
++			sd->shared->poc_fast_eligible = true;
++		} else {
++			sd->shared->poc_nr_words = 0;
++			sd->shared->poc_fast_eligible = false;
++		}
++		for (i = 0; i < POC_MASK_WORDS_MAX; i++) {
++			atomic64_set(&sd->shared->poc_idle_cpus[i], 0);
++			atomic64_set(&sd->shared->poc_idle_cores[i], 0);
++		}
 +#endif
  	}
  
  	sd->private = sdd;
 -- 
 2.34.1
+
