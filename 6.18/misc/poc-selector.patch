@@ -1,21 +1,21 @@
-From c101add62dec294744ac7b1a5ff2320cc9be4e70 Mon Sep 17 00:00:00 2001
+From fd2f12a7d39681eaf5cdf82006036169208ab1c1 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 10 Feb 2026 04:04:01 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v1.9.0
+Date: Tue, 10 Feb 2026 17:24:06 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v1.9.2
 
 ---
  include/linux/sched/topology.h |   27 +-
  init/Kconfig                   |   26 +
- kernel/sched/fair.c            |   69 +-
+ kernel/sched/fair.c            |   46 +-
  kernel/sched/idle.c            |    6 +
- kernel/sched/poc_selector.c    | 1108 ++++++++++++++++++++++++++++++++
+ kernel/sched/poc_selector.c    | 1115 ++++++++++++++++++++++++++++++++
  kernel/sched/sched.h           |   98 +++
  kernel/sched/topology.c        |  125 ++++
- 7 files changed, 1456 insertions(+), 3 deletions(-)
+ 7 files changed, 1440 insertions(+), 3 deletions(-)
  create mode 100644 kernel/sched/poc_selector.c
 
 diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
-index bbcfdf12aa..fb2b6dd039 100644
+index bbcfdf12aa..97c672fac0 100644
 --- a/include/linux/sched/topology.h
 +++ b/include/linux/sched/topology.h
 @@ -66,8 +66,31 @@ struct sched_group;
@@ -38,7 +38,7 @@ index bbcfdf12aa..fb2b6dd039 100644
 +	 * containing nr_busy_cpus / has_idle_cores / nr_idle_scan.
 +	 */
 +	atomic64_t	poc_idle_cpus  ____cacheline_aligned;
-+	atomic64_t	poc_idle_cores ____cacheline_aligned; /* physical core idle mask */
++	atomic64_t	poc_idle_cores;		/* physical core idle mask */
 +	int			poc_cpu_base;		/* smallest CPU ID in this LLC */
 +	u8			poc_affinity_shift;	/* bit shift for cpumask alignment */
 +	u8			poc_cluster_shift;	/* log2(cluster_size) in POC bit space */
@@ -90,7 +90,7 @@ index cab3ad28ca..551812b9cf 100644
  	bool "Kernel->user space relay support (formerly relayfs)"
  	select IRQ_WORK
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 967ca52fb2..d6ee2d4f08 100644
+index 967ca52fb2..0c0e7effaf 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -7423,6 +7423,10 @@ static int wake_affine(struct sched_domain *sd, struct task_struct *p,
@@ -169,48 +169,6 @@ index 967ca52fb2..d6ee2d4f08 100644
  	/*
  	 * For cluster machines which have lower sharing cache like L2 or
  	 * LLC Tag, we tend to find an idle CPU in the target's cluster
-@@ -10369,11 +10413,27 @@ static inline void update_sg_lb_stats(struct lb_env *env,
- {
- 	int i, nr_running, local_group, sd_flags = env->sd->flags;
- 	bool balancing_at_rd = !env->sd->parent;
-+#ifdef CONFIG_SCHED_POC_SELECTOR
-+	u64 poc_idle_mask = 0;
-+	int poc_base = 0;
-+	int poc_idle_count;
-+#endif
- 
- 	memset(sgs, 0, sizeof(*sgs));
- 
- 	local_group = group == sds->local;
- 
-+#ifdef CONFIG_SCHED_POC_SELECTOR
-+	/*
-+	 * POC fast path: pre-calculate idle CPU count and mask.
-+	 * Returns -1 if POC not applicable for this group.
-+	 */
-+	poc_idle_count = poc_lb_prepare_idle_check(env->dst_cpu,
-+		sched_group_span(group), env->cpus, &poc_idle_mask, &poc_base);
-+	if (poc_idle_count >= 0)
-+		sgs->idle_cpus = poc_idle_count;
-+#endif
-+
- 	for_each_cpu_and(i, sched_group_span(group), env->cpus) {
- 		struct rq *rq = cpu_rq(i);
- 		unsigned long load = cpu_load(rq);
-@@ -10392,6 +10452,13 @@ static inline void update_sg_lb_stats(struct lb_env *env,
- 		/*
- 		 * No need to call idle_cpu() if nr_running is not 0
- 		 */
-+#ifdef CONFIG_SCHED_POC_SELECTOR
-+		if (poc_idle_count >= 0) {
-+			/* POC path: check bitmap instead of idle_cpu() */
-+			if (!nr_running && poc_lb_is_cpu_idle(i, poc_idle_mask, poc_base))
-+				continue;
-+		} else
-+#endif
- 		if (!nr_running && idle_cpu(i)) {
- 			sgs->idle_cpus++;
- 			/* Idle cpu can't have misfit task */
 diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
 index c39b089d4f..8a8a13bd6c 100644
 --- a/kernel/sched/idle.c
@@ -237,10 +195,10 @@ index c39b089d4f..8a8a13bd6c 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..2404106724
+index 0000000000..6995589b95
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
-@@ -0,0 +1,1108 @@
+@@ -0,0 +1,1115 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Piece-Of-Cake (POC) CPU Selector
@@ -256,6 +214,18 @@ index 0000000000..2404106724
 + * returns -1 to let CFS standard select_idle_cpu handle it.
 + *
 + * Copyright (C) 2026 Masahito Suzuki
++ *
++ * Acknowledgements:
++ *   This work is heavily inspired by RitzDaCat's scx_cake scheduler.
++ *
++ *   Special thanks to the algorithm inventors whose research enabled
++ *   the O(1) techniques used in this implementation:
++ *
++ *     - Prashant Pandey, Michael A. Bender, Rob Johnson
++ *       ("A Fast x86 Implementation of Select")
++ *
++ *     - Daniel Lemire
++ *       ("Fast Random Integer Generation in an Interval")
 + */
 +
 +#ifdef CONFIG_SCHED_POC_SELECTOR
@@ -267,7 +237,7 @@ index 0000000000..2404106724
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "1.9.0"
++#define SCHED_POC_SELECTOR_VERSION  "1.9.2"
 +
 +/*
 + * IF_SMT - conditionally include code only when SMT is enabled.
@@ -551,17 +521,12 @@ index 0000000000..2404106724
 +			int core_bit = core - sd_share->poc_cpu_base;
 +
 +			if ((unsigned int)core_bit < 64) {
-+				u64 core_mask = 1ULL << core_bit;
-+				u64 cores = (u64)atomic64_read(&sd_share->poc_idle_cores);
-+
-+				if (state > 0 &&
-+				    is_idle_core_poc(cpu, sd_share)) {
-+					if (!(cores & core_mask))
-+						atomic64_or(core_mask, &sd_share->poc_idle_cores);
-+				} else {
-+					if (cores & core_mask)
-+						atomic64_andnot(core_mask, &sd_share->poc_idle_cores);
-+				}
++				if (state > 0 && is_idle_core_poc(cpu, sd_share))
++					atomic64_or(1ULL << core_bit,
++						    &sd_share->poc_idle_cores);
++				else
++					atomic64_andnot(1ULL << core_bit,
++							&sd_share->poc_idle_cores);
 +			}
 +		}
 +	}
