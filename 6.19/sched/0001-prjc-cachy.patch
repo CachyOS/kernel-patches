@@ -1,14 +1,206 @@
-From eebdd43b862b4f438e3f48e813b7243ea17cc78a Mon Sep 17 00:00:00 2001
+From a65157f3b47cfbcd4fd22d922bacf7bf4e9237a8 Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Fri, 13 Feb 2026 14:32:20 +0100
-Subject: [PATCH] prjc-cachy
+Date: Wed, 18 Feb 2026 08:22:58 +0100
+Subject: [PATCH 1/2] Reapply "sched/fair: Proportional newidle balance"
+
+This reverts commit 87e424be39daa8da7424a4eb9b99f808db1572ae.
+
+Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
+---
+ include/linux/sched/topology.h |  3 +++
+ kernel/sched/core.c            |  3 +++
+ kernel/sched/fair.c            | 44 ++++++++++++++++++++++++++++++----
+ kernel/sched/features.h        |  5 ++++
+ kernel/sched/sched.h           |  7 ++++++
+ kernel/sched/topology.c        |  6 +++++
+ 6 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index bbcfdf12a..45c0022b9 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -92,6 +92,9 @@ struct sched_domain {
+ 	unsigned int nr_balance_failed; /* initialise to 0 */
+ 
+ 	/* idle_balance() stats */
++	unsigned int newidle_call;
++	unsigned int newidle_success;
++	unsigned int newidle_ratio;
+ 	u64 max_newidle_lb_cost;
+ 	unsigned long last_decay_max_lb_cost;
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 7224d5fe3..9dc6e37dc 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -121,6 +121,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_update_nr_running_tp);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_compute_energy_tp);
+ 
+ DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
++DEFINE_PER_CPU(struct rnd_state, sched_rnd_state);
+ 
+ #ifdef CONFIG_SCHED_PROXY_EXEC
+ DEFINE_STATIC_KEY_TRUE(__sched_proxy_exec);
+@@ -8485,6 +8486,8 @@ void __init sched_init_smp(void)
+ {
+ 	sched_init_numa(NUMA_NO_NODE);
+ 
++	prandom_init_once(&sched_rnd_state);
++
+ 	/*
+ 	 * There's no userspace yet to cause hotplug operations; hence all the
+ 	 * CPU masks are stable and all blatant races in the below code cannot
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index b859f1f31..3263819ef 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -12236,11 +12236,27 @@ void update_max_interval(void)
+ 	max_load_balance_interval = HZ*num_online_cpus()/10;
+ }
+ 
+-static inline bool update_newidle_cost(struct sched_domain *sd, u64 cost)
++static inline void update_newidle_stats(struct sched_domain *sd, unsigned int success)
++{
++	sd->newidle_call++;
++	sd->newidle_success += success;
++
++	if (sd->newidle_call >= 1024) {
++		sd->newidle_ratio = sd->newidle_success;
++		sd->newidle_call /= 2;
++		sd->newidle_success /= 2;
++	}
++}
++
++static inline bool
++update_newidle_cost(struct sched_domain *sd, u64 cost, unsigned int success)
+ {
+ 	unsigned long next_decay = sd->last_decay_max_lb_cost + HZ;
+ 	unsigned long now = jiffies;
+ 
++	if (cost)
++		update_newidle_stats(sd, success);
++
+ 	if (cost > sd->max_newidle_lb_cost) {
+ 		/*
+ 		 * Track max cost of a domain to make sure to not delay the
+@@ -12288,7 +12304,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
+ 		 * Decay the newidle max times here because this is a regular
+ 		 * visit to all the domains.
+ 		 */
+-		need_decay = update_newidle_cost(sd, 0);
++		need_decay = update_newidle_cost(sd, 0, 0);
+ 		max_cost += sd->max_newidle_lb_cost;
+ 
+ 		/*
+@@ -12924,6 +12940,22 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
+ 			break;
+ 
+ 		if (sd->flags & SD_BALANCE_NEWIDLE) {
++			unsigned int weight = 1;
++
++			if (sched_feat(NI_RANDOM)) {
++				/*
++				 * Throw a 1k sided dice; and only run
++				 * newidle_balance according to the success
++				 * rate.
++				 */
++				u32 d1k = sched_rng() % 1024;
++				weight = 1 + sd->newidle_ratio;
++				if (d1k > weight) {
++					update_newidle_stats(sd, 0);
++					continue;
++				}
++				weight = (1024 + weight/2) / weight;
++			}
+ 
+ 			pulled_task = sched_balance_rq(this_cpu, this_rq,
+ 						   sd, CPU_NEWLY_IDLE,
+@@ -12931,10 +12963,14 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
+ 
+ 			t1 = sched_clock_cpu(this_cpu);
+ 			domain_cost = t1 - t0;
+-			update_newidle_cost(sd, domain_cost);
+-
+ 			curr_cost += domain_cost;
+ 			t0 = t1;
++
++			/*
++			 * Track max cost of a domain to make sure to not delay the
++			 * next wakeup on the CPU.
++			 */
++			update_newidle_cost(sd, domain_cost, weight * !!pulled_task);
+ 		}
+ 
+ 		/*
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 3c12d9f93..136a6584b 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -121,3 +121,8 @@ SCHED_FEAT(WA_BIAS, true)
+ SCHED_FEAT(UTIL_EST, true)
+ 
+ SCHED_FEAT(LATENCY_WARN, false)
++
++/*
++ * Do newidle balancing proportional to its success rate using randomization.
++ */
++SCHED_FEAT(NI_RANDOM, true)
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 18503287e..c00b1be12 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -5,6 +5,7 @@
+ #ifndef _KERNEL_SCHED_SCHED_H
+ #define _KERNEL_SCHED_SCHED_H
+ 
++#include <linux/prandom.h>
+ #include <linux/sched/affinity.h>
+ #include <linux/sched/autogroup.h>
+ #include <linux/sched/cpufreq.h>
+@@ -1350,6 +1351,12 @@ static inline bool is_migration_disabled(struct task_struct *p)
+ }
+ 
+ DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
++DECLARE_PER_CPU(struct rnd_state, sched_rnd_state);
++
++static inline u32 sched_rng(void)
++{
++	return prandom_u32_state(this_cpu_ptr(&sched_rnd_state));
++}
+ 
+ #define cpu_rq(cpu)		(&per_cpu(runqueues, (cpu)))
+ #define this_rq()		this_cpu_ptr(&runqueues)
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 711076aa4..cf643a5dd 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -1669,6 +1669,12 @@ sd_init(struct sched_domain_topology_level *tl,
+ 
+ 		.last_balance		= jiffies,
+ 		.balance_interval	= sd_weight,
++
++		/* 50% success rate */
++		.newidle_call		= 512,
++		.newidle_success	= 256,
++		.newidle_ratio		= 512,
++
+ 		.max_newidle_lb_cost	= 0,
+ 		.last_decay_max_lb_cost	= jiffies,
+ 		.child			= child,
+-- 
+2.53.0
+
+
+From 6ca787ff13c8909b52f5d94094c91bd67e2abd29 Mon Sep 17 00:00:00 2001
+From: Piotr Gorski <lucjan.lucjanov@gmail.com>
+Date: Wed, 18 Feb 2026 08:23:48 +0100
+Subject: [PATCH 2/2] prjc-cachy
 
 Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
 ---
  Documentation/admin-guide/sysctl/kernel.rst |    9 +
  Documentation/scheduler/sched-BMQ.txt       |  110 +
  fs/proc/base.c                              |    2 +-
- include/asm-generic/resource.h              |    2 +-
  include/linux/rseq_entry.h                  |    3 +
  include/linux/sched.h                       |   76 +
  include/linux/sched/deadline.h              |   20 +
@@ -24,10 +216,10 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  kernel/locking/rtmutex.c                    |   16 +-
  kernel/locking/ww_mutex.h                   |    2 +
  kernel/sched/Makefile                       |    5 +
- kernel/sched/alt_core.c                     | 7627 +++++++++++++++++++
+ kernel/sched/alt_core.c                     | 7630 +++++++++++++++++++
  kernel/sched/alt_core.h                     |  197 +
  kernel/sched/alt_debug.c                    |   32 +
- kernel/sched/alt_sched.h                    | 1067 +++
+ kernel/sched/alt_sched.h                    | 1068 +++
  kernel/sched/alt_topology.c                 |  287 +
  kernel/sched/alt_topology.h                 |  113 +
  kernel/sched/bmq.h                          |  103 +
@@ -51,7 +243,7 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  kernel/trace/trace_osnoise.c                |    4 +
  kernel/trace/trace_selftest.c               |    5 +
  kernel/workqueue.c                          |   15 +
- 46 files changed, 10225 insertions(+), 32 deletions(-)
+ 45 files changed, 10228 insertions(+), 31 deletions(-)
  create mode 100644 Documentation/scheduler/sched-BMQ.txt
  create mode 100644 kernel/sched/alt_core.c
  create mode 100644 kernel/sched/alt_core.h
@@ -208,19 +400,6 @@ index 4eec684ba..562a8eebc 100644
  		   (unsigned long long)task->sched_info.run_delay,
  		   task->sched_info.pcount);
  
-diff --git a/include/asm-generic/resource.h b/include/asm-generic/resource.h
-index 8874f681b..59eb72bf7 100644
---- a/include/asm-generic/resource.h
-+++ b/include/asm-generic/resource.h
-@@ -23,7 +23,7 @@
- 	[RLIMIT_LOCKS]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
- 	[RLIMIT_SIGPENDING]	= { 		0,	       0 },	\
- 	[RLIMIT_MSGQUEUE]	= {   MQ_BYTES_MAX,   MQ_BYTES_MAX },	\
--	[RLIMIT_NICE]		= { 0, 0 },				\
-+	[RLIMIT_NICE]		= { 30, 30 },				\
- 	[RLIMIT_RTPRIO]		= { 0, 0 },				\
- 	[RLIMIT_RTTIME]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
- }
 diff --git a/include/linux/rseq_entry.h b/include/linux/rseq_entry.h
 index a36b47262..dd50cea67 100644
 --- a/include/linux/rseq_entry.h
@@ -848,10 +1027,10 @@ index 8ae86371d..a972ef1e3 100644
  obj-y += build_utility.o
 diff --git a/kernel/sched/alt_core.c b/kernel/sched/alt_core.c
 new file mode 100644
-index 000000000..3d9fe8cde
+index 000000000..f3462b963
 --- /dev/null
 +++ b/kernel/sched/alt_core.c
-@@ -0,0 +1,7627 @@
+@@ -0,0 +1,7630 @@
 +/*
 + *  kernel/sched/alt_core.c
 + *
@@ -928,7 +1107,7 @@ index 000000000..3d9fe8cde
 +__read_mostly int sysctl_resched_latency_warn_ms = 100;
 +__read_mostly int sysctl_resched_latency_warn_once = 1;
 +
-+#define ALT_SCHED_VERSION "v6.19-r0"
++#define ALT_SCHED_VERSION "v6.19-r1"
 +
 +#define STOP_PRIO		(MAX_RT_PRIO - 1)
 +
@@ -7557,7 +7736,7 @@ index 000000000..3d9fe8cde
 +static u64 cpu_shares_read_u64(struct cgroup_subsys_state *css,
 +			       struct cftype *cft)
 +{
-+	return 0;
++	return 1024;
 +}
 +
 +static s64 cpu_idle_read_s64(struct cgroup_subsys_state *css,
@@ -7577,7 +7756,7 @@ index 000000000..3d9fe8cde
 +static s64 cpu_cfs_quota_read_s64(struct cgroup_subsys_state *css,
 +				  struct cftype *cft)
 +{
-+	return 0;
++	return -1;
 +}
 +
 +static int cpu_cfs_quota_write_s64(struct cgroup_subsys_state *css,
@@ -7589,7 +7768,7 @@ index 000000000..3d9fe8cde
 +static u64 cpu_cfs_period_read_u64(struct cgroup_subsys_state *css,
 +				   struct cftype *cft)
 +{
-+	return 0;
++	return 100000ULL;
 +}
 +
 +static int cpu_cfs_period_write_u64(struct cgroup_subsys_state *css,
@@ -7650,11 +7829,13 @@ index 000000000..3d9fe8cde
 +#ifdef CONFIG_UCLAMP_TASK_GROUP
 +static int cpu_uclamp_min_show(struct seq_file *sf, void *v)
 +{
++	seq_puts(sf, "0\n");
 +	return 0;
 +}
 +
 +static int cpu_uclamp_max_show(struct seq_file *sf, void *v)
 +{
++	seq_puts(sf, "max\n");
 +	return 0;
 +}
 +
@@ -7744,7 +7925,7 @@ index 000000000..3d9fe8cde
 +static u64 cpu_weight_read_u64(struct cgroup_subsys_state *css,
 +			       struct cftype *cft)
 +{
-+	return 0;
++	return 100;
 +}
 +
 +static int cpu_weight_write_u64(struct cgroup_subsys_state *css,
@@ -7769,6 +7950,7 @@ index 000000000..3d9fe8cde
 +#ifdef CONFIG_CFS_BANDWIDTH
 +static int cpu_max_show(struct seq_file *sf, void *v)
 +{
++	seq_puts(sf, "max 100000\n");
 +	return 0;
 +}
 +
@@ -8722,10 +8904,10 @@ index 000000000..1dbd7eb6a
 +{}
 diff --git a/kernel/sched/alt_sched.h b/kernel/sched/alt_sched.h
 new file mode 100644
-index 000000000..2f6df76b9
+index 000000000..a95cfd291
 --- /dev/null
 +++ b/kernel/sched/alt_sched.h
-@@ -0,0 +1,1067 @@
+@@ -0,0 +1,1068 @@
 +#ifndef _KERNEL_SCHED_ALT_SCHED_H
 +#define _KERNEL_SCHED_ALT_SCHED_H
 +
@@ -9093,6 +9275,7 @@ index 000000000..2f6df76b9
 +#ifdef CONFIG_SCHED_SMT
 +	SMT_LEVEL_SPACE_HOLDER,
 +#endif
++	CLUSTER_LEVEL_SPACE_HOLDER,
 +	COREGROUP_LEVEL_SPACE_HOLDER,
 +	CORE_LEVEL_SPACE_HOLDER,
 +	OTHER_LEVEL_SPACE_HOLDER,
@@ -10815,7 +10998,7 @@ index f921302dc..2fade7dab 100644
  
  #endif /* _KERNEL_SCHED_PELT_H */
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index ebccf24b3..221ab580d 100644
+index c00b1be12..d2bfc8aa3 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -5,6 +5,10 @@
@@ -10829,7 +11012,7 @@ index ebccf24b3..221ab580d 100644
  #include <linux/prandom.h>
  #include <linux/sched/affinity.h>
  #include <linux/sched/autogroup.h>
-@@ -4040,4 +4044,9 @@ DEFINE_CLASS_IS_UNCONDITIONAL(sched_change)
+@@ -4042,4 +4046,9 @@ DEFINE_CLASS_IS_UNCONDITIONAL(sched_change)
  
  #include "ext.h"
  
