@@ -1,7 +1,7 @@
-From 3e296a05de859a3990e55f6eed75cc3c6ded98e2 Mon Sep 17 00:00:00 2001
+From ed691f00ccdc0c398de24a5d3e9117cfad9df48d Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 16 Feb 2026 06:40:47 +0900
-Subject: [PATCH] 6.18.3-poc-selector-v2.0.0
+Date: Wed, 25 Feb 2026 07:24:17 +0900
+Subject: [PATCH] 6.18.3-poc-selector-v2.0.1
 
 ---
  include/linux/sched/topology.h |  33 +-
@@ -167,7 +167,7 @@ index c39b089d4f..3fffa1a43f 100644
  	 * be set, propagate it into PREEMPT_NEED_RESCHED.
 diff --git a/kernel/sched/poc_selector.c b/kernel/sched/poc_selector.c
 new file mode 100644
-index 0000000000..2d055d4950
+index 0000000000..f284cec5f3
 --- /dev/null
 +++ b/kernel/sched/poc_selector.c
 @@ -0,0 +1,927 @@
@@ -210,7 +210,7 @@ index 0000000000..2d055d4950
 +#define SCHED_POC_SELECTOR_AUTHOR   "Masahito Suzuki"
 +#define SCHED_POC_SELECTOR_PROGNAME "Piece-Of-Cake (POC) CPU Selector"
 +
-+#define SCHED_POC_SELECTOR_VERSION  "2.0.0"
++#define SCHED_POC_SELECTOR_VERSION  "2.0.1"
 +
 +/**************************************************************
 + * Static keys:
@@ -512,15 +512,15 @@ index 0000000000..2d055d4950
 +
 +/*
 + * poc_select_rr - Round-robin idle CPU selection from a single-word mask
-+ * @mask: idle bitmask (snapshot)
 + * @base: poc_cpu_base (smallest CPU ID in this LLC)
++ * @mask: idle bitmask (snapshot)
 + * @seed: per-CPU round-robin seed
 + *
 + * Selects uniformly among set bits via FASTRANGE + PTSELECT.
 + * Caller must ensure at least one bit is set in mask.
 + * Returns: selected CPU number.
 + */
-+static __always_inline int poc_select_rr(u64 mask, int base, unsigned int seed)
++static __always_inline int poc_select_rr(int base, u64 mask, unsigned int seed)
 +{
 +	int total = hweight64(mask);
 +	int pick = POC_FASTRANGE(seed, total);
@@ -530,18 +530,17 @@ index 0000000000..2d055d4950
 +
 +/*
 + * poc_cluster_search - Search for an idle CPU within the target's L2 cluster
-+ * @mask: snapshot of idle bitmask (cores or cpus, caller decides)
-+ * @sd_share: per-LLC shared data containing cluster geometry
-+ * @tgt_bit: target CPU's POC-relative bit position
 + * @base: poc_cpu_base (smallest CPU ID in this LLC)
++ * @tgt_bit: target CPU's POC-relative bit position
++ * @sd_share: per-LLC shared data containing cluster geometry
++ * @mask: snapshot of idle bitmask (cores or cpus, caller decides)
++ * @seed: per-CPU round-robin seed
 + *
 + * Uses pre-computed cluster mask for O(1) lookup via CTZ.
 + * Returns: idle CPU number if found within cluster, -1 otherwise.
 + */
-+static __always_inline int poc_cluster_search(u64 mask,
-+					      struct sched_domain_shared *sd_share,
-+					      int tgt_bit, int base,
-+					      unsigned int seed)
++static __always_inline int poc_cluster_search(int base, int tgt_bit,
++	struct sched_domain_shared *sd_share, u64 mask, unsigned int seed)
 +{
 +	u64 cls_mask, cls_idle;
 +
@@ -549,7 +548,7 @@ index 0000000000..2d055d4950
 +	cls_idle = mask & cls_mask;
 +
 +	if (cls_idle)
-+		return poc_select_rr(cls_idle, base, seed);
++		return poc_select_rr(base, cls_idle, seed);
 +
 +	return -1;
 +}
@@ -557,28 +556,23 @@ index 0000000000..2d055d4950
 +#ifdef CONFIG_SCHED_SMT
 +/*
 + * poc_find_idle_smt_sibling - Find an idle CPU among target and its SMT siblings
-+ * @target: CPU to find sibling for (included in search)
++ * @base: poc_cpu_base (smallest CPU ID in this LLC)
++ * @tgt_bit: target CPU's POC-relative bit position
 + * @cpu_mask: snapshot of idle CPU bitmask
-+ * @base: base CPU number for this LLC
-+ * @smt_siblings: pre-computed SMT sibling masks (excludes self)
++ * @smt_mask: pre-computed SMT sibling mask for target (includes self)
 + *
 + * Searches target itself and its SMT siblings for an idle CPU.
-+ * Target is checked first (lowest bit wins via CTZ only if target
-+ * has a lower CPU number; otherwise explicit check).
++ * Target is checked first for cache locality.
 + * Returns: idle CPU number if found, -1 otherwise
 + */
-+static __always_inline int poc_find_idle_smt_sibling(int target,
-+				u64 cpu_mask, int base, const u64 *smt_siblings)
++static __always_inline int poc_find_idle_smt_sibling(
++	int base, int tgt_bit, u64 cpu_mask, u64 smt_mask)
 +{
-+	int tgt_bit = target - base;
-+	u64 sib_mask, idle_sibs;
-+
 +	/* Check target first for cache locality */
 +	if (cpu_mask & (1ULL << tgt_bit))
-+		return target;
++		return base + tgt_bit;
 +
-+	sib_mask = smt_siblings[tgt_bit];
-+	idle_sibs = cpu_mask & sib_mask;
++	u64 idle_sibs = cpu_mask & smt_mask;
 +
 +	if (idle_sibs)
 +		return base + POC_CTZ64(idle_sibs);
@@ -631,8 +625,14 @@ index 0000000000..2d055d4950
 +	affinity = poc_cpumask_to_u64(allowed, sd_share);
 +
 +#ifdef CONFIG_SCHED_SMT
-+	prefetch(&sd_share->poc_idle_cores_mask);
-+	prefetch(&sd_share->poc_smt_mask[tgt_bit]);
++	if (sched_smt_active()) {
++		/* Level 0: Saturation (fast) — no idle CPU */
++		if (!READ_ONCE(sd_share->has_idle_cores))
++			return -1;
++
++		prefetch(&sd_share->poc_idle_cores_mask);
++		prefetch(&sd_share->poc_smt_mask[tgt_bit]);
++	}
 +#endif
 +
 +	cpu_mask = poc_read_idle_cpus(sd_share) & affinity;
@@ -657,7 +657,7 @@ index 0000000000..2d055d4950
 +		if (static_branch_unlikely(&sched_poc_prefer_idle_smt) || !core_mask) {
 +			/* Level 4: target/sibling (all cores busy) */
 +			int smt_cpu = poc_find_idle_smt_sibling(
-+				target, cpu_mask, base, sd_share->poc_smt_mask);
++				base, tgt_bit, cpu_mask, sd_share->poc_smt_mask[tgt_bit]);
 +			if (smt_cpu >= 0) {
 +				poc_count(POC_LV4);
 +				return smt_cpu;
@@ -689,8 +689,8 @@ index 0000000000..2d055d4950
 +		if (static_branch_likely(&sched_poc_l2_cluster_search)
 +				&& static_branch_unlikely(&sched_cluster_active)
 +				&& sd_share->poc_cluster_valid) {
-+			int cpu = poc_cluster_search(cpu_mask, sd_share,
-+						     tgt_bit, base, seed);
++			int cpu = poc_cluster_search(
++				base, tgt_bit, sd_share, cpu_mask, seed);
 +			if (cpu >= 0) {
 +				poc_count(POC_LV2 + level_offset);
 +				return cpu;
@@ -699,7 +699,7 @@ index 0000000000..2d055d4950
 +
 +		/* Level 3/6: idle core/cpu across LLC via RR */
 +		poc_count(POC_LV3 + level_offset);
-+		return poc_select_rr(cpu_mask, base, seed);
++		return poc_select_rr(base, cpu_mask, seed);
 +	}
 +}
 +
