@@ -1,7 +1,7 @@
-From 5bbde9c8c2110b12a37075f7b1b8aa498c77319f Mon Sep 17 00:00:00 2001
+From 56b9692daf3433f7bae6663c9f491a72e52a3530 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 27 Feb 2026 16:02:04 +0900
-Subject: [PATCH] 6.18.3-nap-v0.1.0
+Date: Sat, 28 Feb 2026 12:09:18 +0900
+Subject: [PATCH] 6.18.3-nap-v0.1.2
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
@@ -9,11 +9,11 @@ Subject: [PATCH] 6.18.3-nap-v0.1.0
  drivers/cpuidle/governors/nap/Makefile        |  32 +
  drivers/cpuidle/governors/nap/nap.c           | 621 ++++++++++++++++++
  drivers/cpuidle/governors/nap/nap.h           | 258 ++++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 432 ++++++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c       | 449 +++++++++++++
  drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 162 +++++
- drivers/cpuidle/governors/nap/nap_nn_avx512.c | 174 +++++
+ drivers/cpuidle/governors/nap/nap_nn_avx512.c | 197 ++++++
  drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 169 +++++
- 9 files changed, 1866 insertions(+)
+ 9 files changed, 1906 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -99,7 +99,7 @@ index 0000000000..325f63584c
 +CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma -mavx512f
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..c25d203bd2
+index 0000000000..7c28dc9704
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
 @@ -0,0 +1,621 @@
@@ -144,7 +144,7 @@ index 0000000000..c25d203bd2
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.1.0"
++#define CPUIDLE_NAP_VERSION  "0.1.2"
 +
 +/* Governor defaults */
 +#define NAP_DEFAULT_LR_MILLTHS    1     /* 0.001 = 1 millths */
@@ -694,7 +694,7 @@ index 0000000000..c25d203bd2
 +
 +static struct cpuidle_governor nap_governor = {
 +	.name    = "nap",
-+	.rating  = 15,
++	.rating  = 26,
 +	.enable  = nap_enable,
 +	.disable = nap_disable,
 +	.select  = nap_select,
@@ -990,10 +990,10 @@ index 0000000000..b2871942df
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000..335ea5e03d
+index 0000000000..b194f26a01
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,449 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1284,12 +1284,20 @@ index 0000000000..335ea5e03d
 +	out[9]  = (d->intercept_window > 0)
 +		? (float)d->intercept_recent / (float)d->intercept_window
 +		: 0.0f;
-+	out[10] = (float)(d->last_prediction_error / 1000);
++	/* Sign-preserving log2 scale: maps ±N µs → ±log2(N+1) */
++	{
++		float err_f = (float)(d->last_prediction_error / 1000);
++
++		out[10] = (err_f >= 0.0f)
++			?  fast_log2f(err_f + 1.0f)
++			: -fast_log2f(-err_f + 1.0f);
++	}
 +	out[11] = log_results[2];
 +
 +	/* Group D: External signals */
 +	out[12] = tick_nohz_tick_stopped() ? 1.0f : 0.0f;
-+	out[13] = (float)min_t(unsigned int, nr_iowait_cpu(dev->cpu), 1000);
++	/* Clamp to 8 tasks then normalize to [0, 1] */
++	out[13] = (float)min_t(unsigned int, nr_iowait_cpu(dev->cpu), 8) / 8.0f;
 +
 +	latency_req = cpuidle_governor_latency_req(dev->cpu);
 +	{
@@ -1311,18 +1319,29 @@ index 0000000000..335ea5e03d
 +static int compute_ideal_state(struct cpuidle_driver *drv, u64 actual_ns)
 +{
 +	int i, best = 0;
-+	/* Score 0 baseline: states with negative scores are worse than C0 */
 +	s64 best_score = 0;
 +
 +	for (i = 1; i < drv->state_count; i++) {
 +		struct cpuidle_state *s = &drv->states[i];
-+		s64 margin, score;
++		s64 score;
 +
-+		if (actual_ns < s->target_residency_ns)
++		/*
++		 * Responsiveness criterion: only consider a state "ideal" if
++		 * the CPU slept long enough to cover both the minimum residency
++		 * and the exit latency.  This ensures the wakeup did not incur
++		 * avoidable latency that the caller would have felt.
++		 */
++		if (actual_ns < s->target_residency_ns + s->exit_latency_ns)
 +			continue;
 +
-+		margin = actual_ns - s->target_residency_ns;
-+		score = margin * (i + 1) - (s64)s->exit_latency_ns;
++		/*
++		 * Score: net sleep benefit with exit latency as a fair cost.
++		 * The former (i+1) depth multiplier is removed; it biased the
++		 * label toward deeper states regardless of actual benefit and
++		 * worked against responsiveness.
++		 */
++		score = (s64)(actual_ns - s->target_residency_ns)
++			- (s64)s->exit_latency_ns;
 +
 +		if (score > best_score) {
 +			best = i;
@@ -1369,15 +1388,13 @@ index 0000000000..335ea5e03d
 +	/* Deferred learning (always, even during warmup) */
 +	if (d->needs_learn) {
 +		int ideal = compute_ideal_state(drv, d->learn_actual_ns);
++		int nn_best = nap_nn_argmax(d->nn_output, drv->state_count);
++		bool hit = (nn_best == ideal);
 +
 +		d->stats.learn_count++;
 +
 +		/* Track NN accuracy for convergence detection */
 +		if (!d->converged) {
-+			int nn_best = nap_nn_argmax(d->nn_output,
-+						    drv->state_count);
-+			bool hit = (nn_best == ideal);
-+
 +			d->ema_accuracy += (hit ? 64 : 0)
 +					   - (d->ema_accuracy >> 4);
 +
@@ -1392,7 +1409,7 @@ index 0000000000..335ea5e03d
 +			}
 +		}
 +
-+		if (ideal != d->last_selected_idx)
++		if (!hit)
 +			nap_nn_learn(d, ideal);
 +		d->needs_learn = false;
 +	}
@@ -1596,10 +1613,10 @@ index 0000000000..6a0323012d
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx512.c b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
 new file mode 100644
-index 0000000000..0460e877c6
+index 0000000000..11aa4a8ba3
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,197 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx512.c — AVX-512F forward pass and backpropagation for the nap MLP
@@ -1615,6 +1632,36 @@ index 0000000000..0460e877c6
 +
 +/* __mmask16 is not available without immintrin.h in kernel space */
 +typedef unsigned short __mmask16;
++
++/*
++ * Portable zmm max/min wrappers.
++ *
++ * GCC exposes masked 5-argument builtins:
++ *   __builtin_ia32_maxps512_mask(a, b, passthrough, mask, rounding)
++ * Clang exposes unmasked 3-argument builtins:
++ *   __builtin_ia32_maxps512(a, b, rounding)
++ * Both produce the same vmaxps/vminps zmm instruction when the mask
++ * is all-ones (0xFFFF) and the rounding mode is current-direction (0x04).
++ */
++#ifdef __clang__
++static inline v16sf v16sf_max(v16sf a, v16sf b)
++{
++	return __builtin_ia32_maxps512(a, b, 0x04 /* _MM_FROUND_CUR_DIRECTION */);
++}
++static inline v16sf v16sf_min(v16sf a, v16sf b)
++{
++	return __builtin_ia32_minps512(a, b, 0x04);
++}
++#else
++static inline v16sf v16sf_max(v16sf a, v16sf b)
++{
++	return __builtin_ia32_maxps512_mask(a, b, a, (__mmask16)0xFFFF, 0x04);
++}
++static inline v16sf v16sf_min(v16sf a, v16sf b)
++{
++	return __builtin_ia32_minps512_mask(a, b, a, (__mmask16)0xFFFF, 0x04);
++}
++#endif
 +
 +/* FMA: a*b+c → vfmadd231ps zmm
 + * gcc-12+ uses _mask variant with full mask (0xFFFF) for 16 lanes. */
@@ -1648,9 +1695,7 @@ index 0000000000..0460e877c6
 +
 +	/* ReLU: max(0, x) */
 +	v16sf zero = V16SF_SET1(0.0f);
-+	acc = __builtin_ia32_maxps512_mask(acc, zero, acc,
-+					   (__mmask16)0xFFFF,
-+					   0x04 /* _MM_FROUND_CUR_DIRECTION */);
++	acc = v16sf_max(acc, zero);
 +	*(v16sf *)&hidden_save[0] = acc;
 +
 +	/* === Output layer: 10 outputs = 1×ymm (8) + 2 scalars === */
@@ -1678,12 +1723,7 @@ index 0000000000..0460e877c6
 +/* zmm clamp: max(min(v, hi), lo) */
 +static inline v16sf v16sf_clamp(v16sf v, v16sf lo, v16sf hi)
 +{
-+	v16sf t = __builtin_ia32_minps512_mask(v, hi, v,
-+					       (__mmask16)0xFFFF,
-+					       0x04);
-+	return __builtin_ia32_maxps512_mask(t, lo, t,
-+					    (__mmask16)0xFFFF,
-+					    0x04);
++	return v16sf_max(v16sf_min(v, hi), lo);
 +}
 +
 +/*
