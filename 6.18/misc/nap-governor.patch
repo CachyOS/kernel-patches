@@ -1,19 +1,19 @@
-From 56b9692daf3433f7bae6663c9f491a72e52a3530 Mon Sep 17 00:00:00 2001
+From e74d5ea717a83cb1c1856ae2eb2c0d13c30f6f89 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 28 Feb 2026 12:09:18 +0900
-Subject: [PATCH] 6.18.3-nap-v0.1.2
+Date: Mon, 2 Mar 2026 00:46:32 +0900
+Subject: [PATCH] 6.18.3-nap-v0.1.7r2
 
 ---
  drivers/cpuidle/Kconfig                       |  17 +
  drivers/cpuidle/governors/Makefile            |   1 +
- drivers/cpuidle/governors/nap/Makefile        |  32 +
- drivers/cpuidle/governors/nap/nap.c           | 621 ++++++++++++++++++
- drivers/cpuidle/governors/nap/nap.h           | 258 ++++++++
- drivers/cpuidle/governors/nap/nap_fpu.c       | 449 +++++++++++++
- drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 162 +++++
- drivers/cpuidle/governors/nap/nap_nn_avx512.c | 197 ++++++
- drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 169 +++++
- 9 files changed, 1906 insertions(+)
+ drivers/cpuidle/governors/nap/Makefile        |  33 +
+ drivers/cpuidle/governors/nap/nap.c           | 636 ++++++++++++++++++
+ drivers/cpuidle/governors/nap/nap.h           | 264 ++++++++
+ drivers/cpuidle/governors/nap/nap_fpu.c       | 472 +++++++++++++
+ drivers/cpuidle/governors/nap/nap_nn_avx2.c   | 221 ++++++
+ drivers/cpuidle/governors/nap/nap_nn_avx512.c | 239 +++++++
+ drivers/cpuidle/governors/nap/nap_nn_sse2.c   | 160 +++++
+ 9 files changed, 2043 insertions(+)
  create mode 100644 drivers/cpuidle/governors/nap/Makefile
  create mode 100644 drivers/cpuidle/governors/nap/nap.c
  create mode 100644 drivers/cpuidle/governors/nap/nap.h
@@ -61,10 +61,10 @@ index 63abb5393a..ae688891c0 100644
 +obj-$(CONFIG_CPU_IDLE_GOV_NAP) += nap/
 diff --git a/drivers/cpuidle/governors/nap/Makefile b/drivers/cpuidle/governors/nap/Makefile
 new file mode 100644
-index 0000000000..325f63584c
+index 0000000000..bb983497a4
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/Makefile
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +# SPDX-License-Identifier: GPL-2.0-only
 +#
 +# Makefile for the NAP cpuidle governor
@@ -96,13 +96,14 @@ index 0000000000..325f63584c
 +CFLAGS_nap_fpu.o       += $(CC_FLAGS_FPU)
 +CFLAGS_nap_nn_sse2.o   += $(CC_FLAGS_FPU)
 +CFLAGS_nap_nn_avx2.o   += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma
-+CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma -mavx512f
++CFLAGS_nap_nn_avx512.o += $(CC_FLAGS_FPU) -mavx -mavx2 -mfma -mavx512f \
++			   -Wframe-larger-than=4096
 diff --git a/drivers/cpuidle/governors/nap/nap.c b/drivers/cpuidle/governors/nap/nap.c
 new file mode 100644
-index 0000000000..7c28dc9704
+index 0000000000..e9a9c225de
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.c
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,636 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap.c — Neural Adaptive Predictor cpuidle governor
@@ -127,6 +128,7 @@ index 0000000000..7c28dc9704
 +#include <linux/kobject.h>
 +#include <linux/math64.h>
 +#include <linux/percpu.h>
++#include <linux/sched/clock.h>
 +#include <linux/sysfs.h>
 +#include <linux/string.h>
 +#include <asm/simd.h>
@@ -144,7 +146,7 @@ index 0000000000..7c28dc9704
 +#define CPUIDLE_NAP_PROGNAME "Nap CPUIdle Governor"
 +#define CPUIDLE_NAP_AUTHOR   "Masahito Suzuki"
 +
-+#define CPUIDLE_NAP_VERSION  "0.1.2"
++#define CPUIDLE_NAP_VERSION  "0.1.7"
 +
 +/* Governor defaults */
 +#define NAP_DEFAULT_LR_MILLTHS    1     /* 0.001 = 1 millths */
@@ -160,15 +162,29 @@ index 0000000000..7c28dc9704
 +DEFINE_STATIC_KEY_FALSE(nap_use_avx512);
 +DEFINE_STATIC_KEY_FALSE(nap_use_avx2);
 +
++/*
++ * Intel CPUs (Skylake through Sapphire Rapids) reduce core frequency
++ * when executing 512-bit AVX instructions ("AVX-512 heavy" license).
++ * Recovery takes ~670 µs, so using AVX-512 right before entering idle
++ * can hurt wakeup latency on shallow C-states (C1).
++ *
++ * The cycle savings from AVX-512 over AVX2 are small (~2-4 ns after
++ * accumulator splitting), far outweighed by the frequency penalty.
++ * AMD Zen 4+ does not throttle on AVX-512, so we enable it there.
++ */
 +static void __init nap_detect_simd(void)
 +{
-+	if (boot_cpu_has(X86_FEATURE_AVX512F)) {
++	if (boot_cpu_has(X86_FEATURE_AVX512F) &&
++	    boot_cpu_data.x86_vendor != X86_VENDOR_INTEL) {
 +		static_branch_enable(&nap_use_avx512);
-+		pr_info("nap: using AVX-512F\n");
++		pr_info("nap: using AVX-512F (no frequency penalty)\n");
 +	} else if (boot_cpu_has(X86_FEATURE_FMA) &&
 +		   boot_cpu_has(X86_FEATURE_AVX2)) {
 +		static_branch_enable(&nap_use_avx2);
-+		pr_info("nap: using AVX2+FMA\n");
++		if (boot_cpu_has(X86_FEATURE_AVX512F))
++			pr_info("nap: using AVX2+FMA (AVX-512 avoided for frequency stability)\n");
++		else
++			pr_info("nap: using AVX2+FMA\n");
 +	} else {
 +		pr_info("nap: using SSE2\n");
 +	}
@@ -223,7 +239,7 @@ index 0000000000..7c28dc9704
 +	u64 cur_irq = kstat_cpu_irqs_sum(cpu);
 +
 +	d->prev_irq_count = cur_irq;
-+	d->prev_idle_exit = ktime_get();
++	d->prev_idle_exit = local_clock();
 +}
 +
 +/* ================================================================
@@ -726,10 +742,10 @@ index 0000000000..7c28dc9704
 +postcore_initcall(nap_init);
 diff --git a/drivers/cpuidle/governors/nap/nap.h b/drivers/cpuidle/governors/nap/nap.h
 new file mode 100644
-index 0000000000..b2871942df
+index 0000000000..aa17bce33b
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap.h
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,264 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef NAP_H
 +#define NAP_H
@@ -745,14 +761,10 @@ index 0000000000..b2871942df
 +#define NAP_INPUT_SIZE    16
 +#define NAP_HIDDEN_SIZE   16
 +#define NAP_OUTPUT_SIZE   CPUIDLE_STATE_MAX
++#define NAP_OUTPUT_STRIDE 16  /* SIMD-padded output dimension */
 +
-+/*
-+ * The SIMD forward/backward implementations (SSE2, AVX2, AVX-512) handle
-+ * the output layer as 2×xmm (8 floats) + 2 scalars, i.e. exactly 10.
-+ * If CPUIDLE_STATE_MAX ever changes, those routines must be updated.
-+ */
-+static_assert(NAP_OUTPUT_SIZE == 10,
-+	      "NAP SIMD kernels are hard-coded for 10 output neurons");
++static_assert(NAP_OUTPUT_SIZE <= NAP_OUTPUT_STRIDE,
++	      "NAP_OUTPUT_SIZE must not exceed NAP_OUTPUT_STRIDE");
 +
 +/*
 + * Neural network weight structure for a 16→16→10 MLP.
@@ -761,18 +773,21 @@ index 0000000000..b2871942df
 + * This layout enables efficient column-wise matrix-vector products where
 + * each input broadcasts across all output neurons via SIMD FMA.
 + *
++ * Output arrays use NAP_OUTPUT_STRIDE (16) instead of NAP_OUTPUT_SIZE (10)
++ * so that each row is 64-byte aligned and fits exactly in SSE (4×xmm),
++ * AVX2 (2×ymm), or AVX-512 (1×zmm) registers with no scalar tail.
++ *
 + * __aligned(64) ensures both AVX2 (vmovaps, 32-byte) and AVX-512
 + * (vmovaps, 64-byte) aligned loads work correctly.
 + */
 +struct nap_weights {
 +	/* Hidden layer: input[16] → hidden[16] */
-+	float w_h1[NAP_INPUT_SIZE][NAP_HIDDEN_SIZE];   /* 256 params */
-+	float b_h1[NAP_HIDDEN_SIZE];                    /* 16 params  */
-+	/* Output layer: hidden[16] → output[10] */
-+	float w_out[NAP_HIDDEN_SIZE][NAP_OUTPUT_SIZE];  /* 160 params */
-+	float b_out[NAP_OUTPUT_SIZE];                   /* 10 params  */
++	float w_h1[NAP_INPUT_SIZE][NAP_HIDDEN_SIZE];      /* 256 params */
++	float b_h1[NAP_HIDDEN_SIZE];                       /* 16 params  */
++	/* Output layer: hidden[16] → output[10], padded to 16 */
++	float w_out[NAP_HIDDEN_SIZE][NAP_OUTPUT_STRIDE];   /* 160+pad    */
++	float b_out[NAP_OUTPUT_STRIDE];                    /* 10+pad     */
 +} __aligned(64);
-+/* Total: 442 parameters = 1,768 bytes */
 +
 +/* ISA-specific forward pass implementations */
 +void nap_nn_forward_sse2(const float *input, float *output,
@@ -935,25 +950,32 @@ index 0000000000..b2871942df
 +
 +	/* External signal tracking */
 +	u64     prev_irq_count;
-+	ktime_t prev_idle_exit;
++	u64     prev_idle_exit;
 +	s64     last_predicted_ns;
 +	s64     last_prediction_error;
 +
 +	/* select/reflect handoff */
 +	int   last_selected_idx;
-+	float nn_output[NAP_OUTPUT_SIZE];
 +	/*
-+	 * hidden_out[] is written with aligned SIMD stores in
-+	 * nap_nn_forward_{sse2,avx2,avx512}():
++	 * nn_output[], hidden_out[], features_f32[] are written with
++	 * aligned SIMD stores in nap_nn_forward_{sse2,avx2,avx512}()
++	 * and nap_extract_features():
 +	 *   SSE2:   movaps  (16-byte aligned)
 +	 *   AVX2:   vmovaps (32-byte aligned)
 +	 *   AVX-512: vmovaps zmm (64-byte aligned)
-+	 * Without __aligned(64), the natural struct offset of this
-+	 * field (228) is only 4-byte aligned, causing #GP faults
-+	 * in the idle task → "Attempted to kill the idle task!" panic.
++	 * Without __aligned(64), the natural struct offset would be
++	 * only 4-byte aligned, causing #GP faults in the idle task.
++	 *
++	 * nap_fpu_select() writes directly to these arrays, avoiding
++	 * intermediate buffers and memcpy.
 +	 */
++	float nn_output[NAP_OUTPUT_STRIDE] __aligned(64);
 +	float hidden_out[NAP_HIDDEN_SIZE] __aligned(64);
-+	float features_f32[NAP_NUM_FEATURES];
++	float features_f32[NAP_NUM_FEATURES] __aligned(64);
++
++	/* Backprop scratch (avoids 64-byte-aligned stack arrays) */
++	float learn_d_out[NAP_OUTPUT_STRIDE] __aligned(64);
++	float learn_d_hid[NAP_HIDDEN_SIZE] __aligned(64);
 +
 +	/* Deferred learning data */
 +	bool  needs_learn;
@@ -990,10 +1012,10 @@ index 0000000000..b2871942df
 +#endif /* NAP_H */
 diff --git a/drivers/cpuidle/governors/nap/nap_fpu.c b/drivers/cpuidle/governors/nap/nap_fpu.c
 new file mode 100644
-index 0000000000..b194f26a01
+index 0000000000..4f88baf4d0
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_fpu.c
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,472 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_fpu.c — FPU/SIMD code for the NAP cpuidle governor
@@ -1011,6 +1033,7 @@ index 0000000000..b194f26a01
 +#include <linux/kernel_stat.h>
 +#include <linux/math64.h>
 +#include <linux/percpu.h>
++#include <linux/sched/clock.h>
 +#include <linux/sched/stat.h>
 +#include <linux/string.h>
 +#include <linux/tick.h>
@@ -1020,13 +1043,6 @@ index 0000000000..b194f26a01
 +/* ================================================================
 + * Float math helpers
 + * ================================================================ */
-+
-+static inline float sse_sqrtf(float x)
-+{
-+	v4sf v = { x, 0, 0, 0 };
-+	v4sf r = __builtin_ia32_sqrtps(v);
-+	return r[0];
-+}
 +
 +static inline float float_min(float a, float b) { return a < b ? a : b; }
 +static inline float float_max(float a, float b) { return a > b ? a : b; }
@@ -1106,8 +1122,8 @@ index 0000000000..b194f26a01
 +	int i, j;
 +
 +	/* Xavier uniform: U(-sqrt(6/(fan_in+fan_out)), +sqrt(6/(...))) */
-+	scale_h1  = sse_sqrtf(6.0f / (float)(NAP_INPUT_SIZE + NAP_HIDDEN_SIZE));
-+	scale_out = sse_sqrtf(6.0f / (float)(NAP_HIDDEN_SIZE + NAP_OUTPUT_SIZE));
++	scale_h1  = __builtin_sqrtf(6.0f / (float)(NAP_INPUT_SIZE + NAP_HIDDEN_SIZE));
++	scale_out = __builtin_sqrtf(6.0f / (float)(NAP_HIDDEN_SIZE + NAP_OUTPUT_SIZE));
 +
 +	/* Hidden layer weights */
 +	for (i = 0; i < NAP_INPUT_SIZE; i++)
@@ -1117,16 +1133,17 @@ index 0000000000..b194f26a01
 +	/* Hidden biases: zero (standard) */
 +	memset(w->b_h1, 0, sizeof(w->b_h1));
 +
-+	/* Output layer weights */
++	/* Output layer weights (zero padding columns for SIMD) */
++	memset(w->w_out, 0, sizeof(w->w_out));
 +	for (j = 0; j < NAP_HIDDEN_SIZE; j++)
 +		for (i = 0; i < NAP_OUTPUT_SIZE; i++)
 +			w->w_out[j][i] = nap_prng_float(&rng) * scale_out;
 +
 +	/* Output biases: -0.1 * log2(exit_latency_ns) per state.
 +	 * Shallow states get ~0, deep states get ~-1.7.
-+	 * Unused states get -100 to ensure they're never selected.
++	 * Unused/padding slots get -100 to ensure they're never selected.
 +	 */
-+	for (i = 0; i < NAP_OUTPUT_SIZE; i++) {
++	for (i = 0; i < NAP_OUTPUT_STRIDE; i++) {
 +		if (drv && i < drv->state_count) {
 +			float lat = float_max(
 +				(float)drv->states[i].exit_latency_ns, 1.0f);
@@ -1141,111 +1158,103 @@ index 0000000000..b194f26a01
 + * Feature extraction helpers
 + * ================================================================ */
 +
-+static float logring_avg(const struct nap_cpu_data *d)
++struct logring_stats {
++	float avg;
++	float min;
++	float max;
++	float stdev;
++	float trend;
++};
++
++/*
++ * Compute all log_history statistics in one function: avg, min, max,
++ * stdev (single-pass via E[x²]-E[x]²), and trend (older vs recent
++ * half).  The trend loop accesses the same 8 elements already cached
++ * by the stats loop, so fusing avoids a separate function call.
++ */
++static void logring_compute(const struct nap_cpu_data *d,
++			    struct logring_stats *s)
 +{
 +	int i, n = d->hist_count;
-+	float sum = 0.0f;
++	float sum, sq_sum, val, avg, inv_n, diff;
 +
-+	if (n == 0)
-+		return 0.0f;
-+	for (i = 0; i < n; i++)
-+		sum += d->log_history[i];
-+	return sum / (float)n;
-+}
-+
-+static float logring_min(const struct nap_cpu_data *d)
-+{
-+	int i, n = d->hist_count;
-+	float m;
-+
-+	if (n == 0)
-+		return 0.0f;
-+	m = d->log_history[0];
-+	for (i = 1; i < n; i++)
-+		m = float_min(m, d->log_history[i]);
-+	return m;
-+}
-+
-+static float logring_max(const struct nap_cpu_data *d)
-+{
-+	int i, n = d->hist_count;
-+	float m;
-+
-+	if (n == 0)
-+		return 0.0f;
-+	m = d->log_history[0];
-+	for (i = 1; i < n; i++)
-+		m = float_max(m, d->log_history[i]);
-+	return m;
-+}
-+
-+static float logring_stdev(const struct nap_cpu_data *d)
-+{
-+	int i, n = d->hist_count;
-+	float avg, var_sum = 0.0f, diff;
-+
-+	if (n < 2)
-+		return 0.0f;
-+	avg = logring_avg(d);
-+	for (i = 0; i < n; i++) {
-+		diff = d->log_history[i] - avg;
-+		var_sum += diff * diff;
-+	}
-+	return sse_sqrtf(var_sum / (float)n);
-+}
-+
-+static float compute_trend(const struct nap_cpu_data *d)
-+{
-+	int i, base;
-+	float recent = 0.0f, older = 0.0f, avg;
-+
-+	if (d->hist_count < NAP_HISTORY_SIZE)
-+		return 0.0f;
-+
-+	base = d->hist_idx;
-+	for (i = 0; i < 4; i++) {
-+		older  += d->log_history[(base + i) % NAP_HISTORY_SIZE];
-+		recent += d->log_history[(base + 4 + i) % NAP_HISTORY_SIZE];
++	if (n == 0) {
++		*s = (struct logring_stats){ 0 };
++		return;
 +	}
 +
-+	avg = logring_avg(d);
-+	if (avg == 0.0f)
-+		return 0.0f;
++	sum = d->log_history[0];
++	sq_sum = sum * sum;
++	s->min = sum;
++	s->max = sum;
 +
-+	return (recent - older) / (4.0f * avg);
++	for (i = 1; i < n; i++) {
++		val = d->log_history[i];
++		sum += val;
++		sq_sum += val * val;
++		s->min = float_min(s->min, val);
++		s->max = float_max(s->max, val);
++	}
++
++	inv_n = 1.0f / (float)n;
++	avg = sum * inv_n;
++	s->avg = avg;
++
++	if (n < 2) {
++		s->stdev = 0.0f;
++		s->trend = 0.0f;
++		return;
++	}
++
++	/* Var = E[x²] - E[x]² — single-pass, no second loop needed */
++	diff = sq_sum * inv_n - avg * avg;
++	s->stdev = __builtin_sqrtf(float_max(diff, 0.0f));
++
++	/* Trend: compare older half vs recent half of the ring buffer */
++	if (n < NAP_HISTORY_SIZE || avg == 0.0f) {
++		s->trend = 0.0f;
++	} else {
++		int base = d->hist_idx;
++		float older = 0.0f, recent = 0.0f;
++
++		for (i = 0; i < 4; i++) {
++			older  += d->log_history[(base + i) & 7];
++			recent += d->log_history[(base + 4 + i) & 7];
++		}
++		s->trend = (recent - older) / (4.0f * avg);
++	}
 +}
 +
-+static u64 compute_irq_rate(const struct nap_cpu_data *d)
++static u64 compute_irq_rate(const struct nap_cpu_data *d, u64 elapsed_ns)
 +{
 +	u64 cur_irq = kstat_cpu_irqs_sum(smp_processor_id());
-+	ktime_t now = ktime_get();
-+	u64 elapsed = ktime_to_ns(ktime_sub(now, d->prev_idle_exit));
 +	u64 delta_irq = cur_irq - d->prev_irq_count;
 +
-+	if (elapsed == 0)
++	if (elapsed_ns == 0)
 +		return 0;
-+	return div_u64(delta_irq * NSEC_PER_SEC, elapsed);
++	return div_u64(delta_irq * NSEC_PER_SEC, elapsed_ns);
 +}
 +
 +static void nap_extract_features(struct cpuidle_driver *drv,
 +				 struct cpuidle_device *dev,
-+				 float out[NAP_NUM_FEATURES])
++				 float out[NAP_NUM_FEATURES],
++				 s64 latency_req)
 +{
 +	struct nap_cpu_data *d = this_cpu_ptr(&nap_data);
++	struct logring_stats lr;
 +	ktime_t sleep_length, delta_tick;
 +	u64 busy_ns;
-+	s64 latency_req;
 +	float log_inputs[4] __attribute__((aligned(16)));
 +	float log_results[4] __attribute__((aligned(16)));
 +
 +	sleep_length = tick_nohz_get_sleep_length(&delta_tick);
 +
-+	busy_ns = ktime_to_ns(ktime_sub(ktime_get(), d->prev_idle_exit));
++	busy_ns = local_clock() - d->prev_idle_exit;
 +
 +	log_inputs[0] = (float)ktime_to_ns(sleep_length);
 +	log_inputs[1] = (float)dev->last_residency_ns;
 +	log_inputs[2] = (float)busy_ns;
-+	log_inputs[3] = (float)compute_irq_rate(d);
++	log_inputs[3] = (float)compute_irq_rate(d, busy_ns);
 +
 +	log_inputs[0] = float_max(log_inputs[0], 1.0f);
 +	log_inputs[1] = float_max(log_inputs[1], 1.0f);
@@ -1263,27 +1272,20 @@ index 0000000000..b194f26a01
 +		d->log_history[prev] = log_results[1];
 +	}
 +
++	/* Compute log_history statistics in a single pass */
++	logring_compute(d, &lr);
++
 +	/* Group A: Time prediction */
 +	out[0] = log_results[0];
 +	out[1] = log_results[1];
-+	out[2] = logring_avg(d);
-+	out[3] = logring_stdev(d);
++	out[2] = lr.avg;
++	out[3] = lr.stdev;
 +
 +	/* Group B: Pattern analysis */
-+	out[4] = logring_min(d);
-+	out[5] = logring_max(d);
-+	out[6] = compute_trend(d);
-+	out[7] = (d->total_count > 0)
-+		? (float)d->short_count / (float)d->total_count
-+		: 0.0f;
++	out[4] = lr.min;
++	out[5] = lr.max;
++	out[6] = lr.trend;
 +
-+	/* Group C: State feedback */
-+	out[8]  = (d->total_usage > 0)
-+		? (float)d->total_above / (float)d->total_usage
-+		: 0.0f;
-+	out[9]  = (d->intercept_window > 0)
-+		? (float)d->intercept_recent / (float)d->intercept_window
-+		: 0.0f;
 +	/* Sign-preserving log2 scale: maps ±N µs → ±log2(N+1) */
 +	{
 +		float err_f = (float)(d->last_prediction_error / 1000);
@@ -1296,18 +1298,59 @@ index 0000000000..b194f26a01
 +
 +	/* Group D: External signals */
 +	out[12] = tick_nohz_tick_stopped() ? 1.0f : 0.0f;
-+	/* Clamp to 8 tasks then normalize to [0, 1] */
-+	out[13] = (float)min_t(unsigned int, nr_iowait_cpu(dev->cpu), 8) / 8.0f;
-+
-+	latency_req = cpuidle_governor_latency_req(dev->cpu);
-+	{
-+		u64 deepest_lat =
-+			drv->states[drv->state_count - 1].exit_latency_ns;
-+		out[14] = (latency_req < S64_MAX && deepest_lat > 0)
-+			? (float)latency_req / (float)deepest_lat
-+			: 1.0f;
-+	}
++	out[13] = (float)min_t(unsigned int, nr_iowait_cpu(dev->cpu), 8)
++		  * 0.125f;
 +	out[15] = log_results[3];
++
++	/*
++	 * Batch 4 ratio features using SSE rcpps (~12-bit reciprocal
++	 * approximation) + mulps.  Replaces 4× divss (~44-56 cycles)
++	 * with 1× rcpps + 1× mulps (~5-8 cycles).  The 12-bit precision
++	 * is adequate for NN inputs — weights compensate for any bias.
++	 *
++	 * Denominators are set to 1.0f when zero to avoid rcpps(0)=Inf
++	 * and the resulting NaN from 0*Inf.
++	 */
++	{
++		float nums[4] __aligned(16);
++		float dens[4] __aligned(16);
++		v4sf ratios;
++		bool lat_valid;
++
++		/* out[7]: short_count / total_count */
++		nums[0] = (float)d->short_count;
++		dens[0] = (d->total_count > 0)
++			? (float)d->total_count : 1.0f;
++
++		/* out[8]: total_above / total_usage */
++		nums[1] = (float)d->total_above;
++		dens[1] = (d->total_usage > 0)
++			? (float)d->total_usage : 1.0f;
++
++		/* out[9]: intercept_recent / intercept_window */
++		nums[2] = (float)d->intercept_recent;
++		dens[2] = (d->intercept_window > 0)
++			? (float)d->intercept_window : 1.0f;
++
++		/* out[14]: latency_req / deepest_lat */
++		{
++			u64 deepest_lat =
++				drv->states[drv->state_count - 1]
++				    .exit_latency_ns;
++
++			lat_valid = (latency_req < S64_MAX &&
++				     deepest_lat > 0);
++			nums[3] = lat_valid ? (float)latency_req : 1.0f;
++			dens[3] = lat_valid ? (float)deepest_lat : 1.0f;
++		}
++
++		ratios = *(const v4sf *)nums
++			 * __builtin_ia32_rcpps(*(const v4sf *)dens);
++		out[7]  = ratios[0];
++		out[8]  = ratios[1];
++		out[9]  = ratios[2];
++		out[14] = ratios[3];
++	}
 +
 +	d->last_predicted_ns = ktime_to_ns(sleep_length);
 +}
@@ -1373,8 +1416,8 @@ index 0000000000..b194f26a01
 +		   struct cpuidle_device *dev,
 +		   struct nap_cpu_data *d)
 +{
-+	float features[NAP_NUM_FEATURES];
-+	float output[NAP_OUTPUT_SIZE];
++	s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
++
 +	/* Handle deferred weight reset (set by sysfs or nap_enable) */
 +	if (unlikely(d->reset_pending)) {
 +		nap_init_weights(&d->weights, drv);
@@ -1414,20 +1457,22 @@ index 0000000000..b194f26a01
 +		d->needs_learn = false;
 +	}
 +
-+	/* Feature extraction + NN forward pass */
-+	nap_extract_features(drv, dev, features);
-+	nap_nn_forward(features, output, d->hidden_out, &d->weights);
-+
-+	memcpy(d->nn_output, output, sizeof(output));
-+	memcpy(d->features_f32, features, sizeof(features));
++	/*
++	 * Feature extraction + NN forward pass.
++	 * Write directly to per-CPU arrays — no intermediate buffers.
++	 * features_f32 and nn_output are __aligned(64) in nap_cpu_data,
++	 * satisfying AVX-512 vmovaps requirements.
++	 */
++	nap_extract_features(drv, dev, d->features_f32, latency_req);
++	nap_nn_forward(d->features_f32, d->nn_output, d->hidden_out,
++		       &d->weights);
 +
 +	if (unlikely(!d->converged))
 +		return -1; /* Caller uses heuristic */
 +
 +	/* NN-based selection */
 +	{
-+		s64 latency_req = cpuidle_governor_latency_req(dev->cpu);
-+		float best_score = output[0];
++		float best_score = d->nn_output[0];
 +		int idx = 0, i;
 +
 +		for (i = 1; i < drv->state_count; i++) {
@@ -1435,8 +1480,8 @@ index 0000000000..b194f26a01
 +				continue;
 +			if (drv->states[i].exit_latency_ns > latency_req)
 +				continue;
-+			if (output[i] > best_score) {
-+				best_score = output[i];
++			if (d->nn_output[i] > best_score) {
++				best_score = d->nn_output[i];
 +				idx = i;
 +			}
 +		}
@@ -1445,10 +1490,10 @@ index 0000000000..b194f26a01
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx2.c b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
 new file mode 100644
-index 0000000000..6a0323012d
+index 0000000000..0f800d43f5
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx2.c
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,221 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx2.c — AVX2+FMA forward pass and backpropagation for the nap MLP
@@ -1465,10 +1510,104 @@ index 0000000000..6a0323012d
 +static inline v8sf v8sf_load(const float *p)   { return *(const v8sf *)p; }
 +static inline void v8sf_store(float *p, v8sf v) { *(v8sf *)p = v; }
 +
-+/* FMA: a*b+c → vfmadd231ps */
++/* FMA: a*b+c — inline asm guarantees a single vfmaddps instruction
++ * on both GCC and Clang without relying on compiler-specific builtins
++ * or -ffp-contract settings.
++ *
++ * vfmadd231ps chosen over 213: the accumulator/destination is c ("+x"),
++ * so live-through registers like v_neg_lr in the learn pass stay in
++ * read-only operands and need no extra vmovaps copy. */
 +static inline v8sf v8sf_fmadd(v8sf a, v8sf b, v8sf c)
 +{
-+	return __builtin_ia32_vfmaddps256(a, b, c);
++	/* vfmadd231ps: dest = src1 * src2 + dest → c = a*b + c */
++	asm("vfmadd231ps %2, %1, %0" : "+x"(c) : "x"(a), "xm"(b));
++	return c;
++}
++
++/*
++ * Split forward pass into noinline helpers so that each layer gets its
++ * own stack frame.  Without this, 8+8 ymm accumulators push the combined
++ * frame over 2 KiB due to register spills.
++ */
++static noinline void
++fwd_avx2_hidden(const float *input, float *hidden_save,
++		const struct nap_weights *w)
++{
++	int j;
++
++	/*
++	 * === Hidden layer: 16 outputs = 2×ymm, 4-way accumulator ===
++	 *
++	 * Break the FMA dependency chain (16 × 4cy = 64cy latency-bound)
++	 * into 4 independent chains (4 × 4cy = 16cy each, overlapped).
++	 * 8 ymm accumulators: a{0..3}_lo (lanes 0-7), a{0..3}_hi (lanes 8-15).
++	 */
++	v8sf a0_lo = v8sf_load(&w->b_h1[0]);
++	v8sf a0_hi = v8sf_load(&w->b_h1[8]);
++	v8sf a1_lo = V8SF_ZERO, a1_hi = V8SF_ZERO;
++	v8sf a2_lo = V8SF_ZERO, a2_hi = V8SF_ZERO;
++	v8sf a3_lo = V8SF_ZERO, a3_hi = V8SF_ZERO;
++
++	for (j = 0; j < NAP_INPUT_SIZE; j += 4) {
++		v8sf x0 = V8SF_SET1(input[j]);
++		v8sf x1 = V8SF_SET1(input[j + 1]);
++		v8sf x2 = V8SF_SET1(input[j + 2]);
++		v8sf x3 = V8SF_SET1(input[j + 3]);
++
++		a0_lo = v8sf_fmadd(v8sf_load(&w->w_h1[j][0]), x0, a0_lo);
++		a0_hi = v8sf_fmadd(v8sf_load(&w->w_h1[j][8]), x0, a0_hi);
++		a1_lo = v8sf_fmadd(v8sf_load(&w->w_h1[j + 1][0]), x1, a1_lo);
++		a1_hi = v8sf_fmadd(v8sf_load(&w->w_h1[j + 1][8]), x1, a1_hi);
++		a2_lo = v8sf_fmadd(v8sf_load(&w->w_h1[j + 2][0]), x2, a2_lo);
++		a2_hi = v8sf_fmadd(v8sf_load(&w->w_h1[j + 2][8]), x2, a2_hi);
++		a3_lo = v8sf_fmadd(v8sf_load(&w->w_h1[j + 3][0]), x3, a3_lo);
++		a3_hi = v8sf_fmadd(v8sf_load(&w->w_h1[j + 3][8]), x3, a3_hi);
++	}
++
++	/* ReLU: max(0, x) */
++	{
++		v8sf zero = V8SF_ZERO;
++		v8sf lo = (a0_lo + a1_lo) + (a2_lo + a3_lo);
++		v8sf hi = (a0_hi + a1_hi) + (a2_hi + a3_hi);
++
++		lo = __builtin_ia32_maxps256(lo, zero);
++		hi = __builtin_ia32_maxps256(hi, zero);
++		v8sf_store(&hidden_save[0], lo);
++		v8sf_store(&hidden_save[8], hi);
++	}
++}
++
++static noinline void
++fwd_avx2_output(float *output, const float *hidden_save,
++		const struct nap_weights *w)
++{
++	int j;
++
++	/* === Output layer: 2×ymm, 4-way accumulator === */
++	v8sf a0_lo = v8sf_load(&w->b_out[0]);
++	v8sf a0_hi = v8sf_load(&w->b_out[8]);
++	v8sf a1_lo = V8SF_ZERO, a1_hi = V8SF_ZERO;
++	v8sf a2_lo = V8SF_ZERO, a2_hi = V8SF_ZERO;
++	v8sf a3_lo = V8SF_ZERO, a3_hi = V8SF_ZERO;
++
++	for (j = 0; j < NAP_HIDDEN_SIZE; j += 4) {
++		v8sf h0 = V8SF_SET1(hidden_save[j]);
++		v8sf h1 = V8SF_SET1(hidden_save[j + 1]);
++		v8sf h2 = V8SF_SET1(hidden_save[j + 2]);
++		v8sf h3 = V8SF_SET1(hidden_save[j + 3]);
++
++		a0_lo = v8sf_fmadd(v8sf_load(&w->w_out[j][0]), h0, a0_lo);
++		a0_hi = v8sf_fmadd(v8sf_load(&w->w_out[j][8]), h0, a0_hi);
++		a1_lo = v8sf_fmadd(v8sf_load(&w->w_out[j + 1][0]), h1, a1_lo);
++		a1_hi = v8sf_fmadd(v8sf_load(&w->w_out[j + 1][8]), h1, a1_hi);
++		a2_lo = v8sf_fmadd(v8sf_load(&w->w_out[j + 2][0]), h2, a2_lo);
++		a2_hi = v8sf_fmadd(v8sf_load(&w->w_out[j + 2][8]), h2, a2_hi);
++		a3_lo = v8sf_fmadd(v8sf_load(&w->w_out[j + 3][0]), h3, a3_lo);
++		a3_hi = v8sf_fmadd(v8sf_load(&w->w_out[j + 3][8]), h3, a3_hi);
++	}
++
++	v8sf_store(&output[0], (a0_lo + a1_lo) + (a2_lo + a3_lo));
++	v8sf_store(&output[8], (a0_hi + a1_hi) + (a2_hi + a3_hi));
 +}
 +
 +void nap_nn_forward_avx2(const float *input,
@@ -1476,42 +1615,8 @@ index 0000000000..6a0323012d
 +			 float *hidden_save,
 +			 const struct nap_weights *w)
 +{
-+	int j;
-+
-+	/* === Hidden layer: 16 outputs = 2×ymm === */
-+	v8sf acc0 = v8sf_load(&w->b_h1[0]);
-+	v8sf acc1 = v8sf_load(&w->b_h1[8]);
-+
-+	for (j = 0; j < NAP_INPUT_SIZE; j++) {
-+		v8sf x = V8SF_SET1(input[j]);
-+		acc0 = v8sf_fmadd(v8sf_load(&w->w_h1[j][0]), x, acc0);
-+		acc1 = v8sf_fmadd(v8sf_load(&w->w_h1[j][8]), x, acc1);
-+	}
-+
-+	/* ReLU: max(0, x) */
-+	v8sf zero = V8SF_ZERO;
-+	acc0 = __builtin_ia32_maxps256(acc0, zero);
-+	acc1 = __builtin_ia32_maxps256(acc1, zero);
-+	v8sf_store(&hidden_save[0], acc0);
-+	v8sf_store(&hidden_save[8], acc1);
-+
-+	/*
-+	 * Output layer: 10 outputs = 1×ymm (8) + scalar (2)
-+	 * w_out[16][10] rows are 40 bytes apart — use unaligned loads.
-+	 */
-+	v8sf out_acc = v8sf_loadu(&w->b_out[0]);
-+	float out8 = w->b_out[8], out9 = w->b_out[9];
-+
-+	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
-+		v8sf h = V8SF_SET1(hidden_save[j]);
-+		out_acc = v8sf_fmadd(v8sf_loadu(&w->w_out[j][0]), h, out_acc);
-+		out8 += hidden_save[j] * w->w_out[j][8];
-+		out9 += hidden_save[j] * w->w_out[j][9];
-+	}
-+
-+	v8sf_storeu(&output[0], out_acc);
-+	output[8] = out8;
-+	output[9] = out9;
++	fwd_avx2_hidden(input, hidden_save, w);
++	fwd_avx2_output(output, hidden_save, w);
 +}
 +
 +/* ymm clamp: max(min(v, hi), lo) */
@@ -1529,55 +1634,54 @@ index 0000000000..6a0323012d
 +void nap_nn_learn_avx2(struct nap_cpu_data *d, int ideal)
 +{
 +	int i, j;
-+	float d_out[NAP_OUTPUT_SIZE] __aligned(16);
-+	float d_hid[NAP_HIDDEN_SIZE] __aligned(32);
++	float *d_out = d->learn_d_out;
++	float *d_hid = d->learn_d_hid;
 +	float lr = (float)d->learning_rate_millths / 1000.0f;
 +	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
 +	v8sf v_neg_lr = V8SF_SET1(-lr);
 +	v8sf v_cl_hi  = V8SF_SET1(clamp_val);
 +	v8sf v_cl_lo  = V8SF_SET1(-clamp_val);
-+	v8sf vd8;
-+	float do8, do9;
++	v8sf vd_lo, vd_hi;
 +
 +	/* Output error: nn_output - one_hot(ideal) */
 +	__builtin_memcpy(d_out, d->nn_output, sizeof(d_out));
 +	d_out[ideal] -= 1.0f;
 +
-+	vd8 = v8sf_loadu(&d_out[0]);
-+	do8 = d_out[8];
-+	do9 = d_out[9];
++	vd_lo = v8sf_load(&d_out[0]);
++	vd_hi = v8sf_load(&d_out[8]);
 +
 +	/* Output weight update: w_out[j][i] -= lr * clamp(h[j] * d_out[i]) */
 +	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
 +		v8sf vh = V8SF_SET1(d->hidden_out[j]);
-+		v8sf grad = v8sf_clamp(vh * vd8, v_cl_lo, v_cl_hi);
++		v8sf *w = (v8sf *)&d->weights.w_out[j][0];
 +
-+		v8sf_storeu(&d->weights.w_out[j][0],
-+			    v8sf_fmadd(v_neg_lr, grad,
-+				       v8sf_loadu(&d->weights.w_out[j][0])));
-+		d->weights.w_out[j][8] -= lr * fclampf(
-+			d->hidden_out[j] * do8, -clamp_val, clamp_val);
-+		d->weights.w_out[j][9] -= lr * fclampf(
-+			d->hidden_out[j] * do9, -clamp_val, clamp_val);
++		w[0] = v8sf_fmadd(v_neg_lr,
++				   v8sf_clamp(vh * vd_lo, v_cl_lo, v_cl_hi),
++				   w[0]);
++		w[1] = v8sf_fmadd(v_neg_lr,
++				   v8sf_clamp(vh * vd_hi, v_cl_lo, v_cl_hi),
++				   w[1]);
 +	}
 +
 +	/* Output bias update: b_out[i] -= lr * clamp(d_out[i]) */
-+	v8sf_storeu(&d->weights.b_out[0],
-+		    v8sf_fmadd(v_neg_lr, v8sf_clamp(vd8, v_cl_lo, v_cl_hi),
-+			       v8sf_loadu(&d->weights.b_out[0])));
-+	d->weights.b_out[8] -= lr * fclampf(do8, -clamp_val, clamp_val);
-+	d->weights.b_out[9] -= lr * fclampf(do9, -clamp_val, clamp_val);
++	{
++		v8sf *b = (v8sf *)&d->weights.b_out[0];
++
++		b[0] = v8sf_fmadd(v_neg_lr,
++				   v8sf_clamp(vd_lo, v_cl_lo, v_cl_hi), b[0]);
++		b[1] = v8sf_fmadd(v_neg_lr,
++				   v8sf_clamp(vd_hi, v_cl_lo, v_cl_hi), b[1]);
++	}
 +
 +	/* Hidden gradient: d_hid[j] = relu'(h[j]) * dot(w_out[j][:], d_out[:]) */
 +	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
-+		v8sf s = v8sf_loadu(&d->weights.w_out[j][0]) * vd8;
-+		/* hsum ymm: extract hi128, add to lo128, then hsum xmm */
++		const v8sf *w = (const v8sf *)&d->weights.w_out[j][0];
++		v8sf s = w[0] * vd_lo + w[1] * vd_hi;
 +		v4sf lo = __builtin_ia32_vextractf128_ps256(s, 0);
 +		v4sf hi = __builtin_ia32_vextractf128_ps256(s, 1);
 +		v4sf s4 = lo + hi;
-+		float sum = s4[0] + s4[1] + s4[2] + s4[3]
-+			  + d->weights.w_out[j][8] * do8
-+			  + d->weights.w_out[j][9] * do9;
++		float sum = s4[0] + s4[1] + s4[2] + s4[3];
++
 +		d_hid[j] = (d->hidden_out[j] > 0) ? sum : 0;
 +	}
 +
@@ -1613,16 +1717,16 @@ index 0000000000..6a0323012d
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_avx512.c b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
 new file mode 100644
-index 0000000000..11aa4a8ba3
+index 0000000000..83ef75e4b8
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_avx512.c
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,239 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_avx512.c — AVX-512F forward pass and backpropagation for the nap MLP
 + *
 + * Uses 512-bit zmm registers. Hidden layer fits in a single zmm (16 floats).
-+ * Output layer uses ymm (AVX2+FMA) for 8 outputs + 2 scalars.
++ * Forward pass uses 4-way accumulator splitting to break FMA dependency chains.
 + *
 + * Must be called within kernel_fpu_begin/end.
 + * Compiled with: CFLAGS += -mavx512f
@@ -1630,52 +1734,103 @@ index 0000000000..11aa4a8ba3
 +
 +#include "nap.h"
 +
-+/* __mmask16 is not available without immintrin.h in kernel space */
-+typedef unsigned short __mmask16;
-+
 +/*
-+ * Portable zmm max/min wrappers.
++ * Inline asm wrappers for AVX-512F operations.
 + *
-+ * GCC exposes masked 5-argument builtins:
-+ *   __builtin_ia32_maxps512_mask(a, b, passthrough, mask, rounding)
-+ * Clang exposes unmasked 3-argument builtins:
-+ *   __builtin_ia32_maxps512(a, b, rounding)
-+ * Both produce the same vmaxps/vminps zmm instruction when the mask
-+ * is all-ones (0xFFFF) and the rounding mode is current-direction (0x04).
++ * Eliminates all #ifdef __clang__ / GCC builtin differences.
++ * "v" constraint = xmm/ymm/zmm (AVX-512 register class).
++ * The assembler selects EVEX encoding automatically for zmm operands.
 + */
-+#ifdef __clang__
 +static inline v16sf v16sf_max(v16sf a, v16sf b)
 +{
-+	return __builtin_ia32_maxps512(a, b, 0x04 /* _MM_FROUND_CUR_DIRECTION */);
++	asm("vmaxps %2, %1, %0" : "=v"(a) : "v"(a), "vm"(b));
++	return a;
 +}
-+static inline v16sf v16sf_min(v16sf a, v16sf b)
-+{
-+	return __builtin_ia32_minps512(a, b, 0x04);
-+}
-+#else
-+static inline v16sf v16sf_max(v16sf a, v16sf b)
-+{
-+	return __builtin_ia32_maxps512_mask(a, b, a, (__mmask16)0xFFFF, 0x04);
-+}
-+static inline v16sf v16sf_min(v16sf a, v16sf b)
-+{
-+	return __builtin_ia32_minps512_mask(a, b, a, (__mmask16)0xFFFF, 0x04);
-+}
-+#endif
 +
-+/* FMA: a*b+c → vfmadd231ps zmm
-+ * gcc-12+ uses _mask variant with full mask (0xFFFF) for 16 lanes. */
++static inline v16sf v16sf_min(v16sf a, v16sf b)
++{
++	asm("vminps %2, %1, %0" : "=v"(a) : "v"(a), "vm"(b));
++	return a;
++}
++
++/* FMA: a*b+c — vfmadd231ps with c as read-write destination,
++ * matching the accumulator pattern used in forward/learn passes. */
 +static inline v16sf v16sf_fmadd(v16sf a, v16sf b, v16sf c)
 +{
-+	return __builtin_ia32_vfmaddps512_mask(a, b, c,
-+					       (__mmask16)0xFFFF,
-+					       0x04 /* _MM_FROUND_CUR_DIRECTION */);
++	/* vfmadd231ps: dest = src1 * src2 + dest → c = a*b + c */
++	asm("vfmadd231ps %2, %1, %0" : "+v"(c) : "v"(a), "vm"(b));
++	return c;
 +}
 +
-+/* FMA for ymm (output layer): a*b+c → vfmadd231ps ymm */
-+static inline v8sf v8sf_fmadd(v8sf a, v8sf b, v8sf c)
++/*
++ * Split forward pass into noinline helpers so that each layer gets its
++ * own stack frame.  Without this, the compiler allocates spill slots for
++ * both layers simultaneously, pushing the combined frame over 2 KiB.
++ */
++static noinline void
++fwd_avx512_hidden(const float *input, float *hidden_save,
++		  const struct nap_weights *w)
 +{
-+	return __builtin_ia32_vfmaddps256(a, b, c);
++	int j;
++
++	/*
++	 * === Hidden layer: 16 outputs = 1×zmm, 4-way accumulator ===
++	 *
++	 * FMA has 4-cycle latency but 0.5-cycle throughput (2 ports).
++	 * A single accumulator chain: 16 × 4 = 64 cycles (latency-bound).
++	 * Four independent chains: max(4×4=16cy, throughput=16cy) ≈ 16-20cy.
++	 * The compiler cannot do this automatically (-O2, no -ffast-math).
++	 */
++	v16sf a0 = *(const v16sf *)&w->b_h1[0];
++	v16sf a1 = V16SF_SET1(0.0f);
++	v16sf a2 = V16SF_SET1(0.0f);
++	v16sf a3 = V16SF_SET1(0.0f);
++
++	for (j = 0; j < NAP_INPUT_SIZE; j += 4) {
++		a0 = v16sf_fmadd(*(const v16sf *)&w->w_h1[j][0],
++				  V16SF_SET1(input[j]), a0);
++		a1 = v16sf_fmadd(*(const v16sf *)&w->w_h1[j + 1][0],
++				  V16SF_SET1(input[j + 1]), a1);
++		a2 = v16sf_fmadd(*(const v16sf *)&w->w_h1[j + 2][0],
++				  V16SF_SET1(input[j + 2]), a2);
++		a3 = v16sf_fmadd(*(const v16sf *)&w->w_h1[j + 3][0],
++				  V16SF_SET1(input[j + 3]), a3);
++	}
++
++	/* ReLU: max(0, x) */
++	{
++		v16sf zero = V16SF_SET1(0.0f);
++		v16sf acc = (a0 + a1) + (a2 + a3);
++
++		acc = v16sf_max(acc, zero);
++		*(v16sf *)&hidden_save[0] = acc;
++	}
++}
++
++static noinline void
++fwd_avx512_output(float *output, const float *hidden_save,
++		  const struct nap_weights *w)
++{
++	int j;
++
++	/* === Output layer: 1×zmm, 4-way accumulator === */
++	v16sf a0 = *(const v16sf *)&w->b_out[0];
++	v16sf a1 = V16SF_SET1(0.0f);
++	v16sf a2 = V16SF_SET1(0.0f);
++	v16sf a3 = V16SF_SET1(0.0f);
++
++	for (j = 0; j < NAP_HIDDEN_SIZE; j += 4) {
++		a0 = v16sf_fmadd(*(const v16sf *)&w->w_out[j][0],
++				  V16SF_SET1(hidden_save[j]), a0);
++		a1 = v16sf_fmadd(*(const v16sf *)&w->w_out[j + 1][0],
++				  V16SF_SET1(hidden_save[j + 1]), a1);
++		a2 = v16sf_fmadd(*(const v16sf *)&w->w_out[j + 2][0],
++				  V16SF_SET1(hidden_save[j + 2]), a2);
++		a3 = v16sf_fmadd(*(const v16sf *)&w->w_out[j + 3][0],
++				  V16SF_SET1(hidden_save[j + 3]), a3);
++	}
++
++	*(v16sf *)&output[0] = (a0 + a1) + (a2 + a3);
 +}
 +
 +void nap_nn_forward_avx512(const float *input,
@@ -1683,41 +1838,8 @@ index 0000000000..11aa4a8ba3
 +			   float *hidden_save,
 +			   const struct nap_weights *w)
 +{
-+	int j;
-+
-+	/* === Hidden layer: 16 outputs = 1×zmm === */
-+	v16sf acc = *(const v16sf *)&w->b_h1[0];
-+
-+	for (j = 0; j < NAP_INPUT_SIZE; j++) {
-+		v16sf x = V16SF_SET1(input[j]);
-+		acc = v16sf_fmadd(*(const v16sf *)&w->w_h1[j][0], x, acc);
-+	}
-+
-+	/* ReLU: max(0, x) */
-+	v16sf zero = V16SF_SET1(0.0f);
-+	acc = v16sf_max(acc, zero);
-+	*(v16sf *)&hidden_save[0] = acc;
-+
-+	/* === Output layer: 10 outputs = 1×ymm (8) + 2 scalars === */
-+	v8sf out_acc = v8sf_loadu(&w->b_out[0]);
-+	float out8 = w->b_out[8], out9 = w->b_out[9];
-+
-+	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
-+		v8sf h = V8SF_SET1(hidden_save[j]);
-+		out_acc = v8sf_fmadd(v8sf_loadu(&w->w_out[j][0]), h, out_acc);
-+		out8 += hidden_save[j] * w->w_out[j][8];
-+		out9 += hidden_save[j] * w->w_out[j][9];
-+	}
-+
-+	v8sf_storeu(&output[0], out_acc);
-+	output[8] = out8;
-+	output[9] = out9;
-+}
-+
-+/* ymm clamp: max(min(v, hi), lo) */
-+static inline v8sf v8sf_clamp(v8sf v, v8sf lo, v8sf hi)
-+{
-+	return __builtin_ia32_maxps256(__builtin_ia32_minps256(v, hi), lo);
++	fwd_avx512_hidden(input, hidden_save, w);
++	fwd_avx512_output(output, hidden_save, w);
 +}
 +
 +/* zmm clamp: max(min(v, hi), lo) */
@@ -1729,97 +1851,121 @@ index 0000000000..11aa4a8ba3
 +/*
 + * Online learning (backpropagation) — AVX-512F
 + *
-+ * Output layer (10 neurons): 1×ymm + 2 scalars, with FMA
++ * Split into three noinline phases so each gets its own stack frame,
++ * preventing zmm spill slots from accumulating into a single frame.
++ * Scratch buffers live on the caller's stack and are passed by pointer.
++ *
++ * Output layer (10 neurons): 1×zmm + 2×ymm hsum, with FMA
 + * Hidden layer (16 neurons): 1×zmm, with FMA
 + */
-+void nap_nn_learn_avx512(struct nap_cpu_data *d, int ideal)
++
++/* Phase 1: output error, output weight/bias update (zmm) */
++static noinline void
++learn_avx512_output(struct nap_cpu_data *d, int ideal, float *d_out)
 +{
-+	int i, j;
-+	float d_out[NAP_OUTPUT_SIZE] __aligned(16);
-+	float d_hid[NAP_HIDDEN_SIZE] __aligned(64);
++	int j;
 +	float lr = (float)d->learning_rate_millths / 1000.0f;
 +	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
-+	v8sf v8_neg_lr = V8SF_SET1(-lr);
-+	v8sf v8_cl_hi  = V8SF_SET1(clamp_val);
-+	v8sf v8_cl_lo  = V8SF_SET1(-clamp_val);
 +	v16sf v16_neg_lr = V16SF_SET1(-lr);
 +	v16sf v16_cl_hi  = V16SF_SET1(clamp_val);
 +	v16sf v16_cl_lo  = V16SF_SET1(-clamp_val);
-+	v8sf vd8;
-+	float do8, do9;
++	v16sf vd;
 +
 +	/* Output error: nn_output - one_hot(ideal) */
-+	__builtin_memcpy(d_out, d->nn_output, sizeof(d_out));
++	__builtin_memcpy(d_out, d->nn_output, NAP_OUTPUT_STRIDE * sizeof(float));
 +	d_out[ideal] -= 1.0f;
 +
-+	vd8 = v8sf_loadu(&d_out[0]);
-+	do8 = d_out[8];
-+	do9 = d_out[9];
++	vd = *(const v16sf *)&d_out[0];
 +
 +	/* Output weight update: w_out[j][i] -= lr * clamp(h[j] * d_out[i]) */
 +	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
-+		v8sf vh = V8SF_SET1(d->hidden_out[j]);
-+		v8sf grad = v8sf_clamp(vh * vd8, v8_cl_lo, v8_cl_hi);
++		v16sf vh = V16SF_SET1(d->hidden_out[j]);
++		v16sf *w = (v16sf *)&d->weights.w_out[j][0];
 +
-+		v8sf_storeu(&d->weights.w_out[j][0],
-+			    v8sf_fmadd(v8_neg_lr, grad,
-+				       v8sf_loadu(&d->weights.w_out[j][0])));
-+		d->weights.w_out[j][8] -= lr * fclampf(
-+			d->hidden_out[j] * do8, -clamp_val, clamp_val);
-+		d->weights.w_out[j][9] -= lr * fclampf(
-+			d->hidden_out[j] * do9, -clamp_val, clamp_val);
++		*w = v16sf_fmadd(v16_neg_lr,
++				 v16sf_clamp(vh * vd, v16_cl_lo, v16_cl_hi),
++				 *w);
 +	}
 +
 +	/* Output bias update */
-+	v8sf_storeu(&d->weights.b_out[0],
-+		    v8sf_fmadd(v8_neg_lr, v8sf_clamp(vd8, v8_cl_lo, v8_cl_hi),
-+			       v8sf_loadu(&d->weights.b_out[0])));
-+	d->weights.b_out[8] -= lr * fclampf(do8, -clamp_val, clamp_val);
-+	d->weights.b_out[9] -= lr * fclampf(do9, -clamp_val, clamp_val);
++	{
++		v16sf *b = (v16sf *)&d->weights.b_out[0];
 +
-+	/* Hidden gradient: d_hid[j] = relu'(h[j]) * dot(w_out[j][:], d_out[:]) */
++		*b = v16sf_fmadd(v16_neg_lr,
++				 v16sf_clamp(vd, v16_cl_lo, v16_cl_hi), *b);
++	}
++}
++
++/* Phase 2: hidden gradient via 2×ymm horizontal sum */
++static noinline void
++learn_avx512_hidden_grad(struct nap_cpu_data *d,
++			 const float *d_out, float *d_hid)
++{
++	int j;
++	v8sf vd_lo = *(const v8sf *)&d_out[0];
++	v8sf vd_hi = *(const v8sf *)&d_out[8];
++
 +	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
-+		v8sf s = v8sf_loadu(&d->weights.w_out[j][0]) * vd8;
++		const v8sf *w = (const v8sf *)&d->weights.w_out[j][0];
++		v8sf s = w[0] * vd_lo + w[1] * vd_hi;
 +		v4sf lo = __builtin_ia32_vextractf128_ps256(s, 0);
 +		v4sf hi = __builtin_ia32_vextractf128_ps256(s, 1);
 +		v4sf s4 = lo + hi;
-+		float sum = s4[0] + s4[1] + s4[2] + s4[3]
-+			  + d->weights.w_out[j][8] * do8
-+			  + d->weights.w_out[j][9] * do9;
++		float sum = s4[0] + s4[1] + s4[2] + s4[3];
++
 +		d_hid[j] = (d->hidden_out[j] > 0) ? sum : 0;
 +	}
++}
++
++/* Phase 3: hidden weight/bias update (zmm) */
++static noinline void
++learn_avx512_hidden_update(struct nap_cpu_data *d, const float *d_hid)
++{
++	int i;
++	float lr = (float)d->learning_rate_millths / 1000.0f;
++	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
++	v16sf v16_neg_lr = V16SF_SET1(-lr);
++	v16sf v16_cl_hi  = V16SF_SET1(clamp_val);
++	v16sf v16_cl_lo  = V16SF_SET1(-clamp_val);
++	v16sf dh = *(const v16sf *)&d_hid[0];
 +
 +	/* Hidden weight update: w_h1[i][j] -= lr * clamp(feat[i] * d_hid[j])
 +	 * 16 hidden neurons = 1×zmm per input row */
-+	{
-+		v16sf dh = *(const v16sf *)&d_hid[0];
++	for (i = 0; i < NAP_INPUT_SIZE; i++) {
++		v16sf vf = V16SF_SET1(d->features_f32[i]);
++		v16sf *w = (v16sf *)&d->weights.w_h1[i][0];
 +
-+		for (i = 0; i < NAP_INPUT_SIZE; i++) {
-+			v16sf vf = V16SF_SET1(d->features_f32[i]);
-+			v16sf *w = (v16sf *)&d->weights.w_h1[i][0];
-+
-+			*w = v16sf_fmadd(v16_neg_lr,
-+					 v16sf_clamp(vf * dh,
-+						     v16_cl_lo, v16_cl_hi),
-+					 *w);
-+		}
-+
-+		/* Hidden bias update */
-+		{
-+			v16sf *b = (v16sf *)&d->weights.b_h1[0];
-+
-+			*b = v16sf_fmadd(v16_neg_lr,
-+					 v16sf_clamp(dh, v16_cl_lo, v16_cl_hi),
-+					 *b);
-+		}
++		*w = v16sf_fmadd(v16_neg_lr,
++				 v16sf_clamp(vf * dh,
++					     v16_cl_lo, v16_cl_hi),
++				 *w);
 +	}
++
++	/* Hidden bias update */
++	{
++		v16sf *b = (v16sf *)&d->weights.b_h1[0];
++
++		*b = v16sf_fmadd(v16_neg_lr,
++				 v16sf_clamp(dh, v16_cl_lo, v16_cl_hi),
++				 *b);
++	}
++}
++
++void nap_nn_learn_avx512(struct nap_cpu_data *d, int ideal)
++{
++	float d_out[NAP_OUTPUT_STRIDE] __aligned(64);
++	float d_hid[NAP_HIDDEN_SIZE] __aligned(64);
++
++	learn_avx512_output(d, ideal, d_out);
++	learn_avx512_hidden_grad(d, d_out, d_hid);
++	learn_avx512_hidden_update(d, d_hid);
 +}
 diff --git a/drivers/cpuidle/governors/nap/nap_nn_sse2.c b/drivers/cpuidle/governors/nap/nap_nn_sse2.c
 new file mode 100644
-index 0000000000..8993c8dd9d
+index 0000000000..79ae0aece3
 --- /dev/null
 +++ b/drivers/cpuidle/governors/nap/nap_nn_sse2.c
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,160 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * nap_nn_sse2.c — SSE2 forward pass and backpropagation for the nap MLP
@@ -1875,26 +2021,24 @@ index 0000000000..8993c8dd9d
 +	v4sf_store(&hidden_save[8],  acc2);
 +	v4sf_store(&hidden_save[12], acc3);
 +
-+	/*
-+	 * Output layer: 10 outputs = 2×xmm (8) + scalar (2)
-+	 * w_out[16][10] rows are 40 bytes apart — use unaligned loads.
-+	 */
-+	v4sf out0 = v4sf_loadu(&w->b_out[0]);
-+	v4sf out1 = v4sf_loadu(&w->b_out[4]);
-+	float out8 = w->b_out[8], out9 = w->b_out[9];
++	/* Output layer: 16 outputs (10 active + 6 padding) = 4×xmm */
++	v4sf out0 = v4sf_load(&w->b_out[0]);
++	v4sf out1 = v4sf_load(&w->b_out[4]);
++	v4sf out2 = v4sf_load(&w->b_out[8]);
++	v4sf out3 = v4sf_load(&w->b_out[12]);
 +
 +	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
 +		v4sf h = V4SF_SET1(hidden_save[j]);
-+		out0 += v4sf_loadu(&w->w_out[j][0]) * h;
-+		out1 += v4sf_loadu(&w->w_out[j][4]) * h;
-+		out8 += hidden_save[j] * w->w_out[j][8];
-+		out9 += hidden_save[j] * w->w_out[j][9];
++		out0 += v4sf_load(&w->w_out[j][0])  * h;
++		out1 += v4sf_load(&w->w_out[j][4])  * h;
++		out2 += v4sf_load(&w->w_out[j][8])  * h;
++		out3 += v4sf_load(&w->w_out[j][12]) * h;
 +	}
 +
-+	v4sf_storeu(&output[0], out0);
-+	v4sf_storeu(&output[4], out1);
-+	output[8] = out8;
-+	output[9] = out9;
++	v4sf_store(&output[0],  out0);
++	v4sf_store(&output[4],  out1);
++	v4sf_store(&output[8],  out2);
++	v4sf_store(&output[12], out3);
 +}
 +
 +/*
@@ -1906,15 +2050,14 @@ index 0000000000..8993c8dd9d
 +void nap_nn_learn_sse2(struct nap_cpu_data *d, int ideal)
 +{
 +	int i, j;
-+	float d_out[NAP_OUTPUT_SIZE] __aligned(16);
-+	float d_hid[NAP_HIDDEN_SIZE] __aligned(16);
++	float *d_out = d->learn_d_out;
++	float *d_hid = d->learn_d_hid;
 +	float lr = (float)d->learning_rate_millths / 1000.0f;
 +	float clamp_val = (float)d->max_grad_norm_millths / 1000.0f;
 +	v4sf v_lr    = V4SF_SET1(lr);
 +	v4sf v_cl_hi = V4SF_SET1(clamp_val);
 +	v4sf v_cl_lo = V4SF_SET1(-clamp_val);
-+	v4sf vd0, vd1;
-+	float do8, do9;
++	v4sf vd0, vd1, vd2, vd3;
 +
 +	/* Output error: nn_output - one_hot(ideal) */
 +	__builtin_memcpy(d_out, d->nn_output, sizeof(d_out));
@@ -1922,42 +2065,36 @@ index 0000000000..8993c8dd9d
 +
 +	vd0 = *(const v4sf *)&d_out[0];
 +	vd1 = *(const v4sf *)&d_out[4];
-+	do8 = d_out[8];
-+	do9 = d_out[9];
++	vd2 = *(const v4sf *)&d_out[8];
++	vd3 = *(const v4sf *)&d_out[12];
 +
 +	/* Output weight update: w_out[j][i] -= lr * clamp(h[j] * d_out[i]) */
 +	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
 +		v4sf vh = V4SF_SET1(d->hidden_out[j]);
++		v4sf *w = (v4sf *)&d->weights.w_out[j][0];
 +
-+		v4sf_storeu(&d->weights.w_out[j][0],
-+			    v4sf_loadu(&d->weights.w_out[j][0]) -
-+			    v_lr * v4sf_clamp(vh * vd0, v_cl_lo, v_cl_hi));
-+		v4sf_storeu(&d->weights.w_out[j][4],
-+			    v4sf_loadu(&d->weights.w_out[j][4]) -
-+			    v_lr * v4sf_clamp(vh * vd1, v_cl_lo, v_cl_hi));
-+		d->weights.w_out[j][8] -= lr * fclampf(
-+			d->hidden_out[j] * do8, -clamp_val, clamp_val);
-+		d->weights.w_out[j][9] -= lr * fclampf(
-+			d->hidden_out[j] * do9, -clamp_val, clamp_val);
++		w[0] -= v_lr * v4sf_clamp(vh * vd0, v_cl_lo, v_cl_hi);
++		w[1] -= v_lr * v4sf_clamp(vh * vd1, v_cl_lo, v_cl_hi);
++		w[2] -= v_lr * v4sf_clamp(vh * vd2, v_cl_lo, v_cl_hi);
++		w[3] -= v_lr * v4sf_clamp(vh * vd3, v_cl_lo, v_cl_hi);
 +	}
 +
 +	/* Output bias update: b_out[i] -= lr * clamp(d_out[i]) */
-+	v4sf_storeu(&d->weights.b_out[0],
-+		    v4sf_loadu(&d->weights.b_out[0]) -
-+		    v_lr * v4sf_clamp(vd0, v_cl_lo, v_cl_hi));
-+	v4sf_storeu(&d->weights.b_out[4],
-+		    v4sf_loadu(&d->weights.b_out[4]) -
-+		    v_lr * v4sf_clamp(vd1, v_cl_lo, v_cl_hi));
-+	d->weights.b_out[8] -= lr * fclampf(do8, -clamp_val, clamp_val);
-+	d->weights.b_out[9] -= lr * fclampf(do9, -clamp_val, clamp_val);
++	{
++		v4sf *b = (v4sf *)&d->weights.b_out[0];
++
++		b[0] -= v_lr * v4sf_clamp(vd0, v_cl_lo, v_cl_hi);
++		b[1] -= v_lr * v4sf_clamp(vd1, v_cl_lo, v_cl_hi);
++		b[2] -= v_lr * v4sf_clamp(vd2, v_cl_lo, v_cl_hi);
++		b[3] -= v_lr * v4sf_clamp(vd3, v_cl_lo, v_cl_hi);
++	}
 +
 +	/* Hidden gradient: d_hid[j] = relu'(h[j]) * dot(w_out[j][:], d_out[:]) */
 +	for (j = 0; j < NAP_HIDDEN_SIZE; j++) {
-+		v4sf s = v4sf_loadu(&d->weights.w_out[j][0]) * vd0
-+		       + v4sf_loadu(&d->weights.w_out[j][4]) * vd1;
-+		float sum = s[0] + s[1] + s[2] + s[3]
-+			  + d->weights.w_out[j][8] * do8
-+			  + d->weights.w_out[j][9] * do9;
++		const v4sf *w = (const v4sf *)&d->weights.w_out[j][0];
++		v4sf s = w[0] * vd0 + w[1] * vd1 + w[2] * vd2 + w[3] * vd3;
++		float sum = s[0] + s[1] + s[2] + s[3];
++
 +		d_hid[j] = (d->hidden_out[j] > 0) ? sum : 0;
 +	}
 +
