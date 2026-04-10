@@ -1,6 +1,6 @@
-From b5e863d6a43e4882b7c05ef278adb142f4b8ca2f Mon Sep 17 00:00:00 2001
+From 09045ee39c548dfac5bfebdb400b7e9d362957a9 Mon Sep 17 00:00:00 2001
 From: Piotr Gorski <lucjan.lucjanov@gmail.com>
-Date: Fri, 13 Mar 2026 20:18:05 +0100
+Date: Fri, 10 Apr 2026 08:28:12 +0200
 Subject: [PATCH] bore-cachy
 
 Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
@@ -13,12 +13,12 @@ Signed-off-by: Piotr Gorski <lucjan.lucjanov@gmail.com>
  kernel/fork.c              |  13 ++
  kernel/futex/waitwake.c    |  11 +
  kernel/sched/Makefile      |   1 +
- kernel/sched/bore.c        | 428 +++++++++++++++++++++++++++++++++++++
- kernel/sched/core.c        |  12 ++
+ kernel/sched/bore.c        | 434 +++++++++++++++++++++++++++++++++++++
+ kernel/sched/core.c        |  12 +
  kernel/sched/debug.c       |  61 ++++++
- kernel/sched/fair.c        | 123 ++++++++---
+ kernel/sched/fair.c        | 139 ++++++++++--
  kernel/sched/sched.h       |   9 +
- 13 files changed, 747 insertions(+), 24 deletions(-)
+ 13 files changed, 769 insertions(+), 24 deletions(-)
  create mode 100644 include/linux/sched/bore.h
  create mode 100644 kernel/sched/bore.c
 
@@ -76,7 +76,7 @@ index 3e2005e9e..fd47e4572 100644
  #ifdef CONFIG_SCHED_CORE
 diff --git a/include/linux/sched/bore.h b/include/linux/sched/bore.h
 new file mode 100644
-index 000000000..fbb73a64d
+index 000000000..9215c13a9
 --- /dev/null
 +++ b/include/linux/sched/bore.h
 @@ -0,0 +1,41 @@
@@ -93,7 +93,7 @@ index 000000000..fbb73a64d
 +#define SCHED_BORE_AUTHOR   "Masahito Suzuki"
 +#define SCHED_BORE_PROGNAME "BORE CPU Scheduler modification"
 +
-+#define SCHED_BORE_VERSION  "6.6.2"
++#define SCHED_BORE_VERSION  "6.6.3"
 +
 +extern u8   __read_mostly sched_bore;
 +DECLARE_STATIC_KEY_TRUE(sched_bore_key);
@@ -175,7 +175,7 @@ index e1359db55..31053e619 100644
 +	 an unnecessarily large base slice, resulting in high scheduling
 +	 latency and poor system responsiveness.
 diff --git a/kernel/exit.c b/kernel/exit.c
-index 9f74e8f1c..3767cad1a 100644
+index c8c3ff935..0ec0d3db7 100644
 --- a/kernel/exit.c
 +++ b/kernel/exit.c
 @@ -147,7 +147,11 @@ static void __unhash_process(struct release_task_post *post, struct task_struct
@@ -191,7 +191,7 @@ index 9f74e8f1c..3767cad1a 100644
  	}
  	list_del_rcu(&p->thread_node);
 diff --git a/kernel/fork.c b/kernel/fork.c
-index ef65f7e42..d97f460d9 100644
+index 911e4073b..58af709bf 100644
 --- a/kernel/fork.c
 +++ b/kernel/fork.c
 @@ -116,6 +116,10 @@
@@ -270,10 +270,10 @@ index 8ae86371d..b688084bc 100644
 +obj-$(CONFIG_SCHED_BORE) += bore.o
 diff --git a/kernel/sched/bore.c b/kernel/sched/bore.c
 new file mode 100644
-index 000000000..759eee843
+index 000000000..c27a22cd6
 --- /dev/null
 +++ b/kernel/sched/bore.c
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,434 @@
 +/*
 + *  Burst-Oriented Response Enhancer (BORE) CPU Scheduler
 + *  Copyright (C) 2021-2025 Masahito Suzuki <firelzrd@gmail.com>
@@ -424,8 +424,9 @@ index 000000000..759eee843
 +
 +static inline u32 count_children_upto2(struct task_struct *p) {
 +	struct list_head *head = &p->children;
-+	struct list_head *next = head->next;
-+	return (next != head) + (next->next != head);
++	struct list_head *first = READ_ONCE(head->next);
++	struct list_head *second = READ_ONCE(first->next);
++	return (first != head) + (second != head);
 +}
 +
 +static inline bool burst_cache_expired(struct bore_bc *bc, u64 now) {
@@ -500,9 +501,13 @@ index 000000000..759eee843
 +			if (scan_count++ >= BURST_CACHE_SCAN_LIMIT) break;
 +
 +			struct task_struct *descendant = direct_child;
-+			while (count_children_upto2(descendant) == 1)
-+				descendant = list_first_entry(&descendant->children,
-+												struct task_struct, sibling);
++			while (count_children_upto2(descendant) == 1) {
++				struct task_struct *next_descendant =
++					list_first_or_null_rcu(&descendant->children,
++											struct task_struct, sibling);
++				if (!next_descendant) break;
++				descendant = next_descendant;
++			}
 +
 +			if (!task_is_bore_eligible(descendant)) continue;
 +			count++;
@@ -523,10 +528,11 @@ index 000000000..759eee843
 +
 +	if (burst_cache_expired(bc, now)) {
 +		struct task_struct *sibling;
-+		u32 count = 0, total = 0;
++		u32 count = 0, total = 0, scan_count = 0;
 +
 +		for_each_thread(leader, sibling) {
 +			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
++			if (scan_count++ >= BURST_CACHE_SCAN_LIMIT) break;
 +
 +			if (!task_is_bore_eligible(sibling)) continue;
 +			count++;
@@ -847,7 +853,7 @@ index 93f009e10..ed90b4f94 100644
  	P(se.avg.runnable_sum);
  	P(se.avg.util_sum);
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index b2e4fd207..f6bb0954f 100644
+index b2e4fd207..c70d6484b 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -58,6 +58,10 @@
@@ -992,7 +998,7 @@ index b2e4fd207..f6bb0954f 100644
  		/*
  		 * If the fair_server is active, we need to account for the
  		 * fair_server time whether or not the task is running on
-@@ -3842,7 +3870,7 @@ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
+@@ -3842,17 +3870,23 @@ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
  
  static void place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags);
  
@@ -1001,7 +1007,40 @@ index b2e4fd207..f6bb0954f 100644
  			    unsigned long weight)
  {
  	bool curr = cfs_rq->curr == se;
-@@ -5205,12 +5233,11 @@ void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
+ 	bool rel_vprot = false;
+ 	u64 vprot;
++#ifdef CONFIG_SCHED_BORE
++	s64 vlag_unscaled = 0;
++#endif /* !CONFIG_SCHED_BORE */
+ 
+ 	if (se->on_rq) {
+ 		/* commit outstanding execution time */
+ 		update_curr(cfs_rq);
+ 		update_entity_lag(cfs_rq, se);
++#ifdef CONFIG_SCHED_BORE
++		vlag_unscaled = se->vlag;
++#endif /* !CONFIG_SCHED_BORE */
+ 		se->deadline -= se->vruntime;
+ 		se->rel_deadline = 1;
+ 		if (curr && protect_slice(se)) {
+@@ -3888,6 +3922,16 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+ 
+ 	enqueue_load_avg(cfs_rq, se);
+ 	if (se->on_rq) {
++#ifdef CONFIG_SCHED_BORE
++		if (curr) {
++			se->vruntime += vlag_unscaled - se->vlag;
++			if (se->rel_deadline) {
++				se->deadline += se->vruntime;
++				se->rel_deadline = 0;
++			}
++		}
++		else
++#endif /* !CONFIG_SCHED_BORE */
+ 		place_entity(cfs_rq, se, 0);
+ 		if (rel_vprot)
+ 			se->vprot = se->vruntime + vprot;
+@@ -5205,12 +5249,11 @@ void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
  static void
  place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
  {
@@ -1015,7 +1054,7 @@ index b2e4fd207..f6bb0954f 100644
  
  	/*
  	 * Due to how V is constructed as the weighted average of entities,
-@@ -5295,7 +5322,18 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+@@ -5295,7 +5338,18 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
  		se->rel_deadline = 0;
  		return;
  	}
@@ -1035,7 +1074,7 @@ index b2e4fd207..f6bb0954f 100644
  	/*
  	 * When joining the competition; the existing tasks will be,
  	 * on average, halfway through their slice, as such start tasks
-@@ -5304,6 +5342,9 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+@@ -5304,6 +5358,9 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
  	if (sched_feat(PLACE_DEADLINE_INITIAL) && (flags & ENQUEUE_INITIAL))
  		vslice /= 2;
  
@@ -1045,7 +1084,7 @@ index b2e4fd207..f6bb0954f 100644
  	/*
  	 * EEVDF: vd_i = ve_i + r_i/w_i
  	 */
-@@ -5314,7 +5355,7 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
+@@ -5314,7 +5371,7 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
  static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq);
  
  static void
@@ -1054,7 +1093,7 @@ index b2e4fd207..f6bb0954f 100644
  
  static void
  enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
-@@ -5472,6 +5513,10 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+@@ -5472,6 +5529,10 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
  		if (sched_feat(DELAY_DEQUEUE) && delay &&
  		    !entity_eligible(cfs_rq, se)) {
  			update_load_avg(cfs_rq, se, 0);
@@ -1065,7 +1104,7 @@ index b2e4fd207..f6bb0954f 100644
  			set_delayed(se);
  			return false;
  		}
-@@ -6957,7 +7002,7 @@ static int sched_idle_cpu(int cpu)
+@@ -6957,7 +7018,7 @@ static int sched_idle_cpu(int cpu)
  }
  
  static void
@@ -1074,7 +1113,7 @@ index b2e4fd207..f6bb0954f 100644
  {
  	struct cfs_rq *cfs_rq = cfs_rq_of(se);
  
-@@ -6970,13 +7015,22 @@ requeue_delayed_entity(struct sched_entity *se)
+@@ -6970,13 +7031,22 @@ requeue_delayed_entity(struct sched_entity *se)
  	WARN_ON_ONCE(!se->on_rq);
  
  	if (sched_feat(DELAY_ZERO)) {
@@ -1098,7 +1137,7 @@ index b2e4fd207..f6bb0954f 100644
  			if (se != cfs_rq->curr)
  				__enqueue_entity(cfs_rq, se);
  			cfs_rq->nr_queued++;
-@@ -7016,7 +7070,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -7016,7 +7086,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  		util_est_enqueue(&rq->cfs, p);
  
  	if (flags & ENQUEUE_DELAYED) {
@@ -1107,7 +1146,7 @@ index b2e4fd207..f6bb0954f 100644
  		return;
  	}
  
-@@ -7034,7 +7088,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -7034,7 +7104,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  	for_each_sched_entity(se) {
  		if (se->on_rq) {
  			if (se->sched_delayed)
@@ -1116,7 +1155,7 @@ index b2e4fd207..f6bb0954f 100644
  			break;
  		}
  		cfs_rq = cfs_rq_of(se);
-@@ -7247,6 +7301,15 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -7247,6 +7317,15 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  		util_est_dequeue(&rq->cfs, p);
  
  	util_est_update(&rq->cfs, p, flags & DEQUEUE_SLEEP);
@@ -1132,7 +1171,7 @@ index b2e4fd207..f6bb0954f 100644
  	if (dequeue_entities(rq, &p->se, flags) < 0)
  		return false;
  
-@@ -9067,16 +9130,25 @@ static void yield_task_fair(struct rq *rq)
+@@ -9067,16 +9146,25 @@ static void yield_task_fair(struct rq *rq)
  	/*
  	 * Are we the only task in the tree?
  	 */
@@ -1158,7 +1197,7 @@ index b2e4fd207..f6bb0954f 100644
  	/*
  	 * Tell update_rq_clock() that we've just updated,
  	 * so we don't do microscopic update in schedule()
-@@ -13530,6 +13602,9 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
+@@ -13530,6 +13618,9 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
  	WARN_ON_ONCE(p->se.sched_delayed);
  
  	attach_task_cfs_rq(p);
