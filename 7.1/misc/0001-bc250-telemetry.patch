@@ -1,0 +1,186 @@
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/cyan_skillfish_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/cyan_skillfish_ppt.c
+@@ -32,6 +32,8 @@
+ #include "smu_v11_8_pmfw.h"
+ #include "smu_cmn.h"
+ #include "soc15_common.h"
++#include <linux/topology.h>
++#include <linux/cpumask.h>
+ 
+ /*
+  * DO NOT use these for err/warn/info/debug messages.
+@@ -60,6 +62,19 @@
+ 
+ static uint32_t cyan_skillfish_sclk_default;
+ 
++/*
++ * cs_eight_core_map (default off): force the 8-core hybrid layout. By default
++ * the driver auto-detects the physical core count (cyan_skillfish_core_count)
++ * and picks the hybrid layout when 8 cores are present, so this parameter is
++ * only needed to force it on for debugging. Cores without a firmware slot stay
++ * at the 0xffff sentinel set by smu_cmn_init_soft_gpu_metrics. Aggregate fields
++ * are unaffected.
++ */
++static bool cs_eight_core_map;
++module_param(cs_eight_core_map, bool, 0644);
++MODULE_PARM_DESC(cs_eight_core_map,
++		 "Force 8-core hybrid SMU layout (auto-detected by default; set to 1 to force on)");
++
+ static const struct smu_feature_bits cyan_skillfish_dpm_features = {
+ 	.bits = {
+ 		SMU_FEATURE_BIT_INIT(FEATURE_FCLK_DPM_BIT),
+@@ -77,6 +92,7 @@
+ 	MSG_MAP(TransferTableSmu2Dram,          PPSMC_MSG_TransferTableSmu2Dram,	0),
+ 	MSG_MAP(TransferTableDram2Smu,          PPSMC_MSG_TransferTableDram2Smu,	0),
+ 	MSG_MAP(GetEnabledSmuFeatures,          PPSMC_MSG_GetEnabledSmuFeatures,	0),
++	MSG_MAP(GetGfxclkFrequency,             PPSMC_MSG_GetGfxFrequency,		0),
+ 	MSG_MAP(RequestGfxclk,                  PPSMC_MSG_RequestGfxclk,		0),
+ 	MSG_MAP(ForceGfxVid,                    PPSMC_MSG_ForceGfxVid,			0),
+ 	MSG_MAP(UnforceGfxVid,                  PPSMC_MSG_UnforceGfxVid,		0),
+@@ -143,7 +159,11 @@
+ 
+ 	switch (member) {
+ 	case METRICS_CURR_GFXCLK:
+-		*value = metrics->Current.GfxclkFrequency;
++		ret = smu_cmn_send_smc_msg(smu, SMU_MSG_GetGfxclkFrequency, value);
++		if (ret) {
++			*value = metrics->Current.GfxclkFrequency;
++			ret = 0;
++		}
+ 		break;
+ 	case METRICS_CURR_SOCCLK:
+ 		*value = metrics->Current.SocclkFrequency;
+@@ -384,6 +404,23 @@
+ 					  cyan_skillfish_dpm_features.bits);
+ }
+ 
++/*
++ * Count physical CPU cores present (one per SMT sibling group). Used to
++ * auto-select the SMU metrics layout: 8 cores -> 8-core hybrid table,
++ * otherwise the stock six-wide table. Contributed by FilippoR
++ * (https://github.com/filippor).
++ */
++static uint16_t cyan_skillfish_core_count(void)
++{
++	unsigned int cpu;
++	uint16_t cores = 0;
++
++	for_each_present_cpu(cpu)
++		if (cpumask_first(topology_sibling_cpumask(cpu)) == cpu)
++			cores++;
++	return cores;
++}
++
+ static ssize_t cyan_skillfish_get_gpu_metrics(struct smu_context *smu,
+ 						void **table)
+ {
+@@ -391,12 +428,19 @@
+ 		(struct gpu_metrics_v2_2 *)smu_driver_table_ptr(
+ 			smu, SMU_DRIVER_TABLE_GPU_METRICS);
+ 	SmuMetrics_t metrics;
++	uint32_t gfxclk;
+ 	int i, ret = 0;
+ 
+ 	ret = smu_cmn_get_metrics_table(smu, &metrics, true);
+ 	if (ret)
+ 		return ret;
+ 
++	/* Gfxclk has no slot in the 8-core hybrid Current table (offset 0x44 is
++	 * C0Residency[6]); query it from the SMU, falling back to the table. */
++	gfxclk = metrics.Current.GfxclkFrequency;
++	if (smu_cmn_send_smc_msg(smu, SMU_MSG_GetGfxclkFrequency, &gfxclk))
++		gfxclk = metrics.Current.GfxclkFrequency;
++
+ 	smu_cmn_init_soft_gpu_metrics(gpu_metrics, 2, 2);
+ 
+ 	gpu_metrics->temperature_gfx = metrics.Current.GfxTemperature;
+@@ -413,17 +457,33 @@
+ 	gpu_metrics->average_vclk_frequency = metrics.Average.VclkFrequency;
+ 	gpu_metrics->average_dclk_frequency = metrics.Average.DclkFrequency;
+ 
+-	gpu_metrics->current_gfxclk = metrics.Current.GfxclkFrequency;
++	gpu_metrics->current_gfxclk = gfxclk;
+ 	gpu_metrics->current_socclk = metrics.Current.SocclkFrequency;
+ 	gpu_metrics->current_uclk = metrics.Current.MemclkFrequency;
+ 	gpu_metrics->current_fclk = metrics.Current.MemclkFrequency;
+ 	gpu_metrics->current_vclk = metrics.Current.VclkFrequency;
+ 	gpu_metrics->current_dclk = metrics.Current.DclkFrequency;
+ 
+-	for (i = 0; i < 6; i++) {
+-		gpu_metrics->temperature_core[i] = metrics.Current.CoreTemperature[i];
+-		gpu_metrics->average_core_power[i] = metrics.Average.CorePower[i];
+-		gpu_metrics->current_coreclk[i] = metrics.Current.CoreFrequency[i];
++	if (cs_eight_core_map || cyan_skillfish_core_count() >= 8) {
++		/* Interpret the Current table as the 8-core hybrid layout. The
++		 * Average table stays six-wide, so per-core power is sourced from
++		 * Current (instantaneous, not averaged). Cores with no firmware
++		 * slot stay at the 0xffff sentinel from init_soft_gpu_metrics. */
++		SmuMetricsTable_hybrid_t hcur;
++
++		memcpy(&hcur, &metrics.Current, sizeof(hcur));
++		for (i = 0; i < 8; i++)
++			gpu_metrics->current_coreclk[i] = hcur.CoreFrequency[i];
++		for (i = 1; i < 8; i++)
++			gpu_metrics->average_core_power[i] = hcur.CorePower[i - 1];
++		gpu_metrics->temperature_core[4] = hcur.CoreTemperature[0];
++		gpu_metrics->temperature_core[5] = hcur.CoreTemperature[1];
++	} else {
++		for (i = 0; i < 6; i++) {
++			gpu_metrics->temperature_core[i] = metrics.Current.CoreTemperature[i];
++			gpu_metrics->average_core_power[i] = metrics.Average.CorePower[i];
++			gpu_metrics->current_coreclk[i] = metrics.Current.CoreFrequency[i];
++		}
+ 	}
+ 
+ 	for (i = 0; i < 2; i++) {
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu11_driver_if_cyan_skillfish.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu11_driver_if_cyan_skillfish.h
+@@ -76,4 +76,48 @@
+ 	uint32_t Accnt;
+ } SmuMetrics_t;
+ 
++/*
++ * Actual PMFW layout of the Current metrics table when all eight physical
++ * cores of a BC-250 are enabled.  Mapped empirically by differential
++ * core-offline probing: the firmware keeps the table at 116 bytes (same total
++ * as SmuMetricsTable_t) but redistributes the per-core arrays inside the
++ * 0x00-0x2F window, pinning L3 and the aggregated tail at the same offsets.
++ *
++ * Per-core coverage is NOT uniform:
++ *   CoreFrequency[8]    -> cores 0-7
++ *   CorePower[7]         -> cores 1-7   (core 0 has no slot)
++ *   CoreTemperature[2]   -> cores 4,5   (the power expansion overwrote 0-3)
++ *   C0Residency[7]       -> cores 0-6
++ * GfxclkFrequency has no slot (offset 0x44 is C0Residency[6]); query it via
++ * the GetGfxclkFrequency SMU message instead.
++ *
++ * The Average table stays six-wide (SmuMetricsTable_t).  Field order below is
++ * arranged so natural alignment reproduces the firmware byte offsets exactly;
++ * sizeof == 116 is asserted at build time.
++ */
++typedef struct SmuMetricsTable_hybrid_t {
++	uint16_t CoreFrequency[8];		/* 0x00 cores 0-7 */
++	uint32_t CorePower[7];			/* 0x10 cores 1-7 */
++	uint16_t CoreTemperature[2];		/* 0x2C cores 4,5 */
++	uint16_t L3Frequency[2];		/* 0x30 */
++	uint16_t L3Temperature[2];		/* 0x34 */
++	uint16_t C0Residency[7];		/* 0x38 cores 0-6 */
++	uint16_t GfxTemperature;		/* 0x46 */
++	uint16_t SocclkFrequency;		/* 0x48 */
++	uint16_t VclkFrequency;			/* 0x4A */
++	uint16_t DclkFrequency;			/* 0x4C */
++	uint16_t MemclkFrequency;		/* 0x4E */
++	uint32_t Voltage[2];			/* 0x50 */
++	uint32_t Current[2];			/* 0x58 */
++	uint32_t Power[2];			/* 0x60 */
++	uint32_t CurrentSocketPower;		/* 0x68 */
++	uint16_t SocTemperature;		/* 0x6C */
++	uint16_t EdgeTemperature;		/* 0x6E */
++	uint16_t ThrottlerStatus;		/* 0x70 */
++	uint16_t Spare;				/* 0x72 */
++} SmuMetricsTable_hybrid_t;
++
++static_assert(sizeof(SmuMetricsTable_hybrid_t) == 116,
++		"hybrid metrics table must stay 116 bytes; check field alignment");
++
+ #endif
