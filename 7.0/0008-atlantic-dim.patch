@@ -1,0 +1,232 @@
+--- a/drivers/net/ethernet/aquantia/Kconfig	2026-02-16 16:11:45.000000000 +0000
++++ b/drivers/net/ethernet/aquantia/Kconfig	2026-02-23 01:33:03.716143177 +0000
+@@ -20,6 +20,7 @@
+ 	tristate "aQuantia AQtion(tm) Support"
+ 	depends on PCI
+ 	depends on MACSEC || MACSEC=n
++	select NET_DIM
+ 	help
+ 	  This enables the support for the aQuantia AQtion(tm) Ethernet card.
+ 
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h	2026-02-16 16:11:45.000000000 +0000
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h	2026-02-23 01:33:13.450057021 +0000
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/ethtool.h>
+ #include <net/xdp.h>
++#include <linux/dim.h>
+ #include <linux/bpf.h>
+ 
+ #include "aq_common.h"
+@@ -49,6 +50,8 @@
+ 	u32 itr;
+ 	u16 rx_itr;
+ 	u16 tx_itr;
++	bool is_rx_adaptive;
++	bool is_tx_adaptive;
+ 	u32 rxpageorder;
+ 	u32 num_rss_queues;
+ 	u32 mtu;
+@@ -128,6 +131,11 @@
+ 	atomic_t flags;
+ 	u32 msg_enable;
+ 	struct aq_vec_s *aq_vec[AQ_CFG_VECS_MAX];
++	/* DIM (Dynamic Interrupt Moderation) state */
++	struct dim rx_dim;
++	struct dim tx_dim;
++	u64 dim_rx_event_ctr;
++	u64 dim_tx_event_ctr;
+ 	struct aq_ring_s *aq_ring_tx[AQ_HW_QUEUES_MAX];
+ 	struct aq_hw_s *aq_hw;
+ 	struct bpf_prog *xdp_prog;
+#endif /* AQ_NIC_H */
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c	2026-02-16 16:11:45.000000000 +0000
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c	2026-02-23 01:33:44.071788263 +0000
+@@ -18,6 +18,7 @@
+ #include "aq_ptp.h"
+ #include "aq_filters.h"
+ 
++#include <linux/dim.h>
+ #include <linux/moduleparam.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+@@ -65,6 +66,86 @@
+ 		rss_params->indirection_table[i] = i & (num_rss_queues - 1);
+ }
+ 
++/* ---- DIM (Dynamic Interrupt Moderation) ---- */
++
++static void aq_nic_rx_dim_work(struct work_struct *work)
++{
++	struct dim *dim = container_of(work, struct dim, work);
++	struct aq_nic_s *nic = container_of(dim, struct aq_nic_s, rx_dim);
++	struct dim_cq_moder moder;
++
++	moder = net_dim_get_rx_moderation(dim->mode, dim->profile_ix);
++
++	/* Clamp to hardware max (0x1FF * 2 = 1022 usec) */
++	if (moder.usec > AQ_CFG_INTERRUPT_MODERATION_USEC_MAX)
++		moder.usec = AQ_CFG_INTERRUPT_MODERATION_USEC_MAX;
++
++	nic->aq_nic_cfg.rx_itr = moder.usec;
++	nic->aq_nic_cfg.itr = AQ_CFG_INTERRUPT_MODERATION_ON;
++
++	aq_nic_update_interrupt_moderation_settings(nic);
++
++	dim->state = DIM_START_MEASURE;
++}
++
++static void aq_nic_tx_dim_work(struct work_struct *work)
++{
++	struct dim *dim = container_of(work, struct dim, work);
++	struct aq_nic_s *nic = container_of(dim, struct aq_nic_s, tx_dim);
++	struct dim_cq_moder moder;
++
++	moder = net_dim_get_tx_moderation(dim->mode, dim->profile_ix);
++
++	if (moder.usec > AQ_CFG_INTERRUPT_MODERATION_USEC_MAX)
++		moder.usec = AQ_CFG_INTERRUPT_MODERATION_USEC_MAX;
++
++	nic->aq_nic_cfg.tx_itr = moder.usec;
++	nic->aq_nic_cfg.itr = AQ_CFG_INTERRUPT_MODERATION_ON;
++
++	aq_nic_update_interrupt_moderation_settings(nic);
++
++	dim->state = DIM_START_MEASURE;
++}
++
++static void aq_nic_dim_init(struct aq_nic_s *self)
++{
++	INIT_WORK(&self->rx_dim.work, aq_nic_rx_dim_work);
++	self->rx_dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
++	self->rx_dim.profile_ix = 1; /* start at moderate profile */
++
++	INIT_WORK(&self->tx_dim.work, aq_nic_tx_dim_work);
++	self->tx_dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
++	self->tx_dim.profile_ix = 1;
++
++	self->dim_rx_event_ctr = 0;
++	self->dim_tx_event_ctr = 0;
++}
++
++static void aq_nic_dim_update(struct aq_nic_s *self)
++{
++	/* Use hardware-level DMA packet/byte counters for global view */
++	if (self->aq_nic_cfg.is_rx_adaptive) {
++		struct dim_sample rx_sample = {};
++
++		dim_update_sample(++self->dim_rx_event_ctr,
++				  self->aq_hw->curr_stats.dma_pkt_rc,
++				  self->aq_hw->curr_stats.dma_oct_rc,
++				  &rx_sample);
++		net_dim(&self->rx_dim, &rx_sample);
++	}
++
++	if (self->aq_nic_cfg.is_tx_adaptive) {
++		struct dim_sample tx_sample = {};
++
++		dim_update_sample(++self->dim_tx_event_ctr,
++				  self->aq_hw->curr_stats.dma_pkt_tc,
++				  self->aq_hw->curr_stats.dma_oct_tc,
++				  &tx_sample);
++		net_dim(&self->tx_dim, &tx_sample);
++	}
++}
++
+ /* Recalculate the number of vectors */
+ static void aq_nic_cfg_update_num_vecs(struct aq_nic_s *self)
+ {
+@@ -250,6 +331,11 @@
+ 	mutex_unlock(&self->fwreq_mutex);
+ 
+ 	aq_nic_update_ndev_stats(self);
++
++	/* Update DIM if adaptive coalescing is enabled */
++	if (self->aq_nic_cfg.is_rx_adaptive ||
++	    self->aq_nic_cfg.is_tx_adaptive)
++		aq_nic_dim_update(self);
+ }
+ 
+ static void aq_nic_service_timer_cb(struct timer_list *t)
+@@ -424,6 +510,8 @@
+ 	if (err < 0)
+ 		goto err_exit;
+ 
++	aq_nic_dim_init(self);
++
+ 	if (ATL_HW_IS_CHIP_FEATURE(self->aq_hw, ATLANTIC) &&
+ 	    self->aq_nic_cfg.aq_hw_caps->media_type == AQ_HW_MEDIA_TYPE_TP) {
+ 		self->aq_hw->phy_id = HW_ATL_PHY_ID_MAX;
+@@ -1432,6 +1520,14 @@
+ 	if (!self)
+ 		goto err_exit;
+ 
++	/* Disable adaptive flags first to prevent DIM from rescheduling */
++	self->aq_nic_cfg.is_rx_adaptive = false;
++	self->aq_nic_cfg.is_tx_adaptive = false;
++
++	/* Cancel any pending DIM work before teardown */
++	if (self->rx_dim.work.func)
++		cancel_work_sync(&self->rx_dim.work);
++	if (self->tx_dim.work.func)
++		cancel_work_sync(&self->tx_dim.work);
++
+ 	for (i = 0U; i < self->aq_vecs; i++) {
+ 		aq_vec = self->aq_vec[i];
+ 		aq_vec_deinit(aq_vec);
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c	2026-02-16 16:11:45.000000000 +0000
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c	2026-02-23 01:33:58.379663822 +0000
+@@ -562,6 +562,9 @@
+ 
+ 	cfg = aq_nic_get_cfg(aq_nic);
+ 
++	coal->use_adaptive_rx_coalesce = cfg->is_rx_adaptive;
++	coal->use_adaptive_tx_coalesce = cfg->is_tx_adaptive;
++
+ 	if (cfg->itr == AQ_CFG_INTERRUPT_MODERATION_ON ||
+ 	    cfg->itr == AQ_CFG_INTERRUPT_MODERATION_AUTO) {
+ 		coal->rx_coalesce_usecs = cfg->rx_itr;
+@@ -588,9 +591,28 @@
+ 
+ 	cfg = aq_nic_get_cfg(aq_nic);
+ 
++	/* Capture adaptive coalescing (DIM) flags */
++	cfg->is_rx_adaptive = !!coal->use_adaptive_rx_coalesce;
++	cfg->is_tx_adaptive = !!coal->use_adaptive_tx_coalesce;
++
+ 	/* Atlantic only supports timing based coalescing
+ 	 */
+ 	if (coal->rx_max_coalesced_frames > 1 ||
++	    coal->tx_max_coalesced_frames > 1)
++		return -EOPNOTSUPP;
++
++	/* In adaptive mode, DIM manages the timers automatically */
++	if (cfg->is_rx_adaptive || cfg->is_tx_adaptive) {
++		/* Clamp any user-provided initial timers to hardware max */
++		if (coal->rx_coalesce_usecs > AQ_CFG_INTERRUPT_MODERATION_USEC_MAX ||
++		    coal->tx_coalesce_usecs > AQ_CFG_INTERRUPT_MODERATION_USEC_MAX)
++			return -EINVAL;
++
++		cfg->itr = AQ_CFG_INTERRUPT_MODERATION_ON;
++		if (coal->rx_coalesce_usecs)
++			cfg->rx_itr = coal->rx_coalesce_usecs;
++		if (coal->tx_coalesce_usecs)
++			cfg->tx_itr = coal->tx_coalesce_usecs;
++
++		return aq_nic_update_interrupt_moderation_settings(aq_nic);
++	}
++
++	/* We do not support frame counting. Check this
++	 */
++	if (!(coal->rx_max_coalesced_frames == !coal->rx_coalesce_usecs))
++		return -EOPNOTSUPP;
++@@ -1050,7 +1072,8 @@
+ 
+ const struct ethtool_ops aq_ethtool_ops = {
+ 	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
+-				     ETHTOOL_COALESCE_MAX_FRAMES,
++				     ETHTOOL_COALESCE_MAX_FRAMES |
++				     ETHTOOL_COALESCE_USE_ADAPTIVE,
+ 	.get_link            = aq_ethtool_get_link,
+ 	.get_regs_len        = aq_ethtool_get_regs_len,
+ 	.get_regs            = aq_ethtool_get_regs,
