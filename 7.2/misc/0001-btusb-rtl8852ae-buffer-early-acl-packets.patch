@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fang Zikai <freesky3@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 20:50:00 +0800
+Subject: [PATCH] Bluetooth: btusb: buffer early ACL packets for Realtek RTL8852AE (0bda:4852)
+
+Realtek RTL8852AE USB Bluetooth adapters (0bda:4852) exhibit a timing race
+condition where initial ACL data frames (such as BLE ATT Exchange MTU
+Requests from HOGP mice like Huawei CD23 SE) arrive via USB interrupt/bulk
+endpoints ~10-12ms before the controller reports the LE Enhanced
+Connection Complete event.
+
+Because the connection handle is not yet registered in hci_conn_hash, the
+kernel logs "ACL packet for unknown connection handle" and drops the
+packet. The peripheral's MTU request is never answered, causing it to
+terminate the connection after ~30s (Reason 0x13, Remote User Terminated)
+and rendering the mouse unusable (no evdev pointer device created).
+
+Fix this by buffering early ACL packets for up to 50ms specifically on
+RTL8852AE controllers until the connection handle is established,
+preserving packet order per connection handle and maintaining zero
+overhead for other adapters.
+
+Link: https://patchew.org/linux/3ebd064b6e7a9d3d8d72f1da618765affbd30cd7.1785459643.git.amirabudubai@gmail.com/
+Signed-off-by: Fang Zikai <freesky3@users.noreply.github.com>
+---
+ drivers/bluetooth/btusb.c | 58 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 55 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
+index 28cbdb5f7..12c3f0b4a 100644
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -969,6 +969,7 @@ struct btusb_data {
+ 	unsigned long flags;
+ 
+ 	bool poll_sync;
++	bool hold_early_acl;
+ 	int intr_interval;
+ 	struct work_struct  work;
+ 	struct work_struct  waker;
+@@ -1315,6 +1316,22 @@ static int btusb_recv_intr(struct btusb_data *data, void *buffer, int count)
+ 
+ static int btusb_recv_acl(struct btusb_data *data, struct sk_buff *skb)
+ {
++	/* RTL8852AE can deliver ACL data before its connection event. Keep
++	 * receive timestamps only until rx_work hands the frame to HCI.
++	 * Normal traffic on other adapters retains the upstream path.
++	 */
++	if (data->hold_early_acl) {
++		if (skb_queue_len(&data->acl_q) >= 64) {
++			bt_dev_warn_ratelimited(data->hdev, "early ACL queue full");
++			kfree_skb(skb);
++			return 0;
++		}
++		skb->tstamp = ktime_get();
++		skb_queue_tail(&data->acl_q, skb);
++		schedule_delayed_work(&data->rx_work, 0);
++		return 0;
++	}
++
+ 	/* Only queue ACL packet if intr_interval is set as it means
+ 	 * force_poll_sync has been enabled.
+ 	 */
+@@ -2060,18 +2077,17 @@ static int btusb_close(struct hci_dev *hdev)
+ 
+ 	BT_DBG("%s", hdev->name);
+ 
+-	cancel_delayed_work(&data->rx_work);
+ 	cancel_work_sync(&data->work);
+ 	cancel_work_sync(&data->waker);
+ 
+-	skb_queue_purge(&data->acl_q);
+-
+ 	clear_bit(BTUSB_ISOC_RUNNING, &data->flags);
+ 	clear_bit(BTUSB_BULK_RUNNING, &data->flags);
+ 	clear_bit(BTUSB_INTR_RUNNING, &data->flags);
+ 	clear_bit(BTUSB_DIAG_RUNNING, &data->flags);
+ 
+ 	btusb_stop_traffic(data);
++	cancel_delayed_work_sync(&data->rx_work);
++	skb_queue_purge(&data->acl_q);
+ 	btusb_free_frags(data);
+ 
+ 	err = usb_autopm_get_interface(data->intf);
+@@ -2097,7 +2113,7 @@ static int btusb_flush(struct hci_dev *hdev)
+ 
+ 	BT_DBG("%s", hdev->name);
+ 
+-	cancel_delayed_work(&data->rx_work);
++	cancel_delayed_work_sync(&data->rx_work);
+ 
+ 	skb_queue_purge(&data->acl_q);
+ 
+@@ -2481,10 +2497,40 @@ static void btusb_rx_work(struct work_struct *work)
+ 	struct btusb_data *data = container_of(work, struct btusb_data,
+ 					       rx_work.work);
+ 	struct sk_buff *skb;
++	unsigned int count = skb_queue_len(&data->acl_q);
++	DECLARE_BITMAP(held_handles, 4096);
++	bool retry = false;
+ 
+-	/* Dequeue ACL data received during the interval */
+-	while ((skb = skb_dequeue(&data->acl_q)))
++	bitmap_zero(held_handles, 4096);
++
++	/* Visit each queued frame once. A missing handle must not block
++	 * established links sharing this controller or spin this worker.
++	 * Wait at most 50 ms: the measured interrupt/bulk skew was 11 ms.
++	 */
++	while (count-- && (skb = skb_dequeue(&data->acl_q))) {
++		if (data->hold_early_acl && skb->len >= HCI_ACL_HDR_SIZE) {
++			u16 handle = hci_handle(get_unaligned_le16(skb->data));
++			bool known;
++
++			/* Only test existence; never dereference the returned conn. */
++			rcu_read_lock();
++			known = hci_conn_hash_lookup_handle(data->hdev, handle) != NULL;
++			rcu_read_unlock();
++			if (test_bit(handle, held_handles) ||
++			    (!known && ktime_ms_delta(ktime_get(), skb->tstamp) < 50)) {
++				__set_bit(handle, held_handles);
++				skb_queue_tail(&data->acl_q, skb);
++				retry = true;
++				continue;
++			}
++			skb->tstamp = 0;
++		}
++		/* Expired frames follow the normal unknown-handle drop path. */
+ 		data->recv_acl(data->hdev, skb);
++	}
++
++	if (retry)
++		schedule_delayed_work(&data->rx_work, msecs_to_jiffies(2));
+ }
+ 
+ static int btusb_setup_bcm92035(struct hci_dev *hdev)
+@@ -4426,6 +4472,9 @@ static int btusb_probe(struct usb_interface *intf,
+ 		usb_enable_autosuspend(data->udev);
+ 
+ 	data->poll_sync = enable_poll_sync;
++	data->hold_early_acl =
++		le16_to_cpu(data->udev->descriptor.idVendor) == 0x0bda &&
++		le16_to_cpu(data->udev->descriptor.idProduct) == 0x4852;
+ 
+ 	err = hci_register_dev(hdev);
+ 	if (err < 0)
+-- 
+2.48.1
